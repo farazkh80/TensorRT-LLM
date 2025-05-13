@@ -75,6 +75,10 @@ std::string getSMFlag(int SM)
     {
         smStr += "a";
     }
+    if (SM == 120 || SM == 121)
+    {
+        smStr = "120f";
+    }
     return "-arch=sm_" + smStr;
 }
 
