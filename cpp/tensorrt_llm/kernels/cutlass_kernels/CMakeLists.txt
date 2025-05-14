@@ -143,7 +143,8 @@ function(process_target target_name enable_hopper enable_blackwell)
   endif()
 
   if(${enable_blackwell} AND ("100" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
-                              OR "120" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG))
+                              OR "120" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
+                              OR "121" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG))
 
     if("100" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
       # No kernels should be parsed, unless blackwell is specified. This is a
