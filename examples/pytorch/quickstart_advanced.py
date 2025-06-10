@@ -1,4 +1,6 @@
 import argparse
+import time
+import cuda.bindings.runtime as cudart
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
@@ -193,7 +195,19 @@ def main():
     prompts = args.prompt if args.prompt else example_prompts
 
     llm, sampling_params = setup_llm(args)
+    
+    print("--->>>> Waiting for 5 sec before starting generation <<<---")
+    time.sleep(5)
+    cudart.cudaProfilerStart()
+    print("---->>> Starting ...")
+    start_time = time.time()
     outputs = llm.generate(prompts, sampling_params)
+    end_time = time.time()
+    cudart.cudaProfilerStop()
+    
+    total_time = end_time - start_time 
+    total_tokens = sum([out.outputs[0].length for out in outputs])
+    print(f"---->>>> time = {total_time} output tokens = {total_tokens} perf = {total_tokens/total_time} <<<----")
 
     for i, output in enumerate(outputs):
         prompt = output.prompt

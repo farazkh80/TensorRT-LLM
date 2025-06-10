@@ -1933,8 +1933,15 @@ class PyTorchModelEngine(ModelEngine):
                 extra_model_inputs: Optional[Dict[str, Any]] = None,
                 gather_context_logits: bool = False):
 
+        # Add comprehensive timing for first request debugging
+        forward_start = torch.cuda.Event(enable_timing=True)
+        forward_start.record()
+
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
+
+        setup_start = torch.cuda.Event(enable_timing=True)
+        setup_start.record()
 
         attn_metadata = self._set_up_attn_metadata(kv_cache_manager)
         if self.is_spec_decode:
@@ -1946,6 +1953,9 @@ class PyTorchModelEngine(ModelEngine):
         else:
             spec_metadata = None
 
+        setup_end = torch.cuda.Event(enable_timing=True)
+        setup_end.record()
+
         if kv_cache_manager is None:
             inputs, gather_ids = self._prepare_tp_inputs_no_cache(
                 scheduled_requests, attn_metadata, spec_metadata)
@@ -1953,10 +1963,37 @@ class PyTorchModelEngine(ModelEngine):
                 inputs.update(extra_model_inputs)
             self.last_spec_metadata = spec_metadata
 
-            return self._forward_step(inputs, gather_ids, gather_context_logits)
+            model_forward_start = torch.cuda.Event(enable_timing=True)
+            model_forward_start.record()
+            
+            result = self._forward_step(inputs, gather_ids, gather_context_logits)
+            
+            model_forward_end = torch.cuda.Event(enable_timing=True)
+            model_forward_end.record()
+            
+            forward_end = torch.cuda.Event(enable_timing=True)
+            forward_end.record()
+            torch.cuda.synchronize()
+            
+            setup_time = setup_start.elapsed_time(setup_end)
+            model_time = model_forward_start.elapsed_time(model_forward_end)
+            total_time = forward_start.elapsed_time(forward_end)
+            
+            print(f"=== MODEL ENGINE FORWARD (NO CACHE) ===")
+            print(f"Setup metadata: {setup_time:.3f} ms")
+            print(f"Model forward: {model_time:.3f} ms")
+            print(f"Total forward: {total_time:.3f} ms")
+            print("=" * 40)
+            
+            return result
 
+        # KV cache path - this is likely where the 19.8s is spent
         with self._maybe_pad_batch(scheduled_requests,
                                    kv_cache_manager) as scheduled_requests:
+            
+            graph_setup_start = torch.cuda.Event(enable_timing=True)
+            graph_setup_start.record()
+            
             maybe_graph = self._maybe_get_cuda_graph(
                 scheduled_requests, spec_config=self.spec_config)
             if maybe_graph is not None:
@@ -1968,6 +2005,12 @@ class PyTorchModelEngine(ModelEngine):
                 if self.is_spec_decode:
                     spec_metadata = self.spec_metadata
 
+            graph_setup_end = torch.cuda.Event(enable_timing=True)
+            graph_setup_end.record()
+
+            input_prep_start = torch.cuda.Event(enable_timing=True)
+            input_prep_start.record()
+            
             inputs, gather_ids = self._prepare_inputs(scheduled_requests,
                                                       kv_cache_manager,
                                                       attn_metadata,
@@ -1978,12 +2021,21 @@ class PyTorchModelEngine(ModelEngine):
             self.last_spec_metadata = spec_metadata
 
             self.iter_counter += 1
+            
+            input_prep_end = torch.cuda.Event(enable_timing=True)
+            input_prep_end.record()
+
+            model_exec_start = torch.cuda.Event(enable_timing=True)
+            model_exec_start.record()
 
             if maybe_graph is None:
                 outputs = self._forward_step(inputs, gather_ids,
                                              gather_context_logits)
             else:
                 if maybe_graph.needs_capture():
+                    capture_start = torch.cuda.Event(enable_timing=True)
+                    capture_start.record()
+                    
                     pool = maybe_graph.capture(
                         lambda inputs: self._forward_step(
                             inputs,
@@ -1993,8 +2045,21 @@ class PyTorchModelEngine(ModelEngine):
                         extra_model_inputs,
                     )
                     self._cuda_graph_mem_pool = pool
+                    
+                    capture_end = torch.cuda.Event(enable_timing=True)
+                    capture_end.record()
+                    torch.cuda.synchronize()
+                    
+                    capture_time = capture_start.elapsed_time(capture_end)
+                    print(f"*** CUDA GRAPH CAPTURE TOOK: {capture_time:.3f} ms ***")
 
                 outputs = maybe_graph.run(inputs, extra_model_inputs)
+
+            model_exec_end = torch.cuda.Event(enable_timing=True)
+            model_exec_end.record()
+
+            postproc_start = torch.cuda.Event(enable_timing=True)
+            postproc_start.record()
 
             # Note: To overlap the CPU and GPU computation as much as possible,
             # guided_decoder.build should be called immediately after the launch of the single step;
@@ -2009,6 +2074,34 @@ class PyTorchModelEngine(ModelEngine):
                                             outputs['logits'], seq_slot_manager)
 
             self._execute_logit_post_processors(scheduled_requests, outputs)
+
+            postproc_end = torch.cuda.Event(enable_timing=True)
+            postproc_end.record()
+            
+            forward_end = torch.cuda.Event(enable_timing=True)
+            forward_end.record()
+            torch.cuda.synchronize()
+            
+            # Print detailed timing breakdown
+            setup_time = setup_start.elapsed_time(setup_end)
+            graph_time = graph_setup_start.elapsed_time(graph_setup_end)
+            input_time = input_prep_start.elapsed_time(input_prep_end)
+            model_time = model_exec_start.elapsed_time(model_exec_end)
+            postproc_time = postproc_start.elapsed_time(postproc_end)
+            total_time = forward_start.elapsed_time(forward_end)
+            
+            print(f"=== MODEL ENGINE FORWARD (KV CACHE) ===")
+            print(f"Setup metadata: {setup_time:.3f} ms")
+            print(f"CUDA graph setup: {graph_time:.3f} ms")
+            print(f"Input preparation: {input_time:.3f} ms")
+            print(f"Model execution: {model_time:.3f} ms")
+            print(f"Post-processing: {postproc_time:.3f} ms")
+            print(f"Total forward: {total_time:.3f} ms")
+            print(f"Batch size: {scheduled_requests.batch_size}")
+            print(f"Context reqs: {len(scheduled_requests.context_requests)}")
+            print(f"Gen reqs: {len(scheduled_requests.generation_requests)}")
+            print(f"Graph capture: {'YES' if maybe_graph and maybe_graph.needs_capture() else 'NO'}")
+            print("=" * 40)
 
             return outputs
 
@@ -2028,22 +2121,72 @@ class PyTorchModelEngine(ModelEngine):
                       inputs: Dict[str, Any],
                       gather_ids: Optional[torch.Tensor],
                       gather_context_logits: bool = False) -> Dict[str, Any]:
+        
+        preprocess_start = torch.cuda.Event(enable_timing=True)
+        preprocess_start.record()
+        
         inputs = self._preprocess_inputs(inputs)
+        
+        preprocess_end = torch.cuda.Event(enable_timing=True)
+        preprocess_end.record()
+        
         if self.without_logits:
+            model_start = torch.cuda.Event(enable_timing=True)
+            model_start.record()
+            
             outputs = self.model_forward(**inputs)
+            
+            model_end = torch.cuda.Event(enable_timing=True)
+            model_end.record()
+            torch.cuda.synchronize()
+            
+            preprocess_time = preprocess_start.elapsed_time(preprocess_end)
+            model_time = model_start.elapsed_time(model_end)
+            
+            print(f"=== _FORWARD_STEP (NO LOGITS) ===")
+            print(f"Preprocess: {preprocess_time:.3f} ms")
+            print(f"Model forward: {model_time:.3f} ms")
+            print("=" * 35)
+            
             return outputs
 
         # For simplicity, just return all the the logits if we have special gather_ids
         # from speculative decoding.
+        model_start = torch.cuda.Event(enable_timing=True)
+        model_start.record()
+        
         logits = self.model_forward(
             **inputs,
             return_context_logits=gather_ids is not None
             or gather_context_logits,
         )
+        
+        model_end = torch.cuda.Event(enable_timing=True)
+        model_end.record()
+        
+        gather_start = torch.cuda.Event(enable_timing=True)
+        gather_start.record()
+        
         if gather_ids is not None:
-            return {'logits': logits[gather_ids]}
+            result = {'logits': logits[gather_ids]}
         else:
-            return {'logits': logits}
+            result = {'logits': logits}
+            
+        gather_end = torch.cuda.Event(enable_timing=True)
+        gather_end.record()
+        torch.cuda.synchronize()
+        
+        preprocess_time = preprocess_start.elapsed_time(preprocess_end)
+        model_time = model_start.elapsed_time(model_end)
+        gather_time = gather_start.elapsed_time(gather_end)
+        
+        print(f"=== _FORWARD_STEP (WITH LOGITS) ===")
+        print(f"Preprocess: {preprocess_time:.3f} ms")
+        print(f"Model forward: {model_time:.3f} ms")
+        print(f"Gather logits: {gather_time:.3f} ms")
+        print("=" * 35)
+        
+        return result
 
     def _init_userbuffers(self, hidden_size):
         if self.mapping.tp_size <= 1:

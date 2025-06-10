@@ -237,8 +237,20 @@ class TorchSampler(Sampler):
         return False
 
     def update_requests(self, state: SampleState) -> None:
+        # Start timing
+        start_event = torch.cuda.Event(enable_timing=True)
+        sync_end_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        
+        start_event.record()
+        
+        # Time the sync operation
         if state.sampler_event:
             state.sampler_event.synchronize()
+        
+        sync_end_event.record()
+        
+        # Rest of the processing
         new_tokens_list = state.host.new_tokens.tolist()
         scheduled_requests = state.scheduled_requests
 

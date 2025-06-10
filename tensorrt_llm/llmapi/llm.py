@@ -40,6 +40,8 @@ from .tokenizer import TokenizerBase, _xgrammar_tokenizer_info
 from .utils import (append_docstring, exception_handler, get_device_count,
                     print_colored_debug)
 
+import torch
+
 
 class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
     """The output data of a completion request to the LLM.
@@ -245,6 +247,10 @@ class LLM:
         Returns:
             Union[tensorrt_llm.llmapi.RequestOutput, List[tensorrt_llm.llmapi.RequestOutput]]: The output data of the completion request to the LLM.
         """
+        # Total timing
+        total_start = torch.cuda.Event(enable_timing=True)
+        total_start.record()
+        
         unbatched = not isinstance(inputs, list)
         if not unbatched:
             if isinstance(inputs[0], int):
@@ -261,6 +267,10 @@ class LLM:
             else:
                 return maybe_batched
 
+        # Time the async submission phase
+        submission_start = torch.cuda.Event(enable_timing=True)
+        submission_start.record()
+        
         futures = []
         for i, request_inputs in enumerate(inputs):
             future = self.generate_async(
@@ -274,11 +284,48 @@ class LLM:
                 streaming=False)
             futures.append(future)
 
-        for future in tqdm(futures,
+        submission_end = torch.cuda.Event(enable_timing=True)
+        submission_end.record()
+        
+        # Time the waiting phase - this is where the real work happens
+        waiting_start = torch.cuda.Event(enable_timing=True)
+        waiting_start.record()
+        
+        for i, future in enumerate(tqdm(futures,
                            desc="Processed requests",
                            dynamic_ncols=True,
-                           disable=not use_tqdm):
-            future.result()
+                           disable=not use_tqdm)):
+            # Time each individual future.result() call
+            future_start = torch.cuda.Event(enable_timing=True)
+            future_start.record()
+            
+            result = future.result()
+            
+            future_end = torch.cuda.Event(enable_timing=True)
+            future_end.record()
+            torch.cuda.synchronize()
+            
+            future_time = future_start.elapsed_time(future_end)
+            print(f"Future {i} result() took: {future_time:.3f} ms")
+
+        waiting_end = torch.cuda.Event(enable_timing=True)
+        waiting_end.record()
+        
+        total_end = torch.cuda.Event(enable_timing=True)
+        total_end.record()
+        torch.cuda.synchronize()
+        
+        # Print comprehensive timing breakdown
+        submission_time = submission_start.elapsed_time(submission_end)
+        waiting_time = waiting_start.elapsed_time(waiting_end)
+        total_time = total_start.elapsed_time(total_end)
+        
+        print(f"=== GENERATE TIMING BREAKDOWN ===")
+        print(f"Async submission: {submission_time:.3f} ms")
+        print(f"Waiting for results: {waiting_time:.3f} ms")
+        print(f"Total generate time: {total_time:.3f} ms")
+        print(f"Number of requests: {len(futures)}")
+        print("=" * 35)
 
         if unbatched:
             futures = futures[0]
@@ -313,17 +360,21 @@ class LLM:
         Returns:
             tensorrt_llm.llmapi.RequestOutput: The output data of the completion request to the LLM.
         """
+        # Time each step of input processing
+        step1_start = torch.cuda.Event(enable_timing=True)
+        step1_start.record()
+        
         sampling_params = self._prepare_sampling_params(sampling_params)
 
-        # With pytorch backend, py_executor has logic to handle max_tokens of 1,
-        # so set to 1 to avoid allocating unnecessary KV cache blocks for single request
-        # TODO: Also support for trt backend
         if (disaggregated_params is not None
                 and disaggregated_params.request_type == "context_only"
                 and not self._on_trt_backend):
             sampling_params.max_tokens = 1
 
         inputs = prompt_inputs(inputs)
+        
+        step2_start = torch.cuda.Event(enable_timing=True)
+        step2_start.record()
 
         if not inputs.get("prompt") and inputs.get(
                 "prompt_token_ids") and inputs.get(
@@ -341,6 +392,9 @@ class LLM:
                 )
                 sampling_params.add_special_tokens = False
 
+        step3_start = torch.cuda.Event(enable_timing=True) 
+        step3_start.record()
+
         query_token_ids = None
         multimodal_embedding = None
         mrope_config = None
@@ -349,6 +403,7 @@ class LLM:
             prompt = None
             query_token_ids = inputs.get("query_token_ids", None)
         elif "prompt" in inputs:
+            # This is likely the expensive part for multimodal
             with nvtx_range_debug("input_processor"):
                 prompt_token_ids, extra_processed_inputs = self.input_processor(
                     inputs, sampling_params)
@@ -363,6 +418,9 @@ class LLM:
                 f"The inputs must be type str or list of int, but got {type(inputs)}"
             )
 
+        step4_start = torch.cuda.Event(enable_timing=True)
+        step4_start.record()
+
         self._check_arguments(
             len(prompt_token_ids),
             len(query_token_ids) if query_token_ids is not None else 0,
@@ -370,6 +428,7 @@ class LLM:
         if _postproc_params:
             _postproc_params.postproc_args.num_prompt_tokens = len(
                 prompt_token_ids)
+        
         result = self._executor.generate_async(
             prompt_token_ids,
             query_token_ids=query_token_ids,
@@ -383,6 +442,25 @@ class LLM:
             disaggregated_params=disaggregated_params,
             postproc_params=_postproc_params,
         )
+
+        step5_start = torch.cuda.Event(enable_timing=True)
+        step5_start.record()
+        torch.cuda.synchronize()
+        
+        # Print detailed input processing breakdown
+        step1_time = step1_start.elapsed_time(step2_start)
+        step2_time = step2_start.elapsed_time(step3_start)  
+        step3_time = step3_start.elapsed_time(step4_start) # This is likely the big one
+        step4_time = step4_start.elapsed_time(step5_start)
+        total_input_time = step1_start.elapsed_time(step5_start)
+        
+        print(f"=== INPUT PROCESSING BREAKDOWN ===")
+        print(f"Prepare sampling params: {step1_time:.3f} ms")
+        print(f"VLM/LLM prompt processing: {step2_time:.3f} ms") 
+        print(f"Input processor (w VISION if VLM): {step3_time:.3f} ms")
+        print(f"Executor submit: {step4_time:.3f} ms")
+        print(f"Total input processing: {total_input_time:.3f} ms")
+        print("=" * 35)
 
         return RequestOutput._from_generation_result(result, prompt,
                                                      self.tokenizer)

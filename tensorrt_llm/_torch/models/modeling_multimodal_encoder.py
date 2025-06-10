@@ -19,6 +19,7 @@ import os
 
 import torch.nn as nn
 from transformers import AutoConfig, AutoModel
+import torch
 
 from .modeling_multimodal_utils import multiscale_forward
 
@@ -62,23 +63,85 @@ class VisionTower(nn.Module):
         return image_features
 
     def forward(self, images):
+        tower_start = torch.cuda.Event(enable_timing=True)
+        tower_start.record()
+        
         if type(images) is list:
+            list_start = torch.cuda.Event(enable_timing=True)
+            list_start.record()
+            
             image_features = []
-            for image in images:
+            for i, image in enumerate(images):
+                image_start = torch.cuda.Event(enable_timing=True)
+                image_start.record()
+                
                 image_forward_out = self.vision_tower(
                     image.to(device=self.device, dtype=self.dtype).unsqueeze(0),
                     output_hidden_states=True,
                 )
                 image_feature = self.feature_select(image_forward_out).to(
                     image.dtype)
+                    
+                image_end = torch.cuda.Event(enable_timing=True)
+                image_end.record()
+                torch.cuda.synchronize()
+                
+                image_time = image_start.elapsed_time(image_end)
+                print(f"  Image {i} forward: {image_time:.3f} ms")
+                
                 image_features.append(image_feature)
+                
+            list_end = torch.cuda.Event(enable_timing=True)
+            list_end.record()
+            torch.cuda.synchronize()
+            
+            list_time = list_start.elapsed_time(list_end)
+            print(f"=== VISION TOWER (LIST) ===")
+            print(f"Total images: {len(images)}")
+            print(f"List processing: {list_time:.3f} ms")
+            print(f"Avg per image: {list_time/len(images):.3f} ms")
+            print("=" * 30)
+            
         else:
+            batch_start = torch.cuda.Event(enable_timing=True)
+            batch_start.record()
+            
             image_forward_outs = self.vision_tower(
                 images.to(device=self.device, dtype=self.dtype),
                 output_hidden_states=True,
             )
+            
+            feature_start = torch.cuda.Event(enable_timing=True)
+            feature_start.record()
+            
             image_features = self.feature_select(image_forward_outs).to(
                 images.dtype)
+                
+            feature_end = torch.cuda.Event(enable_timing=True)
+            feature_end.record()
+            
+            batch_end = torch.cuda.Event(enable_timing=True)
+            batch_end.record()
+            torch.cuda.synchronize()
+            
+            tower_time = batch_start.elapsed_time(feature_start)
+            feature_time = feature_start.elapsed_time(feature_end)
+            batch_time = batch_start.elapsed_time(batch_end)
+            
+            print(f"=== VISION TOWER (BATCH) ===")
+            print(f"Input shape: {images.shape}")
+            print(f"Vision tower forward: {tower_time:.3f} ms")
+            print(f"Feature selection: {feature_time:.3f} ms")
+            print(f"Total batch: {batch_time:.3f} ms")
+            print(f"Output shape: {image_features.shape}")
+            print("=" * 30)
+
+        tower_end = torch.cuda.Event(enable_timing=True)
+        tower_end.record()
+        torch.cuda.synchronize()
+        
+        total_tower_time = tower_start.elapsed_time(tower_end)
+        print(f"Vision Tower Total: {total_tower_time:.3f} ms")
 
         return image_features
 

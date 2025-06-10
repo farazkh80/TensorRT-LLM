@@ -845,10 +845,21 @@ class PyExecutor:
             iter_start_time = time.time()
             iter_stats = None
             while not self.is_shutdown or len(self.active_requests) > 0:
+                # Timer for entire iteration
+                iter_timer_start = torch.cuda.Event(enable_timing=True)
+                iter_timer_start.record()
+                
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
+                
+                # Timer for fetch requests
+                fetch_timer_start = torch.cuda.Event(enable_timing=True)
+                fetch_timer_start.record()
                 new_requests = self._fetch_new_requests()
+                fetch_timer_end = torch.cuda.Event(enable_timing=True)
+                fetch_timer_end.record()
+                
                 if self.is_shutdown and len(self.active_requests) == 0:
                     break
 
@@ -865,8 +876,12 @@ class PyExecutor:
                 if self.draft_model_engine is not None or is_ngram:
                     self._prepare_draft_requests()
 
-                scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
-                )
+                # Timer for scheduling
+                schedule_timer_start = torch.cuda.Event(enable_timing=True)
+                schedule_timer_start.record()
+                scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule()
+                schedule_timer_end = torch.cuda.Event(enable_timing=True)
+                schedule_timer_end.record()
 
                 if self.kv_cache_transceiver:
                     # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
@@ -958,6 +973,32 @@ class PyExecutor:
                             scheduled_requests=scheduled_batch),
                                    iter_stats=iter_stats,
                                    iter_start_time=iter_start_time))
+
+                # Print timing breakdown
+                iter_timer_end = torch.cuda.Event(enable_timing=True)
+                iter_timer_end.record()
+                torch.cuda.synchronize()
+                
+                if scheduled_batch.batch_size > 0:
+                    fetch_time = fetch_timer_start.elapsed_time(fetch_timer_end)
+                    schedule_time = schedule_timer_start.elapsed_time(schedule_timer_end)
+                    forward_time = forward_timer_start.elapsed_time(forward_timer_end)
+                    sampling_time = sampling_timer_start.elapsed_time(sampling_timer_end)
+                    update_time = update_timer_start.elapsed_time(update_timer_end)
+                    response_time = response_timer_start.elapsed_time(response_timer_end)
+                    total_iter_time = iter_timer_start.elapsed_time(iter_timer_end)
+                    
+                    print(f"=== EXECUTOR ITERATION TIMING ===")
+                    print(f"Fetch requests: {fetch_time:.3f} ms")
+                    print(f"Schedule: {schedule_time:.3f} ms") 
+                    print(f"Forward step (MODEL): {forward_time:.3f} ms")
+                    print(f"Sampling: {sampling_time:.3f} ms")
+                    print(f"Update requests: {update_time:.3f} ms")
+                    print(f"Handle responses: {response_time:.3f} ms")
+                    print(f"Total iteration: {total_iter_time:.3f} ms")
+                    print(f"Batch size: {scheduled_batch.batch_size}")
+                    print(f"Active requests: {len(self.active_requests)}")
+                    print("=" * 35)
 
         self._executor_loop_cleanup()
 

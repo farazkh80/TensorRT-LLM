@@ -927,12 +927,36 @@ class VilaInputProcessor(InputProcessor):
     def _process(self, mm_tensor, block_sizes):
         """Extract multimodal features from multimodal input"""
 
+        # Add detailed timing for vision processing
+        dtype_start = torch.cuda.Event(enable_timing=True)
+        dtype_start.record()
+        
         mm_tensor = mm_tensor.to(self.vision_tower.dtype)  # must be fp16
+        
+        dtype_end = torch.cuda.Event(enable_timing=True)
+        dtype_end.record()
+
         if getattr(self.model_config, "dynamic_s2", False):
-            # dynamic S2 logic in https://github.com/NVlabs/VILA/blob/main/llava/model/llava_arch.py::encoder_images()
+            # Dynamic S2 path
+            s2_start = torch.cuda.Event(enable_timing=True)
+            s2_start.record()
+            
             if block_sizes is None:
                 block_sizes = [None] * len(mm_tensor)
+            
+            # Vision tower timing
+            tower_start = torch.cuda.Event(enable_timing=True)
+            tower_start.record()
+            
             visual_features = self.vision_tower(mm_tensor)
+            
+            tower_end = torch.cuda.Event(enable_timing=True)
+            tower_end.record()
+            
+            # S2 processing timing
+            s2_process_start = torch.cuda.Event(enable_timing=True)
+            s2_process_start.record()
+            
             visual_features, new_block_sizes = merge_features_for_dynamic_s2(
                 self.vision_tower, visual_features, block_sizes)
 
@@ -943,7 +967,23 @@ class VilaInputProcessor(InputProcessor):
             visual_features = torch.cat(
                 [rearrange(x, "b c h w -> b (h w) c") for x in visual_features],
                 dim=0)  # B * N * C
+            
+            s2_process_end = torch.cuda.Event(enable_timing=True)
+            s2_process_end.record()
+            
+            # Projector timing
+            projector_start = torch.cuda.Event(enable_timing=True)
+            projector_start.record()
+            
             visual_features = self.mm_projector(visual_features)
+            
+            projector_end = torch.cuda.Event(enable_timing=True)
+            projector_end.record()
+            
+            # Final S2 processing
+            final_s2_start = torch.cuda.Event(enable_timing=True)
+            final_s2_start.record()
+            
             visual_features = list(
                 visual_features.split([
                     block_size[0] * block_size[1]
@@ -962,10 +1002,70 @@ class VilaInputProcessor(InputProcessor):
                     for feature in visual_features
             ]):
                 visual_features = torch.stack(visual_features, dim=0)
+                
+            final_s2_end = torch.cuda.Event(enable_timing=True)
+            final_s2_end.record()
+            s2_end = torch.cuda.Event(enable_timing=True)
+            s2_end.record()
+            torch.cuda.synchronize()
+            
+            # Print S2 timing breakdown
+            dtype_time = dtype_start.elapsed_time(dtype_end)
+            tower_time = tower_start.elapsed_time(tower_end)
+            s2_process_time = s2_process_start.elapsed_time(s2_process_end)
+            projector_time = projector_start.elapsed_time(projector_end)
+            final_s2_time = final_s2_start.elapsed_time(final_s2_end)
+            total_s2_time = s2_start.elapsed_time(s2_end)
+            
+            print(f"=== VILA S2 VISION PROCESSING ===")
+            print(f"Dtype conversion: {dtype_time:.3f} ms")
+            print(f"Vision tower: {tower_time:.3f} ms")
+            print(f"S2 feature processing: {s2_process_time:.3f} ms")
+            print(f"MM projector: {projector_time:.3f} ms")
+            print(f"Final S2 reshape: {final_s2_time:.3f} ms")
+            print(f"Total S2 processing: {total_s2_time:.3f} ms")
+            print("=" * 35)
+            
         else:
+            # Standard path
+            std_start = torch.cuda.Event(enable_timing=True)
+            std_start.record()
+            
+            # Vision tower timing
+            tower_start = torch.cuda.Event(enable_timing=True)
+            tower_start.record()
+            
             visual_features = self.vision_tower(mm_tensor)
+            
+            tower_end = torch.cuda.Event(enable_timing=True)
+            tower_end.record()
+            
+            # Projector timing
+            projector_start = torch.cuda.Event(enable_timing=True)
+            projector_start.record()
+            
             visual_features = self.mm_projector(visual_features)
-        return visual_features  # [M, feature_length, hidden_dim], where M is number of multimodal inputs (e.g. images or frames) in the current request; or list of [feature_length_i, hidden_dim] tensors if images have different lengths
+            
+            projector_end = torch.cuda.Event(enable_timing=True)
+            projector_end.record()
+            std_end = torch.cuda.Event(enable_timing=True)
+            std_end.record()
+            torch.cuda.synchronize()
+            
+            # Print standard timing breakdown
+            dtype_time = dtype_start.elapsed_time(dtype_end)
+            tower_time = tower_start.elapsed_time(tower_end)
+            projector_time = projector_start.elapsed_time(projector_end)
+            total_std_time = std_start.elapsed_time(std_end)
+            
+            print(f"=== VILA STANDARD VISION PROCESSING ===")
+            print(f"Dtype conversion: {dtype_time:.3f} ms")
+            print(f"Vision tower: {tower_time:.3f} ms")
+            print(f"MM projector: {projector_time:.3f} ms")
+            print(f"Total processing: {total_std_time:.3f} ms")
+            print("=" * 37)
+            
+        return visual_features
 
     @nvtx_range("[Vision] postprocess")
     def _postprocess(self, input_ids, mm_features):
@@ -1071,38 +1171,77 @@ class VilaInputProcessor(InputProcessor):
     def __call__(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
-        """
-        Input processor will only process 1 prompt at a time (Note: "prompt" here is a general class that contains text prompt (1 text) and multimodal prompt (1 or N images). See TextPrompt class in inputs/data.py). The mechanism between InputProcessor and LLM is:
-
-        (1) InputProcessor run vision model. TODO: allow batch processing for vision model, otherwise it can only batch process N images in a single prompt, but cannot batch process N images across multiple prompts
-
-        (2) Processed multimodal features is saved in prompt tuning config as a single torch.Tensor, i.e. M features will be stacked. Note that text prompt is "<text1><image><text2><video><image>...", tokenized ID is [token_1, ..., token_x, image_token, token_y, ..., token_z, video_token, image_token, ...], where <image> and <video> are multimodal special tokens that tokenized as a single token ID like image_token and video_token. Each text [token_i] maps to a length-1 embedding vector, but each multimodal token [image_token or video_token] maps to a length-N embedding tensor. Therefore the input embedding is a interleaved/fused tensor of text embed & multimodal features. The way we handle this is by providing a expanded input_ids and a packed feature tensor to the LLM:
-
-        Assume the total length of multimodal features is L = sum_{i in 1 to M}(feature_len_i).
-
-        (i) expand the input_ids to match the fused embedding shape, e.g. [token_1, ..., token_x, (image_token), token_y, ..., token_z, (video_token), (image_token), ...] expands to [token_1, ..., token_x, (image1_token_1, ..., image1_token_i), token_y, ..., token_z, (video1_token_1, ..., video1_token_i), (image2_token_1, ..., image2_token_i), ...], where the expanded tokens start from out-of-vocabulary IDs, i.e. (image1_token_1, ..., image1_token_i, video1_token_1, ..., video1_token_i, image2_token_1, ..., image2_token_i) is arange(vocab_size, vocab_size + L). See _postprocess().
-
-        (ii) packed multimodal feature, concatenate M features into a single tensor mm_embed.
-
-        (iii) later in LLM, we can slice-and-assign based on condition fused_embed[input_ids < vocab_size] = text_embed, fused_embed[inputI > vocab_size] = mm_embed.
-
-        (3) passed input_ids and mm_embed via LlmRequest's prompt_token_ids and prompt_embedding_table fields respectively. LlmRequests can be inflight batched, and the mm_embed is passed to LLM model as `multi_modal_data` which is List[torch.Tensor] for batched requests.
-        """
-
+        
+        # Overall timing
+        total_start = torch.cuda.Event(enable_timing=True)
+        total_start.record()
+        
         text_prompt, mm_data = inputs.get("prompt"), inputs.get(
             "multi_modal_data", {})
         mm_processor_kwargs = inputs.get("mm_processor_kwargs", {})
 
+        # Text processing timing
+        text_start = torch.cuda.Event(enable_timing=True)
+        text_start.record()
+        
         text_prompt = _apply_chat_template(text_prompt, self.conv_mode,
                                            self.tokenizer)
         input_ids = self.tokenizer(
             text_prompt, return_tensors="pt").input_ids[0].to(self.device)
+        
+        text_end = torch.cuda.Event(enable_timing=True)
+        text_end.record()
 
+        # Vision preprocessing timing
+        preprocess_start = torch.cuda.Event(enable_timing=True)
+        preprocess_start.record()
+        
         mm_tensor, block_sizes = self._preprocess(
             mm_data, mm_processor_kwargs, use_fast=True
         )  # use_fast uses Pytorch GPU preprocessing, otherwise uses PIL CPU preprocessing
+        
+        preprocess_end = torch.cuda.Event(enable_timing=True)
+        preprocess_end.record()
+
+        # Vision processing timing (vision tower + projector)
+        vision_start = torch.cuda.Event(enable_timing=True)
+        vision_start.record()
+        
         mm_features = self._process(mm_tensor, block_sizes)
+        
+        vision_end = torch.cuda.Event(enable_timing=True)
+        vision_end.record()
+
+        # Postprocessing timing (text + vision fusion)
+        postprocess_start = torch.cuda.Event(enable_timing=True)
+        postprocess_start.record()
+        
         fused_input_ids, mm_features = self._postprocess(input_ids, mm_features)
+        
+        postprocess_end = torch.cuda.Event(enable_timing=True)
+        postprocess_end.record()
+        
+        total_end = torch.cuda.Event(enable_timing=True)
+        total_end.record()
+        torch.cuda.synchronize()
+        
+        # Print detailed breakdown
+        text_time = text_start.elapsed_time(text_end)
+        preprocess_time = preprocess_start.elapsed_time(preprocess_end)
+        vision_time = vision_start.elapsed_time(vision_end)
+        postprocess_time = postprocess_start.elapsed_time(postprocess_end)
+        total_time = total_start.elapsed_time(total_end)
+        
+        print(f"=== VILA INPUT PROCESSOR BREAKDOWN ===")
+        print(f"Text tokenization: {text_time:.3f} ms")
+        print(f"Vision preprocessing: {preprocess_time:.3f} ms")
+        print(f"Vision processing: {vision_time:.3f} ms")
+        print(f"Text+Vision fusion: {postprocess_time:.3f} ms")
+        print(f"Total input processor: {total_time:.3f} ms")
+        print(f"Video shape: {mm_tensor.shape if hasattr(mm_tensor, 'shape') else 'N/A'}")
+        print(f"Features shape: {mm_features.shape if hasattr(mm_features, 'shape') else 'N/A'}")
+        print("=" * 40)
+        
         return fused_input_ids.to(torch.int32).tolist(), {
             "mm_embedding": mm_features
         }
@@ -1155,6 +1294,9 @@ class VilaModel(PreTrainedModel):
         """
         VLM forward logic with inflight batching support.
         """
+        
+        forward_start = torch.cuda.Event(enable_timing=True)
+        forward_start.record()
 
         num_context_requests, num_generation_requests = attn_metadata.num_contexts, attn_metadata.num_generations
         mm_embed = kwargs.get("multi_modal_data", [])
@@ -1163,13 +1305,52 @@ class VilaModel(PreTrainedModel):
             mm_embed
         ) == num_context_requests, "Number of multimodal features (if provided) should be equal to number of context requests"
 
+        # Time the multimodal embedding fusion
+        fusion_start = torch.cuda.Event(enable_timing=True)
+        fusion_start.record()
+        
         input_ids, inputs_embeds = fuse_input_embeds(
             self.llm.model.embed_tokens, input_ids, mm_embed)
+            
+        fusion_end = torch.cuda.Event(enable_timing=True)
+        fusion_end.record()
+        
+        # Time the LLM forward pass
+        llm_start = torch.cuda.Event(enable_timing=True)
+        llm_start.record()
+        
         logits = self.llm.forward(attn_metadata=attn_metadata,
                                   input_ids=input_ids,
                                   position_ids=position_ids,
                                   inputs_embeds=inputs_embeds,
                                   return_context_logits=return_context_logits)
+        
+        llm_end = torch.cuda.Event(enable_timing=True)
+        llm_end.record()
+        
+        forward_end = torch.cuda.Event(enable_timing=True)
+        forward_end.record()
+        torch.cuda.synchronize()
+        
+        # Print detailed timing breakdown
+        fusion_time = fusion_start.elapsed_time(fusion_end)
+        llm_time = llm_start.elapsed_time(llm_end)
+        total_time = forward_start.elapsed_time(forward_end)
+        
+        print(f"=== VILA MODEL FORWARD ===")
+        print(f"Context reqs: {num_context_requests}, Gen reqs: {num_generation_requests}")
+        print(f"Multimodal fusion: {fusion_time:.3f} ms")
+        print(f"LLM forward: {llm_time:.3f} ms")
+        print(f"Total forward: {total_time:.3f} ms")
+        if mm_embed:
+            total_mm_tokens = sum(embed.shape[0] for embed in mm_embed)
+            print(f"Total MM tokens: {total_mm_tokens}")
+        if input_ids is not None:
+            print(f"Input IDs shape: {input_ids.shape}")
+        if inputs_embeds is not None:
+            print(f"Input embeds shape: {inputs_embeds.shape}")
+        print("=" * 30)
+        
         return logits
 
     def get_llm(self):
