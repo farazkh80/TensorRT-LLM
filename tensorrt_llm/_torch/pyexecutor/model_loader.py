@@ -382,17 +382,21 @@ class ModelLoader:
                 f"Use {rank_model_storage / (1024**3):.2f} GB for model weights."
             )
             if load_format == LoadFormat.AUTO:
-                if hasattr(model, 'llm_checkpoint_dir'):
-                    weights = checkpoint_loader.load_weights(
-                        model.llm_checkpoint_dir, mapping=self.mapping)
-                else:
-                    weights = checkpoint_loader.load_weights(
-                        checkpoint_dir, mapping=self.mapping)
+                ckpt_dir = (model.llm_checkpoint_dir if hasattr(
+                    model, 'llm_checkpoint_dir') else checkpoint_dir)
 
                 self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
                     model, config)
-                self._call_load_weights(model.load_weights, weights,
-                                        self.weight_mapper)
+
+                if os.environ.get('TRTLLM_STREAMING_LOAD',
+                                  '0') == '1' and hasattr(
+                                      checkpoint_loader.weight_loader,
+                                      'load_weights_streaming'):
+                    self._load_weights_streaming(
+                        model, ckpt_dir, checkpoint_loader)
+                else:
+                    self._load_weights_baseline(
+                        model, ckpt_dir, checkpoint_loader)
 
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):
@@ -442,6 +446,146 @@ class ModelLoader:
             torch.cuda.current_stream().synchronize()
 
         return model, moe_load_balancer
+
+    def _load_weights_baseline(self, model, checkpoint_dir: str,
+                               checkpoint_loader):
+        """Load all weights at once (original path) with memory logging."""
+        import time
+
+        from .loading_profiler import LoadingProfiler
+
+        rss_before = LoadingProfiler._get_rss_bytes()
+        hwm_before = LoadingProfiler._get_vm_hwm_bytes()
+        mem_before = LoadingProfiler._get_meminfo()
+        gpu_before = torch.cuda.memory_allocated()
+        t0 = time.time()
+
+        logger.info("[Baseline] Loading all shards into memory...")
+        weights = checkpoint_loader.load_weights(
+            checkpoint_dir, mapping=self.mapping)
+        t_loaded = time.time()
+
+        rss_after_load = LoadingProfiler._get_rss_bytes()
+        mem_after_load = LoadingProfiler._get_meminfo()
+        logger.info(
+            f"[Baseline] All weights loaded: "
+            f"RSS: {rss_after_load / (1024**3):.1f} GB "
+            f"(delta: {(rss_after_load - rss_before) / (1024**3):.1f} GB) | "
+            f"Cache: {mem_after_load['cached'] / (1024**3):.1f} GB "
+            f"(delta: {(mem_after_load['cached'] - mem_before['cached']) / (1024**3):+.1f} GB) | "
+            f"Avail: {mem_after_load['available'] / (1024**3):.1f} GB | "
+            f"Time: {t_loaded - t0:.1f}s")
+
+        self._call_load_weights(model.load_weights, weights,
+                                self.weight_mapper)
+        t_applied = time.time()
+
+        gpu_after = torch.cuda.memory_allocated()
+        rss_after_apply = LoadingProfiler._get_rss_bytes()
+        hwm_after = LoadingProfiler._get_vm_hwm_bytes()
+        mem_after_apply = LoadingProfiler._get_meminfo()
+
+        logger.info(
+            f"[Baseline] Weights applied to model: "
+            f"GPU: {gpu_after / (1024**3):.1f} GB "
+            f"(delta: {(gpu_after - gpu_before) / (1024**3):.1f} GB) | "
+            f"RSS: {rss_after_apply / (1024**3):.1f} GB | "
+            f"Peak RSS (HWM): {(hwm_after - hwm_before) / (1024**3):.1f} GB | "
+            f"Cache: {mem_after_apply['cached'] / (1024**3):.1f} GB "
+            f"(delta: {(mem_after_apply['cached'] - mem_before['cached']) / (1024**3):+.1f} GB) | "
+            f"Avail: {mem_after_apply['available'] / (1024**3):.1f} GB | "
+            f"Time: {t_applied - t0:.1f}s")
+
+    def _load_weights_streaming(self, model, checkpoint_dir: str,
+                                checkpoint_loader):
+        """Load weights shard-by-shard with IO overlap and profiling.
+
+        Tries true per-shard loading first (apply each shard immediately,
+        free it, move on). If the model rejects partial loading (e.g.
+        quantized linear layers), falls back to accumulate-then-apply.
+        """
+        import gc
+        import glob
+        import time
+
+        from ..models.checkpoints.base_weight_loader import \
+            ConsumableWeightsDict
+
+        from .loading_profiler import LoadingProfiler
+
+        weight_loader = checkpoint_loader.weight_loader
+        n_shards = len(glob.glob(f"{checkpoint_dir}/*.safetensors")) or \
+            len(glob.glob(f"{checkpoint_dir}/*.bin")) or \
+            len(glob.glob(f"{checkpoint_dir}/*.pth"))
+        profiler = LoadingProfiler(n_shards)
+
+        # First, try true per-shard loading (best memory savings)
+        shard_gen = weight_loader.load_weights_streaming(
+            checkpoint_dir, self.mapping)
+        first_fname, first_shard = next(shard_gen)
+        first_size = sum(t.nelement() * t.element_size()
+                         for t in first_shard.values())
+
+        try:
+            profiler.begin_shard()
+            self._call_load_weights(model.load_weights, first_shard,
+                                    self.weight_mapper,
+                                    allow_partial_loading=True)
+            del first_shard
+            gc.collect()
+            profiler.report_shard(0, first_fname, first_size)
+
+            # Per-shard worked — continue for remaining shards
+            logger.info("[Streaming] Per-shard loading active "
+                        "(best memory savings)")
+            for shard_idx, (filename, shard_weights) in enumerate(
+                    shard_gen, start=1):
+                shard_size = sum(t.nelement() * t.element_size()
+                                 for t in shard_weights.values())
+                profiler.begin_shard()
+                self._call_load_weights(model.load_weights, shard_weights,
+                                        self.weight_mapper,
+                                        allow_partial_loading=True)
+                del shard_weights
+                gc.collect()
+                profiler.report_shard(shard_idx, filename, shard_size)
+
+        except (AssertionError, RuntimeError) as e:
+            # Partial loading not supported (e.g. quantized models).
+            # Fall back: accumulate remaining shards, apply in one pass.
+            logger.info(
+                f"[Streaming] Per-shard loading not supported ({e}), "
+                f"falling back to accumulate-then-apply")
+            accumulated = {}
+            # first_shard may still exist if the error was during load
+            if 'first_shard' in dir() and first_shard is not None:
+                accumulated.update(
+                    first_shard._weights if hasattr(first_shard, '_weights')
+                    else first_shard)
+
+            for shard_idx, (filename, shard_weights) in enumerate(
+                    shard_gen, start=1):
+                shard_size = sum(t.nelement() * t.element_size()
+                                 for t in shard_weights.values())
+                profiler.begin_shard()
+                accumulated.update(
+                    shard_weights._weights
+                    if hasattr(shard_weights, '_weights')
+                    else shard_weights)
+                del shard_weights
+                gc.collect()
+                profiler.report_shard(shard_idx, filename, shard_size)
+
+            if accumulated:
+                logger.info(
+                    f"[Streaming] Applying {len(accumulated)} weight keys "
+                    f"to model...")
+                weights = ConsumableWeightsDict(accumulated)
+                del accumulated
+                self._call_load_weights(model.load_weights, weights,
+                                        self.weight_mapper)
+
+        profiler.summary()
 
     def reload(self,
                model: DecoderModelForCausalLM,

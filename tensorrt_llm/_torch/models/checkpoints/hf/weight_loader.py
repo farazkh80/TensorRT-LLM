@@ -2,7 +2,7 @@ import glob
 import multiprocessing
 import os
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, List
+from typing import Any, Generator, List, Tuple
 
 import psutil
 import safetensors
@@ -114,6 +114,49 @@ class HfWeightLoader(BaseWeightLoader):
                                       mmap=False)
         finally:
             return part_weights
+
+    def load_weights_streaming(
+        self, checkpoint_dir: str, mapping: Mapping
+    ) -> Generator[Tuple[str, ConsumableWeightsDict], None, None]:
+        """Yield (filename, ConsumableWeightsDict) one shard at a time.
+
+        Uses a background thread to prefetch the next shard from disk while
+        the current shard is being processed (IO/compute overlap).
+        """
+        weight_files = sorted(
+            glob.glob(f"{checkpoint_dir}/*.safetensors"))
+        filtered = [
+            x for x in weight_files
+            if "consolidated" not in os.path.split(x)[1]
+        ]
+        if filtered:
+            weight_files = filtered
+
+        if not weight_files:
+            weight_files = sorted(
+                glob.glob(f"{checkpoint_dir}/*.bin"))
+        if not weight_files:
+            weight_files = sorted(
+                glob.glob(f"{checkpoint_dir}/*.pth"))
+        if not weight_files:
+            raise RuntimeError(
+                f"No weight files found in {checkpoint_dir}.")
+
+        is_safetensors = weight_files[0].endswith('.safetensors')
+        load_fn = (self._load_safetensors_file if is_safetensors
+                   else self._load_bin_or_path_file)
+
+        logger.info(
+            f"Streaming load: {len(weight_files)} shards from "
+            f"{checkpoint_dir} (with IO overlap)")
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(load_fn, weight_files[0])
+            for i, fname in enumerate(weight_files):
+                shard = future.result()
+                if i + 1 < len(weight_files):
+                    future = executor.submit(load_fn, weight_files[i + 1])
+                yield fname, ConsumableWeightsDict(shard)
 
     def _prefetch_one_file(self, file_name):
         if os.path.exists(file_name):
