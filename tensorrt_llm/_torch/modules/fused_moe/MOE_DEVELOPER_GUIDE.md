@@ -105,6 +105,7 @@ Still on old path (standalone, with embedded communication):
 | `fused_moe_deepgemm.py` | DeepGemmFusedMoE | SM100/SM103 | FP8 Block Scales on Blackwell |
 | `fused_moe_triton.py` | TritonFusedMoE | SM90 only | GPT-OSS on Hopper (requires `swiglu_gptoss_style=True`) |
 | `fused_moe_cute_dsl.py` | CuteDslFusedMoE | SM100/SM103 | High throughput NVFP4, generally faster than Cutlass |
+| `fused_moe_flashinfer.py` | FlashInferFusedMoE | SM120/SM121 | NVFP4 only; wraps FlashInfer `B12xMoEWrapper` for desktop Blackwell / DGX Spark |
 | `fused_moe_wide_ep.py` | WideEPMoE | All GPUs | Deprecating — use ConfigurableMoE instead |
 | `fused_moe_vanilla.py` | VanillaMoE | All devices | Reference / debugging only |
 
@@ -127,19 +128,38 @@ Communication strategies are auto-selected at runtime by `CommunicationFactory` 
 
 Each backend's `can_implement(quant_algo, dtype_activation, swiglu_gptoss_style)` method declares supported quantizations. Source of truth: the `can_implement` classmethod in each backend file.
 
-| Quantization | Cutlass | TRTLLMGen | DeepGemm | Triton | CuteDSL | WideEP | Vanilla |
-|---|---|---|---|---|---|---|---|
-| Unquantized (BF16/FP16) | Y (SM80+) | N | N | Y (SM90, BF16) | N | Y | Y |
-| FP8 QDQ | Y (SM89+) | N | N | Y (SM90) | N | Y | Y |
-| FP8 Block Scales | Y (SM90, SM120) | Y (SM100/103) | Y (SM100/103) | N | N | Y | Y |
-| NVFP4 | Y (SM100/103/120/121) | Y (SM100/103) | N | N | Y (SM100/103) | Y | Y |
-| W4A8 NVFP4 FP8 | N | Y (SM100/103) | N | N | N | N | N |
-| W4A16 MXFP4 | Y (SM90) | Y (SM100/103) | N | Y (SM90) | N | N | N |
-| W4A8 MXFP4 FP8 | Y (SM100/103) | Y (SM100/103) | N | Y (SM90) | N | N | N |
-| W4A8 MXFP4 MXFP8 | Y (SM100/103) | Y (SM100/103) | N | N | N | N | N |
-| W4A8 AWQ | Y (SM89/90) | N | N | N | N | N | N |
-| W8A16 | Y (SM80+) | N | N | N | N | N | N |
-| INT4 WoQ (W4AFP8) | N | N | N | N | N | Y | N |
+| Quantization | Cutlass | TRTLLMGen | DeepGemm | Triton | CuteDSL | FlashInfer | WideEP | Vanilla |
+|---|---|---|---|---|---|---|---|---|
+| Unquantized (BF16/FP16) | Y (SM80+) | N | N | Y (SM90, BF16) | N | N | Y | Y |
+| FP8 QDQ | Y (SM89+) | N | N | Y (SM90) | N | N | Y | Y |
+| FP8 Block Scales | Y (SM90, SM120) | Y (SM100/103) | Y (SM100/103) | N | N | N | Y | Y |
+| NVFP4 | Y (SM100/103/120/121) | Y (SM100/103) | N | N | Y (SM100/103) | Y (SM120/121) | Y | Y |
+| W4A8 NVFP4 FP8 | N | Y (SM100/103) | N | N | N | N | N | N |
+| W4A16 MXFP4 | Y (SM90) | Y (SM100/103) | N | Y (SM90) | N | N | N | N |
+| W4A8 MXFP4 FP8 | Y (SM100/103) | Y (SM100/103) | N | Y (SM90) | N | N | N | N |
+| W4A8 MXFP4 MXFP8 | Y (SM100/103) | Y (SM100/103) | N | N | N | N | N | N |
+| W4A8 AWQ | Y (SM89/90) | N | N | N | N | N | N | N |
+| W8A16 | Y (SM80+) | N | N | N | N | N | N | N |
+| INT4 WoQ (W4AFP8) | N | N | N | N | N | N | Y | N |
+
+### FlashInferFusedMoE — additional constraints
+
+The FlashInfer backend wraps the b12x SM120/SM121 fused-MoE NVFP4 kernel and is opt-in via `--moe_backend FLASHINFER` (or `moe_backend: FLASHINFER` in YAML). Beyond the NVFP4 + SM gate above, the backend hard-rejects:
+
+- `ep_size > 1` — b12x has no expert-parallel dispatch/combine kernel.
+- MoE alltoall communication — same reason.
+- Activations other than `Relu2` (Nemotron-style) and `Swiglu` (mapped to b12x's `silu`).
+- `swiglu_gptoss_style=True`.
+- `Fp4QuantizedTensor` input — b12x performs its own activation quantization.
+
+Misconfigured selection raises at `get_moe_cls("FLASHINFER", ...)` time rather than silently falling back to CUTLASS.
+
+The wrapper is built lazily inside `post_load_weights()` once the inherited NVFP4 alphas / input-scales / FP8 block scales are populated. At that point:
+
+1. Per-expert `weight_scale_2 = fc_alpha * fc_input_scale` is recovered and multiplied into the FP8 block scales (b12x expects un-normalized scales; HF/ModelOpt NVFP4 stores normalized).
+2. `flashinfer.cute_dsl.utils.convert_sf_to_mma_layout` reshapes scales into the 6D MMA layout b12x consumes.
+3. `w1_alpha = w2_alpha = 1 / fc_input_scale` is passed alongside, restoring algebraic correctness given b12x's dual-use of the alpha tensor.
+4. FP4 weights are exposed as `uint8` views so FlashInfer's internal `view(torch.float4_e2m1fn_x2)` finds byte-contiguous storage.
 
 
 

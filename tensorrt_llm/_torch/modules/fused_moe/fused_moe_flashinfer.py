@@ -1,0 +1,278 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from typing import Optional, Tuple, Union
+
+import torch
+
+from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.logger import logger
+from tensorrt_llm.models.modeling_utils import QuantAlgo
+
+from ...utils import ActivationType, Fp4QuantizedTensor
+from .fused_moe_cutlass import CutlassFusedMoE
+from .interface import _warn_and_return
+
+# ActivationType -> b12x activation string. b12x currently exposes "relu2"
+# (Nemotron-style x * relu(x)) and "silu" (SwiGLU-style x * silu(gate)).
+_ACTIVATION_MAP = {
+    ActivationType.Relu2: "relu2",
+    ActivationType.Swiglu: "silu",
+}
+
+
+class FlashInferFusedMoE(CutlassFusedMoE):
+    """NVFP4 fused-MoE backend wrapping FlashInfer's b12x SM120/SM121 kernel.
+
+    Inherits weight loading and the routing / reducescatter pipeline from
+    :class:`CutlassFusedMoE` and overrides only the per-expert compute step:
+
+    - ``can_implement`` narrows support to NVFP4 on SM120 / SM121.
+    - ``process_weights_after_loading`` builds an ``flashinfer.B12xMoEWrapper``
+      and prepares b12x-shaped weight tensors (un-normalized FP8 block scales
+      converted to MMA layout, FP4 weights byte-viewed for FlashInfer's
+      ``float4_e2m1fn_x2`` reinterpretation).
+    - ``quantize_input`` is a passthrough; b12x quantizes activations
+      internally.
+    - ``run_moe`` dispatches to ``B12xMoEWrapper.run`` instead of
+      ``torch.ops.trtllm.fused_moe``.
+
+    The backend does not support EP (b12x has no dispatch/combine kernel) or
+    SwigluGptOss-style biased SwiGLU.
+    """
+
+    # SM versions on which the FlashInfer b12x NVFP4 MoE kernel is available.
+    # SM120 = desktop Blackwell (RTX 5090 / GB202); SM121 = GB10 / DGX Spark.
+    _SUPPORTED_SM_VERSIONS = frozenset({120, 121})
+
+    @classmethod
+    def can_implement(
+        cls,
+        quant_algo: Optional[QuantAlgo],
+        dtype_activation: torch.dtype = torch.bfloat16,
+        swiglu_gptoss_style: bool = False,
+    ) -> Tuple[bool, Optional[str]]:
+        sm_version = get_sm_version()
+        if sm_version not in cls._SUPPORTED_SM_VERSIONS:
+            sm_list = "/".join(f"SM{v}" for v in sorted(cls._SUPPORTED_SM_VERSIONS))
+            return _warn_and_return(f"FlashInferFusedMoE requires {sm_list}, got SM{sm_version}")
+        if quant_algo != QuantAlgo.NVFP4:
+            return _warn_and_return(
+                f"FlashInferFusedMoE only supports NVFP4 quantization (got quant_algo={quant_algo})"
+            )
+        if dtype_activation not in {torch.float16, torch.bfloat16}:
+            return _warn_and_return(
+                f"FlashInferFusedMoE NVFP4 requires float16 or bfloat16 "
+                f"activation dtype (got {dtype_activation})"
+            )
+        if swiglu_gptoss_style:
+            return _warn_and_return("FlashInferFusedMoE does not support swiglu_gptoss_style")
+        return True, None
+
+    def __init__(self, *args, **kwargs):
+        # ``ModelConfig`` is consumed by the inherited ``__init__`` for cache
+        # / mapping setup but isn't kept on ``self``. b12x's wrapper needs the
+        # ``use_cuda_graph`` flag at construction time, so capture it here
+        # before delegating.
+        model_config = kwargs.get("model_config", None)
+        self._b12x_use_cuda_graph = bool(getattr(model_config, "use_cuda_graph", False))
+
+        super().__init__(*args, **kwargs)
+
+        # b12x has no expert-parallel dispatch/combine kernel, so EP must be
+        # disabled. dp_size > 1 implies the alltoall path which b12x can't run.
+        if self.ep_size != 1:
+            raise ValueError(
+                f"FlashInferFusedMoE requires ep_size == 1 "
+                f"(got ep_size={self.ep_size}); use --moe_backend CUTLASS for EP."
+            )
+        if self.enable_alltoall:
+            raise ValueError("FlashInferFusedMoE does not support MoE alltoall communication.")
+        if self.activation_type not in _ACTIVATION_MAP:
+            supported = ", ".join(a.name for a in _ACTIVATION_MAP)
+            raise ValueError(
+                f"FlashInferFusedMoE does not support activation "
+                f"{ActivationType(self.activation_type).name}; "
+                f"supported: {supported}."
+            )
+
+        self._b12x_weights: Optional[dict] = None
+        self.b12x_wrapper = None
+
+    def post_load_weights(self):
+        """Build the b12x weight dict and instantiate ``B12xMoEWrapper``.
+
+        Called by ``model_loader`` after ``load_weights`` finishes. The NVFP4
+        quant method's ``process_weights_after_loading`` has already run as
+        part of ``load_weights``, so the inherited ``w3_w1_weight`` /
+        ``w2_weight`` / ``*_weight_scale`` / ``*_alpha`` / ``*_input_scale``
+        tensors are populated; we just convert them to the layout b12x
+        expects.
+        """
+        super().post_load_weights()
+
+        try:
+            from flashinfer import B12xMoEWrapper
+            from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+        except ImportError as e:
+            raise RuntimeError(
+                "FlashInferFusedMoE requires the `flashinfer` package "
+                "(B12xMoEWrapper, cute_dsl.utils.convert_sf_to_mma_layout). "
+                f"Original import error: {e}"
+            ) from e
+
+        num_local_experts = self.w3_w1_weight.shape[0]
+        # Tensor shapes use the *padded* per-rank dims because TP partitions
+        # may pad ``intermediate_size`` up to a kernel-friendly boundary.
+        # Recover them from the actual stored tensors rather than the logical
+        # model config so reshapes stay valid under TP > 1.
+        _, w3w1_out_dim, _ = self.w3_w1_weight.shape  # (E, 2*I_pad, H//16)
+        _, w2_out_dim, w2_in_packed = self.w2_weight.shape  # (E, H, I_pad//16)
+        w3w1_in_dim = self.hidden_size
+        w2_in_dim = w2_in_packed * 16
+
+        # b12x reuses the per-expert ``w1_alpha`` tensor as both (a) the
+        # online activation-quant ``global_scale`` and (b) the FC1 epilogue
+        # output-dequant multiplier. That dual use is only self-consistent
+        # when the FP4 weight block scales are stored in their *unnormalized*
+        # form (raw ``max_block / FP4_MAX``), not divided out by the
+        # per-tensor ``weight_scale_2``. HF / ModelOpt NVFP4 checkpoints
+        # store the normalized variant so the FP8 block scales fit in range,
+        # and TRT-LLM's NVFP4 loader preserves that form. To match b12x's
+        # convention we recover ``weight_scale_2 = fc_alpha * fc_input_scale``
+        # and multiply each expert's FP8 block scales by it before handing
+        # them to ``convert_sf_to_mma_layout``. With the un-normalized scales
+        # in place we pass ``w1_alpha = w2_alpha = 1 / fc_input_scale``
+        # (== ``s_in``) so the kernel's dual-use cancels algebraically and
+        # the stored input-side block scales remain FP8-representable.
+        w1_w_scale_2 = (self.fc31_alpha * self.fc31_input_scale).to(torch.float32)
+        w2_w_scale_2 = (self.fc2_alpha * self.fc2_input_scale).to(torch.float32)
+
+        w1_sf_fp8_norm = self.w3_w1_weight_scale.view(torch.float8_e4m3fn).float()
+        w2_sf_fp8_norm = self.w2_weight_scale.view(torch.float8_e4m3fn).float()
+
+        # Broadcast per-expert scalar over the trailing dims (E, *).
+        bcast1 = w1_w_scale_2.view(-1, *([1] * (w1_sf_fp8_norm.dim() - 1)))
+        bcast2 = w2_w_scale_2.view(-1, *([1] * (w2_sf_fp8_norm.dim() - 1)))
+        w1_sf_fp8 = (w1_sf_fp8_norm * bcast1).to(torch.float8_e4m3fn)
+        w2_sf_fp8 = (w2_sf_fp8_norm * bcast2).to(torch.float8_e4m3fn)
+
+        w1_sf_b12x = convert_sf_to_mma_layout(
+            w1_sf_fp8, m=w3w1_out_dim, k=w3w1_in_dim, num_groups=num_local_experts
+        )
+        w2_sf_b12x = convert_sf_to_mma_layout(
+            w2_sf_fp8, m=w2_out_dim, k=w2_in_dim, num_groups=num_local_experts
+        )
+
+        w1_alpha_b12x = (
+            (1.0 / self.fc31_input_scale).expand(self.num_experts).to(torch.float32).contiguous()
+        )
+        w2_alpha_b12x = (
+            (1.0 / self.fc2_input_scale).expand(self.num_experts).to(torch.float32).contiguous()
+        )
+        fc2_input_scale_b12x = (1.0 / self.fc2_input_scale).to(torch.float32)
+
+        # TRT-LLM packs 16 FP4 values per int64. flashinfer's internal
+        # ``view(torch.float4_e2m1fn_x2)`` requires byte-contiguous storage
+        # (stride[-1] == 1 in bytes); a uint8 view of the int64 tensor
+        # provides that without copying.
+        self._b12x_weights = dict(
+            w1_weight=self.w3_w1_weight.view(torch.uint8),
+            w1_weight_sf=w1_sf_b12x,
+            w1_alpha=w1_alpha_b12x,
+            w2_weight=self.w2_weight.view(torch.uint8),
+            w2_weight_sf=w2_sf_b12x,
+            w2_alpha=w2_alpha_b12x,
+            fc2_input_scale=fc2_input_scale_b12x,
+        )
+
+        self.b12x_wrapper = B12xMoEWrapper(
+            num_experts=self.num_experts,
+            top_k=self.routing_method.experts_per_token,
+            hidden_size=self.hidden_size,
+            intermediate_size=self.intermediate_size_per_partition,
+            use_cuda_graph=self._b12x_use_cuda_graph,
+            max_num_tokens=self.moe_max_num_tokens,
+            activation=_ACTIVATION_MAP[self.activation_type],
+        )
+
+        logger.info_once(
+            f"FlashInferFusedMoE active: hidden={self.hidden_size}, "
+            f"intermediate={self.intermediate_size_per_partition}, "
+            f"experts={self.num_experts}, top_k="
+            f"{self.routing_method.experts_per_token}, "
+            f"activation={_ACTIVATION_MAP[self.activation_type]}.",
+            key="flashinfer_moe_active",
+        )
+
+    def quantize_input(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        post_quant_comm: bool = True,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Passthrough: ``B12xMoEWrapper.run`` quantizes activations internally.
+
+        ``CutlassFusedMoE.quantize_input`` would NVFP4-quantize ``x`` here and
+        pass ``(x_quantized, x_sf)`` into the kernel; b12x instead consumes a
+        bf16 / fp16 ``x`` and produces its own scale factors, so we forward
+        the activation unchanged and emit no SF.
+        """
+        if isinstance(x, Fp4QuantizedTensor):
+            raise ValueError(
+                "FlashInferFusedMoE does not accept Fp4QuantizedTensor input; "
+                "b12x performs its own input quantization."
+            )
+        return x, None
+
+    def run_moe(
+        self,
+        x: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        x_sf: Optional[torch.Tensor] = None,
+        is_sf_swizzled: bool = True,
+        output_dtype: Optional[torch.dtype] = None,
+        tuner_num_tokens: Optional[int] = None,
+        tuner_top_k: Optional[int] = None,
+        moe_output: Optional[torch.Tensor] = None,
+        enable_alltoall: Optional[bool] = None,
+    ) -> torch.Tensor:
+        if self.b12x_wrapper is None or self._b12x_weights is None:
+            raise RuntimeError(
+                "FlashInferFusedMoE.run_moe called before process_weights_after_loading completed."
+            )
+        if x_sf is not None:
+            raise ValueError(
+                "FlashInferFusedMoE expects unquantized input (x_sf=None); "
+                "got a precomputed scale factor."
+            )
+
+        out = self.b12x_wrapper.run(
+            x=x,
+            token_selected_experts=token_selected_experts,
+            token_final_scales=token_final_scales,
+            **self._b12x_weights,
+        )
+
+        # B12xMoEWrapper allocates its own output buffer for CUDA-graph
+        # compatibility. If the caller provided ``moe_output`` (e.g. an
+        # alltoall workspace tensor), copy into it; FlashInferFusedMoE
+        # currently rejects alltoall in __init__, so this is a defensive
+        # path for future workspace-driven uses.
+        if moe_output is not None:
+            moe_output.copy_(out)
+            return moe_output
+        return out

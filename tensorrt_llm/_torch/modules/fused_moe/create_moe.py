@@ -13,6 +13,7 @@ from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
 from .fused_moe_densegemm import DenseGEMMFusedMoE
+from .fused_moe_flashinfer import FlashInferFusedMoE
 from .fused_moe_triton import TritonFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .fused_moe_vanilla import VanillaMoE
@@ -81,6 +82,23 @@ def get_moe_cls(
         return WideEPMoE
     elif moe_backend.upper() == "TRITON":
         return TritonFusedMoE
+    elif moe_backend.upper() == "FLASHINFER":
+        # FlashInferFusedMoE wraps the b12x SM120/SM121 NVFP4 MoE kernel from
+        # FlashInfer. Hard-error rather than silently falling back to CUTLASS
+        # so a misconfigured request is loud at startup, not a silent perf
+        # regression.
+        if quant_config is None or not quant_config.quant_mode.has_nvfp4():
+            raise ValueError("FlashInferFusedMoE requires NVFP4 quantization "
+                             f"(got quant_config={quant_config}).")
+        from tensorrt_llm._utils import get_sm_version
+        sm_version = get_sm_version()
+        if sm_version not in FlashInferFusedMoE._SUPPORTED_SM_VERSIONS:
+            sm_list = "/".join(
+                f"SM{v}"
+                for v in sorted(FlashInferFusedMoE._SUPPORTED_SM_VERSIONS))
+            raise ValueError(
+                f"FlashInferFusedMoE requires {sm_list} (got SM{sm_version}).")
+        return FlashInferFusedMoE
     else:
         raise ValueError(f"Unsupported moe backend: {moe_backend}")
 
@@ -195,7 +213,9 @@ def create_moe_backend(
             without_comm=without_comm,
             activation_type=activation_type,
         )
-    elif moe_cls == CutlassFusedMoE:
+    elif issubclass(moe_cls, CutlassFusedMoE):
+        # CutlassFusedMoE and any of its subclasses (e.g. FlashInferFusedMoE)
+        # share the same constructor signature.
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,
