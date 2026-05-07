@@ -17,13 +17,23 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, nvtx_range
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...utils import ActivationType, Fp4QuantizedTensor
 from .fused_moe_cutlass import CutlassFusedMoE
 from .interface import _warn_and_return
+
+# Shared MoE output buffer pool, keyed by (max_num_tokens, hidden_size, dtype,
+# device). ``B12xMoEWrapper.__init__`` allocates a private
+# ``(max_num_tokens, hidden_size)`` output tensor per instance; with one
+# wrapper per MoE layer that is ``num_layers * max_num_tokens * hidden_size``
+# bytes of GPU memory holding identical-shape buffers that are written
+# sequentially. We fold them into a single shared buffer because MoE layers
+# run sequentially on the same CUDA stream, and the wrapper consumes its
+# previous output before the next layer is dispatched.
+_SHARED_MOE_OUTPUT_BUF: dict = {}
 
 # ActivationType -> b12x activation string. b12x currently exposes "relu2"
 # (Nemotron-style x * relu(x)) and "silu" (SwiGLU-style x * silu(gate)).
@@ -208,6 +218,22 @@ class FlashInferFusedMoE(CutlassFusedMoE):
             activation=_ACTIVATION_MAP[self.activation_type],
         )
 
+        # Replace the wrapper's per-instance output buffer with a shared one.
+        # Layers run sequentially on a single stream, so a single buffer of the
+        # right shape is correct and saves
+        # ``(num_moe_layers - 1) * max_num_tokens * hidden_size * 2`` bytes —
+        # ~2.5 GB on Nemotron-Super-120B with ``max_num_tokens=2048``,
+        # ``hidden=8192``, bf16, 80 MoE layers.
+        if self.b12x_wrapper._moe_output is not None:
+            buf = self.b12x_wrapper._moe_output
+            key = (buf.shape[0], buf.shape[1], buf.dtype, str(buf.device))
+            shared = _SHARED_MOE_OUTPUT_BUF.get(key)
+            if shared is None:
+                _SHARED_MOE_OUTPUT_BUF[key] = buf
+            else:
+                # Free the freshly allocated buffer; reuse the existing one.
+                self.b12x_wrapper._moe_output = shared
+
         logger.info_once(
             f"FlashInferFusedMoE active: hidden={self.hidden_size}, "
             f"intermediate={self.intermediate_size_per_partition}, "
@@ -217,6 +243,7 @@ class FlashInferFusedMoE(CutlassFusedMoE):
             key="flashinfer_moe_active",
         )
 
+    @nvtx_range("[b12x] quantize_input")
     def quantize_input(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
@@ -237,6 +264,7 @@ class FlashInferFusedMoE(CutlassFusedMoE):
             )
         return x, None
 
+    @nvtx_range("[b12x] run_moe")
     def run_moe(
         self,
         x: torch.Tensor,
@@ -260,12 +288,15 @@ class FlashInferFusedMoE(CutlassFusedMoE):
                 "got a precomputed scale factor."
             )
 
-        out = self.b12x_wrapper.run(
-            x=x,
-            token_selected_experts=token_selected_experts,
-            token_final_scales=token_final_scales,
-            **self._b12x_weights,
-        )
+        # Annotate the kwargs spread + wrapper entry separately so we can
+        # attribute the per-layer Python dispatch cost vs. the kernel cost.
+        with nvtx_range("[b12x] wrapper.run"):
+            out = self.b12x_wrapper.run(
+                x=x,
+                token_selected_experts=token_selected_experts,
+                token_final_scales=token_final_scales,
+                **self._b12x_weights,
+            )
 
         # B12xMoEWrapper allocates its own output buffer for CUDA-graph
         # compatibility. If the caller provided ``moe_output`` (e.g. an
@@ -273,6 +304,7 @@ class FlashInferFusedMoE(CutlassFusedMoE):
         # currently rejects alltoall in __init__, so this is a defensive
         # path for future workspace-driven uses.
         if moe_output is not None:
-            moe_output.copy_(out)
+            with nvtx_range("[b12x] out_copy"):
+                moe_output.copy_(out)
             return moe_output
         return out
