@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -120,6 +121,26 @@ class FlashInferFusedMoE(CutlassFusedMoE):
 
         self._b12x_weights: Optional[dict] = None
         self.b12x_wrapper = None
+
+    @property
+    def _prefill_via_cutlass_threshold(self) -> int:
+        """Hybrid CUTLASS-prefill / b12x-decode dispatch threshold.
+
+        ``x.shape[0] >= threshold`` => CUTLASS GroupGEMM (better at large m).
+        ``x.shape[0] <  threshold`` => b12x (better at m=1 decode).
+        ``0`` (the default) disables hybrid mode and keeps pure-b12x behavior.
+        """
+        return int(os.environ.get("TRTLLM_FLASHINFER_PREFILL_VIA_CUTLASS_THRESHOLD", "0"))
+
+    def _route_to_cutlass(self, x) -> bool:
+        """Return True iff this call should fall back to the inherited CUTLASS
+        path. ``Fp4QuantizedTensor`` inputs always stay on the b12x path (which
+        rejects them) so the existing error message is preserved."""
+        return (
+            self._prefill_via_cutlass_threshold > 0
+            and isinstance(x, torch.Tensor)
+            and x.shape[0] >= self._prefill_via_cutlass_threshold
+        )
 
     def post_load_weights(self):
         """Build the b12x weight dict and instantiate ``B12xMoEWrapper``.
@@ -256,7 +277,15 @@ class FlashInferFusedMoE(CutlassFusedMoE):
         pass ``(x_quantized, x_sf)`` into the kernel; b12x instead consumes a
         bf16 / fp16 ``x`` and produces its own scale factors, so we forward
         the activation unchanged and emit no SF.
+
+        With ``TRTLLM_FLASHINFER_PREFILL_VIA_CUTLASS_THRESHOLD > 0`` set, the
+        inherited NVFP4 quant path is used for chunks at or above the
+        threshold (prefill); ``run_moe`` performs the matching dispatch.
         """
+        if self._route_to_cutlass(x):
+            return CutlassFusedMoE.quantize_input(
+                self, x, post_quant_comm=post_quant_comm, **kwargs
+            )
         if isinstance(x, Fp4QuantizedTensor):
             raise ValueError(
                 "FlashInferFusedMoE does not accept Fp4QuantizedTensor input; "
@@ -278,6 +307,20 @@ class FlashInferFusedMoE(CutlassFusedMoE):
         moe_output: Optional[torch.Tensor] = None,
         enable_alltoall: Optional[bool] = None,
     ) -> torch.Tensor:
+        if self._route_to_cutlass(x):
+            return CutlassFusedMoE.run_moe(
+                self,
+                x,
+                token_selected_experts=token_selected_experts,
+                token_final_scales=token_final_scales,
+                x_sf=x_sf,
+                is_sf_swizzled=is_sf_swizzled,
+                output_dtype=output_dtype,
+                tuner_num_tokens=tuner_num_tokens,
+                tuner_top_k=tuner_top_k,
+                moe_output=moe_output,
+                enable_alltoall=enable_alltoall,
+            )
         if self.b12x_wrapper is None or self._b12x_weights is None:
             raise RuntimeError(
                 "FlashInferFusedMoE.run_moe called before process_weights_after_loading completed."
