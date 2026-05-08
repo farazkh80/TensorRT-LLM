@@ -9,6 +9,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from ...model_config import ModelConfig
 from ...utils import ActivationType, AuxStreamType
 from .configurable_moe import ConfigurableMoE
+from .fused_moe_b12x_luke import B12xLukeFusedMoE
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
@@ -99,6 +100,23 @@ def get_moe_cls(
             raise ValueError(
                 f"FlashInferFusedMoE requires {sm_list} (got SM{sm_version}).")
         return FlashInferFusedMoE
+    elif moe_backend.upper() == "B12X_LUKE":
+        # B12xLukeFusedMoE wraps lukealonso's standalone b12x package
+        # (https://github.com/lukealonso/b12x), the upstream of flashinfer's
+        # vendored b12x. Same SM120/SM121 + NVFP4 gating; same hard-error
+        # rather than silent CUTLASS fallback.
+        if quant_config is None or not quant_config.quant_mode.has_nvfp4():
+            raise ValueError("B12xLukeFusedMoE requires NVFP4 quantization "
+                             f"(got quant_config={quant_config}).")
+        from tensorrt_llm._utils import get_sm_version
+        sm_version = get_sm_version()
+        if sm_version not in B12xLukeFusedMoE._SUPPORTED_SM_VERSIONS:
+            sm_list = "/".join(
+                f"SM{v}"
+                for v in sorted(B12xLukeFusedMoE._SUPPORTED_SM_VERSIONS))
+            raise ValueError(
+                f"B12xLukeFusedMoE requires {sm_list} (got SM{sm_version}).")
+        return B12xLukeFusedMoE
     else:
         raise ValueError(f"Unsupported moe backend: {moe_backend}")
 

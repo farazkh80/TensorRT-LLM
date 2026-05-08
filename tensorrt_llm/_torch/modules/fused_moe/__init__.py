@@ -1,4 +1,5 @@
 from .create_moe import create_moe, get_moe_cls
+from .fused_moe_b12x_luke import B12xLukeFusedMoE
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_flashinfer import FlashInferFusedMoE
@@ -24,6 +25,7 @@ from .routing import (BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod,
 # yapf: enable
 
 __all__ = [
+    "B12xLukeFusedMoE",
     "BaseMoeRoutingMethod",
     "create_load_balanced_logits",
     "create_moe",
