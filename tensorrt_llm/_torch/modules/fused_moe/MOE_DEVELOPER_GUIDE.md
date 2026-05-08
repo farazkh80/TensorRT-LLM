@@ -147,6 +147,7 @@ Still on old path (standalone, with embedded communication):
 | `fused_moe_deepgemm.py` | `DeepGemmFusedMoE` | SM100/SM103 | FP8 Block Scales on Blackwell | `EXTERNAL_COMM` |
 | `fused_moe_densegemm.py` | `DenseGEMMFusedMoE` | SM100/SM103 | NVFP4 min-latency; CuTe DSL dense GEMM packs all experts into one matrix (vs Cutlass per-expert scatter), efficient for small token counts | `EXTERNAL_COMM` |
 | `fused_moe_cute_dsl.py` | `CuteDslFusedMoE` | SM100/SM103 | High throughput NVFP4, generally faster than Cutlass | `EXTERNAL_COMM` |
+| `fused_moe_flashinfer_nvfp4_sm12x.py` | `FlashInferNvfp4Sm12xFusedMoE` | SM120/SM121 | NVFP4 only; hybrid CUTLASS-prefill / b12x-decode for desktop Blackwell / DGX Spark | `EXTERNAL_COMM` |
 | `mega_moe/mega_moe_deepgemm.py` | `MegaMoEDeepGemm` | SM100 only | W4A8_MXFP4_MXFP8 via DeepGEMM `fp8_fp4_mega_moe` fused dispatch+GEMM+act+GEMM+combine kernel; requires `hidden_size % 512 == 0` | `FUSED_COMM` |
 | `fused_moe_triton.py` | `TritonFusedMoE` | SM90 only | GPT-OSS on Hopper (requires `swiglu_gptoss_style=True`) | (legacy path) |
 | `fused_moe_wide_ep.py` | `WideEPMoE` | All GPUs | Deprecating — use ConfigurableMoE instead | (legacy path) |
@@ -187,19 +188,47 @@ Communication strategies are auto-selected at runtime by `CommunicationFactory` 
 
 Each backend's `can_implement(quant_algo, dtype_activation, swiglu_gptoss_style, ...)` method declares supported quantizations. Source of truth: the `can_implement` classmethod in each backend file.
 
-| Quantization | Cutlass | TRTLLMGen | DeepGemm | DenseGEMM | CuteDSL | MegaMoE-DG | Triton | WideEP | Vanilla |
-|---|---|---|---|---|---|---|---|---|---|
-| Unquantized (BF16/FP16) | Y (SM80+) | N | N | N | N | N | Y (SM90, BF16) | Y | Y |
-| FP8 QDQ | Y (SM89+) | N | N | N | N | N | Y (SM90) | Y | Y |
-| FP8 Block Scales | Y (SM90, SM120) | Y (SM100/103) | Y (SM100/103) | N | Y (SM100/103) | N | N | Y | Y |
-| NVFP4 | Y (SM100/103/120/121) | Y (SM100/103) | N | Y (SM100/103) | Y (SM100/103) | N | N | Y | Y |
-| W4A8 NVFP4 FP8 | N | Y (SM100/103) | N | N | N | N | N | N | N |
-| W4A16 MXFP4 | Y (SM90) | Y (SM100/103) | N | N | N | N | Y (SM90) | N | N |
-| W4A8 MXFP4 FP8 | Y (SM100/103) | Y (SM100/103) | N | N | N | N | Y (SM90) | N | N |
-| W4A8 MXFP4 MXFP8 | Y (SM100/103) | Y (SM100/103) | N | N | N | Y (SM100, requires `hidden_size % 512 == 0`) | N | N | N |
-| W4A8 AWQ | Y (SM89/90) | N | N | N | N | N | N | N | N |
-| W8A16 | Y (SM80+) | N | N | N | N | N | N | N | N |
-| INT4 WoQ (W4AFP8) | N | N | N | N | N | N | N | Y | N |
+| Quantization | Cutlass | TRTLLMGen | DeepGemm | DenseGEMM | CuteDSL | Nvfp4Sm12x | MegaMoE-DG | Triton | WideEP | Vanilla |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Unquantized (BF16/FP16) | Y (SM80+) | N | N | N | N | N | N | Y (SM90, BF16) | Y | Y |
+| FP8 QDQ | Y (SM89+) | N | N | N | N | N | N | Y (SM90) | Y | Y |
+| FP8 Block Scales | Y (SM90, SM120) | Y (SM100/103) | Y (SM100/103) | N | Y (SM100/103) | N | N | N | Y | Y |
+| NVFP4 | Y (SM100/103/120/121) | Y (SM100/103) | N | Y (SM100/103) | Y (SM100/103) | Y (SM120/121) | N | N | Y | Y |
+| W4A8 NVFP4 FP8 | N | Y (SM100/103) | N | N | N | N | N | N | N | N |
+| W4A16 MXFP4 | Y (SM90) | Y (SM100/103) | N | N | N | N | N | Y (SM90) | N | N |
+| W4A8 MXFP4 FP8 | Y (SM100/103) | Y (SM100/103) | N | N | N | N | N | Y (SM90) | N | N |
+| W4A8 MXFP4 MXFP8 | Y (SM100/103) | Y (SM100/103) | N | N | N | N | Y (SM100, requires `hidden_size % 512 == 0`) | N | N | N |
+| W4A8 AWQ | Y (SM89/90) | N | N | N | N | N | N | N | N | N |
+| W8A16 | Y (SM80+) | N | N | N | N | N | N | N | N | N |
+| INT4 WoQ (W4AFP8) | N | N | N | N | N | N | N | N | Y | N |
+
+### FlashInferNvfp4Sm12xFusedMoE — composition, dispatch policy, and constraints
+
+`FlashInferNvfp4Sm12xFusedMoE` is selected via `--moe_backend FLASHINFER_NVFP4SM12X` (or `moe_config.backend: FLASHINFER_NVFP4SM12X` in YAML). It is gated on **NVFP4 quantization + SM120 (RTX 5090 / RTX PRO 6000 / GB202) or SM121 (DGX Spark / GB10)**, and depends at runtime on `flashinfer-python ≥ 0.6.8` (provides `flashinfer.B12xMoEWrapper` and `flashinfer.cute_dsl.utils.convert_sf_to_mma_layout`) plus the matched `nvidia-cutlass-dsl == 4.4.1` trio (`-libs-base`, `-libs-cu13`).
+
+Internally it dispatches per call by activation-row count `m`:
+
+- **`m >= _PREFILL_VIA_CUTLASS_THRESHOLD` (prefill)** routes through the inherited `CutlassFusedMoE.quantize_input` + `run_moe` (CUTLASS NVFP4 GroupGEMM). The b12x kernel's 12-CTA-per-token MMA pattern is suboptimal at large `m`; CUTLASS GroupGEMM wins per-layer.
+- **`m <  _PREFILL_VIA_CUTLASS_THRESHOLD` (decode)** dispatches to FlashInfer's `B12xMoEWrapper.run` — a kernel purpose-built for `m=1` / small routed-row counts. Beats CUTLASS by ~17.6 % TPOT on Nemotron-Super-120B-NVFP4.
+
+The threshold is a class constant (default `64`); it cleanly separates conc=1 prefill (`m=2048` with `max_num_tokens=2048`) from decode (`m=1`) and stays robust against future chunked-prefill splits. CUDA graph capture only covers decode in TRT-LLM, so captured graphs always replay the b12x path; eager prefill always runs CUTLASS — there is no graph-capture conflict.
+
+Beyond the NVFP4 + SM gate above, the backend hard-rejects:
+
+- `ep_size > 1` — b12x has no expert-parallel dispatch/combine kernel.
+- MoE alltoall communication — same reason.
+- Activations other than `Relu2` (Nemotron-style) and `Swiglu` (mapped to b12x's `silu`).
+- `swiglu_gptoss_style=True`.
+- `Fp4QuantizedTensor` input on the decode path — b12x performs its own activation quantization.
+
+Misconfigured selection raises at `get_moe_cls("FLASHINFER_NVFP4SM12X", ...)` time rather than silently falling back to CUTLASS.
+
+NVFP4 weights are loaded once via the inherited NVFP4 quant method; `post_load_weights()` then prepares the b12x-shaped weight tensors alongside the existing CUTLASS layout (both layouts coexist; the dispatcher picks per call):
+
+1. Per-expert `weight_scale_2 = fc_alpha * fc_input_scale` is recovered and multiplied into the FP8 block scales (b12x expects un-normalized scales; HF/ModelOpt NVFP4 stores normalized).
+2. `flashinfer.cute_dsl.utils.convert_sf_to_mma_layout` reshapes scales into the 6D MMA layout b12x consumes.
+3. `w1_alpha = w2_alpha = 1 / fc_input_scale` is passed alongside, restoring algebraic correctness given b12x's dual-use of the alpha tensor (online activation-quant `global_scale` + FC1 epilogue dequant).
+4. FP4 weights are exposed as `uint8` views so FlashInfer's internal `view(torch.float4_e2m1fn_x2)` finds byte-contiguous storage.
 
 ### Scheduler / EPLB Constraints
 
