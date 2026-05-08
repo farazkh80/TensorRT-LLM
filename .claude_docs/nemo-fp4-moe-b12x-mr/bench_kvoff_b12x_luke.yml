@@ -1,0 +1,13 @@
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.6
+# CUDA graphs intentionally disabled: lukealonso b12x's CuTe DSL JIT path is
+# the same kernel family as flashinfer's vendored b12x and was not validated
+# under graph capture for our TRT-LLM build (DSL ICE on SM120 during pass-
+# pipeline lowering when wrapped in a captured graph). Single-batch capture
+# is harmless because TRT-LLM only auto-injects [batch_sizes: [1]] when
+# --max_batch_size 1 is passed, and the bench harness driving this yaml does.
+enable_iter_perf_stats: true
+enable_chunked_prefill: true
+moe_config:
+  backend: B12X_LUKE
