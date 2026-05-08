@@ -200,6 +200,33 @@ Either way, **commit-selection alone within `lukealonso/b12x` cannot close the g
 3. **Hand-port FI's vendored kernel into a `torch.library.custom_op` inside our backend** — apples-to-apples control of both dispatch and kernel; bypasses the dependency on the public `lukealonso/b12x` package.
 4. **File upstream issue** with the trace evidence + bisect data + perf delta, asking lukealonso to (a) fix the `micro_mac` scope bug in the bs1 fast path, (b) clarify which historical state of the kernel flashinfer vendored (since master HEAD doesn't reproduce FI's perf at any commit going back to May 4), and (c) re-tune the public master kernel to match for Nemotron-Super-120B.
 
+## Apples-to-apples: forcing luke's warp-specialized `MoEStaticKernel`
+
+After noticing that luke ships THREE kernel files (`micro.py`, `static.py`, `dynamic.py`) and only the first is flat-16-warp, an obvious follow-up was to force the dispatcher to skip the flat micro path and pick luke's warp-specialized `MoEStaticKernel`. Both `static.py:95` and `dynamic.py:270` set `num_mma_warps=4 / tma_load_warp_id=4 / threads_per_cta=160` — structurally identical to FI's `MoEMicroKernel` warp specialization.
+
+Patch: in `b12x/integration/tp_moe.py`, force the `if use_micro_direct:` block to be skipped, so dispatch falls through to `_get_static_kernel` → `MoEStaticKernel.launch`. Re-bench at `b12x_luke_warpspec_20260508_094658.log`.
+
+| Variant | TPOT P50 (ms) | Δ vs FI hybrid |
+|---|---:|---:|
+| FI hybrid baseline | 11.4935 | — |
+| Luke `1378cea7` flat `MoEMicroKernel` (v2, per-expert) | 13.4047 | +16.6 % |
+| Luke `1378cea7` flat `MoEMicroKernel` (trace, scalar) | 12.9654 | +12.8 % |
+| Luke `c9cc90ec` flat `MoEMicroKernel` | 13.5516 | +17.9 % |
+| Luke `986a405a` flat `MoEMicroKernel` | 13.5534 | +17.9 % |
+| **Luke `1378cea7` warp-specialized `MoEStaticKernel` (forced)** | **13.5717** | **+18.1 %** |
+
+**The +18 % gap survives the warp-specialization swap.** Forcing luke's warp-specialized kernel did not recover the FI perf. So the architectural delta is more nuanced than "FI has warp spec, luke doesn't":
+
+- **FI** has a separate **small-batch-specialized** warp-spec kernel (`MoEMicroKernel`, picked when `routed_rows ≤ 40`). It is tuned specifically for the m=1 / decode case.
+- **Luke master** has:
+  - **`MoEMicroKernel`** (`micro.py`, flat 16-warp) — picked for small batches via `use_micro_direct`
+  - **`MoEStaticKernel`** (`static.py`, warp-specialized 5-warp) — fallback, but tuned for *larger* routed_rows
+  - **`MoEDynamicKernel`** (`dynamic.py`, warp-specialized 5-warp) — for large batches
+
+So luke has a "small-batch flat" kernel and a "large-batch warp-spec" kernel, but **no "small-batch warp-spec" kernel** matching FI's `MoEMicroKernel`. Forcing the large-batch kernel onto small-batch shapes pays the wrong-tuning cost (≈ same as forcing the wrong-architecture flat micro kernel).
+
+The real perf gap is **kernel-level tuning specific to small routed_rows / decode shapes**: CTA tile sizes, software-pipelining stages, FC1/FC2 chunk counts, MMA mode ladder. None of luke's three published kernels appear to be tuned for our shape.
+
 ## Kernel-source diff — the smoking gun
 
 After exhausting bisect, I diff'd the actual kernel files inside the container:
@@ -229,13 +256,14 @@ For decode (m=1, latency-bound), warp specialization is the dominant optimizatio
 
 ## Bottom line
 
-The two packages share the same DISPATCH architecture (same micro path, same `is_supported` shape gates, same scale conventions modulo the sharing flags), but they ship **different KERNELS**:
+Refined verdict after the warp-specialization swap test:
 
-- **FI's `MoEMicroKernel`** uses Blackwell's warp-specialized producer/consumer pattern (5 warps/CTA, dedicated DMA warp, async TMA bulk loads, register repartitioning). This is the optimization pattern that hides memory latency for free at decode m=1.
-- **Luke's `MoEMicroKernel`** uses a flat 16-warp design with no producer/consumer split. All 16 warps load + compute themselves. No async DMA pipelining.
+- Luke does ship warp specialization — in `MoEStaticKernel` and `MoEDynamicKernel` (5-warp `num_mma_warps=4 / tma_load_warp_id=4`). My initial diff against `MoEMicroKernel` (flat 16-warp) was apples-to-oranges.
+- But forcing luke's warp-spec `MoEStaticKernel` doesn't recover the perf — it lands at +18.1 % vs FI, essentially the same as the flat micro path.
+- So the real gap is **shape-specific kernel tuning**: FI's `MoEMicroKernel` is a separate kernel **specifically tuned for the small-batch / decode case** (routed_rows ≤ 40). Luke has no equivalent — its small-batch path uses a flat kernel, its warp-spec kernels are tuned for larger routed_rows.
 
-The bisect (May 4 → May 7) confirmed the gap is **not** in any tuning knob luke has touched recently — it's intrinsic to the kernel implementation. The `lukealonso/b12x` master kernel was authored without warp specialization; FI's vendored kernel has it.
+The bisect (May 4 → May 7) showed the gap is constant across that window. The warp-spec swap showed the gap survives the architectural pattern swap. So: closing the gap requires either kernel-level retuning of luke's `MoEStaticKernel` for `routed_rows ≤ 40`, or hand-porting FI's small-batch-tuned `MoEMicroKernel` (~12k lines of CuTe DSL cascade — out of scope).
 
-`FlashInferFusedMoE` (#13773) remains the fastest known SM120 Nemotron-Super decode path. `B12xLukeFusedMoE` is committed as a stepping stone — but the gap will not close with further upstream commits unless lukealonso rewrites the micro kernel to use warp specialization, or until we hand-port FI's vendored kernel into our own torch op (~1–2 days of work, ~2,400 lines of CuTe DSL to vendor).
+`FlashInferFusedMoE` (#13773) remains the fastest known SM120 Nemotron-Super decode path. `B12xLukeFusedMoE` is committed as a stepping stone — when lukealonso adds a small-batch-tuned warp-spec kernel (or re-tunes the existing `MoEStaticKernel` for routed_rows ≤ 40), this backend activates the win without further TRT-LLM changes.
 
 The cleanest next move if the perf delta matters enough is option 3 above: hand-port FI's `moe_micro_kernel.py` into a `torch.library.custom_op` inside `B12xLukeFusedMoE`, with the kernel-launch glue from `flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_dispatch.py` adapted to b12x's `B12XFP4ExpertWeights` weight format. That gives us FI's kernel perf without depending on flashinfer's wrapper code.
