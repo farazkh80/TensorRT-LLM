@@ -142,6 +142,10 @@ class _RoutePredicateStub:
 
     _PREFILL_VIA_CUTLASS_THRESHOLD = FlashInferNvfp4Sm12xFusedMoE._PREFILL_VIA_CUTLASS_THRESHOLD
 
+    # W4A16 is off by default; W4A16-specific tests flip this to True on the
+    # stub instance to mirror what the real ``__init__`` does from the env var.
+    _b12x_w4a16 = False
+
     _route_to_cutlass = FlashInferNvfp4Sm12xFusedMoE._route_to_cutlass
 
 
@@ -167,4 +171,16 @@ def test_dispatch_rejects_non_tensor():
     """Non-tensor inputs (e.g. Fp4QuantizedTensor) stay on the b12x path
     so the existing ValueError surfaces in quantize_input."""
     stub = _RoutePredicateStub()
+    assert stub._route_to_cutlass(object()) is False
+
+
+def test_dispatch_w4a16_disables_cutlass_prefill_fallback():
+    """In W4A16 mode the CUTLASS path is W4A4-only and would break numerics,
+    so ``_route_to_cutlass`` must return False for every input shape."""
+    stub = _RoutePredicateStub()
+    stub._b12x_w4a16 = True
+    x_prefill = torch.empty(_RoutePredicateStub._PREFILL_VIA_CUTLASS_THRESHOLD, 1024)
+    x_decode = torch.empty(1, 1024)
+    assert stub._route_to_cutlass(x_prefill) is False
+    assert stub._route_to_cutlass(x_decode) is False
     assert stub._route_to_cutlass(object()) is False

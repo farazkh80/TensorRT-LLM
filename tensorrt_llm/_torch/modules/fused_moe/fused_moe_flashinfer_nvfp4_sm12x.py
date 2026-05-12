@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -42,6 +43,17 @@ _ACTIVATION_MAP = {
     ActivationType.Swiglu: "silu",
 }
 
+# Env flag (v1 opt-in): force the b12x decode path to the W4A16 kernel
+# variant (``activation_precision="bf16"``) instead of the default W4A4
+# (``activation_precision="fp4"``). Matches the FlashInfer-side flag
+# ``FLASHINFER_B12X_FORCE_MOE_W4A16`` from PR flashinfer-ai/flashinfer#3271
+# so a single env export propagates through both layers.
+_FORCE_W4A16_ENV = "FLASHINFER_B12X_FORCE_MOE_W4A16"
+
+
+def _force_w4a16_enabled() -> bool:
+    return os.environ.get(_FORCE_W4A16_ENV, "0") == "1"
+
 
 class FlashInferNvfp4Sm12xFusedMoE(CutlassFusedMoE):
     """Hybrid CUTLASS-prefill / b12x-decode NVFP4 fused-MoE backend for SM120 / SM121.
@@ -68,6 +80,13 @@ class FlashInferNvfp4Sm12xFusedMoE(CutlassFusedMoE):
     MoE alltoall, ``Fp4QuantizedTensor`` input, ``swiglu_gptoss_style``
     biased SwiGLU, and activations outside ``{Relu2, Swiglu}``. It is
     selected via ``moe_config.backend: FLASHINFER_NVFP4SM12X``.
+
+    **W4A16 mode (v1 env opt-in)**: setting
+    ``FLASHINFER_B12X_FORCE_MOE_W4A16=1`` switches the b12x call to the
+    W4A16 kernel family added in flashinfer-ai/flashinfer#3271
+    (``activation_precision="bf16"``). In W4A16 mode the CUTLASS
+    prefill fallback is disabled (CUTLASS NVFP4 GroupGEMM is W4A4 and
+    would break numerics), so every call routes through b12x.
     """
 
     # SM versions on which the FlashInfer b12x NVFP4 MoE kernel is available.
@@ -118,6 +137,11 @@ class FlashInferNvfp4Sm12xFusedMoE(CutlassFusedMoE):
         model_config = kwargs.get("model_config", None)
         self._b12x_use_cuda_graph = bool(getattr(model_config, "use_cuda_graph", False))
 
+        # W4A16 opt-in is captured once per instance so the dispatch and the
+        # weight-prep stay self-consistent for the lifetime of the layer.
+        # See PR flashinfer-ai/flashinfer#3271 for the kernel side.
+        self._b12x_w4a16 = _force_w4a16_enabled()
+
         super().__init__(*args, **kwargs)
 
         # b12x has no expert-parallel dispatch/combine kernel, so EP must be
@@ -146,7 +170,14 @@ class FlashInferNvfp4Sm12xFusedMoE(CutlassFusedMoE):
         """Return ``True`` iff this call should fall back to the inherited
         CUTLASS path (prefill chunk). ``Fp4QuantizedTensor`` inputs always
         stay on the b12x path (which rejects them) so the existing error
-        message is preserved."""
+        message is preserved.
+
+        In W4A16 mode the inherited CUTLASS NVFP4 GroupGEMM path is W4A4
+        (it FP4-quantizes activations online), so falling back there would
+        change the numerics. Always stay on b12x in W4A16 mode.
+        """
+        if self._b12x_w4a16:
+            return False
         return isinstance(x, torch.Tensor) and x.shape[0] >= self._PREFILL_VIA_CUTLASS_THRESHOLD
 
     def post_load_weights(self):
@@ -214,13 +245,31 @@ class FlashInferNvfp4Sm12xFusedMoE(CutlassFusedMoE):
             w2_sf_fp8, m=w2_out_dim, k=w2_in_dim, num_groups=num_local_experts
         )
 
-        w1_alpha_b12x = (
-            (1.0 / self.fc31_input_scale).expand(self.num_experts).to(torch.float32).contiguous()
-        )
-        w2_alpha_b12x = (
-            (1.0 / self.fc2_input_scale).expand(self.num_experts).to(torch.float32).contiguous()
-        )
-        fc2_input_scale_b12x = (1.0 / self.fc2_input_scale).to(torch.float32)
+        if self._b12x_w4a16:
+            # W4A16 path: bf16 activations into FP4 weights. The kernel uses
+            # ``w*_alpha`` only as the FC1/FC2 epilogue dequant multiplier
+            # (no dual-use with online activation quant because there is no
+            # activation quant in this mode). Since we still un-normalize
+            # the FP8 block scales by ``weight_scale_2`` above, the
+            # epilogue already produces bf16-correct outputs after
+            # ``acc * un_normalized_sf``, so ``alpha = 1.0`` per expert.
+            # ``fc2_input_scale`` is ignored by the kernel in this mode
+            # (see B12xMoEWrapper.run docstring); pass ``None``.
+            alpha_device = self.w3_w1_weight.device
+            w1_alpha_b12x = torch.ones(self.num_experts, dtype=torch.float32, device=alpha_device)
+            w2_alpha_b12x = torch.ones(self.num_experts, dtype=torch.float32, device=alpha_device)
+            fc2_input_scale_b12x = None
+        else:
+            w1_alpha_b12x = (
+                (1.0 / self.fc31_input_scale)
+                .expand(self.num_experts)
+                .to(torch.float32)
+                .contiguous()
+            )
+            w2_alpha_b12x = (
+                (1.0 / self.fc2_input_scale).expand(self.num_experts).to(torch.float32).contiguous()
+            )
+            fc2_input_scale_b12x = (1.0 / self.fc2_input_scale).to(torch.float32)
 
         # TRT-LLM packs 16 FP4 values per int64. flashinfer's internal
         # ``view(torch.float4_e2m1fn_x2)`` requires byte-contiguous storage
@@ -236,14 +285,26 @@ class FlashInferNvfp4Sm12xFusedMoE(CutlassFusedMoE):
             fc2_input_scale=fc2_input_scale_b12x,
         )
 
+        # ``self.intermediate_size_per_partition`` may be the LOGICAL value
+        # while TRT-LLM's NVFP4 quant method allocates the stored tensors
+        # with an internal padding (e.g. 1856 logical -> 1920 padded on
+        # Nano3.5). The wrapper's ``intermediate_size`` controls the SF
+        # shape it expects to reshape back from MMA layout per-forward, so
+        # it must match what we passed to ``convert_sf_to_mma_layout``
+        # (which is ``w2_in_dim``, derived from the stored shape).
+        # Padding columns are zeros so matmul with them is a no-op
+        # semantically.
+        b12x_intermediate_size = w2_in_dim
+
         self.b12x_wrapper = B12xMoEWrapper(
             num_experts=self.num_experts,
             top_k=self.routing_method.experts_per_token,
             hidden_size=self.hidden_size,
-            intermediate_size=self.intermediate_size_per_partition,
+            intermediate_size=b12x_intermediate_size,
             use_cuda_graph=self._b12x_use_cuda_graph,
             max_num_tokens=self.moe_max_num_tokens,
             activation=_ACTIVATION_MAP[self.activation_type],
+            activation_precision=("bf16" if self._b12x_w4a16 else "fp4"),
         )
 
         # Replace the wrapper's per-instance output buffer with a shared one.
@@ -267,7 +328,9 @@ class FlashInferNvfp4Sm12xFusedMoE(CutlassFusedMoE):
             f"intermediate={self.intermediate_size_per_partition}, "
             f"experts={self.num_experts}, top_k="
             f"{self.routing_method.experts_per_token}, "
-            f"activation={_ACTIVATION_MAP[self.activation_type]}.",
+            f"activation={_ACTIVATION_MAP[self.activation_type]}, "
+            f"precision={'w4a16' if self._b12x_w4a16 else 'w4a4'} "
+            f"(hybrid_cutlass_prefill={'OFF' if self._b12x_w4a16 else 'ON'}).",
             key="flashinfer_nvfp4_sm12x_moe_active",
         )
 

@@ -8,6 +8,7 @@ from torch.nn.parameter import Parameter
 from tensorrt_llm.functional import AllReduceParams
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..distributed import allgather
 from .linear import Linear, TensorParallelMode
@@ -34,6 +35,7 @@ class LMHead(Linear):
         gather_output: bool = False,
         reduce_output: bool = True,
         use_custom_cublas_mm: bool = False,
+        quant_config: Optional[QuantConfig] = None,
     ):
         local_in_features = embedding_dim
         local_out_features = num_embeddings
@@ -66,6 +68,7 @@ class LMHead(Linear):
             gather_output=gather_output,
             reduce_output=reduce_output,
             use_custom_cublas_mm=use_custom_cublas_mm,
+            quant_config=quant_config,
         )
 
         if tensor_parallel_mode == TensorParallelMode.ROW:
@@ -76,8 +79,21 @@ class LMHead(Linear):
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
 
-        weight_shape = (self.out_features, self.in_features)
-        self.weight = Parameter(torch.empty(weight_shape, dtype=dtype))
+        # The parent ``Linear`` constructor already created the right
+        # parameter set via ``self.quant_method.create_weights(...)`` --
+        # for quantized lm_heads (e.g. NVFP4 ``-LMHEAD-CT`` checkpoints)
+        # that's ``weight`` (uint8 packed) + ``weight_scale`` +
+        # ``weight_scale_2`` + ``input_scale``. We must NOT overwrite
+        # those with a vanilla bf16 ``self.weight``; otherwise the loader
+        # tries to copy FP4-packed source into bf16 dest and crashes with
+        # shape mismatch (``tensor a (2688) vs b (1344)``). For the bf16
+        # path we keep the explicit override so the LMHead-specific
+        # padding adjustment above still takes effect.
+        is_quantized = quant_config is not None and quant_config.layer_quant_mode.has_any_quant(
+            exclude_kv_cache=True)
+        if not is_quantized:
+            weight_shape = (self.out_features, self.in_features)
+            self.weight = Parameter(torch.empty(weight_shape, dtype=dtype))
         self.register_parameter("bias", None)
 
     @property

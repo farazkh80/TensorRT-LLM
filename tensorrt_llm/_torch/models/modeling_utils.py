@@ -369,15 +369,25 @@ class DecoderModelForCausalLM(nn.Module,
         self.pp_size = config.mapping.pp_size
         self.has_custom_lm_head = False
 
+        # Forward the model's quant_config to the lm_head so checkpoints that
+        # quantize the LM head (e.g. compressed-tensors "*-LMHEAD-CT"
+        # NemotronH variants where the lm_head ships as NVFP4) construct
+        # ``self.lm_head`` with the right quantized parameter shapes.
+        # ``PostInitCaller`` then walks all modules and resets
+        # ``quant_config = None`` for any whose name matches
+        # ``quant_config.exclude_modules`` (handled by the existing
+        # exclusion mechanism a few lines below), so checkpoints that
+        # *exclude* lm_head fall back to bf16 automatically.
+        lm_head_quant_config = getattr(config, "quant_config", None)
+
         if config.mapping.enable_attention_dp and not config.mapping.enable_lm_head_tp_in_adp:
             self.lm_head = LMHead(
                 vocab_size,
                 hidden_size,
                 dtype=config.pretrained_config.torch_dtype,
+                quant_config=lm_head_quant_config,
             )
         else:
-            # TODO(zhenhuanc): Currently lm_head Linear will not accept QuantConfig
-            # will considering per layer QuantConfig in the future.
             if (hasattr(config, 'lora_config')
                     and config.lora_config is not None
                     and len(config.lora_config.lora_dir) == 1):
@@ -399,6 +409,7 @@ class DecoderModelForCausalLM(nn.Module,
                 reduce_output=False,
                 use_custom_cublas_mm=getattr(model, 'use_custom_cublas_mm',
                                              False),
+                quant_config=lm_head_quant_config,
             )
 
             if self.has_custom_lm_head:

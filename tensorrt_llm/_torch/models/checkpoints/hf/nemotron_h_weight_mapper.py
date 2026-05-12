@@ -10,7 +10,91 @@ from tensorrt_llm._torch.utils import split
 @register_mapper("HF", "NemotronHForCausalLM")
 class NemotronHHfWeightMapper(HfWeightMapper):
 
+    @staticmethod
+    def _normalize_compressed_tensors_names(weights: dict) -> dict:
+        """Translate compressed-tensors NVFP4 weight names to the ModelOpt names
+        the downstream NemotronH loader expects.
+
+        Some NVFP4 checkpoints (e.g. ``nvidia/Nano3.5-BF16-NVFP4-W4A16-LMHEAD-CT``,
+        ModelOpt 0.37+ with ``nvfp4-pack-quantized`` format) export weights as
+        ``weight_packed`` / ``weight_global_scale`` / optionally
+        ``input_global_scale`` instead of ModelOpt's legacy
+        ``weight`` / ``weight_scale_2`` / ``input_scale``. The per-block
+        ``weight_scale`` keeps the same name in both formats.
+
+        W4A16 checkpoints omit the per-tensor activation scale entirely
+        (no online activation quant). To keep the inherited NVFP4 quant
+        method self-consistent we synthesize ``input_scale = 1.0`` per
+        module that has a ``weight_global_scale``. The downstream MoE
+        backend (``FlashInferNvfp4Sm12xFusedMoE`` in W4A16 mode) ignores
+        the input scale on the kernel side, but the loader needs a
+        tensor present to populate ``self.fc31_input_scale`` /
+        ``self.fc2_input_scale``.
+        """
+        has_packed = any(".weight_packed" in k for k in weights)
+        has_gs = any(".weight_global_scale" in k for k in weights)
+        if not (has_packed or has_gs):
+            return weights
+
+        renamed: dict = {}
+        has_input_gs_by_module: set = set()
+        # First pass: detect which modules carry an explicit activation scale.
+        for name in weights:
+            if name.endswith(".input_global_scale"):
+                has_input_gs_by_module.add(name[:-len(".input_global_scale")])
+
+        for name, tensor in weights.items():
+            new_name = name
+            if name.endswith(".weight_packed"):
+                # compressed-tensors and ModelOpt both store the FP4
+                # weight as ``uint8`` shape ``(out, in/2)`` (2 FP4 per
+                # byte); only the suffix differs. Pure rename, no
+                # reinterpret.
+                new_name = name[:-len(".weight_packed")] + ".weight"
+            elif name.endswith(".weight_global_scale"):
+                new_name = name[:-len(".weight_global_scale"
+                                      )] + ".weight_scale_2"
+                # ``weight_global_scale`` (compressed-tensors) is
+                # ``FP8_MAX / max(scale_per_block)`` -- the INVERSE of
+                # ModelOpt's ``weight_scale_2`` (``max_block_max_abs/
+                # FP4_MAX``). Take the reciprocal so downstream
+                # consumers using ModelOpt convention compute the right
+                # dequant scale.
+                if tensor.dtype.is_floating_point:
+                    tensor = (1.0 / tensor.to(
+                        torch.float32)).to(tensor.dtype if tensor.dtype !=
+                                           torch.float64 else torch.float32)
+            elif name.endswith(".input_global_scale"):
+                new_name = name[:-len(".input_global_scale")] + ".input_scale"
+                # Same inverse semantics for activation global scale.
+                if tensor.dtype.is_floating_point:
+                    tensor = (1.0 / tensor.to(
+                        torch.float32)).to(tensor.dtype if tensor.dtype !=
+                                           torch.float64 else torch.float32)
+            renamed[new_name] = tensor
+
+        # Synthesize input_scale=1.0 for modules whose checkpoint omits it
+        # (i.e. W4A16 — bf16 activations into FP4 weights).
+        for name in list(renamed.keys()):
+            if not name.endswith(".weight_scale_2"):
+                continue
+            module = name[:-len(".weight_scale_2")]
+            if module in has_input_gs_by_module:
+                continue
+            input_key = f"{module}.input_scale"
+            if input_key not in renamed:
+                ref = renamed[name]
+                renamed[input_key] = torch.tensor([1.0],
+                                                  dtype=torch.float32,
+                                                  device=ref.device)
+
+        return renamed
+
     def preprocess_weights(self, weights: dict) -> dict:
+        # Pull the compressed-tensors names into the legacy ModelOpt scheme
+        # before the existing remap logic runs.
+        weights = self._normalize_compressed_tensors_names(weights)
+
         config = self.config.pretrained_config
         tp_size = 1 if self.config.mapping.enable_attention_dp else self.config.mapping.tp_size
         tp_rank = self.config.mapping.tp_rank
