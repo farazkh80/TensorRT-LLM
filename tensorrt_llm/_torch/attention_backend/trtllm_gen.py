@@ -1418,6 +1418,15 @@ class FlashInferTrtllmGenAttention:
         # we can remove the conditional and always pass params.context_buf.
         out_buf = params.context_buf if q_len_per_req == 1 else None
 
+        # SPIKE PATCH: contradicts the comment above. flashinfer 0.6.9's
+        # ``trtllm_batch_decode_with_kv_cache_mla`` and tokenspeed-mla's
+        # decode kernel BOTH require a 4D ``out`` ([B, q_len, H, D]). When
+        # ``q_len_per_req == 1`` ``params.context_buf`` is 3D, so unsqueeze
+        # to a 4D view; mutations write through to the original storage so
+        # no copy-back is needed for ``q_len_per_req == 1``.
+        if out_buf is not None and out_buf.ndim == 3:
+            out_buf = out_buf.unsqueeze(1)
+
         # Spike: TLLM_TOKENSPEED_MLA=1 swaps the FlashInfer MLA decode kernel
         # for tokenspeed-mla's CuTe DSL kernel. Gated by an availability check
         # (SM 10.0 / 10.3 + tokenspeed_mla importable) — silently falls back
