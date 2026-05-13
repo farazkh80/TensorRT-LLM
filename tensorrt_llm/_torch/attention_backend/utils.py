@@ -33,6 +33,24 @@ def get_attention_backend(
     elif backend_name == "FLASHINFER_STAR_ATTENTION" and IS_FLASHINFER_AVAILABLE:
         from .star_flashinfer import StarAttention
         return StarAttention
+    elif backend_name == "TOKENSPEED_MLA":
+        # Spike: tokenspeed-mla provides a CuTe DSL MLA decode kernel for
+        # data-center Blackwell (SM 10.0 / 10.3). The wrapper in
+        # ``tokenspeed_mla.py`` exposes a drop-in for FlashInfer MLA; the
+        # actual kernel swap inside TrtllmAttention.run_mla_generation is a
+        # follow-up. Selecting this name today resolves to TrtllmAttention so
+        # callers see no behaviour change while the wrapper is being
+        # validated for numerical parity. See
+        # ``tensorrt_llm/_torch/attention_backend/tokenspeed_mla.py``.
+        from .tokenspeed_mla import is_tokenspeed_mla_available
+        if not is_tokenspeed_mla_available():
+            from tensorrt_llm.logger import logger
+            logger.warning(
+                "attn_backend=TOKENSPEED_MLA requested but tokenspeed-mla is "
+                "unavailable on this GPU/install; falling back to TRTLLM.")
+        if sparse_attn_config is not None:
+            return get_trtllm_sparse_attn_attention_backend(sparse_attn_config)
+        return TrtllmAttention
 
     return TrtllmAttention
 

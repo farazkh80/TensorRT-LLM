@@ -25,6 +25,7 @@ Example:
 """
 
 import math
+import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -1417,21 +1418,52 @@ class FlashInferTrtllmGenAttention:
         # we can remove the conditional and always pass params.context_buf.
         out_buf = params.context_buf if q_len_per_req == 1 else None
 
-        mla_out = flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
-            query=query,
-            kv_cache=kv_cache,
-            workspace_buffer=params.workspace.view(-1, 4),
-            qk_nope_head_dim=params.qk_nope_head_dim,
-            kv_lora_rank=params.kv_lora_rank,
-            qk_rope_head_dim=params.qk_rope_head_dim,
-            block_tables=block_tables,
-            seq_lens=params.sequence_lengths,
-            max_seq_len=params.max_past_kv_length,
-            out=out_buf,
-            bmm1_scale=bmm1_scale,
-            bmm2_scale=bmm2_scale,
-            sinks=params.attention_sinks,
-        )
+        # Spike: TLLM_TOKENSPEED_MLA=1 swaps the FlashInfer MLA decode kernel
+        # for tokenspeed-mla's CuTe DSL kernel. Gated by an availability check
+        # (SM 10.0 / 10.3 + tokenspeed_mla importable) — silently falls back
+        # to FlashInfer otherwise so non-Blackwell paths are unaffected. See
+        # tensorrt_llm/_torch/attention_backend/tokenspeed_mla.py.
+        _use_tokenspeed_mla = False
+        if os.environ.get("TLLM_TOKENSPEED_MLA") == "1":
+            from .tokenspeed_mla import (
+                is_tokenspeed_mla_available,
+                tokenspeed_batch_decode_with_kv_cache_mla,
+            )
+
+            _use_tokenspeed_mla = is_tokenspeed_mla_available()
+
+        if _use_tokenspeed_mla:
+            mla_out = tokenspeed_batch_decode_with_kv_cache_mla(
+                query=query,
+                kv_cache=kv_cache,
+                workspace_buffer=params.workspace.view(-1, 4),
+                qk_nope_head_dim=params.qk_nope_head_dim,
+                kv_lora_rank=params.kv_lora_rank,
+                qk_rope_head_dim=params.qk_rope_head_dim,
+                block_tables=block_tables,
+                seq_lens=params.sequence_lengths,
+                max_seq_len=params.max_past_kv_length,
+                out=out_buf,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                sinks=params.attention_sinks,
+            )
+        else:
+            mla_out = flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
+                query=query,
+                kv_cache=kv_cache,
+                workspace_buffer=params.workspace.view(-1, 4),
+                qk_nope_head_dim=params.qk_nope_head_dim,
+                kv_lora_rank=params.kv_lora_rank,
+                qk_rope_head_dim=params.qk_rope_head_dim,
+                block_tables=block_tables,
+                seq_lens=params.sequence_lengths,
+                max_seq_len=params.max_past_kv_length,
+                out=out_buf,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                sinks=params.attention_sinks,
+            )
 
         if q_len_per_req > 1:
             params.context_buf.copy_(mla_out.reshape_as(params.context_buf))
