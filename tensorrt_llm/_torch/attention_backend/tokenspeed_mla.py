@@ -131,7 +131,17 @@ def tokenspeed_batch_decode_with_kv_cache_mla(
 
     ws = _ensure_int8_workspace(workspace_buffer)
 
-    return tokenspeed_mla_decode(
+    # FlashInfer's MLA wrapper accepts a 3D out buffer ([B, H, D]) when
+    # q_len_per_req == 1 and writes into it in place; for q_len > 1 it expects
+    # 4D ([B, q_len, H, D]). TokenSpeed's kernel always expects 4D. Bridge
+    # transparently: unsqueeze a 3D `out` to 4D (zero-copy view, mutations
+    # write through to the original storage), then re-squeeze the returned
+    # tensor so callers see the same shape they passed in.
+    _out_was_3d = out is not None and out.ndim == 3
+    if _out_was_3d:
+        out = out.unsqueeze(1)
+
+    result = tokenspeed_mla_decode(
         query=query,
         kv_cache=kv_cache,
         workspace_buffer=ws,
@@ -144,3 +154,7 @@ def tokenspeed_batch_decode_with_kv_cache_mla(
         output_scale=bmm2_scale,
         out=out,
     )
+
+    if _out_was_3d:
+        return result.squeeze(1)
+    return result
