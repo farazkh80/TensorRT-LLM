@@ -1,5 +1,5 @@
-# trtllm-bench --extra_llm_api_options config for the TokenSpeed MLA
-# evaluation on Kimi K2.5 — AttentionDP variant of the TP4 conc16 throughput
+# Standard trtllm-bench --extra_llm_api_options config for the Kimi K2.5
+# TokenSpeed MLA evaluation — AttentionDP variant of the TP4 conc16 throughput
 # sweep.
 #
 # Sibling of:
@@ -17,15 +17,15 @@
 #   2. The request-distribution path is different — runs in attention_dp_config
 #      can affect which sub-batch hits the MLA decode kernel at all.
 #
-# Production-relevance: K2.5 / K2.6 throughput deployments typically use
-# AttentionDP, so the on-config is the realistic deployment regime; the
-# off-config (bench-1k1k_tp4_conc16.yml) is the cleaner kernel-isolated
-# measurement. Reporting both lets us separate "TokenSpeed kernel-level win"
-# from "TokenSpeed × DP system-level win".
+# Production-relevance: K2.5 / K2.6 deployments at Fireworks and Together are
+# expected to use AttentionDP for throughput, so the on-config is the realistic
+# customer regime; the off-config is the cleaner kernel-isolated measurement.
+# Reporting both lets us separate "TokenSpeed kernel-level win" from
+# "TokenSpeed × DP system-level win".
 #
-# Model:  nvidia/Kimi-K2-Thinking-NVFP4
-# GPU:    4× Blackwell SXM
-# Dataset: token-norm-dist, ISL=1024, OSL=1024, ≥256 requests, concurrency=16
+# Model:  nvidia/Kimi-K2-Thinking-NVFP4  (DeepSeek-V3 dense-MLA architecture)
+# GPU:    4× B200 / B300 SXM6
+# Dataset: token-norm-dist, ISL=1024, OSL=1024, ≥256 requests
 #
 # Invocation:
 #   # Baseline:
@@ -64,9 +64,8 @@ kv_cache_config:
 
 moe_config:
   backend: TRTLLM           # Held constant with the conc16 sibling for an
-                            # apples-to-apples DP-only diff. Existing
-                            # long-context AttentionDP reference configs in
-                            # examples/configs/database/ use CUTLASS at high
+                            # apples-to-apples DP-only diff. DSR1's
+                            # attention_dp configs use CUTLASS at high
                             # concurrency for separate perf reasons; if a
                             # CUTLASS variant is needed, fork into
                             # bench-1k1k_tp4_conc16_attndp_cutlass.yml.

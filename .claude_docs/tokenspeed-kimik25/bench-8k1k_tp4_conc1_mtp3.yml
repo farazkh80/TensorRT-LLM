@@ -1,9 +1,8 @@
-# trtllm-bench --extra_llm_api_options config for the TokenSpeed MLA
-# evaluation on Kimi K2.5 — long-context × MTP=3. Cross-product of
-# bench-8k1k_tp4_conc1.yml (long context) and bench-1k1k_tp4_conc16_mtp3.yml
-# (spec-decode regime) — the experiment closest to TokenSpeed's published
-# blog headline (small batch, dense long context, q_len_per_req=4) within
-# our feasible KV-cache budget at TP4.
+# Standard trtllm-bench --extra_llm_api_options config for the Kimi K2.5
+# TokenSpeed MLA evaluation — long-context × MTP=3. This is the cross-product
+# of bench-8k1k_tp4_conc1.yml (long context) and bench-1k1k_tp4_conc16_mtp3.yml
+# (spec-decode regime) — i.e. the experiment closest to TokenSpeed's published
+# blog headline: small batch, dense long context, q_len_per_req=4.
 #
 # Sibling of:
 #   bench-8k1k_tp4_conc1.yml         (same shape, MTP=1, q_len_per_req=2)
@@ -12,30 +11,33 @@
 #
 # Both prior caveats apply, compounded:
 #
-# 1. CHECKPOINT MTP LAYERS. As in bench-1k1k_tp4_conc16_mtp3.yml — confirm
-#    Kimi-K2-Thinking-NVFP4 exposes ≥3 native MTP layers before running.
+# 1. CHECKPOINT MTP LAYERS. As in bench-1k1k_tp4_conc16_mtp3.yml — confirm the
+#    Kimi-K2-Thinking-NVFP4 checkpoint exposes ≥3 native MTP layers before
+#    running. DSV3-Lite spike failed here.
 #
-# 2. PARITY DIVERGENCE. The earlier-evaluation spec-decode parity gap lives
-#    in the MTP=3 regime. At long context the divergence magnitude may
-#    shift because the split-KV reduction is over more partials — could
-#    either tighten (more averaging) or worsen (more accumulator drift).
-#    Worth measuring as a function of context length.
+# 2. PARITY DIVERGENCE. Spec-decode parity gap (max abs 0.33, max rel ~1166×
+#    on the spike's BS=8/q_len=4 unit test) lives in the MTP=3 regime. At
+#    long context the *magnitude* of the divergence may shift because the
+#    split-KV reduction is over more partials — could either tighten (more
+#    averaging) or worsen (more accumulator drift). Worth measuring as a
+#    function of context length.
 #
-# 3. KV CACHE PRESSURE. With max_draft_len=3 the KV cache stores speculative
-#    tokens for the draft chain on top of the ISL=8192 context. Verify
-#    free_gpu_memory_fraction=0.8 still fits; if OOMs appear, drop to 0.75.
+# 3. KV CACHE PRESSURE. With max_draft_len=3 the KV cache must store
+#    speculative tokens for the draft chain on top of the ISL=8192 context.
+#    Verify free_gpu_memory_fraction=0.8 still fits; if OOMs appear, drop
+#    to 0.75 (matching the curated kimi-k2-thinking.yaml setting).
 #
 # Why this experiment matters: bench-config.yml (1k/MTP1/BS1) gives the
 # kernel-level floor. This file should give the TokenSpeed-favorable
-# ceiling at TP4 / 8k context — the regime where TS's blog claims its
-# largest decode-latency win. If the bench-config.yml kernel-level win
-# grows substantially here, the integration is justified for K2.5. If it
-# doesn't, TokenSpeed's headline number is workload-specific in ways that
-# don't transfer to K2.5 on our hardware.
+# *ceiling* — the regime where their blog claims ~2× decode latency. If
+# the spike's ~10% kernel-level win on 1k/MTP1 grows substantially here,
+# the integration is justified for K2.5. If it doesn't, TokenSpeed's
+# headline number is workload-specific in ways that don't transfer to
+# K2.5 / our hardware.
 #
 # Model:  nvidia/Kimi-K2-Thinking-NVFP4  (must have ≥3 native MTP layers)
-# GPU:    4× Blackwell SXM
-# Dataset: token-norm-dist, ISL=8192, OSL=1024, ≥32 requests, concurrency=1
+# GPU:    4× B200 / B300 SXM6
+# Dataset: token-norm-dist, ISL=8192, OSL=1024, ≥32 requests
 #
 # Invocation:
 #   # Baseline:
@@ -56,8 +58,9 @@ max_seq_len: 9416
 
 tensor_parallel_size: 4
 moe_expert_parallel_size: 4
-# AttentionDP intentionally OFF — kernel-clean A/B with the other TP4 BS=1
-# siblings.
+# AttentionDP intentionally OFF — kernel-clean A/B with the long-context BS=1
+# sibling. Production-realistic AttnDP variant is its own follow-up if this
+# experiment reproduces a meaningful win.
 
 cuda_graph_config:
   enable_padding: true
@@ -73,9 +76,8 @@ moe_config:
 speculative_config:
   decoding_type: MTP
   max_draft_len: 3          # q_len_per_req = 4 at ISL=8k. The blog-headline
-                            # regime within TP4 / 8k bounds: TS's
-                            # fold_sq_factor × split-KV reorg should both
-                            # be load-bearing here.
+                            # regime: TS's fold_sq_factor × split-KV reorg
+                            # should both be load-bearing here.
 
 stream_interval: 10
 print_iter_log: true

@@ -1,9 +1,9 @@
-# Disaggregated-serving config for the TokenSpeed MLA evaluation on Kimi
-# K2.5 — blog-regime context length, split across one prefill (P) server
-# and one generation (D) server. This is a different shape of file than
-# the rest of the grid: it's a disagg orchestration config consumed by
-# `trtllm-serve --disagg_config_file`, NOT a `trtllm-bench
-# --extra_llm_api_options` file. The per-server LLM args are embedded inline.
+# Disaggregated-serving config for the Kimi K2.5 TokenSpeed MLA evaluation —
+# blog-regime context length, split across one prefill (P) server and one
+# generation (D) server. This is a different shape of file than the rest of
+# the grid: it's a disagg orchestration config consumed by `trtllm-serve
+# --disagg_config_file`, NOT a `trtllm-bench --extra_llm_api_options` file.
+# The per-server LLM args are embedded inline.
 #
 # Sibling of:
 #   bench-60k1k_tp8_conc1_mtp3.yml  (same total GPU count = 8, unified TP8)
@@ -12,13 +12,15 @@
 #
 # Why a disagg sibling exists for a decode-kernel evaluation:
 #
-# Reported wisdom in the broader literature is that disagg is unfavorable
-# for TokenSpeed because their PREFILL kernel speedup doesn't translate to
-# E2E. That's about TS prefill, not TS decode.
+# The JIRA (TRTLLM-12510) explicitly cautions that disagg is unfavorable for
+# TokenSpeed: their *prefill* kernel win doesn't translate to E2E because
+# prefill must over-feed decode regardless of P speed; the blog reports
+# only aggregated numbers; etc. All of that is about TS prefill — and we're
+# evaluating TS *decode*.
 #
 # For TS decode, disagg is actually the CLEANEST possible isolation:
-#   - P side runs prefill only. The MLA decode kernel never fires there,
-#     so the TS swap has no effect. P performance is irrelevant to the eval.
+#   - P side runs prefill only. The MLA decode kernel never fires there, so
+#     the TS swap has no effect. P performance is irrelevant to the eval.
 #   - D side runs decode only, on a 60k KV cache transferred from P. No
 #     prefill bleed. q_len_per_req=4 (MTP=3). This is exactly the regime
 #     the TS decode kernel was designed for — and unlike the agg case where
@@ -35,7 +37,7 @@
 # reading logs).
 #
 # Model:  nvidia/Kimi-K2-Thinking-NVFP4  (must have ≥3 native MTP layers)
-# GPUs:   8× Blackwell SXM (4 for P + 4 for D, separate processes)
+# GPUs:   8× B200 / B300 SXM6 (4 for P + 4 for D, separate processes)
 # KV transport: NIXL (default in current TRT-LLM main); UCX as fallback.
 # Dataset: same multi-turn replay as bench-60k1k_tp8_conc1_mtp3_multiturn.yml
 #          (KV reuse on the P side is still load-bearing — multi-turn lets
@@ -95,6 +97,8 @@ hostname: localhost
 port: 8000
 model: nvidia/Kimi-K2-Thinking-NVFP4
 backend: pytorch
+# disable_overlap_scheduler matches the simple_example disagg config; revisit
+# if/when overlap-scheduler-aware disagg shows up.
 disable_overlap_scheduler: true
 
 context_servers:

@@ -1,16 +1,13 @@
-# trtllm-bench --extra_llm_api_options config for evaluating the TokenSpeed
-# MLA decode kernel (https://github.com/lightseekorg/tokenspeed) on Kimi K2.5
-# / K2-Thinking. One file = one experiment.
+# Standard trtllm-bench --extra_llm_api_options config for the Kimi K2.5
+# TokenSpeed MLA evaluation. One file = one experiment. This is the baseline
+# experiment: min-latency, q_len_per_req=2 (MTP=1), TP4 NVFP4 — matches the
+# JIRA-stated K2.5 production placement and the regime where TokenSpeed's
+# fold_sq_factor wins (effective num_heads = 128 / TP4 = 32).
 #
-# This file is the baseline: min-latency, q_len_per_req=2 (MTP=1), TP4 NVFP4.
-# This is a representative K2.5 NVFP4 production placement and is in the
-# regime where TokenSpeed's fold_sq_factor optimization is expected to win
-# (effective num_heads = 128 / TP4 = 32).
-#
-# Model:  nvidia/Kimi-K2-Thinking-NVFP4  (DeepSeek-V3-style dense-MLA arch:
-#         num_heads=128, kv_lora_rank=512, qk_rope_head_dim=64)
-# GPU:    4× Blackwell SXM (B200 / B300, sm_100 / sm_103)
-# Dataset: token-norm-dist, ISL=1024, OSL=1024, 64 requests, concurrency=1
+# Model:  nvidia/Kimi-K2-Thinking-NVFP4   (same arch as K2.5: DeepSeek-V3
+#         dense-MLA, num_heads=128, kv_lora_rank=512, qk_rope_head_dim=64)
+# GPU:    B200 / B300 SXM6 (sm_100 / sm_103)
+# Dataset: token-norm-dist, ISL=1024, OSL=1024, 64 requests (single concurrency=1)
 #
 # Invocation:
 #   # Baseline:
@@ -25,21 +22,25 @@
 #           throughput --dataset synth_1k1k_64.txt \
 #           --extra_llm_api_options bench-config.yml --concurrency 1
 #
-# Sibling experiments (separate files in this directory):
-#   bench-1k1k_tp4_conc16.yml          throughput sweep
-#   bench-1k1k_tp8_conc1.yml           TP8 (effective num_heads=16)
-#   bench-8k1k_tp4_conc1.yml           longer context
-#   bench-*_mtp3.yml                   spec-decode regime (q_len_per_req=4)
+# Sibling experiments (separate files, add when needed):
+#   bench-1k1k_tp4_conc16.yml   throughput sweep at ~100 TPS/user target
+#   bench-1k1k_tp8_conc1.yml    TP8 (effective heads=16, larger TS win)
+#   bench-8k1k_tp4_conc1.yml    longer context, closer to the blog's regime
+#   bench-1k1k_tp4_conc1_mtp3.yml  spec-decode regime (requires MTP-3-capable
+#                                  checkpoint; the parity divergence from the
+#                                  DSV3-Lite spike lives here)
 
 max_batch_size: 1
 max_num_tokens: 2176        # 1024 ISL + headroom; small enough for min-latency
 max_seq_len: 2068           # 1024 + 1024 + margin
 
-# Dense MLA TP4 — effective num_heads at 32, the TokenSpeed sweet spot.
+# Dense MLA TP4 deployment — matches JIRA's stated K2.5 NVFP4 placement and
+# puts effective num_heads at 32, the TokenSpeed sweet spot.
 tensor_parallel_size: 4
 moe_expert_parallel_size: 4
-# AttentionDP intentionally OFF for min-latency: BS=1 has nothing to balance,
-# and we want the kernel-level A/B clean. Enable it for throughput configs.
+# AttentionDP intentionally OFF for min-latency: BS=1 means there's nothing to
+# balance, and we want the kernel-level A/B clean. Enable it for the
+# throughput sweep configs.
 
 cuda_graph_config:
   enable_padding: true
@@ -50,7 +51,7 @@ kv_cache_config:
   free_gpu_memory_fraction: 0.8
 
 moe_config:
-  backend: TRTLLM
+  backend: TRTLLM           # matches DSR1 TP8 NVFP4 reference path
 
 speculative_config:
   decoding_type: MTP

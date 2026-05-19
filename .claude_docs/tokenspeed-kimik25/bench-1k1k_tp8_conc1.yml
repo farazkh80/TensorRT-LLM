@@ -1,17 +1,17 @@
-# trtllm-bench --extra_llm_api_options config for the TokenSpeed MLA
-# evaluation on Kimi K2.5 — TP8 sibling of bench-config.yml.
+# Standard trtllm-bench --extra_llm_api_options config for the Kimi K2.5
+# TokenSpeed MLA evaluation — TP8 sibling of bench-config.yml.
 #
 # Sibling of: bench-config.yml (TP4, effective num_heads=32)
 # This file:  TP8, effective num_heads = 128 / 8 = 16
 #
-# Why TP8: TokenSpeed's fold_sq_factor benefit grows as effective num_heads
-# shrinks (it boosts BMM1 M utilization when num_heads is small). TP8 → 16
-# effective heads is the larger-win regime; TP4 → 32 matches a representative
-# K2.5 NVFP4 production placement. Running both isolates the win as a
-# function of TP.
+# Why TP8: per the JIRA, TokenSpeed's fold_sq_factor benefit grows as effective
+# num_heads shrinks (it boosts BMM1 M utilization when num_heads is small).
+# TP8 → 16 effective heads is the larger-win regime; TP4 → 32 is the regime
+# matched to the JIRA-stated K2.5 NVFP4 production placement. Running both
+# isolates the win as a function of TP.
 #
-# Model:  nvidia/Kimi-K2-Thinking-NVFP4
-# GPU:    8× Blackwell SXM (B200 / B300)
+# Model:  nvidia/Kimi-K2-Thinking-NVFP4  (DeepSeek-V3 dense-MLA architecture)
+# GPU:    8× B200 / B300 SXM6
 # Dataset: token-norm-dist, ISL=1024, OSL=1024, 64 requests, concurrency=1
 #
 # Invocation:
@@ -34,8 +34,9 @@ max_seq_len: 2068
 # Dense MLA TP8 — effective num_heads = 16, deeper into the TokenSpeed regime.
 tensor_parallel_size: 8
 moe_expert_parallel_size: 8
-# AttentionDP intentionally OFF for min-latency BS=1 A/B (kernel-clean
-# comparison with the BS=1 siblings).
+# AttentionDP intentionally OFF for min-latency BS=1 A/B (no batching to
+# balance; keeps kernel-level comparison clean). For the eventual
+# bench-1k1k_tp8_conc{16,32}.yml throughput configs, enable it.
 
 cuda_graph_config:
   enable_padding: true
