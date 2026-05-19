@@ -656,6 +656,13 @@ class Attention(nn.Module):
         return q, k, v
 
     def _use_quantize_output(self):
+        # In the dense W4A16 contract (B12X_DENSE_W4A16=1), o_proj must
+        # consume bf16 activations; skip the FMHA FP4-output epilogue so
+        # the attention output stays bf16.
+        from ..utils import _b12x_w4a16_enabled
+        if _b12x_w4a16_enabled():
+            return False
+
         # If o_proj can't consume, then no need to quantize the output to nvfp4
         if hasattr(self.attn, 'has_nvfp4'
                    ) and self.attn.has_nvfp4 and not self.o_proj.has_nvfp4:

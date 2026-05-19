@@ -453,6 +453,20 @@ def relu2(x: torch.Tensor) -> torch.Tensor:
     return torch.square(F.relu(x))
 
 
+def _b12x_w4a16_enabled() -> bool:
+    """Whether the dense W4A16 contract is requested for this run.
+
+    When set, NVFP4 activation-output fast paths (RMSNormGated FP4-quant,
+    block RMSNorm FP4-quant, MLP fused relu2-quant, attention quantize-
+    output) are disabled at module construction, so every NVFP4 Linear
+    sees a bf16 input and the b12x dense W4A16 GEMM kernel is the
+    natural fit. Mirrors the existing FLASHINFER_B12X_FORCE_MOE_W4A16
+    env on the MoE side.
+    """
+    import os
+    return os.environ.get("B12X_DENSE_W4A16", "0") == "1"
+
+
 def tensor_to_str(x: torch.Tensor, num_elements: int = 10) -> str:
     # Pass num_elements=-1 will print the whole tensor
     if num_elements < 0:

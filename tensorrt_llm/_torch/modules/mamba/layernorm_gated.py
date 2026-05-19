@@ -199,7 +199,12 @@ class RMSNorm(torch.nn.Module):
         self.group_size = group_size if group_size is not None else hidden_size
         self.norm_before_gate = norm_before_gate
 
-        self.is_nvfp4 = is_nvfp4
+        # Under the dense W4A16 contract (B12X_DENSE_W4A16=1), the
+        # fused gate+norm+FP4-quant fast path must be disabled so the
+        # output is bf16 — the downstream NVFP4 Linear consumes bf16
+        # activations in W4A16 mode.
+        from tensorrt_llm._torch.utils import _b12x_w4a16_enabled
+        self.is_nvfp4 = is_nvfp4 and not _b12x_w4a16_enabled()
         # nvfp4_scale will be set externally if is_nvfp4 is True
         self.nvfp4_scale: torch.Tensor | None = None
 

@@ -1350,11 +1350,37 @@ class PyTorchModelEngine(ModelEngine):
                 max_num_draft_tokens=draft_len)
             available_tokens = min(available_tokens, draft_available_tokens)
 
-        token_num = max(
-            1,
-            min(
-                available_tokens, max_seq_len - 1 -
-                get_num_extra_kv_tokens(self.spec_config) - draft_len))
+        # On hybrid Mamba+attention models (NemotronH/Nano3.5) we observed
+        # `available_tokens` returning a single block (32 tokens) even with
+        # ~18 M tokens of allocated KV-cache budget. Capturing a CUDA graph
+        # with that 32-token warmup state produces a graph whose kernels'
+        # block-offset metadata is sized for ~1 block; replay at real long
+        # context (>= ~1024 tokens) reads stale entries from the block
+        # offset table and trips a CUDA illegal memory access (cudaError
+        # 700).  See `.claude_docs/w4a16-b12x-e2e/reports/step-bug-mamba-
+        # cuda-graph-ima.md` for the diagnosis.
+        #
+        # The fix is to ignore the `available_tokens` clamp here and use
+        # `max_seq_len` directly. `kv_cache_manager.add_dummy_requests`
+        # below performs its own allocation and returns None on OOM, so
+        # the existing fallback path (skip graph capture for this bs) still
+        # works under genuine memory pressure.
+        #
+        # Opt-out via TLLM_WARMUP_USE_AVAILABLE_TOKENS=1 if a regression
+        # is suspected on another model.
+        import os as _os
+        _use_old = _os.environ.get("TLLM_WARMUP_USE_AVAILABLE_TOKENS", "0") == "1"
+        token_num_from_max_seq_len = max(
+            1, max_seq_len - 1
+            - get_num_extra_kv_tokens(self.spec_config) - draft_len)
+        if _use_old:
+            token_num = max(
+                1,
+                min(
+                    available_tokens, max_seq_len - 1 -
+                    get_num_extra_kv_tokens(self.spec_config) - draft_len))
+        else:
+            token_num = token_num_from_max_seq_len
         model_config = self.model.model_config.pretrained_config
         max_position_embeddings = getattr(model_config,
                                           'max_position_embeddings', None)

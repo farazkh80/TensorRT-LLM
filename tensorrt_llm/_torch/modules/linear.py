@@ -30,8 +30,138 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 
 from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
-from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
+from ..utils import (Fp4QuantizedTensor, _b12x_w4a16_enabled,
+                     get_model_extra_attrs,
                      replace_parameter_and_save_metadata, unswizzle_sf)
+
+
+# ---------------------------------------------------------------------------
+# b12x dense W4A16 path
+# ---------------------------------------------------------------------------
+# When B12X_DENSE_W4A16=1, NVFP4LinearMethod routes bf16-input calls
+# through b12x.gemm.w4a16's dense W4A16 GEMM instead of the trtllm NVFP4
+# kernel. Requires the matching upstream patches that keep activations as
+# bf16 (RMSNormGated, MLP, Attention — see _b12x_w4a16_enabled). The
+# weight is lazily repacked from trtllm's stored NVFP4 format (packed
+# weight + flat swizzled SF + scalar weight_scale_2) into b12x's expected
+# 2D-SF + alpha layout on first apply call, then cached on the module.
+
+try:
+    from b12x.gemm.w4a16 import quantize_dense_weight_to_fp4 as _b12x_quantize_dense_weight_to_fp4
+    from b12x.moe.fused.reference import (
+        _apply_block_scales as _b12x_apply_block_scales,
+        _dequant_fp4 as _b12x_dequant_fp4,
+        _make_fp4_lut as _b12x_make_fp4_lut,
+        unswizzle_block_scale as _b12x_unswizzle_block_scale,
+    )
+except Exception:
+    _b12x_quantize_dense_weight_to_fp4 = None
+    _b12x_apply_block_scales = None
+    _b12x_dequant_fp4 = None
+    _b12x_make_fp4_lut = None
+    _b12x_unswizzle_block_scale = None
+
+
+def _b12x_repack_nvfp4_weight_for_w4a16(module):
+    """Dequant trtllm NVFP4 weight → bf16 → re-quantize to b12x format.
+
+    Caches the result as ``module._b12x_w_fp4``, ``module._b12x_w_bs``,
+    ``module._b12x_w_alpha``. Idempotent — safe to call multiple times.
+    """
+    if hasattr(module, "_b12x_w_fp4"):
+        return
+
+    # Use module-cached b12x symbols (imported once at module load).
+    quantize_dense_weight_to_fp4 = _b12x_quantize_dense_weight_to_fp4
+    _apply_block_scales = _b12x_apply_block_scales
+    _dequant_fp4 = _b12x_dequant_fp4
+    _make_fp4_lut = _b12x_make_fp4_lut
+    unswizzle_block_scale = _b12x_unswizzle_block_scale
+
+    w_packed = module.weight.data
+    ws_flat = module.weight_scale.data
+    ws2 = module.weight_scale_2.data
+    n = w_packed.shape[0]
+    k = w_packed.shape[1] * 2
+
+    # Reverse of NVFP4LinearMethod.create_weights buffer layout:
+    # weight_scale is flat size pad_up(N,128) * pad_up(K/16, 4) fp8_e4m3.
+    rows_pad = ((n + 127) // 128) * 128
+    cols_pad = (((k // 16) + 3) // 4) * 4
+
+    w_u8 = w_packed.view(torch.uint8) if w_packed.dtype != torch.uint8 else w_packed
+    fp4_lut = _make_fp4_lut(w_u8.device)
+    raw_w = _dequant_fp4(w_u8, rows=n, cols=k, fp4_lut=fp4_lut)
+
+    sf_2d = ws_flat.view(rows_pad, cols_pad)
+    sf_f32 = unswizzle_block_scale(sf_2d, rows=n, cols_blocks=k // 16)
+    w_fp32 = _apply_block_scales(raw_w, sf_f32, rows=n, cols=k, block_size=16)
+    w_fp32 = w_fp32 * float(ws2.item())
+    w_bf16 = w_fp32.to(torch.bfloat16).contiguous()
+
+    w_fp4, w_bs, w_alpha = quantize_dense_weight_to_fp4(
+        w_bf16, weight_scale_2=float(ws2.item()))
+
+    module._b12x_w_fp4 = w_fp4
+    module._b12x_w_bs = w_bs
+    module._b12x_w_alpha = w_alpha
+
+
+# Cache the b12x imports at module load time so the hot apply() path
+# doesn't pay a per-call try/import cost. None means "b12x not available";
+# the apply() helper then falls back to the standard NVFP4 path.
+try:
+    from b12x.gemm.w4a16 import (DenseGemmW4A16MicroKernel as _B12X_MICRO_CLS,
+                                 dense_gemm_w4a16 as _b12x_dense_gemm_w4a16)
+except Exception:  # b12x not installed
+    _B12X_MICRO_CLS = None
+    _b12x_dense_gemm_w4a16 = None
+
+
+def _maybe_apply_b12x_w4a16(module, input, bias, original_shape):
+    """Try the b12x dense W4A16 GEMM path. Returns the output tensor on
+    success, or ``None`` if the shapes / dtypes / kernel availability
+    don't fit — caller falls back to the standard NVFP4 path.
+    """
+    if _b12x_dense_gemm_w4a16 is None:
+        return None
+
+    # b12x kernel shape constraints: K % 64 == 0 and N % 64 == 0.
+    # No shape gating beyond the kernel's own is_supported check — even
+    # for shapes outside the kernel's tuning envelope (lm_head N=131072,
+    # MoE router N=128), we still go through b12x to honor the W4A16
+    # contract. Perf for out-of-envelope shapes is a kernel-tuning
+    # follow-up, not a contract violation.
+    n = module.weight.shape[0]
+    k = module.weight.shape[1] * 2
+    m = input.shape[0]
+    if k % 64 != 0 or n % 64 != 0 or not _B12X_MICRO_CLS.is_supported(m, k, n):
+        return None
+
+    _b12x_repack_nvfp4_weight_for_w4a16(module)
+
+    x = input
+    pre_quant_scale = getattr(module, "pre_quant_scale", None)
+    if pre_quant_scale is not None:
+        x = x * pre_quant_scale.to(x.dtype)
+    if x.dtype != torch.bfloat16:
+        x = x.to(torch.bfloat16)
+
+    out = _b12x_dense_gemm_w4a16(
+        x.contiguous(),
+        module._b12x_w_fp4,
+        module._b12x_w_bs,
+        module._b12x_w_alpha,
+        out=None,
+    )
+
+    if bias is not None:
+        out = out + bias.to(out.dtype)
+
+    if original_shape is not None:
+        out = out.reshape(*original_shape[:-1], out.shape[-1])
+    return out
+# ---------------------------------------------------------------------------
 
 
 class WeightMode(str, enum.Enum):
@@ -1389,6 +1519,20 @@ class NVFP4LinearMethod(LinearMethodBase):
                           (tuple, Fp4QuantizedTensor)) and input.dim() > 2:
             original_shape = input.shape
             input = input.reshape(-1, input.shape[-1])
+
+        # Dense W4A16 contract via b12x: when B12X_DENSE_W4A16=1 and input
+        # is a plain bf16 tensor (i.e. the upstream FP4-quant fast paths
+        # were disabled — see _b12x_w4a16_enabled() in utils.py and the
+        # matching patches in mamba/layernorm_gated.py, mlp.py,
+        # attention.py), route through b12x.gemm.w4a16's dense W4A16 GEMM
+        # instead of trtllm's NVFP4 GEMM. Falls back to the standard NVFP4
+        # path when shapes don't satisfy b12x's K%64=N%64=0 constraint, so
+        # this is safe for arbitrary models.
+        if _b12x_w4a16_enabled() and isinstance(input, torch.Tensor):
+            b12x_output = _maybe_apply_b12x_w4a16(module, input, bias,
+                                                  original_shape)
+            if b12x_output is not None:
+                return b12x_output
 
         act_fp4, act_sf, alpha = self._input_prepare(module, input)
 

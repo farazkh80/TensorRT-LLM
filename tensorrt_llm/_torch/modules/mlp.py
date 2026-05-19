@@ -102,7 +102,13 @@ class MLP(nn.Module):
         has_scale = hasattr(self.down_proj, 'input_scale')
         is_relu2 = self.activation is relu2
 
-        self._use_fused_relu2_quant = has_nvfp4 and has_kernel and has_scale and is_relu2
+        # In the dense W4A16 contract (B12X_DENSE_W4A16=1), down_proj must
+        # consume bf16 activations; skip the fused relu2+FP4-quant fast
+        # path and run plain relu2 instead so the activation stays bf16.
+        from tensorrt_llm._torch.utils import _b12x_w4a16_enabled
+        self._use_fused_relu2_quant = (
+            has_nvfp4 and has_kernel and has_scale and is_relu2
+            and not _b12x_w4a16_enabled())
 
     def forward(
         self,
