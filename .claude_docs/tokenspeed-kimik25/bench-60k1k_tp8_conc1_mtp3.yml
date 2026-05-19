@@ -1,0 +1,121 @@
+# Standard trtllm-bench --extra_llm_api_options config for the Kimi K2.5
+# TokenSpeed MLA evaluation — TokenSpeed BLOG-HEADLINE regime.
+#
+# Sibling of:
+#   bench-8k1k_tp4_conc1_mtp3.yml  (same MTP=3 / BS=1 shape, ISL=8k stand-in)
+# This file:
+#   ISL=60k, OSL=500–1024, TP8, BS=1, MTP=3 — matches the TokenSpeed blog's
+#   primary headline workload as closely as our hardware will allow.
+#
+# Blog regime (from the lightseek.org TokenSpeed post + JIRA evaluation):
+#   - Average ISL=60k, OSL=500
+#   - Multi-turn (large KV cache reuse — dataset characteristic, not YAML config)
+#   - Max BS tested = 16, decode tokens = BS × 4 → MTP=3
+#   - K2.5 NVFP4
+#   - Blog's leftmost TRT-LLM TP4 curve OOMed at BS=16 (per JIRA: partly
+#     activation memory, mostly because TokenSpeed used CPU-memory KV offload
+#     and we hadn't enabled it for TRT-LLM at the time of the evaluation)
+#
+# What we adapt vs the blog to fit our hardware honestly:
+#   - TP8 instead of TP4 — extra aggregate memory, accepts the trade-off of
+#     deeper TokenSpeed regime (effective num_heads = 16 instead of 32)
+#   - BS=1 to start — the blog's BS=16 OOMs without CPU KV offload, which we
+#     haven't enabled on this side; treat the BS=1 number as the proof-of-fit
+#     and scale BS in a follow-up sibling only after confirming this fits.
+#   - free_gpu_memory_fraction lowered to 0.75 (matches kimi-k2-thinking.yaml
+#     curated default) — buys headroom for the long context + draft chain
+#
+# Combined risk surface (most loaded experiment in the grid):
+#
+# 1. CHECKPOINT MTP LAYERS. Same as the other MTP=3 siblings — confirm ≥3
+#    native MTP layers in nvidia/Kimi-K2-Thinking-NVFP4 before running.
+#
+# 2. PARITY DIVERGENCE × LONG CONTEXT. The spike's parity gap (max abs 0.33,
+#    max rel ~1166×) was measured at short context. At 60k the split-KV
+#    reduction is over many more partials — divergence behavior is unknown
+#    and is the main data point Albert Di needs.
+#
+# 3. KV CACHE FIT. 60k × K2.5 dense MLA (kv_lora_rank=512, qk_rope_head_dim=64)
+#    × num_layers ≈ 61 layers × fp8 KV is ~95 MB per request — should fit at
+#    TP8 NVFP4 with free_gpu_memory_fraction=0.75 + draft chain, but verify
+#    on first launch. If OOM, drop to 0.7 or fall back to bench-8k1k_tp4_conc1_mtp3.yml
+#    as the upper bound we can hit cleanly.
+#
+# 4. rc14 trtllm-bench BUG (from spike step-7). The
+#    TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=1 path mis-computes q_len_per_req as
+#    (1 − input_length) under trtllm-bench multi-request scheduling. At
+#    ISL=60k that surfaces as a shape dim of −59999. Verify this is fixed in
+#    current main (rc15+) before running, else fall back to nsys-per-iter
+#    measurement like spike step-6.
+#
+# 5. PREFILL COST DOMINATES. At ISL=60k / OSL=1k the per-request work is
+#    ~98% prefill. TokenSpeed claims decode-only wins. So even a 50% decode
+#    speedup translates to ≤1% E2E request latency. The blog's headline win
+#    only shows up because they report multi-turn average over many short
+#    decode bursts on shared long context. To mirror that we need a
+#    multi-turn dataset (sharegpt-style turn-replay) rather than a synthetic
+#    token-norm-dist dataset; otherwise this experiment will under-report
+#    the TokenSpeed win. Treat this config as the *infra-fit* test, and
+#    re-run with a multi-turn dataset once available.
+#
+# Model:  nvidia/Kimi-K2-Thinking-NVFP4  (must have ≥3 native MTP layers)
+# GPU:    8× B200 / B300 SXM6
+# Dataset: token-norm-dist, ISL=61440, OSL=512, ≥8 requests
+#          OR (preferred for headline-match): multi-turn replay dataset
+#          (sharegpt-format) so KV reuse is real.
+#
+# Invocation:
+#   # Baseline:
+#   TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=1 TLLM_TOKENSPEED_MLA=0 \
+#       trtllm-bench --model nvidia/Kimi-K2-Thinking-NVFP4 \
+#           throughput --dataset synth_60k500_8.txt \
+#           --extra_llm_api_options bench-60k1k_tp8_conc1_mtp3.yml --concurrency 1
+#
+#   # TokenSpeed variant:
+#   TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=1 TLLM_TOKENSPEED_MLA=1 \
+#       trtllm-bench --model nvidia/Kimi-K2-Thinking-NVFP4 \
+#           throughput --dataset synth_60k500_8.txt \
+#           --extra_llm_api_options bench-60k1k_tp8_conc1_mtp3.yml --concurrency 1
+
+max_batch_size: 1
+max_num_tokens: 16384       # 16k prefill chunks; 60k ISL → 4 chunks per request.
+max_seq_len: 61952          # 60k ISL + 1k OSL + margin (matches max chunk + tail).
+
+tensor_parallel_size: 8
+moe_expert_parallel_size: 8
+# AttentionDP intentionally OFF — kernel-clean A/B with the rest of the grid.
+# A bench-60k1k_tp8_conc8_attndp_mtp3.yml sibling would be the production-
+# realistic follow-up if/when this configuration both fits and shows a win
+# (and once a multi-turn dataset is wired in — see header note 5).
+
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 1
+
+kv_cache_config:
+  dtype: fp8
+  free_gpu_memory_fraction: 0.75    # Lowered from 0.8 (other siblings) for
+                                    # 60k context + draft chain headroom.
+                                    # If OOM, drop to 0.7. If still OOM,
+                                    # the experiment is hardware-bound.
+
+moe_config:
+  backend: TRTLLM           # Held constant with the rest of the grid. The
+                            # DSR1 long-context configs use CUTLASS for
+                            # large-batch memory reasons; if this OOMs and
+                            # we want to keep ISL=60k, fork into
+                            # bench-60k1k_tp8_conc1_mtp3_cutlass.yml.
+
+speculative_config:
+  decoding_type: MTP
+  max_draft_len: 3          # Blog regime: q_len_per_req = 4. Combined with
+                            # 60k context this is where both TokenSpeed
+                            # optimization mechanisms (fold_sq_factor and
+                            # split-KV reorg) should be simultaneously load-
+                            # bearing — the experiment most likely to
+                            # reproduce the blog's headline numbers if those
+                            # numbers transfer to K2.5 on our hardware.
+
+stream_interval: 10
+print_iter_log: true
+trust_remote_code: true

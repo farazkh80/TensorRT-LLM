@@ -1,0 +1,74 @@
+# Standard trtllm-bench --extra_llm_api_options config for the Kimi K2.5
+# TokenSpeed MLA evaluation — MTP=3 spec-decode regime. This is the TokenSpeed
+# headline-claim regime: blog reports "decode token num = BS × 4", which is
+# q_len_per_req=4 (1 verified + 3 draft), i.e. MTP=3.
+#
+# Sibling of:
+#   bench-1k1k_tp4_conc16.yml  (same shape, MTP=1, q_len_per_req=2)
+# This file:                    MTP=3, q_len_per_req=4
+#
+# Two gating concerns for this experiment:
+#
+# 1. CHECKPOINT SUPPORT. The DSV3-Lite spike confirmed MTP=3 fails when the
+#    checkpoint ships num_nextn_predict_layers<3 (KeyError on
+#    model.layers.N.self_attn.kv_a_proj_with_mqa.weight). Confirm that the
+#    Kimi-K2-Thinking-NVFP4 checkpoint exposes ≥3 native MTP layers before
+#    running this. If not, either retrain MTP layers or use an EAGLE-style
+#    draft model (different config plumbing).
+#
+# 2. PARITY DIVERGENCE. The spike's unit-level parity test failed on the
+#    BS=8 / q_len=4 case (max abs diff 0.33, max rel ~1166×, 0.9% of elements
+#    mismatched) — exactly this regime. Cause: TokenSpeed's fold_sq_factor
+#    reorders queries into the head axis, changing the multi-CTA split-KV
+#    reduction order vs the FlashInfer baseline. Whether 0.33 abs survives
+#    softmax + sampling on K2.5 is the open question for Albert Di. Pair
+#    this throughput run with a downstream accuracy eval (e.g. MMLU-Pro
+#    subset) on both variants before trusting the speedup as a net win.
+#
+# Model:  nvidia/Kimi-K2-Thinking-NVFP4  (must have ≥3 native MTP layers)
+# GPU:    4× B200 / B300 SXM6
+# Dataset: token-norm-dist, ISL=1024, OSL=1024, ≥256 requests
+#
+# Invocation:
+#   # Baseline:
+#   TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=1 TLLM_TOKENSPEED_MLA=0 \
+#       trtllm-bench --model nvidia/Kimi-K2-Thinking-NVFP4 \
+#           throughput --dataset synth_1k1k_256.txt \
+#           --extra_llm_api_options bench-1k1k_tp4_conc16_mtp3.yml --concurrency 16
+#
+#   # TokenSpeed variant:
+#   TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=1 TLLM_TOKENSPEED_MLA=1 \
+#       trtllm-bench --model nvidia/Kimi-K2-Thinking-NVFP4 \
+#           throughput --dataset synth_1k1k_256.txt \
+#           --extra_llm_api_options bench-1k1k_tp4_conc16_mtp3.yml --concurrency 16
+
+max_batch_size: 128         # conc=16 × q_len_per_req=4 = 64 decode tokens/step,
+                            # plus draft-validation + CUDA graph padding headroom.
+max_num_tokens: 5248
+max_seq_len: 2068
+
+tensor_parallel_size: 4
+moe_expert_parallel_size: 4
+# AttentionDP intentionally OFF — same rationale as the conc16 / MTP=1 sibling:
+# keep the kernel-level A/B vs TokenSpeed apples-to-apples.
+
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 128
+
+kv_cache_config:
+  dtype: fp8
+  free_gpu_memory_fraction: 0.8
+
+moe_config:
+  backend: TRTLLM
+
+speculative_config:
+  decoding_type: MTP
+  max_draft_len: 3          # q_len_per_req = 4. fold_sq_factor's headline
+                            # regime; also where the spike's spec-decode
+                            # parity divergence lives. See header note 2.
+
+stream_interval: 10
+print_iter_log: true
+trust_remote_code: true

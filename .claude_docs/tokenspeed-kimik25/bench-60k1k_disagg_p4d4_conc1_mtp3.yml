@@ -1,0 +1,159 @@
+# Disaggregated-serving config for the Kimi K2.5 TokenSpeed MLA evaluation —
+# blog-regime context length, split across one prefill (P) server and one
+# generation (D) server. This is a different shape of file than the rest of
+# the grid: it's a disagg orchestration config consumed by `trtllm-serve
+# --disagg_config_file`, NOT a `trtllm-bench --extra_llm_api_options` file.
+# The per-server LLM args are embedded inline.
+#
+# Sibling of:
+#   bench-60k1k_tp8_conc1_mtp3.yml  (same total GPU count = 8, unified TP8)
+# This file:
+#   8 GPUs split as P=4 + D=4. Same workload (ISL=60k, OSL=1k, BS=1, MTP=3).
+#
+# Why a disagg sibling exists for a decode-kernel evaluation:
+#
+# The JIRA (TRTLLM-12510) explicitly cautions that disagg is unfavorable for
+# TokenSpeed: their *prefill* kernel win doesn't translate to E2E because
+# prefill must over-feed decode regardless of P speed; the blog reports
+# only aggregated numbers; etc. All of that is about TS prefill — and we're
+# evaluating TS *decode*.
+#
+# For TS decode, disagg is actually the CLEANEST possible isolation:
+#   - P side runs prefill only. The MLA decode kernel never fires there, so
+#     the TS swap has no effect. P performance is irrelevant to the eval.
+#   - D side runs decode only, on a 60k KV cache transferred from P. No
+#     prefill bleed. q_len_per_req=4 (MTP=3). This is exactly the regime
+#     the TS decode kernel was designed for — and unlike the agg case where
+#     prefill dominates wall-clock per-request work, here the decode-kernel
+#     speedup translates ~1:1 to D-side throughput.
+#
+# So this experiment answers a question the agg grid cannot:
+#   "Assuming we have enough P capacity to keep D busy, what does the TS
+#    decode kernel buy on the D side at the blog's context length?"
+#
+# Important: the TS env vars must be set ONLY on the D-side worker process,
+# not on P. The P process doesn't traverse the patched MLA decode path and
+# setting the env var there is a no-op at best (and risks confusion when
+# reading logs).
+#
+# Model:  nvidia/Kimi-K2-Thinking-NVFP4  (must have ≥3 native MTP layers)
+# GPUs:   8× B200 / B300 SXM6 (4 for P + 4 for D, separate processes)
+# KV transport: NIXL (default in current TRT-LLM main); UCX as fallback.
+# Dataset: same multi-turn replay as bench-60k1k_tp8_conc1_mtp3_multiturn.yml
+#          (KV reuse on the P side is still load-bearing — multi-turn lets
+#          P reuse the 60k prefix across turns, otherwise P becomes the
+#          bottleneck and the D-side TS win never shows up at E2E).
+#
+# Approximate launch:
+#   # Start P worker (no TS env vars):
+#   CUDA_VISIBLE_DEVICES=0,1,2,3 \
+#       trtllm-serve nvidia/Kimi-K2-Thinking-NVFP4 \
+#           --host 0.0.0.0 --port 8001 \
+#           --extra_llm_api_options p-llm-args.yaml  # see context_servers block
+#
+#   # Start D worker (TS env vars ON):
+#   CUDA_VISIBLE_DEVICES=4,5,6,7 \
+#   TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=1 TLLM_TOKENSPEED_MLA=1 \
+#       trtllm-serve nvidia/Kimi-K2-Thinking-NVFP4 \
+#           --host 0.0.0.0 --port 8002 \
+#           --extra_llm_api_options d-llm-args.yaml  # see generation_servers block
+#
+#   # Start disagg orchestrator on top of these:
+#   trtllm-serve nvidia/Kimi-K2-Thinking-NVFP4 \
+#       --host 0.0.0.0 --port 8000 \
+#       --disagg_config_file bench-60k1k_disagg_p4d4_conc1_mtp3.yml
+#
+#   # Drive load (baseline vs variant by re-launching D worker with the env
+#   # var flipped):
+#   trtllm-bench --model nvidia/Kimi-K2-Thinking-NVFP4 \
+#       throughput --backend openai --base_url http://localhost:8000 \
+#       --dataset multiturn_replay.jsonl --concurrency 1
+#
+# Additional risks beyond the agg blog-regime sibling:
+#
+# 7. P–D BALANCE. The whole point of this experiment is to isolate D-side
+#    decode. If P can't keep up (e.g. 4× TP4 NVFP4 prefill is slower than
+#    D's decode appetite at 60k context), D will be starved, GPU idle on
+#    D goes up, and the TS decode win is masked by P-bottleneck. Verify
+#    by checking P-side queue depth and D-side GPU idle ratio in the
+#    `print_iter_log` output. May need to scale P (e.g. P=8 / D=4) if
+#    starvation appears.
+#
+# 8. KV TRANSFER COST. NIXL/UCX transfer of a 60k MLA KV cache between P
+#    and D is non-trivial. The transfer time is added latency that doesn't
+#    exist in the agg case. For TPOT we typically don't care (the transfer
+#    is one-shot per request), but for TTFT it can be the dominant cost
+#    at long context. If TS shaves D-side TPOT by ~10% but P→D KV transfer
+#    is 30% of E2E, the per-request E2E delta is small. Worth measuring
+#    both metrics separately.
+#
+# 9. EXPERIMENT INFRA. Disagg requires a multi-process launch with KV
+#    transceiver setup. The other configs in this directory are
+#    single-process trtllm-bench runs. Validate the orchestration on a
+#    small model (e.g. TinyLlama from examples/disaggregated/disagg_config.yaml)
+#    before burning K2.5 hours.
+
+hostname: localhost
+port: 8000
+model: nvidia/Kimi-K2-Thinking-NVFP4
+backend: pytorch
+# disable_overlap_scheduler matches the simple_example disagg config; revisit
+# if/when overlap-scheduler-aware disagg shows up.
+disable_overlap_scheduler: true
+
+context_servers:
+  num_instances: 1
+  tensor_parallel_size: 4
+  pipeline_parallel_size: 1
+  moe_expert_parallel_size: 4
+  max_batch_size: 1
+  max_num_tokens: 16384
+  max_seq_len: 61952
+  trust_remote_code: true
+  moe_config:
+    backend: TRTLLM
+  kv_cache_config:
+    dtype: fp8
+    free_gpu_memory_fraction: 0.75
+    enable_block_reuse: true        # see multi-turn sibling — load-bearing
+    enable_partial_reuse: true
+  # No speculative_config on P: prefill doesn't consume draft tokens; MTP runs
+  # on D. Keep P focused on chunked prefill throughput.
+  cache_transceiver_config:
+    backend: DEFAULT                # NIXL by default in main; UCX/MPI fallback
+  urls:
+    - "localhost:8001"
+
+generation_servers:
+  num_instances: 1
+  tensor_parallel_size: 4
+  pipeline_parallel_size: 1
+  moe_expert_parallel_size: 4
+  max_batch_size: 1
+  # D-side max_num_tokens sized for decode-only steady state: q_len_per_req=4
+  # × BS=1 × CUDA graph padding. Small. Bumped slightly above 4 for safety.
+  max_num_tokens: 256
+  max_seq_len: 61952               # must accept the 60k KV transferred from P
+  trust_remote_code: true
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 1
+  moe_config:
+    backend: TRTLLM
+  kv_cache_config:
+    dtype: fp8
+    free_gpu_memory_fraction: 0.75
+    enable_block_reuse: true
+    enable_partial_reuse: true
+  speculative_config:
+    decoding_type: MTP
+    max_draft_len: 3               # The TS decode-win regime. ALL of TS's
+                                   # claimed benefit on this experiment fires
+                                   # in this worker process. Pair with
+                                   # TLLM_TOKENSPEED_MLA=1 on the worker env.
+  stream_interval: 10
+  print_iter_log: true             # need this to verify P–D balance (note 7)
+  cache_transceiver_config:
+    backend: DEFAULT
+  urls:
+    - "localhost:8002"

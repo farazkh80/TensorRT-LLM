@@ -1,0 +1,111 @@
+# Standard trtllm-bench --extra_llm_api_options config for the Kimi K2.5
+# TokenSpeed MLA evaluation — multi-turn dataset sibling of the blog-regime
+# config. This is the experiment that should reproduce the TokenSpeed blog's
+# headline numbers IF those numbers transfer to K2.5 on our hardware. It is
+# also the only experiment in this grid where the dataset, not the YAML, is
+# the primary experimental delta.
+#
+# Sibling of:
+#   bench-60k1k_tp8_conc1_mtp3.yml  (same shape, synthetic token-norm-dist
+#                                    dataset → under-reports TS win per
+#                                    header note 5 in that file)
+# This file:
+#   Same hardware/model/MTP config, paired with a multi-turn replay dataset
+#   so KV prefix reuse across turns is real — which is the regime where
+#   TokenSpeed's decode-only win actually matters for E2E latency.
+#
+# Why a separate file when the YAML delta is tiny:
+#
+# The headline-blocking factor identified in bench-60k1k_tp8_conc1_mtp3.yml
+# was *dataset shape*, not config. At ISL=60k / OSL=1k single-turn, the
+# per-request work is ~98% prefill. TokenSpeed's decode-only win translates
+# to ≤1% E2E request latency in that regime regardless of how big the
+# decode kernel speedup is. The blog gets its headline number by averaging
+# over MULTI-TURN conversations on shared long-context prefixes:
+#   - System+history prefix: ~60k tokens, cached
+#   - Each turn: ~50–500 new input tokens, ~100–1500 output tokens
+#   - Decode dominates per-turn TTFT because KV-prefix hits the cache
+# This file makes that regime explicit, with KV block reuse pinned on as
+# self-documentation (defaults are already True, but anyone reading this
+# file should know reuse is load-bearing for this experiment, not optional).
+#
+# The YAML delta vs bench-60k1k_tp8_conc1_mtp3.yml:
+#   - kv_cache_config.enable_block_reuse: true   (explicit; default True)
+#   - kv_cache_config.enable_partial_reuse: true (explicit; default True)
+#   - (no other changes — same TP8 / BS=1 / MTP=3 / 60k / fp8 KV / TRTLLM MoE)
+#
+# The DATASET delta (the real experimental dial):
+#
+#   Use a multi-turn replay dataset such as sharegpt or NVIDIA's internal
+#   multi-turn chat replay format. Approximate invocation:
+#
+#     trtllm-bench --model nvidia/Kimi-K2-Thinking-NVFP4 prepare-dataset \
+#         --output multiturn_replay.jsonl \
+#         --dataset hf --dataset_id Aeala/ShareGPT_Vicuna_unfiltered \
+#         --num-requests 64 --max-input-len 60000 --keep-multi-turn
+#
+#   (Verify the exact prepare-dataset flag set — trtllm-bench's multi-turn
+#   support has evolved; if `--keep-multi-turn` is unavailable on current
+#   main, use a token-norm-dist dataset with multiple prompts that share a
+#   60k prefix as a hand-rolled stand-in.)
+#
+# Same combined risk surface as bench-60k1k_tp8_conc1_mtp3.yml — checkpoint
+# MTP layers, parity-divergence × long context, KV fit, rc14 trtllm-bench
+# bug. Plus one additional caveat:
+#
+# 6. KV REUSE VALIDITY. If the trtllm-bench multi-turn mode doesn't actually
+#    cache across requests (some prepare-dataset paths emit fully-independent
+#    requests that happen to share a prefix), the reuse this experiment
+#    relies on will be invisible. Verify after a first run by checking the
+#    KV cache reuse stats in the print_iter_log output — they must be > 0
+#    or this experiment is silently equivalent to the synthetic one.
+#
+# Model:  nvidia/Kimi-K2-Thinking-NVFP4  (must have ≥3 native MTP layers)
+# GPU:    8× B200 / B300 SXM6
+# Dataset: multi-turn replay (sharegpt or equivalent), ~60k accumulated context
+#
+# Invocation:
+#   # Baseline:
+#   TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=1 TLLM_TOKENSPEED_MLA=0 \
+#       trtllm-bench --model nvidia/Kimi-K2-Thinking-NVFP4 \
+#           throughput --dataset multiturn_replay.jsonl \
+#           --extra_llm_api_options bench-60k1k_tp8_conc1_mtp3_multiturn.yml --concurrency 1
+#
+#   # TokenSpeed variant:
+#   TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=1 TLLM_TOKENSPEED_MLA=1 \
+#       trtllm-bench --model nvidia/Kimi-K2-Thinking-NVFP4 \
+#           throughput --dataset multiturn_replay.jsonl \
+#           --extra_llm_api_options bench-60k1k_tp8_conc1_mtp3_multiturn.yml --concurrency 1
+
+max_batch_size: 1
+max_num_tokens: 16384
+max_seq_len: 61952
+
+tensor_parallel_size: 8
+moe_expert_parallel_size: 8
+# AttentionDP intentionally OFF — kernel-clean A/B with the rest of the grid.
+
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 1
+
+kv_cache_config:
+  dtype: fp8
+  free_gpu_memory_fraction: 0.75
+  # Explicit (defaults are True). Pinning these in the file documents that
+  # KV reuse is load-bearing for this experiment — disabling either would
+  # silently revert it to the synthetic-equivalent regime.
+  enable_block_reuse: true
+  enable_partial_reuse: true
+
+moe_config:
+  backend: TRTLLM
+
+speculative_config:
+  decoding_type: MTP
+  max_draft_len: 3
+
+stream_interval: 10
+print_iter_log: true       # NB: also use this to verify KV reuse stats > 0
+                           # (see header risk 6).
+trust_remote_code: true

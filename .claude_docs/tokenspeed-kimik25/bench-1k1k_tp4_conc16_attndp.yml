@@ -1,0 +1,79 @@
+# Standard trtllm-bench --extra_llm_api_options config for the Kimi K2.5
+# TokenSpeed MLA evaluation — AttentionDP variant of the TP4 conc16 throughput
+# sweep.
+#
+# Sibling of:
+#   bench-1k1k_tp4_conc16.yml  (same shape, AttentionDP OFF — kernel-clean A/B)
+# This file:                    AttentionDP ON — measures the TS × DP interaction.
+#
+# Why a separate sibling: AttentionDP partitions requests across ranks instead
+# of TP-sharding attention across ranks. With TP4 + conc=16 + AttnDP, each
+# rank handles ~4 requests locally rather than all 16 with sharded attention.
+# Two things change for the TokenSpeed kernel:
+#   1. The per-rank effective batch dimension shrinks (16 → 4). TokenSpeed's
+#      fold_sq_factor folds q_seqlen × num_heads into BMM1 M; the win profile
+#      changes when per-rank batch is smaller because there are fewer
+#      tile-parallel CTAs to spread across SMs.
+#   2. The request-distribution path is different — runs in attention_dp_config
+#      can affect which sub-batch hits the MLA decode kernel at all.
+#
+# Production-relevance: K2.5 / K2.6 deployments at Fireworks and Together are
+# expected to use AttentionDP for throughput, so the on-config is the realistic
+# customer regime; the off-config is the cleaner kernel-isolated measurement.
+# Reporting both lets us separate "TokenSpeed kernel-level win" from
+# "TokenSpeed × DP system-level win".
+#
+# Model:  nvidia/Kimi-K2-Thinking-NVFP4  (DeepSeek-V3 dense-MLA architecture)
+# GPU:    4× B200 / B300 SXM6
+# Dataset: token-norm-dist, ISL=1024, OSL=1024, ≥256 requests
+#
+# Invocation:
+#   # Baseline:
+#   TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=1 TLLM_TOKENSPEED_MLA=0 \
+#       trtllm-bench --model nvidia/Kimi-K2-Thinking-NVFP4 \
+#           throughput --dataset synth_1k1k_256.txt \
+#           --extra_llm_api_options bench-1k1k_tp4_conc16_attndp.yml --concurrency 16
+#
+#   # TokenSpeed variant:
+#   TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=1 TLLM_TOKENSPEED_MLA=1 \
+#       trtllm-bench --model nvidia/Kimi-K2-Thinking-NVFP4 \
+#           throughput --dataset synth_1k1k_256.txt \
+#           --extra_llm_api_options bench-1k1k_tp4_conc16_attndp.yml --concurrency 16
+
+max_batch_size: 64
+max_num_tokens: 5248
+max_seq_len: 2068
+
+tensor_parallel_size: 4
+moe_expert_parallel_size: 4
+
+# The single experimental delta vs bench-1k1k_tp4_conc16.yml.
+enable_attention_dp: true
+attention_dp_config:
+  batching_wait_iters: 0
+  enable_balance: true
+  timeout_iters: 60
+
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 64
+
+kv_cache_config:
+  dtype: fp8
+  free_gpu_memory_fraction: 0.8
+
+moe_config:
+  backend: TRTLLM           # Held constant with the conc16 sibling for an
+                            # apples-to-apples DP-only diff. DSR1's
+                            # attention_dp configs use CUTLASS at high
+                            # concurrency for separate perf reasons; if a
+                            # CUTLASS variant is needed, fork into
+                            # bench-1k1k_tp4_conc16_attndp_cutlass.yml.
+
+speculative_config:
+  decoding_type: MTP
+  max_draft_len: 1
+
+stream_interval: 10
+print_iter_log: true
+trust_remote_code: true
