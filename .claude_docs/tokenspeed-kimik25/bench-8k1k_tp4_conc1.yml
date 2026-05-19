@@ -28,18 +28,11 @@
 # GPU:    4× B200 / B300 SXM6
 # Dataset: token-norm-dist, ISL=8192, OSL=1024, ≥32 requests
 #
-# Invocation:
-#   # Baseline:
-#   TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=1 TLLM_TOKENSPEED_MLA=0 \
-#       trtllm-bench --model nvidia/Kimi-K2-Thinking-NVFP4 \
-#           throughput --dataset synth_8k1k_32.txt \
-#           --extra_llm_api_options bench-8k1k_tp4_conc1.yml --concurrency 1
-#
-#   # TokenSpeed variant:
-#   TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=1 TLLM_TOKENSPEED_MLA=1 \
-#       trtllm-bench --model nvidia/Kimi-K2-Thinking-NVFP4 \
-#           throughput --dataset synth_8k1k_32.txt \
-#           --extra_llm_api_options bench-8k1k_tp4_conc1.yml --concurrency 1
+# Invocation (current-main edition):
+#   bash scripts/run_bench_v2.sh bench-8k1k_tp4_conc1.yml
+# Defaults model_path to /scratch/hf-cache-patched/k2.6-bf16kv (BF16 KV);
+# TS arm uses attn_backend=TOKENSPEED_MLA; base arm uses TRTLLM and crashes
+# on the current-main NVRTC bug.
 
 max_batch_size: 1
 max_num_tokens: 8768        # one full ISL=8192 prefill chunked batch + margin.
@@ -56,20 +49,19 @@ cuda_graph_config:
   enable_padding: true
   max_batch_size: 1
 
+# TokenSpeed swap point.
+attn_backend: TOKENSPEED_MLA
+
 kv_cache_config:
-  dtype: fp8
+  # 'auto' lets the BF16-KV-patched K2.6 snapshot drive: KV stays BF16,
+  # matching the TokenSpeed kernel's kv_cache.dtype == query.dtype gate.
+  dtype: auto
   free_gpu_memory_fraction: 0.8
 
 moe_config:
   backend: TRTLLM
 
-speculative_config:
-  decoding_type: MTP
-  max_draft_len: 1          # K2.5 native MTP=1. Long-context × MTP=3 would
-                            # combine the headline regime (q_len_per_req=4)
-                            # with the long-KV regime — a worthwhile sibling
-                            # once we know the checkpoint supports MTP=3
-                            # and Albert has weighed in on the parity gap.
+# K2.6 ships num_nextn_predict_layers=0; MTP not available on this checkpoint.
 
 stream_interval: 10
 print_iter_log: true

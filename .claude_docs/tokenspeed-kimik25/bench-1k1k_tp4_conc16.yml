@@ -14,18 +14,11 @@
 # Dataset: token-norm-dist, ISL=1024, OSL=1024, ≥256 requests (need enough
 #          for the conc=16 sweep to reach steady state)
 #
-# Invocation:
-#   # Baseline:
-#   TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=1 TLLM_TOKENSPEED_MLA=0 \
-#       trtllm-bench --model nvidia/Kimi-K2-Thinking-NVFP4 \
-#           throughput --dataset synth_1k1k_256.txt \
-#           --extra_llm_api_options bench-1k1k_tp4_conc16.yml --concurrency 16
-#
-#   # TokenSpeed variant:
-#   TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=1 TLLM_TOKENSPEED_MLA=1 \
-#       trtllm-bench --model nvidia/Kimi-K2-Thinking-NVFP4 \
-#           throughput --dataset synth_1k1k_256.txt \
-#           --extra_llm_api_options bench-1k1k_tp4_conc16.yml --concurrency 16
+# Invocation (current-main edition):
+#   bash scripts/run_bench_v2.sh bench-1k1k_tp4_conc16.yml
+# Defaults model_path to /scratch/hf-cache-patched/k2.6-bf16kv (BF16 KV);
+# TS arm uses attn_backend=TOKENSPEED_MLA; base arm uses TRTLLM and crashes
+# on the current-main NVRTC bug.
 
 max_batch_size: 64          # conc=16 + spec-decode bursts (16 × q_len_per_req=2)
                             # + CUDA graph padding headroom.
@@ -43,20 +36,19 @@ cuda_graph_config:
   enable_padding: true
   max_batch_size: 64
 
+# TokenSpeed swap point.
+attn_backend: TOKENSPEED_MLA
+
 kv_cache_config:
-  dtype: fp8
+  # 'auto' lets the BF16-KV-patched K2.6 snapshot drive: KV stays BF16,
+  # matching the TokenSpeed kernel's kv_cache.dtype == query.dtype gate.
+  dtype: auto
   free_gpu_memory_fraction: 0.8
 
 moe_config:
   backend: TRTLLM
 
-speculative_config:
-  decoding_type: MTP
-  max_draft_len: 1          # K2.5 native MTP=1 → q_len_per_req=2.
-                            # The blog's headline ratio "decode token num =
-                            # BS × 4" implies MTP=3 (q_len=4); add an
-                            # bench-1k1k_tp4_conc16_mtp3.yml sibling once
-                            # we have a K2.5 checkpoint with ≥3 MTP layers.
+# K2.6 ships num_nextn_predict_layers=0; MTP not available on this checkpoint.
 
 stream_interval: 10
 print_iter_log: true
