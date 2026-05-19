@@ -160,32 +160,126 @@ trtllm-gen FMHA cubin symbols don't appear in this report — they'd require
 aggregated kernel sets are *identical* between base and variant, not that
 attention kernels are missing from both.)
 
-### Implication for the hybrid criterion
+### 8a. Phase 3 follow-up diagnostic (2026-05-19)
 
-The hybrid criterion in `runbook.md` Phase 5 said: if the spike-patch path
-reproduces the JIRA-claimed kernel-level win on K2.6, invest in the
-`TokenSpeedMLAAttention(TrtllmAttention)` backend class. Phase 3 shows the
-spike-patches *cannot reach* the MLA decode code path on K2.6, so the
-hybrid criterion is exhausted with a "spike-measurement bridge gave us no
-signal" result. The only remaining path to land a measurement on K2.6 is
-the backend-class implementation that intercepts at `TrtllmAttention._run`
-(the dispatch site upstream of the C++ thop call).
+To verify *why* the env-var swap was dead code — `is_supported()` rejection,
+some other gate, or an entirely different cause — `scripts/diagnose_dispatch.py`
+patches `TrtllmAttentionWrapper.run()` to log the dispatch decision once
+per Wrapper instance, gated on `TLLM_DIAG=1`. Ran once on K2.6 with
+`TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=1 TLLM_TOKENSPEED_MLA=1`. Result:
+
+| Phase | `is_fused_qkv` | `is_supported(...)` return | Branch fired |
+|---|---|---|---|
+| **Context (prefill)** | `False` | `(False, 'MLA context (separate Q/K/V) falls back to thop.')` | `thop.attention` |
+| **Decode (generation)** | `True` | `(False, '[Context] Unsupported dtype combination: Q=torch.bfloat16, KV=DataType.FP8, O=torch.bfloat16.')` | `thop.attention` |
+
+244 log entries each (61 layers × 4 ranks × first call of each phase).
+`_TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=True` and `TLLM_TOKENSPEED_MLA=1`
+both confirmed as set at runtime — the env vars worked, the gate inside
+`is_supported()` is what kept us out of the spike's swap.
+
+The **decode rejection reason names the exact gate**: the FlashInfer
+Python MLA path on rc14 does not support (BF16 Q + FP8 KV + BF16 O), so
+the K2.6 NVFP4 default config (which forces FP8 KV via the model's
+`hf_quant_config.json:quantization.kv_cache_quant_algo = "FP8"`) cannot
+reach `trtllm_gen_attention(...)` and thus cannot reach the spike's swap.
+
+### 8b. Option B — force BF16 KV (2026-05-19)
+
+The natural counter-experiment: remove the FP8-KV forcing so `is_supported()`
+passes, then the spike's swap fires. Two routes tried:
+
+1. **`kv_cache_config.dtype="bfloat16"`** (LLM constructor kwarg). Pydantic
+   validation accepted the string, but the runtime executor rejected with
+   `ValueError: Overriding KV cache quantization with an invalid type
+   "...dtype=bfloat16" Accepted types are ('fp8', 'nvfp4', 'auto')`. The
+   override path only accepts `(fp8, nvfp4, auto)`; "auto" with this model's
+   quant config still picks FP8.
+2. **Patched snapshot** at `/scratch/hf-cache-patched/k2.6-bf16kv/` —
+   sibling dir with relative symlinks to the original snapshot's files
+   except `hf_quant_config.json`, which is a real copy with
+   `kv_cache_quant_algo` removed. With this, `kv_cache_config.dtype="auto"`
+   loads the engine with BF16 KV (verified: KV cache allocation jumped from
+   8.71 GiB → 17.42 GiB / rank, exactly 2× as expected).
+
+With BF16 KV: `is_supported()` now passes (no rejection log appears), and
+TRT-LLM begins JIT-downloading `flashinfer.trtllm-gen` cubins from NVIDIA
+artifactory — confirming the Python FlashInfer-trtllm-gen MLA path was
+chosen. **But the engine crashes during warmup before any attention forward
+runs:**
+
+```
+ValueError: Invalid shape of out:
+    expected torch.Size([1, 1, 16, 512]),
+    got      torch.Size([1, 16, 512])
+File ".../flashinfer/utils.py", line 651, in check_shape_dtype_device
+Stack: executor.worker_main → setup_engine → _create_py_executor → create_executor → ...
+```
+
+Shape mismatch in `[B, q_len_per_req, H, D_v]` — TRT-LLM rc14 prepares a
+3D output buffer where the flashinfer wrapper now requires 4D. This is
+the same class of upstream rc14 bug the DSV3-Lite spike hit in step 7
+(the `q_len_per_req = 1 - input_length` issue under `trtllm-bench`).
+
+The DIAG patch never logged a single line on this run because the crash
+fires inside `setup_engine`, upstream of any attention forward.
+
+### 8c. Architecture skew rc14 vs current main
+
+While instrumenting `TrtllmAttention._run` for the diagnostic, I also
+discovered:
+
+- **rc14**: the dispatch if-branch lives in `TrtllmAttentionWrapper.run()`
+  (line 560), a separate Wrapper class. `TrtllmAttention` is a thin
+  AttentionBackend that owns a `wrapper` instance; it has no `_run` method.
+- **Current main** (the host source tree on this branch): the dispatch
+  lives in `TrtllmAttention._run` (line 1204), the natural override point
+  for a `TokenSpeedMLAAttention(TrtllmAttention)` subclass per the spike's
+  design doc.
+
+The design doc's override-`_run` strategy is structurally correct **only
+on current main**, not on rc14. In rc14 the same effect would require
+either subclassing `TrtllmAttentionWrapper` (and threading it through
+`TrtllmAttention.__init__` somehow), or overriding `TrtllmAttention.forward()`
+and replicating its prep before bypassing `self.wrapper.run()`. Both are
+substantially uglier than the main-tree pattern.
+
+### Updated implication for the hybrid criterion
+
+The hybrid criterion is exhausted with a stronger result than the original
+§8 conclusion: the spike's env-var swap is unreachable on K2.6 within rc14
+through **any combination of config tried** —
+  - default FP8 KV → `is_supported()` rejects the dtype combo;
+  - patched BF16 KV → `is_supported()` passes but `setup_engine` crashes
+    on a separate rc14 output-shape bug, before attention fires.
+
+The viable next step is therefore not "implement the design's backend
+class on rc14" but **"build current main from source and implement the
+backend class against `TrtllmAttention._run` directly"**. Current main's
+architecture matches the design, and the rc14-specific output-shape and
+dtype-gate bugs are likely already fixed (or at least patchable in a
+single place rather than chasing them in a binary release container).
+~2–3 hours via the `exec-local-compile` skill on this compute node.
 
 ### Action required (paused for leadership sign-off)
 
 Before implementing the backend class, this finding needs to land with:
 
-- **Rajeev Rao** — confirm continued staffing now that the cheap spike path
-  is exhausted; the next step is a ~1-day implementation per the design
-  doc, not a sub-day measurement.
+- **Rajeev Rao** — confirm continued staffing. The next step has grown from
+  "1-day backend class on rc14" to "build current main from source +
+  implement backend class against `TrtllmAttention._run`" (~2-3 hours to
+  build + ~1 day implementation). Still doable but is no longer sub-day.
 - **Sharan Chetlur / June Yang** — re-confirm the "absorb into trtllm-gen
   post-CTM+RTS" plan still holds (per JIRA TRTLLM-12510 + email thread).
-  The Python backend class is the temporary measurement bridge in that
-  plan; the eventual home is in trtllm-gen.
+  The Python backend class is the temporary measurement bridge; the
+  eventual home is in trtllm-gen. The rc14-bugs-block-everything finding
+  is additional evidence that trtllm-gen-side investment is the right
+  long-term answer.
 - **Albert Di** — needs the DSV3-Lite parity divergence answer (max abs
   0.33 / max rel ~1166× on spec-decode shapes) before any TS path can
-  default-on for K2.6 MTP=3 production. This was open before Phase 3 and
-  remains the gating question for actually merging the backend class.
+  default-on for K2.6 MTP=3 production. Independent of the integration
+  path — applies whether we land via Python backend class or trtllm-gen
+  port.
 - **Julien Demouth** — CTM+RTS timeline (Tao Li's hanging JIRA question);
   determines whether the Python backend class is a quick-win for ≤1 quarter
   or a longer-term production landing.
@@ -194,25 +288,35 @@ Before implementing the backend class, this finding needs to land with:
 
 - Kernel-level win is real on DSV3-Lite (~10% via direct kernel A/B in spike step 7).
 - Customer pressure (Fireworks / Together on K2.6) is real.
-- The spike's Python env-var swap can't reach K2.6's MLA decode path — Phase 3 confirmed this directly. Same as DSV3-Lite.
-- The next viable step is the `TokenSpeedMLAAttention(TrtllmAttention)` backend class (~1 day implementation), per `../tokenspeed-mla-dsv3-lite/design-tokenspeed-attn-backend.md`. Code + grid + risk register are all staged in this directory; only blocker is leadership go-ahead.
+- The spike's Python env-var swap **cannot reach K2.6's MLA decode path on rc14** under any config we tested:
+  - default FP8 KV → `is_supported()` rejects (BF16 Q + FP8 KV + BF16 O);
+  - patched BF16 KV → `is_supported()` passes but engine crashes on a separate rc14 output-shape bug, before attention fires.
+- The next viable step is **build current main from source + implement `TokenSpeedMLAAttention(TrtllmAttention)` backend class against current main's `_run`**, per `../tokenspeed-mla-dsv3-lite/design-tokenspeed-attn-backend.md`. Total ~1.5 days. Code + grid + risk register are all staged in this directory; build is the gating step.
 - The spec-decode parity divergence remains the gate for default-on production. Until Albert weighs in, even the backend class is a "perf measurement bridge", not a default-on path.
 
 ## 9. Phase 3 trace artifacts
 
-Stored at `/home/scratch.fkhoubsirat_coreai/runs/k2.6-spike/phase3-verify/`:
+Stored at `/home/scratch.fkhoubsirat_coreai/runs/k2.6-spike/`:
 
-- `nsys-k26-base-mtp1.nsys-rep` (44 MB) — baseline trace
-- `nsys-k26-base-mtp1.sqlite` (108 MB) — exported event DB
-- `nsys-k26-base-stdout.log` (145 KB) — full base run output
-- `nsys-k26-ts-mtp1.nsys-rep` (44 MB) — variant trace
-- `nsys-k26-ts-mtp1.sqlite` (108 MB) — exported event DB
-- `nsys-k26-ts-stdout.log` (140 KB) — full variant run output
+- `phase3-verify/nsys-k26-{base,ts}-mtp1.{nsys-rep,sqlite}` — original
+  Phase 3 traces (FP8 KV default; both runs identical kernel sets).
+- `phase3-verify/nsys-k26-{base,ts}-stdout.log` — full stdout including
+  `[minimal]` markers and (for the diagnostic run) `[DIAG]` lines.
+- `dispatch-diag/diag-stderr.log` — diagnostic run output showing the
+  244 (61 layers × 4 ranks) `is_supported()` rejection logs.
+- `verify_bf16kv_v4.log` and `phase3-verify/nsys-k26-base-stdout.log`
+  for the Option B run — contains the `Invalid shape of out` upstream
+  rc14 crash.
 
-The traces stay on `/home/scratch.fkhoubsirat_coreai` (not committed) for
-follow-up analysis. If a deeper diff with `--cudagraph-trace=node` becomes
-useful before the backend class lands, the traces are re-runnable via
-`./scripts/verify_kernel_swap.sh` once we update the nsys invocation.
+Patched snapshot for Option B reruns:
+- `/home/scratch.fkhoubsirat_coreai/hf-cache-patched/k2.6-bf16kv/` —
+  sibling of the real snapshot with relative symlinks to all files,
+  except `hf_quant_config.json` which has `kv_cache_quant_algo` removed.
+
+The traces stay on `/home/scratch.fkhoubsirat_coreai` (not committed)
+for follow-up analysis. If a deeper diff with `--cudagraph-trace=node`
+becomes useful or once we have a working backend class on current main,
+the traces are re-runnable via `./scripts/verify_kernel_swap.sh`.
 
 ## References
 

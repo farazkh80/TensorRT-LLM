@@ -31,19 +31,27 @@
 set -euo pipefail
 
 CONTAINER="${CONTAINER:-tokenspeed-spike-k26}"
-MODEL_PATH="${MODEL_PATH:-/scratch/hf-cache/models--nvidia--Kimi-K2-Thinking-NVFP4}"
-SNAPSHOT_GLOB="$MODEL_PATH/snapshots/*"
+# NB: snapshot dir overridable. The Phase-3-fixup default points at the
+# *patched* sibling snapshot (kv_cache_quant_algo removed from
+# hf_quant_config.json), which makes K2.6 NVFP4 load with BF16 KV instead
+# of the default FP8 KV — required for the spike's run_mla_generation
+# swap to be reachable. Override to /scratch/hf-cache/models--... and
+# KV_DTYPE=auto for the original FP8 KV behavior.
+MODEL_SNAPSHOT="${MODEL_SNAPSHOT:-/scratch/hf-cache-patched/k2.6-bf16kv}"
 RUN_DIR="/scratch/runs/k2.6-spike/phase3-verify"
 MAX_TOKENS="${MAX_TOKENS:-32}"
 # Phase 3 uses TP4 (matches bench-config.yml). Override for TP8 variants.
 TP="${TP:-4}"
+# KV cache dtype override. With the patched snapshot, "auto" is correct
+# (no fp8 forcing in quant config). Valid: auto | fp8 | nvfp4.
+KV_DTYPE="${KV_DTYPE:-auto}"
 
 docker exec "$CONTAINER" bash -c "
     set -uo pipefail
     mkdir -p $RUN_DIR
-    MODEL=\$(ls -d $SNAPSHOT_GLOB 2>/dev/null | head -1)
-    if [[ -z \"\$MODEL\" ]]; then
-        echo 'ERROR: no model snapshot found under $MODEL_PATH/snapshots/' >&2
+    MODEL=$MODEL_SNAPSHOT
+    if [[ ! -d \"\$MODEL\" ]]; then
+        echo \"ERROR: model snapshot dir \$MODEL not found\" >&2
         exit 1
     fi
     echo \"[verify] using model: \$MODEL\"
@@ -62,6 +70,7 @@ docker exec "$CONTAINER" bash -c "
                     --tp_size $TP \
                     --max_tokens $MAX_TOKENS \
                     --attention_backend TRTLLM \
+                    --kv_cache_dtype $KV_DTYPE \
                     > \"\$LOG\" 2>&1 || {
                 echo \"  WARN: \$VARIANT run failed or partial; tail of log:\"
                 tail -10 \"\$LOG\"

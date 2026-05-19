@@ -31,7 +31,15 @@ def main() -> int:
     p.add_argument("--max_tokens", type=int, default=32)
     p.add_argument("--attention_backend", default="TRTLLM")
     p.add_argument("--moe_backend", default="AUTO")
-    p.add_argument("--kv_cache_dtype", default="auto")
+    # NB: kv_cache_dtype default "auto" means the model config drives the choice
+    # (K2.6 NVFP4 defaults to fp8 KV which causes trtllm_gen.is_supported() to
+    # reject the BF16-Q/FP8-KV/BF16-O combo — see Phase 3 diagnostic finding).
+    # Override to "bfloat16" to force the Q/KV/O dtypes to all be bf16, which
+    # lets trtllm_gen.is_supported() pass and exercise the spike's swap.
+    # Valid values per TorchLlmArgs.kv_cache_config.dtype:
+    #   "auto" | "fp8" | "nvfp4" | a torch.dtype string ("bfloat16", "float16", ...)
+    p.add_argument("--kv_cache_dtype", default="auto",
+                   choices=["auto", "bfloat16", "float16", "fp8", "nvfp4"])
     args = p.parse_args()
 
     # [EOS] in the Kimi tokenizer is token id 163585 (per tokenizer_config.json
@@ -53,16 +61,20 @@ def main() -> int:
         flush=True,
     )
 
+    llm_kwargs = {
+        "model": args.model_dir,
+        "tensor_parallel_size": args.tp_size,
+        "trust_remote_code": True,
+        "skip_tokenizer_init": True,    # don't load the broken Kimi tokenizer
+        "attn_backend": args.attention_backend,
+        # moe_backend intentionally left as engine default — we care about MLA decode.
+    }
+    if args.kv_cache_dtype != "auto":
+        # Pass via kv_cache_config dict (matches the YAML bench configs' shape).
+        llm_kwargs["kv_cache_config"] = {"dtype": args.kv_cache_dtype}
+
     t0 = time.time()
-    llm = LLM(
-        model=args.model_dir,
-        tensor_parallel_size=args.tp_size,
-        trust_remote_code=True,
-        skip_tokenizer_init=True,    # <-- the key: don't load the broken tokenizer
-        attn_backend=args.attention_backend,
-        # moe_backend / kv_cache_dtype intentionally left as engine defaults — we
-        # care about the MLA decode-kernel swap, not the MoE backend choice.
-    )
+    llm = LLM(**llm_kwargs)
     t_init = time.time() - t0
     print(f"[minimal] LLM init done in {t_init:.1f}s", flush=True)
 
