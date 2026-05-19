@@ -1,0 +1,97 @@
+Skipping import of cpp extensions due to incompatible torch version 2.11.0a0+eb65b36914.nv26.02 for torchao version 0.15.0             Please see https://github.com/pytorch/ao/issues/2919 for more info
+/usr/local/lib/python3.12/dist-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 4.57.3 is incompatible with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+🚨 Config not found for parakeet. You can manually add it to HARDCODED_CONFIG_FOR_MODELS in utils/auto_docstring.py
+🚨 Config not found for parakeet. You can manually add it to HARDCODED_CONFIG_FOR_MODELS in utils/auto_docstring.py
+🚨 Config not found for parakeet. You can manually add it to HARDCODED_CONFIG_FOR_MODELS in utils/auto_docstring.py
+[TensorRT-LLM] TensorRT LLM version: 1.3.0rc14
+[05/13/2026-16:23:55] [TRT-LLM] [I] [bench   ] Preparing to run throughput benchmark...
+Parse safetensors files:   0%|          | 0/4 [00:00<?, ?it/s]Parse safetensors files:  25%|██▌       | 1/4 [00:00<00:01,  2.67it/s]Parse safetensors files: 100%|██████████| 4/4 [00:00<00:00,  9.43it/s]
+[05/13/2026-16:23:55] [TRT-LLM] [I] [bench   ] 
+===========================================================
+= DATASET DETAILS
+===========================================================
+Dataset Path:         /tmp/synth_128_128_50.txt
+Number of Sequences:  50
+
+-- Percentiles statistics ---------------------------------
+
+        Input              Output           Seq. Length
+-----------------------------------------------------------
+MIN:   128.0000           128.0000           256.0000
+MAX:   128.0000           128.0000           256.0000
+AVG:   128.0000           128.0000           256.0000
+P50:   128.0000           128.0000           256.0000
+P90:   128.0000           128.0000           256.0000
+P95:   128.0000           128.0000           256.0000
+P99:   128.0000           128.0000           256.0000
+===========================================================
+
+Parse safetensors files:   0%|          | 0/4 [00:00<?, ?it/s]Parse safetensors files: 100%|██████████| 4/4 [00:00<00:00, 45.52it/s]
+`torch_dtype` is deprecated! Use `dtype` instead!
+[05/13/2026-16:23:56] [TRT-LLM] [I] [_torch  ] Validating KV Cache config against kv_cache_dtype="auto"
+[05/13/2026-16:23:56] [TRT-LLM] [I] [_torch  ] KV cache quantization set to "auto". Using checkpoint KV quantization.
+[05/13/2026-16:23:56] [TRT-LLM] [I] [bench   ] Number of attention layers: 30
+[05/13/2026-16:23:56] [TRT-LLM] [I] [bench   ] Estimated engine size: 7.41 GB
+[05/13/2026-16:23:56] [TRT-LLM] [I] [bench   ] Estimated total available memory for KV cache: 261.18 GB
+[05/13/2026-16:23:56] [TRT-LLM] [I] [bench   ] Estimated total cache memory: 235.06 GB. KV cache: 235.06 GB, Extra cache: 0.00 GB
+[05/13/2026-16:23:56] [TRT-LLM] [I] [bench   ] Estimated kv cache max tokens: 821607.18
+[05/13/2026-16:23:56] [TRT-LLM] [I] [bench   ] Estimated max number of requests in KV cache memory: 3209.40
+[05/13/2026-16:23:56] [TRT-LLM] [I] [bench   ] Estimated max batch size (after fine-tune): 3328
+[05/13/2026-16:23:56] [TRT-LLM] [I] [bench   ] Estimated max num tokens (after fine-tune): 6656
+[05/13/2026-16:23:56] [TRT-LLM] [I] [bench   ] Max batch size and max num tokens not provided. Using heuristics or pre-defined settings: max_batch_size=3328, max_num_tokens=6656.
+[05/13/2026-16:23:56] [TRT-LLM] [W] [bench   ] Chunked prefill is disabled, but max_num_tokens (6656) is less than the max ISL (128). Forcing max_num_tokens to 3456.
+[05/13/2026-16:23:56] [TRT-LLM] [I] [bench   ] Setting PyTorch max sequence length to 256
+[05/13/2026-16:23:56] [TRT-LLM] [I] [bench   ] Setting up throughput benchmark.
+[05/13/2026-16:23:56] [TRT-LLM] [W] [bench   ] Ignore batching_type for pytorch backend.
+[05/13/2026-16:23:56] [TRT-LLM] [W] [bench   ] Ignore extended_runtime_perf_knob_config for pytorch backend.
+[05/13/2026-16:23:56] [TRT-LLM] [I] [llmapi  ] Using LLM with PyTorch backend
+[05/13/2026-16:23:56] [TRT-LLM] [W] [llmapi  ] Using default gpus_per_node: 8
+[05/13/2026-16:23:56] [TRT-LLM] [I] [llmapi  ] neither checkpoint_format nor checkpoint_loader were provided, checkpoint_format will be set to HF.
+[05/13/2026-16:23:56] [TRT-LLM] [I] [llmapi  ] Found /workspace/TensorRT-LLM/.claude_docs/models/nvfp4_moe_only/hf_quant_config.json, pre-quantized checkpoint is used.
+[05/13/2026-16:23:56] [TRT-LLM] [I] [llmapi  ] Setting quant_algo=NVFP4 from HF quant config.
+[05/13/2026-16:23:56] [TRT-LLM] [I] [llmapi  ] Setting group_size=16 from HF quant config.
+[05/13/2026-16:23:56] [TRT-LLM] [I] [llmapi  ] Setting exclude_modules=['model.layers.16.self_attn*', 'model.layers.10.self_attn*', 'model.layers.29.self_attn*', 'model.la... from HF quant config.
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+You are using a model of type deepseek_v3 to instantiate a model of type . This is not supported for all configurations of models and can yield errors.
+[05/13/2026-16:23:56] [TRT-LLM] [W] [executor] Orchestrator is creating IPC executor
+[33;20mrank 0 using MpiPoolSession to spawn MPI processes
+[0m[05/13/2026-16:23:56] [TRT-LLM] [I] [executor] Generating a new HMAC key for server proxy_request_queue
+[05/13/2026-16:23:56] [TRT-LLM] [I] [executor] Generating a new HMAC key for server worker_init_status_queue
+[05/13/2026-16:23:56] [TRT-LLM] [I] [executor] Generating a new HMAC key for server proxy_result_queue
+Skipping import of cpp extensions due to incompatible torch version 2.11.0a0+eb65b36914.nv26.02 for torchao version 0.15.0             Please see https://github.com/pytorch/ao/issues/2919 for more info
+Multiple distributions found for package optimum. Picked distribution: optimum
+Multiple distributions found for package modelopt. Picked distribution: nvidia-modelopt
+/usr/local/lib/python3.12/dist-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 4.57.3 is incompatible with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+🚨 Config not found for parakeet. You can manually add it to HARDCODED_CONFIG_FOR_MODELS in utils/auto_docstring.py
+🚨 Config not found for parakeet. You can manually add it to HARDCODED_CONFIG_FOR_MODELS in utils/auto_docstring.py
+🚨 Config not found for parakeet. You can manually add it to HARDCODED_CONFIG_FOR_MODELS in utils/auto_docstring.py
+[TensorRT-LLM] TensorRT LLM version: 1.3.0rc14
+[TRT-LLM] [I] [runtime ] [RANK 0] Refreshed the MPI local session
+[05/13/2026-16:24:06] [TRT-LLM] [W] [executor] Worker process 16578 is affined to run on the following CPUs: [2, 114] (subset of all logical CPUs). This may harm performance if set incorrectly.
+[05/13/2026-16:24:06] [TRT-LLM] [W] [executor] Worker process 16578 has constrained CPU affinity but `TLLM_NUMA_AWARE_WORKER_AFFINITY` is not set. Removing CPU affinity constraints.
+/usr/local/lib/python3.12/dist-packages/tensorrt_llm/serve/openai_protocol.py:115: UserWarning: Field name "schema" in "ResponseFormat" shadows an attribute in parent "OpenAIBaseModel"
+  class ResponseFormat(OpenAIBaseModel):
+`torch_dtype` is deprecated! Use `dtype` instead!
+[05/13/2026-16:24:06] [TRT-LLM] [I] [_torch  ] ATTENTION RUNTIME FEATURES:  AttentionRuntimeFeatures(chunked_prefill=True, cache_reuse=False, has_speculative_draft_tokens=False, chunk_size=6656, chunked_prefill_buffer_batch_size=4)
+[05/13/2026-16:24:06] [TRT-LLM] [I] [_torch  ] Validating KV Cache config against kv_cache_dtype="auto"
+[05/13/2026-16:24:06] [TRT-LLM] [I] [_torch  ] KV cache quantization set to "auto". Using checkpoint KV quantization.
+[05/13/2026-16:24:07] [TRT-LLM] [I] [_torch  ] Use 16.57 GB for model weights.
+[05/13/2026-16:24:07] [TRT-LLM] [I] [_torch  ] Prefetching 16.34GB checkpoint files.
+[05/13/2026-16:24:07] [TRT-LLM] [I] [_torch  ] Prefetching /workspace/TensorRT-LLM/.claude_docs/models/nvfp4_moe_only/model-00001-of-00004.safetensors to memory...
+[05/13/2026-16:24:07] [TRT-LLM] [I] [_torch  ] Prefetching /workspace/TensorRT-LLM/.claude_docs/models/nvfp4_moe_only/model-00002-of-00004.safetensors to memory...
+[05/13/2026-16:24:07] [TRT-LLM] [I] [_torch  ] Prefetching /workspace/TensorRT-LLM/.claude_docs/models/nvfp4_moe_only/model-00003-of-00004.safetensors to memory...
+[05/13/2026-16:24:07] [TRT-LLM] [I] [_torch  ] Prefetching /workspace/TensorRT-LLM/.claude_docs/models/nvfp4_moe_only/model-00004-of-00004.safetensors to memory...
+[05/13/2026-16:24:09] [TRT-LLM] [I] [_torch  ] Finished prefetching /workspace/TensorRT-LLM/.claude_docs/models/nvfp4_moe_only/model-00004-of-00004.safetensors.
+[05/13/2026-16:24:10] [TRT-LLM] [I] [_torch  ] Finished prefetching /workspace/TensorRT-LLM/.claude_docs/models/nvfp4_moe_only/model-00001-of-00004.safetensors.
+[05/13/2026-16:24:10] [TRT-LLM] [I] [_torch  ] Finished prefetching /workspace/TensorRT-LLM/.claude_docs/models/nvfp4_moe_only/model-00003-of-00004.safetensors.
+[05/13/2026-16:24:10] [TRT-LLM] [I] [_torch  ] Finished prefetching /workspace/TensorRT-LLM/.claude_docs/models/nvfp4_moe_only/model-00002-of-00004.safetensors.
+Loading safetensors weights in parallel:   0%|          | 0/4 [00:00<?, ?it/s][05/13/2026-16:24:10] [TRT-LLM] [I] [_torch  ] Start to load safetensor file /workspace/TensorRT-LLM/.claude_docs/models/nvfp4_moe_only/model-00001-of-00004.safetensors
+[05/13/2026-16:24:10] [TRT-LLM] [I] [_torch  ] Start to load safetensor file /workspace/TensorRT-LLM/.claude_docs/models/nvfp4_moe_only/model-00002-of-00004.safetensors
+[05/13/2026-16:24:10] [TRT-LLM] [I] [_torch  ] Start to load safetensor file /workspace/TensorRT-LLM/.claude_docs/models/nvfp4_moe_only/model-00003-of-00004.safetensors
+[05/13/2026-16:24:10] [TRT-LLM] [I] [_torch  ] Start to load safetensor file /workspace/TensorRT-LLM/.claude_docs/models/nvfp4_moe_only/model-00004-of-00004.safetensors
+Loading safetensors weights in parallel:  25%|██▌       | 1/4 [00:00<00:01,  2.36it/s]Loading safetensors weights in parallel:  50%|█████     | 2/4 [00:00<00:00,  3.96it/s]Loading safetensors weights in parallel:  75%|███████▌  | 3/4 [00:00<00:00,  5.19it/s]Loading safetensors weights in parallel: 100%|██████████| 4/4 [00:00<00:00,  5.80it/s]
+Loading weights:   0%|          | 0/693 [00:00<?, ?it/s]Loading weights:   2%|▏         | 13/693 [00:00<00:05, 116.08it/s]Loading weights:   4%|▎         | 25/693 [00:00<00:14, 46.38it/s] /usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/modules/fused_moe/quantization.py:2652: UserWarning: TypedStorage is deprecated. It will be removed in the future and UntypedStorage will be the only storage class. This should only matter to you if you are using storages directly.  To access UntypedStorage directly, use tensor.untyped_storage() instead of tensor.storage()
+  dst_base = dst_w3_w1_weight.storage().data_ptr()
+Loading weights:   5%|▌         | 38/693 [00:00<00:10, 60.75it/s]Loading weights:   9%|▉         | 61/693 [00:00<00:07, 89.15it/s]Loading weights:  12%|█▏        | 84/693 [00:00<00:05, 108.86it/s]

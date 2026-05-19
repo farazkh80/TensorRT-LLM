@@ -1,0 +1,6 @@
+# Nsight Systems traces from the DSV3-Lite spike — large binary blobs
+# (.sqlite files exceed GitHub's 100 MB hard limit). The narrative in
+# step-*.md and summary.md cites the relevant findings from each trace;
+# the binaries themselves stay on the experimenter's disk.
+*.nsys-rep
+*.sqlite
