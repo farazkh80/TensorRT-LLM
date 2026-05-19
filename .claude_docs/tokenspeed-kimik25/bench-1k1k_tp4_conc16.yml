@@ -1,0 +1,56 @@
+# trtllm-bench --extra_llm_api_options config for the TokenSpeed MLA
+# evaluation on Kimi K2.5 — TP4 throughput sweep at concurrency=16.
+#
+# Sibling of:
+#   bench-config.yml             (TP4, BS=1 min-latency)
+#   bench-1k1k_tp8_conc1.yml     (TP8, BS=1, deeper TS regime)
+# This file:
+#   TP4 at concurrency=16 — the upper edge of TokenSpeed's blog-reported
+#   decode-win envelope (their blog tests up to BS=16).
+#
+# Model:  nvidia/Kimi-K2-Thinking-NVFP4
+# GPU:    4× Blackwell SXM (B200 / B300)
+# Dataset: token-norm-dist, ISL=1024, OSL=1024, ≥256 requests, concurrency=16
+#
+# Invocation:
+#   # Baseline:
+#   TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=1 TLLM_TOKENSPEED_MLA=0 \
+#       trtllm-bench --model nvidia/Kimi-K2-Thinking-NVFP4 \
+#           throughput --dataset synth_1k1k_256.txt \
+#           --extra_llm_api_options bench-1k1k_tp4_conc16.yml --concurrency 16
+#
+#   # TokenSpeed variant:
+#   TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=1 TLLM_TOKENSPEED_MLA=1 \
+#       trtllm-bench --model nvidia/Kimi-K2-Thinking-NVFP4 \
+#           throughput --dataset synth_1k1k_256.txt \
+#           --extra_llm_api_options bench-1k1k_tp4_conc16.yml --concurrency 16
+
+max_batch_size: 64          # conc=16 + spec-decode bursts (16 × q_len_per_req=2)
+                            # + CUDA graph padding headroom.
+max_num_tokens: 5248        # one full prefill batch (16 × ISL=1024 chunked) + margin.
+max_seq_len: 2068
+
+tensor_parallel_size: 4
+moe_expert_parallel_size: 4
+# AttentionDP intentionally OFF: keeps the kernel-level A/B for TS vs baseline
+# apples-to-apples with the BS=1 siblings. See bench-1k1k_tp4_conc16_attndp.yml
+# for the AttentionDP × TokenSpeed interaction.
+
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 64
+
+kv_cache_config:
+  dtype: fp8
+  free_gpu_memory_fraction: 0.8
+
+moe_config:
+  backend: TRTLLM
+
+speculative_config:
+  decoding_type: MTP
+  max_draft_len: 1          # K2.5 native MTP=1 → q_len_per_req=2.
+
+stream_interval: 10
+print_iter_log: true
+trust_remote_code: true

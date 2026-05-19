@@ -1,0 +1,72 @@
+# trtllm-bench --extra_llm_api_options config for the TokenSpeed MLA
+# evaluation on Kimi K2.5 — long-context, BS=1.
+#
+# Sibling of:
+#   bench-config.yml             (TP4, BS=1, ISL=OSL=1k — short min-latency)
+# This file:
+#   TP4, BS=1, ISL=8k / OSL=1k — long-context min-latency.
+#
+# Why long context matters for this eval: TokenSpeed's MLA win profile is
+# reported on long-context workloads (the public blog uses average ISL ≈
+# 60k with multi-turn KV reuse). At long context the MLA decode kernel
+# spends proportionally more time in the BMM2-against-KV-cache step, which
+# is where TokenSpeed's split-KV partial-reduction reorganization operates.
+# The kernel-level win at 1k context (bench-config.yml number) is the
+# floor; long-context is where TS's claim should be larger if their
+# fold_sq_factor + split-KV reorg are the dominant gains.
+#
+# Why ISL=8k and not 60k: 60k × Kimi K2.5 dense MLA KV cache (kv_lora_rank=512,
+# qk_rope_head_dim=64, num_layers≈61) does not fit on 4× B200/B300 at BS=1
+# unless we drop free_gpu_memory_fraction aggressively and lose other
+# experimental controls. 8k is the largest round number that comfortably
+# fits our standard kv_cache_config and matches an existing 8k1k reference
+# shape in the broader bench-config family. The 60k-scale regime is the
+# bench-60k1k_tp8_conc1_mtp3.yml sibling (TP8, lower free fraction).
+#
+# Model:  nvidia/Kimi-K2-Thinking-NVFP4
+# GPU:    4× Blackwell SXM
+# Dataset: token-norm-dist, ISL=8192, OSL=1024, ≥32 requests, concurrency=1
+#
+# Invocation:
+#   # Baseline:
+#   TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=1 TLLM_TOKENSPEED_MLA=0 \
+#       trtllm-bench --model nvidia/Kimi-K2-Thinking-NVFP4 \
+#           throughput --dataset synth_8k1k_32.txt \
+#           --extra_llm_api_options bench-8k1k_tp4_conc1.yml --concurrency 1
+#
+#   # TokenSpeed variant:
+#   TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=1 TLLM_TOKENSPEED_MLA=1 \
+#       trtllm-bench --model nvidia/Kimi-K2-Thinking-NVFP4 \
+#           throughput --dataset synth_8k1k_32.txt \
+#           --extra_llm_api_options bench-8k1k_tp4_conc1.yml --concurrency 1
+
+max_batch_size: 1
+max_num_tokens: 8768        # one full ISL=8192 prefill chunked batch + margin.
+max_seq_len: 9416           # 8192 + 1024 + margin.
+
+tensor_parallel_size: 4
+moe_expert_parallel_size: 4
+# AttentionDP intentionally OFF — kernel-clean A/B with the other TP4 BS=1
+# siblings. A long-context AttnDP variant (bench-8k1k_tp4_conc16_attndp.yml)
+# is the natural production-realistic follow-up if the min-latency long-
+# context number reproduces the win.
+
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 1
+
+kv_cache_config:
+  dtype: fp8
+  free_gpu_memory_fraction: 0.8
+
+moe_config:
+  backend: TRTLLM
+
+speculative_config:
+  decoding_type: MTP
+  max_draft_len: 1          # K2.5 native MTP=1. Long-context × MTP=3 is
+                            # bench-8k1k_tp4_conc1_mtp3.yml.
+
+stream_interval: 10
+print_iter_log: true
+trust_remote_code: true

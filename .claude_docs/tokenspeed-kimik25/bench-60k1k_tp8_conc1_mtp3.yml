@@ -1,0 +1,104 @@
+# trtllm-bench --extra_llm_api_options config for the TokenSpeed MLA
+# evaluation on Kimi K2.5 — TokenSpeed BLOG-HEADLINE regime.
+#
+# Sibling of:
+#   bench-8k1k_tp4_conc1_mtp3.yml  (same MTP=3 / BS=1 shape, ISL=8k stand-in)
+# This file:
+#   ISL=60k, OSL=500–1024, TP8, BS=1, MTP=3 — matches the public TokenSpeed
+#   blog's primary headline workload as closely as our hardware will allow.
+#
+# Blog regime (from https://lightseek.org/blog/lightseek-tokenspeed.html):
+#   - Average ISL=60k, OSL=500
+#   - Multi-turn (large KV cache reuse — dataset characteristic, not YAML config)
+#   - Max BS tested = 16, decode tokens = BS × 4 → MTP=3
+#   - K2.5 NVFP4
+#   - Blog reports TRT-LLM TP4 OOMing at BS=16 because TokenSpeed used CPU
+#     KV offload while the comparison TRT-LLM run did not. Closed in this
+#     grid via bench-60k1k_tp8_conc16_mtp3_cpukvoffload.yml.
+#
+# Adaptations vs the blog for hardware fit on our side:
+#   - TP8 instead of TP4 — extra aggregate memory at the cost of a deeper
+#     TokenSpeed regime (effective num_heads = 16 instead of 32).
+#   - BS=1 to start — at the blog's BS=16 we'd need CPU KV offload to fit;
+#     this file is the proof-of-fit baseline.
+#     bench-60k1k_tp8_conc16_mtp3_cpukvoffload.yml takes BS=16 separately.
+#   - free_gpu_memory_fraction lowered to 0.75 (matches an existing
+#     curated kimi-k2-thinking reference config) — buys headroom for the
+#     long context + draft chain.
+#
+# Combined risk surface (most loaded experiment in the grid):
+#
+# 1. CHECKPOINT MTP LAYERS. Same as the other MTP=3 siblings.
+#
+# 2. PARITY DIVERGENCE × LONG CONTEXT. The earlier-evaluation parity gap was
+#    measured at short context. At 60k the split-KV reduction is over many
+#    more partials — divergence behavior is unknown and is the main data
+#    point needed for the TokenSpeed kernel author to comment on.
+#
+# 3. KV CACHE FIT. 60k × K2.5 dense MLA (kv_lora_rank=512,
+#    qk_rope_head_dim=64) × num_layers ≈ 61 × fp8 KV is ~95 MB per request
+#    — should fit at TP8 NVFP4 with free_gpu_memory_fraction=0.75 + draft
+#    chain, but verify on first launch. If OOM, drop to 0.7 or fall back
+#    to bench-8k1k_tp4_conc1_mtp3.yml as the upper bound we can hit cleanly.
+#
+# 4. POSSIBLE UPSTREAM BUG: an earlier evaluation observed that on rc14,
+#    the TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=1 path mis-computes
+#    q_len_per_req as (1 − input_length) under trtllm-bench multi-request
+#    scheduling. At ISL=60k that surfaces as a shape dim of −59999.
+#    Verify this is fixed in current main (rc15+) before running, else
+#    fall back to nsys-per-iter measurement.
+#
+# 5. PREFILL COST DOMINATES. At ISL=60k / OSL=1k the per-request work is
+#    ~98% prefill. TokenSpeed claims decode-only wins. So even a 50%
+#    decode speedup translates to ≤1% E2E request latency in a single-turn
+#    setting. The blog headline only shows up under multi-turn decode
+#    bursts on a shared long-context KV cache. To mirror that, use
+#    bench-60k1k_tp8_conc1_mtp3_multiturn.yml with a multi-turn dataset.
+#    Treat this config as the infra-fit test.
+#
+# Model:  nvidia/Kimi-K2-Thinking-NVFP4  (must have ≥3 native MTP layers)
+# GPU:    8× Blackwell SXM
+# Dataset: token-norm-dist, ISL=61440, OSL=512, ≥8 requests, concurrency=1
+#          (multi-turn for the headline-match measurement)
+#
+# Invocation:
+#   # Baseline:
+#   TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=1 TLLM_TOKENSPEED_MLA=0 \
+#       trtllm-bench --model nvidia/Kimi-K2-Thinking-NVFP4 \
+#           throughput --dataset synth_60k500_8.txt \
+#           --extra_llm_api_options bench-60k1k_tp8_conc1_mtp3.yml --concurrency 1
+#
+#   # TokenSpeed variant:
+#   TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=1 TLLM_TOKENSPEED_MLA=1 \
+#       trtllm-bench --model nvidia/Kimi-K2-Thinking-NVFP4 \
+#           throughput --dataset synth_60k500_8.txt \
+#           --extra_llm_api_options bench-60k1k_tp8_conc1_mtp3.yml --concurrency 1
+
+max_batch_size: 1
+max_num_tokens: 16384       # 16k prefill chunks; 60k ISL → 4 chunks per request.
+max_seq_len: 61952          # 60k ISL + 1k OSL + margin.
+
+tensor_parallel_size: 8
+moe_expert_parallel_size: 8
+# AttentionDP intentionally OFF — kernel-clean A/B with the rest of the grid.
+
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 1
+
+kv_cache_config:
+  dtype: fp8
+  free_gpu_memory_fraction: 0.75    # Lowered from 0.8; see header note 3.
+
+moe_config:
+  backend: TRTLLM           # Held constant with the rest of the grid. If
+                            # CUTLASS is needed for memory reasons, fork
+                            # into bench-60k1k_tp8_conc1_mtp3_cutlass.yml.
+
+speculative_config:
+  decoding_type: MTP
+  max_draft_len: 3          # Blog regime: q_len_per_req = 4.
+
+stream_interval: 10
+print_iter_log: true
+trust_remote_code: true

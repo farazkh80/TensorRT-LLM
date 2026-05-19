@@ -1,0 +1,119 @@
+# trtllm-bench --extra_llm_api_options config for the TokenSpeed MLA
+# evaluation on Kimi K2.5 — CPU KV offload sibling. This file's purpose is
+# to reach a point in the experiment grid that the published TokenSpeed
+# blog includes (BS=16 / 60k context with K2.5) but the comparison
+# TRT-LLM measurement in that blog OOMed because CPU KV offload wasn't
+# enabled on the TRT-LLM side at the time.
+#
+# Sibling of:
+#   bench-60k1k_tp8_conc1_mtp3.yml           (same 60k/MTP=3 shape, BS=1 only)
+#   bench-60k1k_tp8_conc1_mtp3_multiturn.yml (same shape + multi-turn dataset)
+# This file:
+#   60k / MTP=3 / TP8 at concurrency=16, made fittable by enabling TRT-LLM's
+#   CPU host KV cache (host_cache_size).
+#
+# Why this experiment exists:
+#
+# The public TokenSpeed blog reports an apples-to-apples comparison at
+# BS=16 / 60k. The TRT-LLM curve in their chart is missing that BS=16 point
+# because their TRT-LLM run OOMed there — attributed primarily to TS having
+# enabled CPU memory offload while the TRT-LLM run had not.
+#
+# TRT-LLM's KV cache manager DOES support CPU offload via host_cache_size.
+# Enabling it on our side closes the gap and makes the BS=16 / 60k
+# apples-to-apples possible. Without this sibling, any "TRT-LLM vs
+# TokenSpeed at the blog's BS=16 point" comparison is unfair because we're
+# not using a feature TRT-LLM has and TokenSpeed is.
+#
+# Three deltas vs bench-60k1k_tp8_conc1_mtp3.yml:
+#   1. concurrency=16 → max_batch_size=32 (16 + spec-decode + CUDA graph pad)
+#   2. host_cache_size: ~64 GiB on each rank (the new feature being measured)
+#   3. free_gpu_memory_fraction: 0.75 → 0.7 (leave host cache room to actually
+#      kick in; with 0.75 the GPU pool is large enough that offload barely
+#      activates and the experiment silently reduces to OOM territory)
+#
+# Combined risk surface (#1–#5 inherited from bench-60k1k_tp8_conc1_mtp3.yml,
+# #6 from the multiturn sibling, #7–#9 from the disagg sibling, and:
+#
+# 10. HOST RAM BUDGET. host_cache_size: ~64 GiB per rank × 8 ranks = ~512 GiB
+#     of host RAM reserved across the node. Standard DGX-class nodes
+#     typically have ~2 TiB host RAM, so this is comfortable, but verify
+#     before launch — if the node is shared with other workloads (training
+#     jobs, dev shells, OS overhead), 512 GiB pinned can starve them.
+#     Drop host_cache_size to 32 GiB per rank if needed; experiment still
+#     works, just with shallower offload depth.
+#
+# 11. PCIe / NVLink-C2C BANDWIDTH. Each KV block evicted from GPU must
+#     transit back to GPU before the next decode step touches it. On B200
+#     PCIe Gen5 (~64 GB/s) vs B300 Grace-Hopper NVLink-C2C (much higher),
+#     the bandwidth is different. K2.5 at 60k × 16 concurrent requests
+#     pushes ~35 GB of KV churn — a few hundred ms per pass on PCIe Gen5,
+#     sub-100 ms on NVLink-C2C. If the offload-induced latency exceeds
+#     the TS decode-kernel savings, the experiment shows a net loss vs
+#     the BS=1 baseline. Worth measuring even if it's a wash.
+#
+# 12. TS × HOST CACHE INTERACTION. CPU offload changes where KV blocks are
+#     stored when not actively used; the MLA decode kernel still only sees
+#     GPU pointers (blocks are re-paged into GPU before decode). So there
+#     is no direct interaction between TS's kernel and the host cache.
+#     But: the priority-based eviction logic
+#     (secondary_offload_min_priority) interacts with multi-turn KV reuse —
+#     if priorities aren't set sensibly, the most-reused 60k prefix may
+#     get offloaded over and over. Defaulted to None here (offload eligible
+#     for all blocks); tighten via secondary_offload_min_priority if eviction
+#     logs show thrashing.
+#
+# Model:  nvidia/Kimi-K2-Thinking-NVFP4  (must have ≥3 native MTP layers)
+# GPU:    8× Blackwell SXM (NVLink-C2C preferred for offload bandwidth)
+# Dataset: multi-turn replay (same as the multiturn sibling — at BS=16 with
+#          KV reuse, prefix sharing dominates host cache hit rate)
+#
+# Invocation:
+#   # Baseline:
+#   TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=1 TLLM_TOKENSPEED_MLA=0 \
+#       trtllm-bench --model nvidia/Kimi-K2-Thinking-NVFP4 \
+#           throughput --dataset multiturn_replay_64.jsonl \
+#           --extra_llm_api_options bench-60k1k_tp8_conc16_mtp3_cpukvoffload.yml \
+#           --concurrency 16
+#
+#   # TokenSpeed variant:
+#   TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=1 TLLM_TOKENSPEED_MLA=1 \
+#       trtllm-bench --model nvidia/Kimi-K2-Thinking-NVFP4 \
+#           throughput --dataset multiturn_replay_64.jsonl \
+#           --extra_llm_api_options bench-60k1k_tp8_conc16_mtp3_cpukvoffload.yml \
+#           --concurrency 16
+
+max_batch_size: 32          # conc=16 × MTP=3 burst + CUDA graph pad
+max_num_tokens: 16384       # one 16k prefill chunk; ISL=60k → 4 chunks
+max_seq_len: 61952
+
+tensor_parallel_size: 8
+moe_expert_parallel_size: 8
+# AttentionDP intentionally OFF — held constant across the grid for
+# kernel-clean A/B.
+
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 32
+
+kv_cache_config:
+  dtype: fp8
+  free_gpu_memory_fraction: 0.7      # Down from 0.75; leave room for offload
+                                     # to actually engage.
+  host_cache_size: 68719476736       # 64 GiB host pool per rank. THE
+                                     # experimental dial. See header risk
+                                     # 10 for sizing guidance.
+  enable_block_reuse: true           # Multi-turn dataset needs reuse + host
+  enable_partial_reuse: true         # offload to actually pay off.
+
+moe_config:
+  backend: TRTLLM
+
+speculative_config:
+  decoding_type: MTP
+  max_draft_len: 3
+
+stream_interval: 10
+print_iter_log: true                 # Use this to verify host cache hit rate
+                                     # and offload eviction stats > 0 (note 12).
+trust_remote_code: true
