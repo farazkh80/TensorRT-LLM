@@ -135,7 +135,9 @@ RuntimeError: Failed to preprocess kernel
 
 Same family of kernel fails for `QkvE4m3O...` (FP8 input) and `QkvBfloat16O...` (BF16 input), and the TP8 variant fails on a different cubin name (`...HVPerCta128...VarSeqQ8Kv128...`) but with the same "expected a type specifier" error class.
 
-This is an upstream bug independent of TokenSpeed. It needs to be filed separately. Reference comparison points until the bug is fixed:
+Root cause (from log lines 183 / 333 / 3046 / 5629 / 5631 / 5635 / 5637): NVRTC cannot resolve `trtllm::dev::CutlassUmmaConsumerAsyncPipeline<1, false, false, false>` — both the class type and its nested `::SharedStorage` / `::PipelineState`. The class is defined at `cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/trtllmGen_fmha_export/trtllm/dev/CutlassPipeline.h:1467`, so the likely cause is either a missing Jitify include or a CUTLASS-version mismatch on the underlying `cutlass::PipelineUmmaConsumerAsync<NumStages, AtomThrShapeMNK>` alias.
+
+This is an upstream bug independent of TokenSpeed. Paste-ready NVBugs draft (manual submit — NVBugs MCP does not support bug creation): `.claude_docs/tokenspeed-kimik25/nvbug-draft-nvrtc-baseline.md`. Reference comparison points until the bug is fixed:
 
 - DSV3-Lite spike step 7 (rc14, `TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=1` Python path): TokenSpeed = ~+10% over FlashInfer/trtllm-gen MLA decode at q_len=1.
 - Same spike step 5: parity FAIL on `bs8_qlen4_spec` (max abs 0.33, max rel ~1166×). Independent of integration path; gates default-on production until Albert weighs in.
@@ -200,7 +202,7 @@ Per-config logs at:
 
 ## Recommended next steps (in priority order)
 
-1. **File the upstream NVRTC bug.** `fmhaSm103aKernel_...HQk576HV512...ForGen` family (multiple Qkv dtype variants) fails to JIT-compile under NVRTC in current main on sm_103a with the container's NVRTC toolchain. Once that's fixed, re-run the four configs above with the baseline arm enabled to get the ratio TokenSpeed/baseline.
+1. **File the upstream NVRTC bug.** `fmhaSm103aKernel_...HQk576HV512...ForGen` family (multiple Qkv dtype variants) fails to JIT-compile under NVRTC in current main on sm_103a with the container's NVRTC toolchain. Paste-ready NVBugs draft at `.claude_docs/tokenspeed-kimik25/nvbug-draft-nvrtc-baseline.md` — submit manually (NVBugs MCP does not support bug creation). Once that's fixed, re-run the four configs above with the baseline arm enabled to get the ratio TokenSpeed/baseline.
 2. **Land the backend class as a feature-branch PR.** Three small files plus an utils.py entry; the implementation is in `tensorrt_llm/_torch/attention_backend/tokenspeed_mla{,_attention}.py`. Caveats above belong in the PR description (single sentence each).
 3. **Spec-decode parity (Albert Di).** Even on K2.6 without MTP weights, the parity gate from the DSV3-Lite spike (max abs 0.33, max rel ~1166× on `bs8 q_len=4`) is the hard go/no-go for production default-on. Surface those numbers in the same review.
 4. **TTFT.** Add a streaming variant of `minimal_bench.py` to capture TTFT and complete the per-user latency picture for customers.
