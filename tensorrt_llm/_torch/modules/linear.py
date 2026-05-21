@@ -31,7 +31,7 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
 from ..utils import (Fp4QuantizedTensor, _b12x_w4a16_enabled,
-                     get_model_extra_attrs,
+                     _b12x_w4a16_min_m, get_model_extra_attrs,
                      replace_parameter_and_save_metadata, unswizzle_sf)
 
 
@@ -135,6 +135,17 @@ def _maybe_apply_b12x_w4a16(module, input, bias, original_shape):
     n = module.weight.shape[0]
     k = module.weight.shape[1] * 2
     m = input.shape[0]
+
+    # M-dispatch: skip b12x for small M (decode at small batch). Per Spark
+    # nsys cross-compare (.claude_docs/w4a16-b12x-e2e/reports/
+    # step-nsys-cross-compare.md), the b12x DSL dense kernel is ~3x slower
+    # per call at M=1 than trtllm's nvfp4_gemm fallback. b12x's prefill
+    # kernel (M ≥ ~1024) is competitive — keep it there. Threshold is
+    # configurable via B12X_DENSE_W4A16_MIN_M (default 16); set to 0/1 to
+    # always use b12x (old behavior).
+    if m < _b12x_w4a16_min_m():
+        return None
+
     if k % 64 != 0 or n % 64 != 0 or not _B12X_MICRO_CLS.is_supported(m, k, n):
         return None
 

@@ -467,6 +467,38 @@ def _b12x_w4a16_enabled() -> bool:
     return os.environ.get("B12X_DENSE_W4A16", "0") == "1"
 
 
+def _b12x_w4a16_min_m() -> int:
+    """Minimum M at which the b12x W4A16 dense kernel is preferred.
+
+    For M smaller than this threshold (i.e. decode at small batch),
+    ``_maybe_apply_b12x_w4a16`` returns ``None`` and the caller falls
+    back to the standard NVFP4 GEMM path. Per the Spark nsys
+    cross-compare (.claude_docs/w4a16-b12x-e2e/reports/
+    step-nsys-cross-compare.md), the b12x DSL dense kernel is ~3x
+    slower per call at M=1 than trtllm's M=1-optimized
+    ``cuda_core_gemm_nvfp4::cudaCoreGemmFp4`` and pamela's
+    ``cuda_core_gemm_w4a16_nvfp4::cudaCoreGemm``, while at large M
+    (prefill) it is competitive with dequant+BF16-CUTLASS.
+
+    Default 16 — gates out M=1 / small-batch decode but lets prefill
+    (M≥1024) and bench/serve at moderate concurrency keep using b12x.
+    Set to 0 or 1 to disable the gate (always use b12x — old behavior).
+
+    Note: the small-M fallback path is ``torch.ops.trtllm.nvfp4_gemm``
+    which quantizes activations to FP4 (W4A4). At M<threshold the
+    W4A16 activation contract is therefore relaxed to W4A4 for that
+    Linear call only — matching trtllm baseline numerics at decode.
+    Full-W4A16-at-M=1 requires a dedicated M=1 BF16-activation kernel
+    (e.g. pamela's ``cuda_core_gemm_w4a16_nvfp4::cudaCoreGemm``); when
+    that lands in this branch, raise the default threshold accordingly.
+    """
+    import os
+    try:
+        return int(os.environ.get("B12X_DENSE_W4A16_MIN_M", "16"))
+    except ValueError:
+        return 16
+
+
 def tensor_to_str(x: torch.Tensor, num_elements: int = 10) -> str:
     # Pass num_elements=-1 will print the whole tensor
     if num_elements < 0:
