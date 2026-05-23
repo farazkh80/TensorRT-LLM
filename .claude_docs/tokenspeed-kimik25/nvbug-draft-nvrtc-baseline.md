@@ -1,5 +1,22 @@
 # NVBugs draft — TRT-LLM MLA decode NVRTC compilation failure on sm_103a (B300)
 
+> **STATUS (2026-05-20): FIXED UPSTREAM, draft archived — do not file.**
+>
+> Resolved by upstream PR #14291 (`a173761069 [None][feat] Update the logic
+> of FMHA JIT path`) which moved `CutlassUmmaConsumerAsyncPipeline` from
+> `namespace cutlass` to `namespace trtllm::dev` and refreshed the cubin
+> archives to match. After rebasing onto `upstream/main@f278c4f170` and
+> rebuilding `libtensorrt_llm.so`, the TRTLLM baseline arm runs
+> end-to-end on K2.6 (TP4 1k/1k conc=1, 148.6 tok/s aggregate, 6.73 ms/tok
+> ITL — no NVRTC failure). Confirms root-cause hypothesis #3 below. See
+> `nvrtc-rebase-verify.md` for the verification run.
+>
+> The rest of this file is kept as triage history — the root-cause
+> analysis and three-hypothesis ranking remain instructive but the bug
+> itself no longer needs filing.
+
+---
+
 This is a paste-ready NVBugs draft. Field mapping follows the standard NVBugs web-form layout.
 
 ---
