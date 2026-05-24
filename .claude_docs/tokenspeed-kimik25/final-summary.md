@@ -15,6 +15,15 @@ default-on**. If the algorithmic idea (`fold_sq_factor` BMM1 reformulation)
 is worth keeping, absorb it into TRT-LLM's fused FMHA kernel via DKG
 MR 21023 patterns — don't take the TokenSpeed package.
 
+**Kernel-level update (2026-05-24, Phase 5 nsys TP=4 with
+`--cuda-graph-trace=node`):** TS's MLA-decode kernel IS measurably
+faster per call (~12.7% per-call, ~9.1% on attention total wall on a
+TP=4 num_req=4 sample). The end-to-end loss is from acceptance-length
+volatility larger than the kernel saving, not from a slow kernel. The
+algorithmic case for absorbing `fold_sq_factor` into the fused FMHA
+path is therefore strengthened. See
+`phase5-k25-eagle3-nsys-tp4-graphnode.md`.
+
 ## Result grid
 
 | Phase | Model | Regime | TP | Bench | TS Δ throughput | Caveat |
@@ -25,6 +34,7 @@ MR 21023 patterns — don't take the TokenSpeed package.
 | Phase 4 | K2.6 NVFP4 | `q_len_per_req=1` (no MTP) | 4 | 1k/1k conc=16, 256 reqs | **+0.6% (tied)** | clean |
 | Phase 5 | K2.5 NVFP4 | `q_len_per_req=4` (EAGLE-3 mtp=3) | 4 | 1k/1k conc=2, 32 reqs | **+4.2%** | acceptance-rate confound (+6.7% AL gap) |
 | Phase 5 | K2.5 NVFP4 | `q_len_per_req=4` (EAGLE-3 mtp=3) | 8 | 1k/1k conc=2, 4 reqs (nsys) | **−15.6%** | acceptance gap collapsed to +1.3% |
+| Phase 5 nsys TP=4 graph-trace=node | K2.5 NVFP4 | `q_len_per_req=4` (EAGLE-3 mtp=3) | 4 | 1k/1k conc=2, 4 reqs | **−3.6%** | AL flipped to **−9.4%**; **TS attn kernel −12.7%/call, −9.1% on attn total wall** |
 
 **The headline TokenSpeed "+10% decode-latency / ~9% min-latency
 bs=1 / ~11% throughput at ~100 TPS/user" claims do not reproduce on
@@ -57,13 +67,16 @@ and graph-related API queries on both arms' traces:
 |---|---|---|
 | TS has more launch overhead | **REFUTED** | TS spends 43 sec LESS on `cudaLaunchKernel*` across whole trace |
 | TS falls out of CUDA graph capture | **REFUTED** | Both arms have exactly 48,340 `cudaGraphLaunch` instances |
-| TS's MLA-decode kernel is slower per call | **INCONCLUSIVE** | The 918 visible MLA-decode invocations per rank are non-graph (warmup/autotuner only); timed-run kernels are inside the captured graphs and not individually visible in this trace |
+| TS's MLA-decode kernel is slower per call | **REFUTED (Phase 5 nsys TP=4 graph-trace=node)** | With graph-trace=node exposing per-kernel timings: TS attention is **−12.7% per call** (13.40 µs vs 15.34 µs) and **−9.1% on attention total wall** (4.12 vs 4.53 s); TS does ~4-5% more attn calls due to more forward steps from worse AL in this sample |
 | TS has more GPU idle time during timed run | **PLAUSIBLE** | TS's faster kernels in isolation unbalance the compute/comm overlap pattern; allreduce kernels show 2.27× different per-call durations between arms (`ar_fusion_kernel<pattern=0>`: base 36.99 ms/call vs ts 16.30 ms/call) — consistent with base hiding allreduce behind longer compute, TS exposing it |
 
-To definitively measure timed-run kernel time, would need to re-run
-nsys with `--cuda-graph-trace=node` (unfolds graph-captured kernels
-into individual events). Not worth the ~1 hour re-run given the
-end-to-end verdict is already clear.
+The TP=4 nsys run with `--cuda-graph-trace=node` (added 2026-05-24)
+resolves the previous INCONCLUSIVE entry: **TokenSpeed's MLA-decode
+kernel IS faster per call**, by ~12.7%. The end-to-end product still
+isn't a win because the kernel saving (~5% of total wall, ~0.4 s on
+this 8-9 s run) is smaller than AL variance from EAGLE-3 verifier
+outcomes (±10% sample-to-sample at small N). See
+`phase5-k25-eagle3-nsys-tp4-graphnode.md` for the full per-kernel diff.
 
 ## Cross-phase findings that hold up
 
@@ -121,6 +134,7 @@ end-to-end verdict is already clear.
 ├── phase5-plan.md                ← Phase 5 plan (K2.5 EAGLE-3 setup)
 ├── phase5-k25-eagle3.md          ← Phase 5 perf-only K2.5 EAGLE-3 mtp=3 TP=4 — main K2.5 result
 ├── phase5-k25-eagle3-nsys.md     ← Phase 5 nsys A/B + kernel/graph hypothesis testing
+├── phase5-k25-eagle3-nsys-tp4-graphnode.md  ← Phase 5 nsys TP=4 + cuda-graph-trace=node — per-kernel A/B
 │
 ├── bench-config.yml                ← K2.6 TP4 1k/1k conc=1
 ├── bench-config_base.yml           ← K2.6 TP4 1k/1k conc=1 (TRTLLM sidecar)
@@ -154,4 +168,5 @@ Runtime artifacts (~30 GB total):
 | Phase 4 (K2.6) | Rebuilt rebased TRT-LLM + 4-config A/B | TS −3 to −7% at conc=1, tied at conc=16 | done |
 | Phase 5 perf | K2.5 NVFP4 + EAGLE-3 mtp=3 TP=4 | TS +4.2% (acceptance confound, not kernel) | done |
 | Phase 5 nsys | K2.5 EAGLE-3 mtp=3 TP=8, pure-kernel A/B | TS −15.6% when AL gap collapses; launch overhead + CUDA graphs are NOT the cause; timed-run kernel-level attribution requires `--cuda-graph-trace=node` | done (verdict clear despite per-kernel inconclusive) |
+| Phase 5 nsys TP=4 graph-trace=node | K2.5 EAGLE-3 mtp=3 TP=4, per-kernel A/B | **TS attn kernel −12.7% per call** (13.40 vs 15.34 µs); **−9.1% on attn total wall** (4.12 vs 4.53 s). End-to-end −3.6% because AL=−9.4% (this sample's AL swung the opposite direction vs num_req=32). Absorb-path GEMM time tied (+1.2%). Trace-total GPU time +5.9% (warmup + more forward steps). | done — confirms kernel-level TS advantage exists but is too small to survive AL noise |
 | Phase 5 output check | (not run, deferred per user) | open question on TS kernel output quality | OPEN |
