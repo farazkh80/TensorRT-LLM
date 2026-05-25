@@ -1581,6 +1581,31 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
         model_config.pretrained_config = self.llm.config
         model_config._frozen = True
 
+    # Forward speculative-decoding attrs from the wrapped DSV3 LLM.
+    # tensorrt_llm/_torch/pyexecutor/model_loader.py:455-471 accesses
+    # model.draft_config / draft_model / load_draft_weights / model.model /
+    # model.lm_head on the top-level model. SpecDecOneEngineForCausalLM
+    # sets these on self.llm during DSV3 init; expose them here via
+    # read-only properties to avoid double-registering submodules.
+    @property
+    def draft_config(self):
+        return self.llm.draft_config
+
+    @property
+    def draft_model(self):
+        return self.llm.draft_model
+
+    @property
+    def lm_head(self):
+        return self.llm.lm_head
+
+    @property
+    def model(self):
+        return self.llm.model
+
+    def load_draft_weights(self, weights, weight_mapper):
+        return self.llm.load_draft_weights(weights, weight_mapper)
+
     @property
     def multimodal_data_device_paths(self) -> List[str]:
         return [
@@ -1678,10 +1703,16 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
             **fuse_kwargs,
         )
 
+        # Forward spec_metadata / resource_manager / other kwargs through
+        # to the DSV3 LLM. Required for speculative-decoding (EAGLE-3/MTP)
+        # where SpecDecOneEngineForCausalLM.forward needs spec_metadata to
+        # gather hidden states (see modeling_speculative.py:1740).
+        fuse_kwargs.pop("multimodal_params", None)
         return self.llm.forward(
             attn_metadata,
             input_ids,
             position_ids,
             inputs_embeds,
             return_context_logits,
+            **fuse_kwargs,
         )

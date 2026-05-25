@@ -24,6 +24,15 @@ def get_attention_backend(
         if sparse_attn_config is not None:
             return get_trtllm_sparse_attn_attention_backend(sparse_attn_config)
         return TrtllmAttention
+    elif backend_name == "TOKENSPEED_MLA":
+        # TokenSpeed MLA subclass of TrtllmAttention; only overrides
+        # `_run` for the MLA-decode-generation-only branch. Sparse-attn
+        # config is intentionally not forwarded — the TokenSpeed kernel
+        # does not support sparse attention; fall through to base.
+        if sparse_attn_config is not None:
+            return get_trtllm_sparse_attn_attention_backend(sparse_attn_config)
+        from .tokenspeed_mla_attention import TokenSpeedMLAAttention
+        return TokenSpeedMLAAttention
     elif backend_name == "FLASHINFER" and IS_FLASHINFER_AVAILABLE:
         from .flashinfer import FlashInferAttention
         if sparse_attn_config is not None:

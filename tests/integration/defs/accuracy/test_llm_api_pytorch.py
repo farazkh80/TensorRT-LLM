@@ -4300,6 +4300,54 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
             task = GSM8K(model_name)
             task.evaluate(llm)
 
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(120000)
+    @parametrize_with_ids("attn_backend", ["TRTLLM", "TOKENSPEED_MLA"])
+    def test_eagle3_nvfp4_bf16kv_4gpus(self, attn_backend):
+        """K2.5 NVFP4 (BF16 KV) + EAGLE-3 mtp=3 GSM8K A/B across attention backends.
+
+        Compares TRTLLM (reference fmhaSm103a) vs TOKENSPEED_MLA (TokenSpeed
+        split_kv + reduction) for output quality. Phase 6 measured a systematic
+        +12-26% AL gain in the TOKENSPEED_MLA arm at bs=1; this test answers
+        whether that gain is a real win or a quality artifact from TS's
+        numerical divergence (max abs 0.33, max rel ~1166x). If both arms
+        produce equal GSM8K accuracy, the throughput win is real; if TS
+        accuracy drops, the AL gain is a verifier-leniency artifact.
+
+        Uses the BF16-KV variant of K2.5 NVFP4: TS asserts kv.dtype == q.dtype,
+        so the standard FP8-KV K2.5 checkpoint is not compatible. Expected
+        layout: ``${LLM_MODELS_ROOT}/Kimi-K2.5-NVFP4-BF16KV``.
+
+        See ``.claude_docs/tokenspeed-kimik25/phase6-minlat-bs1.md`` for the
+        Phase 6 AL measurements that motivate this test.
+        """
+        model_name = "moonshotai/Kimi-K2.5"
+        model_path = f"{llm_models_root()}/Kimi-K2.5-NVFP4-BF16KV"
+        eagle_model_dir = f"{llm_models_root()}/Kimi-K2.5-Thinking-Eagle3"
+
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=0.85,
+            enable_block_reuse=False,
+        )
+
+        spec_config = Eagle3DecodingConfig(
+            max_draft_len=3,
+            speculative_model_dir=eagle_model_dir,
+        )
+
+        with LLM(model_path,
+                 tensor_parallel_size=4,
+                 moe_expert_parallel_size=4,
+                 max_batch_size=2,
+                 pipeline_parallel_size=1,
+                 kv_cache_config=kv_cache_config,
+                 trust_remote_code=True,
+                 attn_backend=attn_backend,
+                 speculative_config=spec_config) as llm:
+            task = GSM8K(model_name)
+            task.evaluate(llm)
+
 
 class TestMinitron4BBaseInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-Mini-4B-Instruct"
