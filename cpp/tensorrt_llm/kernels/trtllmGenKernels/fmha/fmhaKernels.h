@@ -230,6 +230,80 @@ public:
             && options.mDtypeKv != tg::Dtype::E2m1;
     }
 
+    // Prototype (TRTLLM-12510, fold_sq_factor absorption): for Kimi-style MLA
+    // generation with q_len > 1 and a small effective Q-side M, fold the
+    // (q_len * num_heads_q) dimension into the BMM1 M dimension by enabling
+    // mGroupsTokensHeadsQ. Cubins for MLA gen are exported with this flag
+    // false, so the override is restricted to the NVRTC code path which can
+    // jit a kernel with the requested option set. Gated by the env var
+    // TRTLLM_FMHA_MLA_GEN_FOLD_TOKENS_HEADS to keep production paths intact.
+    static bool maybeEnableMlaGenFoldTokensHeads(FmhaOptions& options, RunnerParams const& params)
+    {
+        if (!options.mIsMlaGen)
+        {
+            return false;
+        }
+        if (!shouldUseNvrtc(options))
+        {
+            return false;
+        }
+        if (!tensorrt_llm::common::getBoolEnv("TRTLLM_FMHA_MLA_GEN_FOLD_TOKENS_HEADS"))
+        {
+            return false;
+        }
+        // Gate to Kimi-style MLA dims only — these are the dims the prototype
+        // has been reasoned about and where existing MLA cubins land.
+        if (options.mHeadDimQk != 576 || options.mHeadDimV != 512)
+        {
+            return false;
+        }
+        // Only useful when q_len > 1 (e.g. spec decoding); q_len=1 has nothing
+        // to fold along the token axis.
+        if (params.mMaxSeqLenQ <= 1)
+        {
+            return false;
+        }
+        // Effective Q-side M = batchSize * q_len * numHeadsQ. The fold is
+        // only a win in the small-M regime; above the gate the upstream
+        // tile selection is already saturating tensor cores.
+        int64_t effectiveM = static_cast<int64_t>(params.mBatchSize)
+            * static_cast<int64_t>(params.mMaxSeqLenQ) * static_cast<int64_t>(options.mNumHeadsQ);
+        if (effectiveM > 128)
+        {
+            return false;
+        }
+        options.mGroupsTokensHeadsQ = true;
+
+        // Second-stage override: also bump mTileSizeQ to force the autotuner's
+        // Q16 choice up to a tile where the fold actually does work. With
+        // numGroupedHeads = mNumHeadsQ (e.g. 16 at TP=4), numTokensPerCtaQ =
+        // tileSizeQ / numGroupedHeads. Set TRTLLM_FMHA_MLA_GEN_FOLD_TILE_Q=64
+        // to pack all q_len=4 tokens into one CTA along the M axis.
+        // Gated separately so the two effects can be A/B'd independently.
+        auto foldTileQEnv = tensorrt_llm::common::getIntEnv("TRTLLM_FMHA_MLA_GEN_FOLD_TILE_Q");
+        if (foldTileQEnv.has_value() && foldTileQEnv.value() > 0)
+        {
+            int32_t requestedTileQ = foldTileQEnv.value();
+            int32_t prevTileQ = options.mTileSizeQ;
+            int32_t prevNumInstsQ = options.mNumInstsQ;
+            options.mTileSizeQ = requestedTileQ;
+            options.mNumInstsQ = 1;
+            TLLM_LOG_INFO(
+                "FMHA MLA-gen mGroupsTokensHeadsQ prototype: tile override "
+                "tileSizeQ %d->%d, numInstsQ %d->1 "
+                "(numTokensPerCtaQ = tileSizeQ/numGroupedHeads = %d)",
+                prevTileQ, requestedTileQ, prevNumInstsQ,
+                options.mNumHeadsQ > 0 ? (requestedTileQ / options.mNumHeadsQ) : -1);
+        }
+
+        TLLM_LOG_INFO(
+            "FMHA MLA-gen mGroupsTokensHeadsQ prototype enabled "
+            "(bs=%d, q_len=%d, numHeadsQ=%d, effectiveM=%lld, tileSizeQ=%d)",
+            params.mBatchSize, params.mMaxSeqLenQ, options.mNumHeadsQ,
+            static_cast<long long>(effectiveM), options.mTileSizeQ);
+        return true;
+    }
+
     std::pair<bool, std::string> checkIfKernelExist(RunnerParams const& params) const
     {
         // Some conditions to check if the kernel is supported.
@@ -256,6 +330,11 @@ public:
 
         FmhaAutoTuner autoTuner(options, optionsFromArgs, params.mMultiProcessorCount);
         std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
+
+        // Prototype: optionally enable mGroupsTokensHeadsQ for MLA generation
+        // (NVRTC path only). Must run before checkFmhaOptions so the relaxed
+        // FmhaOptions guard sees the flipped flag.
+        maybeEnableMlaGenFoldTokensHeads(options, params);
 
         // Check if the options are valid or not.
         checkFmhaOptions(options, optionsFromArgs);
@@ -312,6 +391,11 @@ public:
 
         FmhaAutoTuner autoTuner(options, optionsFromArgs, params.mMultiProcessorCount);
         std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
+
+        // Prototype: optionally enable mGroupsTokensHeadsQ for MLA generation
+        // (NVRTC path only). Must run before checkFmhaOptions so the relaxed
+        // FmhaOptions guard sees the flipped flag.
+        maybeEnableMlaGenFoldTokensHeads(options, params);
 
         // Check if the options are valid or not.
         checkFmhaOptions(options, optionsFromArgs);

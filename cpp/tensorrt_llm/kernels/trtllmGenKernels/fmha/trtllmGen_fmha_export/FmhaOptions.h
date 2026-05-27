@@ -488,8 +488,15 @@ inline void checkFmhaOptions(FmhaOptions const& options,
   if (options.mGroupsTokensHeadsQ) {
     TLLM_CHECK_ERROR(!isContextKernel(options.mFmhaKernelType),
                      "mGroupsTokensHeadsQ should only be enabled for generation kernels.");
-    TLLM_CHECK_ERROR(!options.mIsMlaGen,
-                     "MLA gen kernels haven't supported mGroupsTokensHeadsQ yet.");
+    // Prototype (TRTLLM-12510, fold_sq_factor absorption): allow MLA gen kernels
+    // with mGroupsTokensHeadsQ when running Kimi-style MLA (HQk=576, HV=512).
+    // Enabled by the runtime via TRTLLM_FMHA_MLA_GEN_FOLD_TOKENS_HEADS only when
+    // the NVRTC path is taken (cubins for MLA gen are exported with this flag
+    // false; cubin-path enablement requires DKG support).
+    TLLM_CHECK_ERROR(!options.mIsMlaGen
+                       || (options.mHeadDimQk == 576 && options.mHeadDimV == 512),
+                     "MLA gen kernels with mGroupsTokensHeadsQ prototype only "
+                     "supports HQk=576 / HV=512 (Kimi-style).");
   }
 
 
