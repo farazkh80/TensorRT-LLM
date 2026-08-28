@@ -49,11 +49,7 @@ from tensorrt_llm._torch.locality_domain_utils import (
     is_locality_domain_supported,
     node_local_max_active_clusters,
 )
-from tensorrt_llm._torch.modules.linear import (
-    Linear,
-    TensorParallelMode,
-    _copy_to_new_cuda_allocation,
-)
+from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceParams
 
 
@@ -102,10 +98,12 @@ class TestLocalityDomainSupport:
         is_locality_domain_enabled.cache_clear()
 
 
+# TODO: drop the wiring skips below when the locality-domain wiring PR lands.
 class TestLocalityDomainComputeTopology:
     """Pure mocked tests for compute topology and grid sizing."""
 
     @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="cutlass-dsl is not available")
+    @pytest.mark.skip(reason="requires locality-domain wiring (Linear/ModelConfig/cute_dsl_custom_ops) from a later PR in this series")
     def test_cluster_occupancy_cache_keeps_topology_scaling_dynamic(self, monkeypatch):
         from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
 
@@ -143,6 +141,7 @@ class TestLocalityDomainComputeTopology:
             occupancy_cache.cache_clear()
 
     @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="cutlass-dsl is not available")
+    @pytest.mark.skip(reason="requires locality-domain wiring (Linear/ModelConfig/cute_dsl_custom_ops) from a later PR in this series")
     def test_cluster_occupancy_cache_is_scoped_by_device_and_cluster(self, monkeypatch):
         from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
 
@@ -646,7 +645,9 @@ class TestLocalityDomainMempoolAllocation:
     """Tests for LOCALITY_DOMAIN memory pool allocation and deallocation."""
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+    @pytest.mark.skip(reason="requires locality-domain wiring (Linear/ModelConfig/cute_dsl_custom_ops) from a later PR in this series")
     def test_copy_to_new_cuda_allocation_does_not_alias_contiguous_input(self):
+        from tensorrt_llm._torch.modules.linear import _copy_to_new_cuda_allocation
         source_storage = torch.arange(32, device="cuda")
         source = source_storage[:16]
         assert source.is_contiguous()

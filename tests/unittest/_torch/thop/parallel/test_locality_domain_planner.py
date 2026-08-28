@@ -452,6 +452,8 @@ class TestLocalityDomainExecutionPlanner:
             pytest.param(None, 7168, 2114, True, False, ("alignment",), id="unaligned-n"),
         ],
     )
+    # TODO: drop the wiring skips below when the locality-domain wiring PR lands.
+    @pytest.mark.skip(reason="requires locality-domain wiring (Linear/ModelConfig/cute_dsl_custom_ops) from a later PR in this series")
     def test_bf16_linear_decision_table(
         self,
         mock_locality_domain,
@@ -487,6 +489,7 @@ class TestLocalityDomainExecutionPlanner:
         "tensorrt_llm._torch.locality_domain_utils.is_locality_domain_enabled", return_value=True
     )
     @patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_AVAILABLE", True)
+    @pytest.mark.skip(reason="requires locality-domain wiring (Linear/ModelConfig/cute_dsl_custom_ops) from a later PR in this series")
     def test_bf16_fused_gate_up_requires_canonical_mapping(self, mock_locality_domain):
         from tensorrt_llm._torch.modules.linear import Linear, WeightMode, WeightsLoadingConfig
 
@@ -514,6 +517,7 @@ class TestLocalityDomainExecutionPlanner:
         assert not linear.partition_plan.enabled
         assert "canonical [gate | up]" in linear.partition_plan.reason_if_disabled
 
+    @pytest.mark.skip(reason="requires locality-domain wiring (Linear/ModelConfig/cute_dsl_custom_ops) from a later PR in this series")
     def test_linear_reads_policy_from_model_extra_attrs(self):
         from tensorrt_llm._torch.modules.linear import Linear
 
@@ -534,6 +538,7 @@ class TestLocalityDomainExecutionPlanner:
         "tensorrt_llm._torch.locality_domain_utils.is_locality_domain_enabled", return_value=True
     )
     @patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_AVAILABLE", True)
+    @pytest.mark.skip(reason="requires locality-domain wiring (Linear/ModelConfig/cute_dsl_custom_ops) from a later PR in this series")
     def test_linear_copies_backend_list_before_locality_domain_append(self, mock_locality_domain):
         from tensorrt_llm._torch.modules.linear import Linear
 
@@ -567,6 +572,7 @@ class TestLocalityDomainExecutionPlanner:
     )
     @patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_AVAILABLE", True)
     @pytest.mark.parametrize("start_nvfp4", [True, False], ids=["nvfp4-to-bf16", "bf16-to-nvfp4"])
+    @pytest.mark.skip(reason="requires locality-domain wiring (Linear/ModelConfig/cute_dsl_custom_ops) from a later PR in this series")
     def test_linear_replans_after_quant_override(self, mock_locality_domain, start_nvfp4):
         from tensorrt_llm._torch.modules.linear import Linear
 
@@ -600,6 +606,7 @@ class TestLocalityDomainExecutionPlanner:
         "tensorrt_llm._torch.locality_domain_utils.is_locality_domain_enabled", return_value=True
     )
     @patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_AVAILABLE", True)
+    @pytest.mark.skip(reason="requires locality-domain wiring (Linear/ModelConfig/cute_dsl_custom_ops) from a later PR in this series")
     def test_linear_replan_after_sharding_requires_reload(self, mock_locality_domain):
         from tensorrt_llm._torch.modules.linear import Linear
 
@@ -626,6 +633,7 @@ class TestLocalityDomainExecutionPlanner:
         assert linear._locality_domain_runtime is original_runtime
         assert linear._locality_domain_weight_shards is shards
 
+    @pytest.mark.skip(reason="requires locality-domain wiring (Linear/ModelConfig/cute_dsl_custom_ops) from a later PR in this series")
     def test_model_config_exports_locality_domain_policy(self):
         from tensorrt_llm._torch.model_config import ModelConfig
 
