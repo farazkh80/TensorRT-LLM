@@ -33,6 +33,7 @@ from ...distributed import AllReduce, AllReduceStrategy
 from ...model_config import ModelConfig
 from ...pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ...utils import get_model_extra_attrs
+from ..fine_grained_sync import active_stream_manager, get_stream_manager, maybe_stage
 from ..linear import Linear
 from ..mamba.causal_conv1d import causal_conv1d_fn
 from ..mamba.fuse_elementwise_ops import extract_transpose_prefill_slice
@@ -445,6 +446,15 @@ class KimiKDALinearAttention(nn.Module):
             )
             maybe_bcg_kda_core_inplace(hidden_states, self.layer_idx_str, core)
         else:
+            fgs = get_stream_manager()
+            # Only prefill is staged; decode and verify keep the stock schedule.
+            if fgs is not None and attn_metadata.num_contexts == attn_metadata.seq_lens.shape[0]:
+                with fgs.region():
+                    core = self._forward_impl(hidden_states, attn_metadata)
+                    with fgs.stage("kda.o_proj", after=("kda.output_gate",)):
+                        out = self._project_output(core)
+                    fgs.keep(core, out)
+                return out
             core = self._forward_impl(hidden_states, attn_metadata)
 
         return self._project_output(core)
@@ -668,8 +678,13 @@ class KimiKDALinearAttention(nn.Module):
         from einops import rearrange
 
         x = x2d.unsqueeze(0)  # [1, T, hidden]
+        fgs = active_stream_manager()
 
-        packed_conv, onorm_g = self._project_packed_conv_input(x, x2d)
+        with maybe_stage(fgs, "kda.qkvg_proj"):
+            packed_conv, onorm_g = self._project_packed_conv_input(x, x2d)
+        if fgs is not None:
+            # A token-major projection is replaced by the convolution's new output.
+            fgs.keep(packed_conv)
 
         # Initial states: present for continuation chunks (chunked prefill)
         # and for prefix-cache hits (block reuse), where the previous
@@ -717,70 +732,78 @@ class KimiKDALinearAttention(nn.Module):
         # place on channel-major input and returns a new token-major tensor
         # for a transposed view.
         assert self._packed_conv_weight is not None
-        packed_conv = causal_conv1d_fn(
-            packed_conv,
-            self._packed_conv_weight,
-            query_start_loc=mamba_metadata.query_start_loc[: num_prefills + 1],
-            cache_indices=mamba_metadata.state_indices[:num_prefills],
-            has_initial_state=has_init,
-            conv_states=conv_pool,
-            activation="silu",
-        )
+        with maybe_stage(fgs, "kda.conv1d", after=("kda.qkvg_proj",)):
+            packed_conv = causal_conv1d_fn(
+                packed_conv,
+                self._packed_conv_weight,
+                query_start_loc=mamba_metadata.query_start_loc[: num_prefills + 1],
+                cache_indices=mamba_metadata.state_indices[:num_prefills],
+                has_initial_state=has_init,
+                conv_states=conv_pool,
+                activation="silu",
+            )
 
-        if self._bfa_proj_weight is not None:
-            beta, g, onorm_lowrank = self._project_gate_inputs(x)
-            beta = beta.float()
-            if onorm_g is None:
-                onorm_g = onorm_lowrank
-        else:
-            g = self.f_b_proj(self.f_a_proj(x))
-            beta = self.b_proj(x).float()
-        g = rearrange(g, "... (h d) -> ... h d", d=self.head_dim)
+        with maybe_stage(fgs, "kda.gate_proj"):
+            if self._bfa_proj_weight is not None:
+                beta, g, onorm_lowrank = self._project_gate_inputs(x)
+                beta = beta.float()
+                if onorm_g is None:
+                    onorm_g = onorm_lowrank
+            else:
+                g = self.f_b_proj(self.f_a_proj(x))
+                beta = self.b_proj(x).float()
+            g = rearrange(g, "... (h d) -> ... h d", d=self.head_dim)
 
-        q, k, v = fused_kda_post_conv(
-            packed_conv,
-            num_heads=self.num_heads,
-            head_dim=self.head_dim,
-        )
+        with maybe_stage(fgs, "kda.post_conv", after=("kda.conv1d",)):
+            q, k, v = fused_kda_post_conv(
+                packed_conv,
+                num_heads=self.num_heads,
+                head_dim=self.head_dim,
+            )
 
         # The optimized kernel reads and writes the V-first pool directly;
         # the FLA core exchanges batch-dense recurrent states.
         lower_bound = self.gate_lower_bound
-        o, final_state = self._dispatch.prefill_chunk_kda(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            A_log=self.A_log,
-            dt_bias=self.dt_bias,
-            scale=self.head_k_dim**-0.5,
-            initial_state=None if use_indexed_state else recurrent_in,
-            safe_gate=lower_bound is not None,
-            lower_bound=lower_bound,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            state_pool=kernel_pool if use_indexed_state else None,
-            state_indices=kernel_indices if use_indexed_state else None,
-            varlen_is_aligned=varlen_is_aligned,
-            single_sequence_length=single_sequence_length,
-        )
+        with maybe_stage(fgs, "kda.chunk", after=("kda.post_conv", "kda.gate_proj")):
+            o, final_state = self._dispatch.prefill_chunk_kda(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                scale=self.head_k_dim**-0.5,
+                initial_state=None if use_indexed_state else recurrent_in,
+                safe_gate=lower_bound is not None,
+                lower_bound=lower_bound,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+                state_pool=kernel_pool if use_indexed_state else None,
+                state_indices=kernel_indices if use_indexed_state else None,
+                varlen_is_aligned=varlen_is_aligned,
+                single_sequence_length=single_sequence_length,
+            )
 
-        # The packed convolution persisted the live convolution pool in place.
-        if final_state is not None:
-            _writeback_state_rows(ssm_pool, slot_indices_long, final_state)
-        else:
-            assert use_indexed_state
-            if staged_state is not None:
-                _writeback_state_rows(ssm_pool, slot_indices_long, staged_state)
-        # Fused-verify replay caches: seed the committed conv window so the
-        # first verify round convolves the correct history (pending drafts
-        # are zero for a fresh request, so the tail columns are unused).
-        self._sync_kda_replay_conv_window(layer_cache, slot_indices, conv_pool)
+            # The packed convolution persisted the live convolution pool in place.
+            if final_state is not None:
+                _writeback_state_rows(ssm_pool, slot_indices_long, final_state)
+            else:
+                assert use_indexed_state
+                if staged_state is not None:
+                    _writeback_state_rows(ssm_pool, slot_indices_long, staged_state)
+            # Fused-verify replay caches: seed the committed conv window so the
+            # first verify round convolves the correct history (pending drafts
+            # are zero for a fresh request, so the tail columns are unused).
+            self._sync_kda_replay_conv_window(layer_cache, slot_indices, conv_pool)
 
-        core = self._output_gate(x, o, onorm_g)
-        # Can be removed once attention writes the core in place.
-        return self._store_core(core, output)
+        with maybe_stage(fgs, "kda.output_gate", after=("kda.chunk", "kda.qkvg_proj")):
+            core = self._output_gate(x, o, onorm_g)
+            # Can be removed once attention writes the core in place.
+            core = self._store_core(core, output)
+        if fgs is not None:
+            fgs.keep(packed_conv, onorm_g, g, beta, q, k, v, o, core)
+        return core
 
     def forward_decode(
         self,
