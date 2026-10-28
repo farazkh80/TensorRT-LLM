@@ -219,6 +219,7 @@ kv_cache_manager = Runner.create_kv_cache_manager(
     spec_config=spec_config,
     vision_config=args.vision_config,
     use_kv_cache_manager_v2=args.use_kv_cache_manager_v2,
+    scaled_from=args.scaled_from,
 )
 attn_workspace = torch.empty((0,), device="cuda", dtype=torch.int8)
 logger.info("Layer-wise benchmarks: Create KV cache manager  ... Done")

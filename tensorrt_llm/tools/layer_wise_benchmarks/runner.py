@@ -551,19 +551,31 @@ class Runner:
             # (2) MoE: If EP, reduce the number of experts; If TP, reduce head size.
             def load_pretrained_config(*args, **kwargs):
                 pretrained_config = load_pretrained_config_orig(*args, **kwargs)
+                # Multimodal checkpoints (e.g. Kimi K3) keep the decoder fields in text_config.
+                config = getattr(pretrained_config, "text_config", None) or pretrained_config
                 if not mapping.enable_attention_dp:
-                    if hasattr(pretrained_config, "index_n_heads"):
+                    if hasattr(config, "index_n_heads"):
                         raise NotImplementedError("Not support Indexer TP for weak scaling")
-                    pretrained_config.num_attention_heads = (
-                        pretrained_config.num_attention_heads // scaled_from * mapping.tp_size
+                    config.num_attention_heads = (
+                        config.num_attention_heads // scaled_from * mapping.tp_size
                     )
-                    pretrained_config.num_key_value_heads = (
-                        pretrained_config.num_key_value_heads // scaled_from * mapping.tp_size
+                    config.num_key_value_heads = (
+                        config.num_key_value_heads // scaled_from * mapping.tp_size
                     )
+                    linear_attn_config = getattr(config, "linear_attn_config", None)
+                    if linear_attn_config is not None:
+                        linear_attn_config["num_heads"] = (
+                            linear_attn_config["num_heads"] // scaled_from * mapping.tp_size
+                        )
                 if mapping.moe_ep_size != mapping.tp_size:
                     raise NotImplementedError("Not support MoE TP for weak scaling")
-                pretrained_config.n_routed_experts = (
-                    pretrained_config.n_routed_experts // scaled_from * mapping.moe_ep_size
+                experts_attr = (
+                    "n_routed_experts" if hasattr(config, "n_routed_experts") else "num_experts"
+                )
+                setattr(
+                    config,
+                    experts_attr,
+                    getattr(config, experts_attr) // scaled_from * mapping.moe_ep_size,
                 )
                 return pretrained_config
 
@@ -891,9 +903,12 @@ class Runner:
         spec_config: Optional[DecodingBaseConfig] = None,
         vision_config: Optional[str] = None,
         use_kv_cache_manager_v2: bool | Literal["auto"] = "auto",
+        scaled_from: Optional[int] = None,
     ) -> KVCacheManager:
         # Please refer to `tensorrt_llm/_torch/pyexecutor/py_executor_creator.py` for `tokens_per_block`
-        with Runner.vision_config_ctx(vision_config):
+        # Scaled head counts size per-rank recurrent state (e.g. Kimi K3 KDA), so the
+        # cache must see the same scaled config as the model.
+        with Runner.vision_config_ctx(vision_config), Runner.scaled_from_ctx(scaled_from, mapping):
             model_config = ModelConfig.from_pretrained(pretrained_model_name_or_path)
         validate_and_set_kv_cache_quant(model_config, kv_cache_dtype)
         validate_and_set_mamba_ssm_cache_dtype(model_config, mamba_ssm_cache_dtype)

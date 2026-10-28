@@ -88,7 +88,7 @@ import math
 import os
 import threading
 import weakref
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -113,6 +113,7 @@ from ...models.modeling_utils import QuantAlgo, QuantConfig
 from ..attention.backends import AttentionMetadata
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams
 from ..model_config import ModelConfig
+from ..modules.fine_grained_sync import active_stream_manager, get_stream_manager, maybe_stage
 from ..modules.gated_mlp import GatedMLP
 from ..modules.kimi_kda import KimiKDALinearAttention
 from ..modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
@@ -124,6 +125,7 @@ from ..modules.situ import SituAndMul
 from ..moe.fused_moe import ConfigurableMoE, SiTuActivation, TRTLLMGenFusedMoE, create_moe
 from ..moe.fused_moe.interface import MoESchedulerKind
 from ..moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
+from ..pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
 from ..utils import AuxStreamType
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
@@ -1636,29 +1638,31 @@ class KimiK3MoERuntime(nn.Module):
         identity = hidden_states
         projected_input = None
         early_routed_in = None
-        if self._can_fuse_router_down(hidden_states):
-            router_logits, projected_input = torch.ops.trtllm.dsv3_router_latent_gemm_op(
-                hidden_states, self.gate.weight, self.routed_expert_down_proj.weight
-            )
-        else:
-            if (
-                self.latent_down_stream is not None
-                and do_multi_stream()
-                and not torch.compiler.is_compiling()
-            ):
-                # Forked ahead of the router GEMM: the latent chain needs only
-                # hidden_states.
-                self.moe_latent_fork_event.record()
-                with torch.cuda.stream(self.latent_down_stream):
-                    self.moe_latent_fork_event.wait()
-                    early_routed_in = self._routed_projection(
-                        hidden_states, self.routed_expert_down_proj
-                    )
-                    self.moe_latent_ready_event.record()
-                # No record_stream (under graph capture it holds every layer's
-                # blocks until capture ends): both tensors are read on main only
-                # after the join, and later work on this stream forks from main.
-            router_logits = self.gate.compute_logits(hidden_states)
+        fgs = active_stream_manager()
+        with maybe_stage(fgs, "moe.router"):
+            if self._can_fuse_router_down(hidden_states):
+                router_logits, projected_input = torch.ops.trtllm.dsv3_router_latent_gemm_op(
+                    hidden_states, self.gate.weight, self.routed_expert_down_proj.weight
+                )
+            else:
+                if (
+                    self.latent_down_stream is not None
+                    and do_multi_stream()
+                    and not torch.compiler.is_compiling()
+                ):
+                    # Forked ahead of the router GEMM: the latent chain needs only
+                    # hidden_states.
+                    self.moe_latent_fork_event.record()
+                    with torch.cuda.stream(self.latent_down_stream):
+                        self.moe_latent_fork_event.wait()
+                        early_routed_in = self._routed_projection(
+                            hidden_states, self.routed_expert_down_proj
+                        )
+                        self.moe_latent_ready_event.record()
+                    # No record_stream (under graph capture it holds every layer's
+                    # blocks until capture ends): both tensors are read on main only
+                    # after the join, and later work on this stream forks from main.
+                router_logits = self.gate.compute_logits(hidden_states)
         moe_all_reduce = self.routed_experts.all_reduce if self._reduce_routed_output else None
         overlap_shared_allreduce = (
             self._defer_shared_allreduce
@@ -1678,43 +1682,45 @@ class KimiK3MoERuntime(nn.Module):
             # replaced the projection module, call it directly: its weight is
             # an e4m3 buffer the bf16 dsv3 op must not read, and its forward
             # is already a single fused GEMM (fp8_swap_ab_gemm).
-            moe_kwargs = {}
-            if projected_input is not None:
-                routed_in = projected_input
-            elif early_routed_in is not None:
-                routed_in = early_routed_in
-                # ConfigurableMoE joins the event before its first read of x.
-                moe_kwargs = {"input_ready_event": self.moe_latent_ready_event}
-            else:
-                routed_in = self._routed_projection(hidden_states, self.routed_expert_down_proj)
-            y = self.routed_experts(
-                routed_in,
-                router_logits,
-                all_rank_num_tokens=all_rank_num_tokens,
-                **moe_kwargs,
-            )
-            if overlap_shared_allreduce:
-                self.moe_routed_event.record()
-            if self._reduce_routed_output:
-                return y
-            # Communication-backed paths return a complete routed result.
-            y = self.routed_expert_norm(y)
-            return self._routed_projection(y, self.routed_expert_up_proj)
+            with maybe_stage(fgs, "moe.routed", after=("moe.router",)):
+                moe_kwargs = {}
+                if projected_input is not None:
+                    routed_in = projected_input
+                elif early_routed_in is not None:
+                    routed_in = early_routed_in
+                    # ConfigurableMoE joins the event before its first read of x.
+                    moe_kwargs = {"input_ready_event": self.moe_latent_ready_event}
+                else:
+                    routed_in = self._routed_projection(hidden_states, self.routed_expert_down_proj)
+                y = self.routed_experts(
+                    routed_in,
+                    router_logits,
+                    all_rank_num_tokens=all_rank_num_tokens,
+                    **moe_kwargs,
+                )
+                if overlap_shared_allreduce:
+                    self.moe_routed_event.record()
+                if self._reduce_routed_output:
+                    return y
+                # Communication-backed paths return a complete routed result.
+                y = self.routed_expert_norm(y)
+                return self._routed_projection(y, self.routed_expert_up_proj)
 
         def _shared_output():
-            shared_out = self.shared_experts(
-                identity,
-                final_all_reduce_params=(
-                    AllReduceParams(enable_allreduce=False)
-                    if self._defer_shared_allreduce
-                    else None
-                ),
-            )
-            if overlap_shared_allreduce:
-                # Wait for all routed chunks, but overlap the norm/up tail.
-                self.moe_routed_event.wait()
-                shared_out = self.shared_experts.down_proj.all_reduce(shared_out)
-            return shared_out
+            with maybe_stage(fgs, "moe.shared"):
+                shared_out = self.shared_experts(
+                    identity,
+                    final_all_reduce_params=(
+                        AllReduceParams(enable_allreduce=False)
+                        if self._defer_shared_allreduce
+                        else None
+                    ),
+                )
+                if overlap_shared_allreduce:
+                    # Wait for all routed chunks, but overlap the norm/up tail.
+                    self.moe_routed_event.wait()
+                    shared_out = self.shared_experts.down_proj.all_reduce(shared_out)
+                return shared_out
 
         # Shared experts depend only on the block input, so overlap their GEMMs
         # with the routed dispatch/expert/combine chain. Multi-stream engages
@@ -1732,23 +1738,26 @@ class KimiK3MoERuntime(nn.Module):
             self.shared_expert_stream,
             disable_on_compile=True,
         )
-        if self._defer_shared_allreduce and not overlap_shared_allreduce:
-            shared_out = self.shared_experts.down_proj.all_reduce(shared_out)
-        if self._reduce_routed_output:
-            # RMSNorm folded into the routed all-reduce (RMS_NORM fusion): the
-            # MNNVL kernel normalizes straight out of the lamport buffer, so
-            # the reduced row never round-trips through HBM for a norm kernel.
-            # Strategies without the fusion fall back inside AllReduce.
-            routed_latent = moe_all_reduce(
-                routed_out,
-                all_reduce_params=AllReduceParams(
-                    fusion_op=AllReduceFusionOp.RMS_NORM,
-                    norm_weight=self.routed_expert_norm.weight,
-                    eps=float(self.routed_expert_norm.variance_epsilon),
-                ),
-            )
-            routed_out = self._routed_projection(routed_latent, self.routed_expert_up_proj)
-        return routed_out + shared_out
+        if fgs is not None:
+            fgs.keep(router_logits, projected_input, early_routed_in, routed_out, shared_out)
+        with maybe_stage(fgs, "moe.combine", after=("moe.routed", "moe.shared")):
+            if self._defer_shared_allreduce and not overlap_shared_allreduce:
+                shared_out = self.shared_experts.down_proj.all_reduce(shared_out)
+            if self._reduce_routed_output:
+                # RMSNorm folded into the routed all-reduce (RMS_NORM fusion): the
+                # MNNVL kernel normalizes straight out of the allreduce buffer, so
+                # the reduced row never round-trips through HBM for a norm kernel.
+                # Strategies without the fusion fall back inside AllReduce.
+                routed_latent = moe_all_reduce(
+                    routed_out,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.RMS_NORM,
+                        norm_weight=self.routed_expert_norm.weight,
+                        eps=float(self.routed_expert_norm.variance_epsilon),
+                    ),
+                )
+                routed_out = self._routed_projection(routed_latent, self.routed_expert_up_proj)
+            return routed_out + shared_out
 
 
 def resolve_attention_quant_config(
@@ -1870,12 +1879,17 @@ class KimiMLARuntime(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
     ) -> torch.Tensor:
+        fgs = active_stream_manager()
         # MLA.forward takes position_ids first; K3 is NoPE, so pass None.
-        out = self.mixer(None, hidden_states, attn_metadata)
+        with maybe_stage(fgs, "mla.dec"):
+            out = self.mixer(None, hidden_states, attn_metadata)
         if self._o_allreduce is not None:
+            if fgs is not None:
+                fgs.keep(out)
             # Head-sharded TP: sum the row-sharded o_proj partials across
             # the head-shard group.
-            out = self._o_allreduce(out)
+            with maybe_stage(fgs, "mla.dec_allreduce", after=("mla.dec",)):
+                out = self._o_allreduce(out)
         return out
 
 
@@ -2016,73 +2030,98 @@ class KimiLinearDecoderLayer(nn.Module):
         possible because K3 asserts pp_size == 1 -- layer j+1 is always local.
         PP support would need a recompute at the rank boundary.
         """
-        prefix_sum = hidden_states
-        valid_block_residual = block_residual[:num_snapshots]
-
-        if capture is not None:
-            # The mixture tap needs the PRE-norm value, which the fused
-            # attn-res + RMSNorm kernel does not expose. Keep the two steps
-            # split on captured layers only and fuse everywhere else.
-            if num_snapshots > 0:
-                hidden_states = _apply_attn_res(
-                    prefix_sum,
-                    valid_block_residual,
-                    self.self_attention_res_proj,
-                    self.self_attention_res_norm,
-                )
-            # A property of the DRAFTER checkpoint, not a knob: a mismatch only lowers
-            # acceptance, silently. hidden_states is the pre-norm attn_res mixture;
-            # prefix_only wants the running prefix, already in hand as prefix_sum.
-            tapped = hidden_states if _AUX_ATTN_RES_STREAM_ENABLED else prefix_sum
-            capture[0].maybe_capture_hidden_states(capture[1], tapped, None)
-            hidden_states = self.input_layernorm(hidden_states)
-        elif num_snapshots > 0:
-            hidden_states = _apply_attn_res_and_rmsnorm(
-                prefix_sum,
-                valid_block_residual,
-                self.self_attention_res_proj,
-                self.self_attention_res_norm,
-                self.input_layernorm,
-            )
-        else:
-            hidden_states = self.input_layernorm(hidden_states)
-
-        if self.layer_idx % self.attn_res_block_size == 0:
-            block_residual[num_snapshots].copy_(prefix_sum)
-            num_snapshots += 1
-            valid_block_residual = block_residual[:num_snapshots]
-            prefix_sum = None
-        if self.is_kda:
-            hidden_states = self.linear_attn(hidden_states, attn_metadata)
-        else:
-            hidden_states = self.self_attn(hidden_states, attn_metadata)
-
-        if prefix_sum is None:
+        fgs = get_stream_manager()
+        if fgs is not None and (
+            fgs.active or attn_metadata.num_contexts > 0 or is_in_breakable_cuda_graph()
+        ):
+            fgs = None
+        with fgs.region() if fgs is not None else nullcontext():
             prefix_sum = hidden_states
-            hidden_states = _apply_attn_res_and_rmsnorm(
-                prefix_sum,
-                valid_block_residual,
-                self.mlp_res_proj,
-                self.mlp_res_norm,
-                self.post_attention_layernorm,
-            )
-        else:
-            prefix_sum, hidden_states = _apply_attn_res_add_and_rmsnorm(
-                prefix_sum,
-                hidden_states,
-                valid_block_residual,
-                self.mlp_res_proj,
-                self.mlp_res_norm,
-                self.post_attention_layernorm,
-            )
-        if self.is_moe:
-            hidden_states = self.block_sparse_moe(
-                hidden_states, getattr(attn_metadata, "all_rank_num_tokens", None)
-            )
-        else:
-            hidden_states = self.mlp(hidden_states)
+            valid_block_residual = block_residual[:num_snapshots]
 
-        prefix_sum = prefix_sum + hidden_states
+            with maybe_stage(fgs, "layer.pre_norm"):
+                if capture is not None:
+                    # The mixture tap needs the PRE-norm value, which the fused
+                    # attn-res + RMSNorm kernel does not expose. Keep the two steps
+                    # split on captured layers only and fuse everywhere else.
+                    if num_snapshots > 0:
+                        hidden_states = _apply_attn_res(
+                            prefix_sum,
+                            valid_block_residual,
+                            self.self_attention_res_proj,
+                            self.self_attention_res_norm,
+                        )
+                    # A property of the DRAFTER checkpoint, not a knob: a mismatch only lowers
+                    # acceptance, silently. hidden_states is the pre-norm attn_res mixture;
+                    # prefix_only wants the running prefix, already in hand as prefix_sum.
+                    tapped = hidden_states if _AUX_ATTN_RES_STREAM_ENABLED else prefix_sum
+                    capture[0].maybe_capture_hidden_states(capture[1], tapped, None)
+                    hidden_states = self.input_layernorm(hidden_states)
+                elif num_snapshots > 0:
+                    hidden_states = _apply_attn_res_and_rmsnorm(
+                        prefix_sum,
+                        valid_block_residual,
+                        self.self_attention_res_proj,
+                        self.self_attention_res_norm,
+                        self.input_layernorm,
+                    )
+                else:
+                    hidden_states = self.input_layernorm(hidden_states)
+
+                if self.layer_idx % self.attn_res_block_size == 0:
+                    block_residual[num_snapshots].copy_(prefix_sum)
+                    num_snapshots += 1
+                    valid_block_residual = block_residual[:num_snapshots]
+                    prefix_sum = None
+            if fgs is not None:
+                fgs.keep(hidden_states)
+            # The attention and MoE modules stage their own kernels inside these
+            # stages; see StreamManager for nested stages.
+            with maybe_stage(fgs, "layer.attention", after=("layer.pre_norm",)):
+                if self.is_kda:
+                    hidden_states = self.linear_attn(hidden_states, attn_metadata)
+                else:
+                    hidden_states = self.self_attn(hidden_states, attn_metadata)
+            if fgs is not None:
+                fgs.keep(hidden_states)
+
+            # pre_norm wrote the block_residual snapshot that post_norm reads.
+            with maybe_stage(fgs, "layer.post_norm", after=("layer.attention", "layer.pre_norm")):
+                if prefix_sum is None:
+                    prefix_sum = hidden_states
+                    hidden_states = _apply_attn_res_and_rmsnorm(
+                        prefix_sum,
+                        valid_block_residual,
+                        self.mlp_res_proj,
+                        self.mlp_res_norm,
+                        self.post_attention_layernorm,
+                    )
+                else:
+                    prefix_sum, hidden_states = _apply_attn_res_add_and_rmsnorm(
+                        prefix_sum,
+                        hidden_states,
+                        valid_block_residual,
+                        self.mlp_res_proj,
+                        self.mlp_res_norm,
+                        self.post_attention_layernorm,
+                    )
+            if fgs is not None:
+                fgs.keep(prefix_sum, hidden_states)
+            with maybe_stage(fgs, "layer.moe", after=("layer.post_norm",)):
+                if self.is_moe:
+                    hidden_states = self.block_sparse_moe(
+                        hidden_states, getattr(attn_metadata, "all_rank_num_tokens", None)
+                    )
+                else:
+                    hidden_states = self.mlp(hidden_states)
+            if fgs is not None:
+                fgs.keep(hidden_states)
+
+            # prefix_sum is the attention output on snapshot layers.
+            with maybe_stage(
+                fgs, "layer.residual", after=("layer.moe", "layer.post_norm", "layer.attention")
+            ):
+                prefix_sum = prefix_sum + hidden_states
         return prefix_sum, num_snapshots
 
     def skip_forward(
