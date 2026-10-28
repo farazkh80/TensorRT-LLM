@@ -872,6 +872,12 @@ class Runner:
             else:
                 run_moe_orig = None
 
+            # A fused route+quant result bypasses `routing_method.apply`, so force
+            # the separated path (taken under DEP16 with the TRTLLM backend).
+            backend = getattr(moe_module, "backend", None)
+            if backend is not None and hasattr(backend, "try_fused_route_quant"):
+                backend.try_fused_route_quant = lambda *args, **kwargs: None
+
             # Replace `forward_impl` to ensure that routing results are replaced
             forward_impl_orig = moe_module.forward_impl
             moe_module.forward_impl = make_forward_impl_check(moe_module, forward_impl_orig)
@@ -887,6 +893,9 @@ class Runner:
                 if isinstance(moe_module, TRTLLMGenFusedMoE):
                     moe_module.run_moe = run_moe_orig
                 moe_module.forward_impl = forward_impl_orig
+                backend = getattr(moe_module, "backend", None)
+                if backend is not None and "try_fused_route_quant" in vars(backend):
+                    del backend.try_fused_route_quant
 
     @staticmethod
     def create_kv_cache_manager(

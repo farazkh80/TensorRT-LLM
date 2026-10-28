@@ -1345,6 +1345,7 @@ class KimiK3MoERuntime(nn.Module):
         self.moe_main_event = torch.cuda.Event()
         self.moe_shared_event = torch.cuda.Event()
         self.moe_routed_event = torch.cuda.Event() if self._defer_shared_allreduce else None
+        self.moe_shared_gate_event = torch.cuda.Event()
         # CuteDSL already quantizes the MoE input on the MoeOutputMemset stream;
         # the latent down-projection runs there too, beside the routing chain.
         self.latent_down_stream = (
@@ -1633,6 +1634,44 @@ class KimiK3MoERuntime(nn.Module):
         routed_model_config._frozen = True
         return routed_model_config
 
+    def _shared_expert_gate(self, hidden_states: torch.Tensor) -> bool:
+        """Arm the experimental shared-expert start gate for this forward.
+
+        ``TLLM_K3_SHARED_AT=dispatch_start|dispatch_end`` holds the shared-expert
+        stream until the routed EP dispatch is issued (or has completed), so its
+        GEMMs fill the low-occupancy dispatch window instead of contending with
+        the router and latent-down GEMMs. ``TLLM_K3_SHARED_AT_MAX_TOKENS`` turns
+        the gate off above that many local tokens.
+        """
+        where = os.environ.get("TLLM_K3_SHARED_AT")
+        comm = getattr(self.routed_experts, "comm", None)
+        max_tokens = int(os.environ.get("TLLM_K3_SHARED_AT_MAX_TOKENS", "0"))
+        if (
+            where not in ("dispatch_start", "dispatch_end")
+            or comm is None
+            or self.shared_expert_stream is None
+            or not do_multi_stream()
+            or (max_tokens and hidden_states.shape[0] > max_tokens)
+        ):
+            return False
+        if not getattr(comm, "_k3_shared_gate_wrapped", False):
+            dispatch = comm.dispatch
+
+            def gated_dispatch(*args, **kwargs):
+                event, at = comm._k3_shared_gate
+                if at == "dispatch_start":
+                    event.record()
+                out = dispatch(*args, **kwargs)
+                if at == "dispatch_end":
+                    event.record()
+                return out
+
+            comm.dispatch = gated_dispatch
+            comm._k3_shared_gate_wrapped = True
+        # The comm object may be shared across layers; each forward re-targets it.
+        comm._k3_shared_gate = (self.moe_shared_gate_event, where)
+        return True
+
     def forward(self, hidden_states: torch.Tensor, all_rank_num_tokens=None) -> torch.Tensor:
         """``hidden_states``: ``[num_tokens, hidden_size]`` bf16."""
         identity = hidden_states
@@ -1706,7 +1745,11 @@ class KimiK3MoERuntime(nn.Module):
                 y = self.routed_expert_norm(y)
                 return self._routed_projection(y, self.routed_expert_up_proj)
 
+        shared_gate = self._shared_expert_gate(hidden_states)
+
         def _shared_output():
+            if shared_gate:
+                self.moe_shared_gate_event.wait()
             with maybe_stage(fgs, "moe.shared"):
                 shared_out = self.shared_experts(
                     identity,

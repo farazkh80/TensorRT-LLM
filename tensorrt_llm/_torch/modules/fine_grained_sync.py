@@ -7,15 +7,19 @@ kernel group with :meth:`StreamManager.stage`. Stages run on a small pool of
 lane streams; every named producer -> consumer edge has an :class:`EdgePolicy`
 that decides whether the consumer waits for the producer to complete.
 
-``ORACLE`` edges do not wait at all. The consumer reads its producer's output
-buffer as if every tile were already valid, which is the best-case overlap a
-fine-grained-sync (data-as-flag) consumer could reach with zero validity-check
-and buffer re-arm cost. Numerics are only meaningful when the buffer already holds
-the values the producer is about to write, e.g. CUDA graph replays of a fixed
-input, and never for an edge whose consumer updates the buffer in place. The
-producer must write a persistent buffer: a caching-allocator block may be
-recycled from an earlier stage's temporary, which rewrites it every replay
-before the producer runs, so the consumer would read that temporary instead.
+``ORACLE`` edges do not wait for the producer to complete. The consumer waits
+only until the producer starts (for a producer with nested stages, until its
+last nested stage starts, which is the kernel group that writes the output),
+then reads the output buffer as if every tile were already valid. This is the
+best-case overlap a fine-grained-sync (data-as-flag) consumer could reach with
+zero validity-check and buffer re-arm cost; waiting for the start keeps the
+consumer ordered after the producer's own inputs. Numerics are only meaningful
+when the buffer already holds the values the producer is about to write, e.g.
+CUDA graph replays of a fixed input, and never for an edge whose consumer
+updates the buffer in place. The producer must write a persistent buffer: a
+caching-allocator block may be recycled from an earlier stage's temporary,
+which rewrites it every replay before the producer runs, so the consumer would
+read that temporary instead.
 
 Configuration is read from the environment when the manager is first used:
 
@@ -24,6 +28,10 @@ Configuration is read from the environment when the manager is first used:
 - ``TLLM_FGS_EDGE_POLICIES``: comma-separated ``producer->consumer=policy``
   overrides.
 - ``TLLM_FGS_NUM_LANES``: number of lane streams (default 2).
+- ``TLLM_FGS_STAGES``: comma-separated stage names to schedule on lanes; any
+  other stage runs inline on its calling stream (default: all stages).
+- ``TLLM_FGS_ORACLE_FROM``: ``start`` (default) or ``none``; with ``none`` an
+  ``ORACLE`` consumer does not wait for its producer at all.
 """
 
 from __future__ import annotations
@@ -33,7 +41,7 @@ import threading
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, Iterator, List, Mapping, Optional, Set, Tuple
+from typing import Dict, FrozenSet, Iterator, List, Mapping, Optional, Set, Tuple
 
 import torch
 
@@ -50,6 +58,8 @@ class FineGrainedSyncConfig:
     default_policy: EdgePolicy = EdgePolicy.STANDALONE
     edge_policies: Mapping[str, EdgePolicy] = field(default_factory=dict)
     num_lanes: int = 2
+    stages: Optional[FrozenSet[str]] = None
+    oracle_waits_for_start: bool = True
 
     def __post_init__(self) -> None:
         if self.num_lanes < 1:
@@ -69,10 +79,16 @@ class FineGrainedSyncConfig:
                 continue
             edge, policy = item.rsplit("=", 1)
             edge_policies[edge.strip()] = EdgePolicy(policy.strip().lower())
+        stages = os.environ.get("TLLM_FGS_STAGES", "").strip()
+        oracle_from = os.environ.get("TLLM_FGS_ORACLE_FROM", "start").strip().lower()
+        if oracle_from not in ("start", "none"):
+            raise ValueError(f"TLLM_FGS_ORACLE_FROM must be start or none, got {oracle_from!r}")
         return cls(
             default_policy=EdgePolicy(mode),
             edge_policies=edge_policies,
             num_lanes=int(os.environ.get("TLLM_FGS_NUM_LANES", "2")),
+            stages=frozenset(s.strip() for s in stages.split(",")) if stages else None,
+            oracle_waits_for_start=oracle_from == "start",
         )
 
 
@@ -107,6 +123,8 @@ class StreamManager:
         self.config = config
         self._lanes = [torch.cuda.Stream(device=device) for _ in range(config.num_lanes)]
         self._done_events: Dict[str, torch.cuda.Event] = {}
+        self._start_events: Dict[str, torch.cuda.Event] = {}
+        self._last_child: Dict[str, str] = {}
         self._stage_lane: Dict[str, int] = {}
         self._origin: Optional[torch.cuda.Stream] = None
         self._recorded: Set[str] = set()
@@ -148,6 +166,15 @@ class StreamManager:
         if not self.active:
             raise RuntimeError(f"stage {name!r} requires an active region")
         enclosing = torch.cuda.current_stream()
+        if self.config.stages is not None and name not in self.config.stages:
+            for producer in after:
+                if (
+                    producer in self._recorded
+                    and self.config.policy(producer, name) is not EdgePolicy.ORACLE
+                ):
+                    enclosing.wait_event(self._done_events[producer])
+            yield
+            return
         lane_index = self._pick_lane(name, after)
         lane = self._lanes[lane_index]
         lane.wait_stream(enclosing)
@@ -155,15 +182,29 @@ class StreamManager:
             if producer not in self._recorded:
                 continue
             if self.config.policy(producer, name) is EdgePolicy.ORACLE:
+                if self.config.oracle_waits_for_start:
+                    source = producer
+                    while source in self._last_child:
+                        source = self._last_child[source]
+                    lane.wait_event(self._start_events[source])
                 continue
             if self._stage_lane[producer] != lane_index:
                 lane.wait_event(self._done_events[producer])
+        start = self._start_events.get(name)
+        if start is None:
+            start = self._start_events[name] = torch.cuda.Event()
+        start.record(lane)
         self._open_stages.append((lane_index, []))
         with torch.cuda.stream(lane):
             yield
-        for child in self._open_stages.pop()[1]:
+        children = self._open_stages.pop()[1]
+        for child in children:
             if self._stage_lane[child] != lane_index:
                 lane.wait_event(self._done_events[child])
+        if children:
+            self._last_child[name] = children[-1]
+        else:
+            self._last_child.pop(name, None)
         event = self._done_events.get(name)
         if event is None:
             event = self._done_events[name] = torch.cuda.Event()
