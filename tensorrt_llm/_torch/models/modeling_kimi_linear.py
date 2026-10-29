@@ -88,7 +88,7 @@ import math
 import os
 import threading
 import weakref
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -121,6 +121,7 @@ from ..distributed import (
 )
 from ..distributed.symm_mem_allgather import SymmetricMemoryAllGather
 from ..model_config import ModelConfig
+from ..modules.fine_grained_sync import get_stream_manager, maybe_stage
 from ..modules.gated_mlp import GatedMLP
 from ..modules.kimi_kda import KimiKDALinearAttention
 from ..modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
@@ -138,6 +139,7 @@ from ..moe.fused_moe import ConfigurableMoE, SiTuActivation, TRTLLMGenFusedMoE, 
 from ..moe.fused_moe.interface import MoESchedulerKind
 from ..moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from ..nccl_window_tensor_scope import nccl_window_tensor_scoped_module
+from ..pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
 from ..utils import AuxStreamType
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
@@ -2257,49 +2259,61 @@ class KimiLinearDecoderLayer(nn.Module):
         prefix_sum = hidden_states
         valid_block_residual = block_residual[:num_snapshots]
 
-        if capture is not None:
-            # The mixture tap needs the PRE-norm value, which the fused
-            # attn-res + RMSNorm kernel does not expose. Keep the two steps
-            # split on captured layers only and fuse everywhere else.
-            if num_snapshots > 0:
-                hidden_states = _apply_attn_res(
-                    prefix_sum,
-                    valid_block_residual,
-                    self.self_attention_res_proj,
-                    self.self_attention_res_norm,
-                )
-            # A property of the DRAFTER checkpoint, not a knob: a mismatch only lowers
-            # acceptance, silently. hidden_states is the pre-norm attn_res mixture;
-            # prefix_only wants the running prefix, already in hand as prefix_sum.
-            tapped = hidden_states if _AUX_ATTN_RES_STREAM_ENABLED else prefix_sum
-            capture[0].maybe_capture_hidden_states(capture[1], _full_rows(tapped), None)
-            hidden_states = self.input_layernorm(hidden_states)
-        elif num_snapshots > 0:
-            hidden_states = _apply_attn_res_and_rmsnorm(
-                prefix_sum,
-                valid_block_residual,
-                self.self_attention_res_proj,
-                self.self_attention_res_norm,
-                self.input_layernorm,
-            )
-        else:
-            hidden_states = self.input_layernorm(hidden_states)
+        # Fine-grained sync for the pre-norm -> KDA edge: decode-only KDA layers
+        # open the region here so the KDA stages nest in "layer.attention".
+        fgs = get_stream_manager() if self.is_kda and sliced is None and capture is None else None
+        if fgs is not None and (
+            fgs.active or attn_metadata.num_contexts != 0 or is_in_breakable_cuda_graph()
+        ):
+            fgs = None
+        with fgs.region() if fgs is not None else nullcontext():
+            with maybe_stage(fgs, "layer.pre_norm"):
+                if capture is not None:
+                    # The mixture tap needs the PRE-norm value, which the fused
+                    # attn-res + RMSNorm kernel does not expose. Keep the two steps
+                    # split on captured layers only and fuse everywhere else.
+                    if num_snapshots > 0:
+                        hidden_states = _apply_attn_res(
+                            prefix_sum,
+                            valid_block_residual,
+                            self.self_attention_res_proj,
+                            self.self_attention_res_norm,
+                        )
+                    # A property of the DRAFTER checkpoint, not a knob: a mismatch only lowers
+                    # acceptance, silently. hidden_states is the pre-norm attn_res mixture;
+                    # prefix_only wants the running prefix, already in hand as prefix_sum.
+                    tapped = hidden_states if _AUX_ATTN_RES_STREAM_ENABLED else prefix_sum
+                    capture[0].maybe_capture_hidden_states(capture[1], _full_rows(tapped), None)
+                    hidden_states = self.input_layernorm(hidden_states)
+                elif num_snapshots > 0:
+                    hidden_states = _apply_attn_res_and_rmsnorm(
+                        prefix_sum,
+                        valid_block_residual,
+                        self.self_attention_res_proj,
+                        self.self_attention_res_norm,
+                        self.input_layernorm,
+                    )
+                else:
+                    hidden_states = self.input_layernorm(hidden_states)
+            if fgs is not None:
+                fgs.keep(hidden_states)
 
-        if self.layer_idx % self.attn_res_block_size == 0:
-            block_residual[num_snapshots].copy_(prefix_sum)
-            num_snapshots += 1
-            valid_block_residual = block_residual[:num_snapshots]
-            prefix_sum = None
+            if self.layer_idx % self.attn_res_block_size == 0:
+                block_residual[num_snapshots].copy_(prefix_sum)
+                num_snapshots += 1
+                valid_block_residual = block_residual[:num_snapshots]
+                prefix_sum = None
 
-        # Attention is head-TP over every row: KDA rows are gathered in and its
-        # row-sharded o_proj partials reduce-scattered back out here; helix MLA
-        # does both itself (_helix_cp_allgather_input / _helix_cp_output_projection).
-        if self.is_kda:
-            hidden_states = self.linear_attn(_full_rows(hidden_states), attn_metadata)
-            if sliced is not None:
-                hidden_states = sliced.reduce_scatter(hidden_states, num_tokens)
-        else:
-            hidden_states = self.self_attn(hidden_states, attn_metadata)
+            # Attention is head-TP over every row: KDA rows are gathered in and its
+            # row-sharded o_proj partials reduce-scattered back out here; helix MLA
+            # does both itself (_helix_cp_allgather_input / _helix_cp_output_projection).
+            if self.is_kda:
+                with maybe_stage(fgs, "layer.attention", after=("layer.pre_norm",)):
+                    hidden_states = self.linear_attn(_full_rows(hidden_states), attn_metadata)
+                if sliced is not None:
+                    hidden_states = sliced.reduce_scatter(hidden_states, num_tokens)
+            else:
+                hidden_states = self.self_attn(hidden_states, attn_metadata)
 
         if prefix_sum is None:
             prefix_sum = hidden_states
