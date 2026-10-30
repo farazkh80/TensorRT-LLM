@@ -257,7 +257,9 @@ class KdaDecodeT1:
         if cutlass.const_expr(not self.early_state):
             self._load_state(state, state_s, state_regs, lane, warp, row_base, head, slot)
 
-        # Setup: 96 conv items (4 channels of q, k or v each) and 128 gate items.
+        # Setup: 96 conv items (4 channels of q, k or v each) and 128 gate items. Conv items
+        # are always the first iteration (threads >= 128), so tidx < CONV_ITEMS owns one.
+        new_hist = cute.make_rmem_tensor((4, 3), BF16)
         for it in cutlass.range_constexpr((SETUP_ITEMS + self.threads - 1) // self.threads):
             item = tidx + it * self.threads
             if item < CONV_ITEMS:
@@ -280,7 +282,6 @@ class KdaDecodeT1:
                 cur = cute.make_rmem_tensor((4,), BF16)
                 cute.copy(copy_bf16x4, _aligned(x[(None, cl, sec, head, row)], 8), cur)
                 silu = cute.make_rmem_tensor((4,), F32)
-                new_hist = cute.make_rmem_tensor((4, 3), BF16)
                 for e in cutlass.range_constexpr(4):
                     # Lane-local element (channel e, tap t) sits at 3 * e + t.
                     acc = hist[(3 * e) % 4, (3 * e) // 4].to(F32) * w_regs[e, 0]
@@ -303,14 +304,6 @@ class KdaDecodeT1:
                         16,
                     ),
                 )
-                if is_live:
-                    if rank == 0:
-                        for j in cutlass.range_constexpr(3):
-                            cute.copy(
-                                copy_bf16x4,
-                                new_hist[(None, j)],
-                                _aligned(conv_state[(None, j, cl, sec, head, slot)], 8),
-                            )
             elif item < SETUP_ITEMS:
                 c = item - CONV_ITEMS
                 a = cute.math.exp(A_log[head], fastmath=True)
@@ -321,7 +314,24 @@ class KdaDecodeT1:
                 if c == 0:
                     scalars[0] = _sigmoid(raw_beta[head, row].to(F32))
 
-        cute.arch.barrier()
+        if cutlass.const_expr(self.v_split > 1):
+            # Every CTA of the cluster reads the old conv window; rank 0 overwrites it only
+            # after all of them have passed this point.
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
+        else:
+            cute.arch.barrier()
+        if tidx < CONV_ITEMS:
+            if is_live:
+                if rank == 0:
+                    cl = tidx % 32
+                    sec = tidx // 32
+                    for j in cutlass.range_constexpr(3):
+                        cute.copy(
+                            copy_bf16x4,
+                            new_hist[(None, j)],
+                            _aligned(conv_state[(None, j, cl, sec, head, slot)], 8),
+                        )
 
         q = cute.make_rmem_tensor((4,), F32)
         k = cute.make_rmem_tensor((4,), F32)

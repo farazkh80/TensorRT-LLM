@@ -181,6 +181,38 @@ def _pick_config(rows: int, device_index: int) -> tuple[int, int]:
     return 1, 2
 
 
+def _rows_ok(t: torch.Tensor) -> bool:
+    return (
+        t.dtype == torch.bfloat16
+        and t.stride(1) == 1
+        and t.stride(0) % VEC == 0
+        and t.data_ptr() % 16 == 0
+    )
+
+
+def supports(
+    x: torch.Tensor, z: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None = None
+) -> bool:
+    """Whether ``kda_gated_rmsnorm`` accepts these layouts (otherwise it raises)."""
+    if x.ndim != 2 or z.ndim != 3 or x.shape[1] != HEAD_DIM or z.shape[2] != HEAD_DIM:
+        return False
+    if (
+        z.shape[0] * z.shape[1] != x.shape[0]
+        or weight.dtype not in _TORCH_TO_CUTE
+        or weight.shape != (HEAD_DIM,)
+    ):
+        return False
+    if not _rows_ok(x) or (out is not None and (out.shape != x.shape or not _rows_ok(out))):
+        return False
+    return (
+        z.dtype == torch.bfloat16
+        and z.stride(2) == 1
+        and z.stride(1) == HEAD_DIM
+        and z.stride(0) % VEC == 0
+        and z.data_ptr() % 16 == 0
+    )
+
+
 def kda_gated_rmsnorm(
     x: torch.Tensor,
     z: torch.Tensor,
@@ -196,24 +228,14 @@ def kda_gated_rmsnorm(
     ``out`` may be any ``[T*H, 128]`` BF16 view with 16-byte aligned rows (for example the
     caller's graph-owned core buffer), which removes the separate copy.
     """
-    if x.dtype != torch.bfloat16 or z.dtype != torch.bfloat16:
-        raise TypeError("x and z must be BF16")
-    if weight.dtype not in _TORCH_TO_CUTE or weight.shape != (HEAD_DIM,):
-        raise TypeError("weight must be a [128] BF16 or FP32 tensor")
-    rows = x.shape[0]
-    tokens, heads, _ = z.shape
-    if x.shape != (rows, HEAD_DIM) or z.shape[2] != HEAD_DIM or tokens * heads != rows:
-        raise ValueError(f"x {tuple(x.shape)} does not match z {tuple(z.shape)}")
+    if not supports(x, z, weight, out):
+        raise ValueError(
+            "kda_gated_rmsnorm needs BF16 x/out [T*H, 128] and z [T, H, 128] with 16-byte aligned rows"
+        )
     if out is None:
         out = torch.empty_like(x)
-    elif out.shape != x.shape or out.dtype != torch.bfloat16:
-        raise ValueError("out must be a BF16 tensor shaped like x")
-    for name, t in (("x", x), ("out", out)):
-        if t.stride(1) != 1 or t.stride(0) % VEC or t.data_ptr() % 16:
-            raise ValueError(f"{name} rows must be contiguous and 16-byte aligned")
-    if z.stride(2) != 1 or z.stride(1) != HEAD_DIM or z.stride(0) % VEC or z.data_ptr() % 16:
-        raise ValueError("z must have contiguous (H, 128) blocks with 16-byte aligned tokens")
-    weight = weight.contiguous()
+    rows = x.shape[0]
+    heads = z.shape[1]
     if rows == 0:
         return out
     device_index = x.device.index
