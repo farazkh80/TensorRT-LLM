@@ -194,7 +194,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.enable_ex2_emulation = enable_ex2_emulation
         self.use_tma_store = use_tma_store
         # Overrides of _setup_attributes / register-split attributes (kv_stage, enable_sequence_barrier,
-        # enable_correction_double_buffer, num_regs_*) and "lpt" (heaviest causal q tiles launch first).
+        # enable_correction_double_buffer, num_regs_*), "lpt" (longest causal q tiles first; snaked over CTAs when
+        # persistent) and "persistent" (read by the caller, which passes it as is_persistent).
         self.tuning = dict(tuning or {})
 
         self.softmax0_warp_ids = (0, 1, 2, 3)
@@ -352,7 +353,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         # Optional double buffering for correction rescale.
         self.enable_correction_double_buffer = False
         for name, value in self.tuning.items():
-            if name != "lpt":
+            if name not in ("lpt", "persistent"):
                 assert hasattr(self, name), f"unknown FMHA tuning attribute {name}"
                 setattr(self, name, value)
 

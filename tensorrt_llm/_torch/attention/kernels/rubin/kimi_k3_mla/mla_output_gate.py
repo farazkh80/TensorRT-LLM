@@ -14,7 +14,7 @@
 # limitations under the License.
 """Kimi K3 MLA output gate ``o * sigmoid(g)`` as one CuTe DSL elementwise kernel.
 
-Rounding follows the two ATen kernels it replaces (``g.sigmoid()`` then ``o * s``):
+Rounding matches ATen's ``o * g.sigmoid()`` (two kernels):
 s = bf16(1 / (1 + expf(-float(g)))) with IEEE expf / division, then out = bf16(float(o) * float(s)).
 The product of two bf16 values is exact in fp32, so the only rounding steps are the two bf16 casts.
 
@@ -45,12 +45,15 @@ def _sigmoid_bf16_as_f32(g: cutlass.Float32, fast: cutlass.Constexpr) -> cutlass
         s = cute.arch.rcp_approx(
             cutlass.Float32(1.0) + cute.math.exp2(g * cutlass.Float32(-LOG2E), fastmath=True)
         )
-        low = cutlass.Vector.from_elements((s,), cutlass.Float32).bitcast(cutlass.Int32)[0] & cutlass.Int32(0xFFFF)
-        off = low - cutlass.Int32(0x8000)
+        bits = cutlass.Vector.from_elements((s,), cutlass.Float32).bitcast(cutlass.Int32)[0]
+        off = (bits & cutlass.Int32(0xFFFF)) - cutlass.Int32(0x8000)
         if (
             g <= cutlass.Float32(-80.0)
             or g != g
-            or (off <= cutlass.Int32(MIDPOINT_GUARD_ULPS) and off >= cutlass.Int32(-MIDPOINT_GUARD_ULPS))
+            or (
+                off <= cutlass.Int32(MIDPOINT_GUARD_ULPS)
+                and off >= cutlass.Int32(-MIDPOINT_GUARD_ULPS)
+            )
         ):
             s = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.math.exp(-g, fastmath=False))
     else:
@@ -62,7 +65,7 @@ def _gate_chunk(o_arr, g_arr, out_arr, idx, vec, fast):
     o = o_arr.load(idx, vec, alignment=2 * vec).to(cutlass.Float32)
     g = g_arr.load(idx, vec, alignment=2 * vec).to(cutlass.Float32)
     res = []
-    for e in cutlass.range_constexpr(vec):
+    for e in range(vec):
         res.append(o[e] * _sigmoid_bf16_as_f32(g[e], fast))
     out_arr.store(
         cutlass.Vector.from_elements(tuple(res), dtype=cutlass.Float32).to(cutlass.BFloat16),
@@ -104,7 +107,9 @@ def _output_gate_kernel(
             for e in cutlass.range_constexpr(vec):
                 res.append(o[e] * _sigmoid_bf16_as_f32(g[e], fast))
             out_arr.store(
-                cutlass.Vector.from_elements(tuple(res), dtype=cutlass.Float32).to(cutlass.BFloat16),
+                cutlass.Vector.from_elements(tuple(res), dtype=cutlass.Float32).to(
+                    cutlass.BFloat16
+                ),
                 idx=idx,
                 vector_size=vec,
                 alignment=2 * vec,
@@ -128,7 +133,9 @@ def _output_gate_host(
     unroll: cutlass.Constexpr,
     fast: cutlass.Constexpr,
 ):
-    layout = cute.make_layout((num_ctas, THREADS * unroll * vec), stride=(THREADS * unroll * vec, 1))
+    layout = cute.make_layout(
+        (num_ctas, THREADS * unroll * vec), stride=(THREADS * unroll * vec, 1)
+    )
     _output_gate_kernel(
         cute.make_tensor(o_ptr, layout),
         cute.make_tensor(g_ptr, layout),
@@ -167,14 +174,22 @@ def supported(o: torch.Tensor, g: torch.Tensor) -> bool:
 
 
 def mla_output_gate(
-    o: torch.Tensor, g: torch.Tensor, out: Optional[torch.Tensor] = None, config: tuple = DEFAULT_CONFIG
+    o: torch.Tensor,
+    g: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    config: tuple = DEFAULT_CONFIG,
 ) -> torch.Tensor:
     """out = o * sigmoid(g), bf16, bit-matching ``o * g.sigmoid()``. ``out`` may alias ``o``."""
     if not supported(o, g):
         raise ValueError("mla_output_gate needs contiguous, 32B-aligned bf16 o / g of equal shape")
     if out is None:
         out = torch.empty_like(o)
-    elif not (out.shape == o.shape and out.dtype == o.dtype and out.is_contiguous() and out.data_ptr() % 32 == 0):
+    elif not (
+        out.shape == o.shape
+        and out.dtype == o.dtype
+        and out.is_contiguous()
+        and out.data_ptr() % 32 == 0
+    ):
         raise ValueError("out must be a contiguous, 32B-aligned bf16 tensor shaped like o")
     vec, unroll, fast = config
     num_vecs = o.numel() // vec
@@ -186,7 +201,14 @@ def mla_output_gate(
     if fn is None:
         with BaseDSL.enable_pyir():
             fn = cute.compile(
-                _output_gate_host, *ptrs, stream, cutlass.Int64(1), cutlass.Int32(1), vec, unroll, fast
+                _output_gate_host,
+                *ptrs,
+                stream,
+                cutlass.Int64(1),
+                cutlass.Int32(1),
+                vec,
+                unroll,
+                fast,
             )
         _COMPILED[config] = fn
     fn(*ptrs, stream, cutlass.Int64(num_vecs), cutlass.Int32(-(-num_vecs // (THREADS * unroll))))

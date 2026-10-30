@@ -15,8 +15,8 @@
 """Kimi K3 MLA context attention (qk 192 / v 128, causal, bf16, varlen) with the CuTe DSL FMHA.
 
 q, k: [T, H, 192]; v, o: [T, H, 128]; cu_seqlens: int32 [B + 1] on device, shared by q and kv (no cached
-prefix). The kernel is the Blackwell CuTe DSL FMHA in ``context_fmha`` (non-persistent, st.global epilogue)
-with SM107 tuning applied through ``tuning``.
+prefix). The kernel is the Blackwell CuTe DSL FMHA in ``context_fmha`` (st.global epilogue) with SM107 tuning
+applied through ``tuning``.
 """
 
 import functools
@@ -40,18 +40,19 @@ HEAD_DIM_QK = 192
 HEAD_DIM_V = 128
 
 # SM107 (328 KiB smem): the st.global epilogue frees sO, so four K/V stages of a D=192 tile fit next to the
-# two Q stages; the longest causal q tiles launch first.
-DEFAULT_TUNING = (("kv_stage", 4), ("lpt", True))
+# two Q stages. Round 3 on ts3: kv_stage 4 at 770.6 us vs the cubin's 715.5 (launch-order LPT 778.0).
+DEFAULT_TUNING = (("kv_stage", 4),)
 
 
 @functools.cache
 def _compile(num_heads: int, tuning: tuple):
+    is_persistent = dict(tuning).get("persistent", False)
     fmha = BlackwellFusedMultiHeadAttentionForward(
         qk_acc_dtype=cutlass.Float32,
         pv_acc_dtype=cutlass.Float32,
         mma_tiler=(128, 128),
         head_dim=(HEAD_DIM_QK, HEAD_DIM_V),
-        is_persistent=False,
+        is_persistent=is_persistent,
         mask_type=fmha_utils.MaskEnum.WINDOW_MASK_INFERENCE,
         enable_ex2_emulation=False,
         enable_skip_correction=True,

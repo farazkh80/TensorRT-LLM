@@ -233,17 +233,25 @@ class FmhaStaticTileScheduler:
         :return: WorkTileInfo containing tile coordinates and validity flag.
         :rtype: WorkTileInfo
         """
-        is_valid = (
-            self._current_work_linear_idx < self._num_blocks
-            if self._is_persistent
-            else self._is_first_block
-        )
+        work_idx = self._current_work_linear_idx
+        if self._is_persistent and self._params.lpt:
+            # Snake the CTAs over rounds of the longest-first order below, so every CTA's tiles sum to about the
+            # same causal work. Each round is a full permutation of its slots, so the tiles stay covered once.
+            n_cta = self.num_persistent_sm
+            rnd = work_idx // n_cta
+            slot = work_idx - rnd * n_cta
+            work_idx = rnd * n_cta + slot + (rnd & 1) * (n_cta - 1 - 2 * slot)
+        is_valid = work_idx < self._num_blocks if self._is_persistent else self._is_first_block
 
         blk_coord = (0, 0, 0)
-        if self._is_persistent:
-            blk_coord = self._problem_shape_mhb.get_hier_coord(
-                self._current_work_linear_idx, loc=loc, ip=ip
-            )
+        if self._is_persistent and self._params.lpt:
+            m_cnt, h_cnt, b_cnt = self._params.problem_shape_mhb
+            hb_cnt = h_cnt * b_cnt
+            m_rank = work_idx // hb_cnt
+            rest = work_idx - m_rank * hb_cnt
+            blk_coord = (m_cnt - 1 - m_rank, rest % h_cnt, rest // h_cnt)
+        elif self._is_persistent:
+            blk_coord = self._problem_shape_mhb.get_hier_coord(work_idx, loc=loc, ip=ip)
         else:
             blk_coord = self._blk_coord
             if self._params.lpt:
@@ -387,7 +395,7 @@ def compute_grid(
             cute.size(o_shape[2][0]),
             cute.size(o_shape[2][1]),
         ),
-        lpt=lpt and not is_persistent,
+        lpt=lpt,
     )
     grid = FmhaStaticTileScheduler.get_grid_shape(tile_sched_params)
 
