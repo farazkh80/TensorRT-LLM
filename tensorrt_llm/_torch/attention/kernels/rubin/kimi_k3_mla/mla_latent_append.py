@@ -109,9 +109,7 @@ def _latent_append_kernel(
                 + cutlass.Int64(latent)
                 + cutlass.Int64(v * cutlass.Int32(VEC))
             )
-            fused_q.store(
-                qpe.load(src, VEC, alignment=16), idx=dst, vector_size=VEC, alignment=16
-            )
+            fused_q.store(qpe.load(src, VEC, alignment=16), idx=dst, vector_size=VEC, alignment=16)
     elif bidx < ctas_q + ctas_kv:
         gid = (bidx - ctas_q) * cutlass.Int32(THREADS) + tidx
         if gid < num_tokens * cutlass.Int32(row_vecs):
@@ -120,9 +118,10 @@ def _latent_append_kernel(
             b = t // seq_len_q
             pos = cutlass.Int32(mKvLens[b]) - seq_len_q + (t - b * seq_len_q)
             if pos >= cutlass.Int32(0):
-                page = cutlass.Int32(
-                    mPtIn[b * pt_in_stride + pos // cutlass.Int32(page_size)]
-                ) + page_offset
+                page = (
+                    cutlass.Int32(mPtIn[b * pt_in_stride + pos // cutlass.Int32(page_size)])
+                    + page_offset
+                )
                 dst = (
                     cutlass.Int64(page) * cutlass.Int64(page_size)
                     + cutlass.Int64(pos % cutlass.Int32(page_size))
@@ -316,15 +315,22 @@ def _compiled(key: tuple, addrs, stream) -> Callable:
     return fn
 
 
-def kv_pool_geometry(kv_pool: torch.Tensor) -> tuple[int, int, int, int]:
-    """(base address, total rows, row stride in elements, layer_in_pool) of the paged latent pool.
+def kv_pool_geometry(kv_pool: torch.Tensor) -> tuple[int, int, int, int, bool]:
+    """(base address, total rows, row stride in elements, layer_in_pool, interleaved) of the paged latent pool.
 
     ``kv_pool`` is ``kv_cache_manager.get_buffers(layer_idx)``, ``[pages, 1, page_size, 1, dim]``.
     Mirrors ``CuteDslMlaFmha._run_mla_decode``: a V1 per-layer view over an interleaved pool is
     addressed as the packed combined-slot pool with this layer's slot added to every page index.
     """
-    if kv_pool.dim() != 5 or kv_pool.shape[1] != 1 or kv_pool.shape[3] != 1 or kv_pool.stride(-1) != 1:
-        raise ValueError(f"expected a [pages, 1, page_size, 1, dim] pool, got {tuple(kv_pool.shape)}")
+    if (
+        kv_pool.dim() != 5
+        or kv_pool.shape[1] != 1
+        or kv_pool.shape[3] != 1
+        or kv_pool.stride(-1) != 1
+    ):
+        raise ValueError(
+            f"expected a [pages, 1, page_size, 1, dim] pool, got {tuple(kv_pool.shape)}"
+        )
     packed = 1
     for size in kv_pool.shape[1:]:
         packed *= size
@@ -336,6 +342,7 @@ def kv_pool_geometry(kv_pool: torch.Tensor) -> tuple[int, int, int, int]:
         pages = kv_pool.shape[0] * layers_in_pool
         page_stride = packed
     else:
+        layers_in_pool = 1
         layer_in_pool = 0
         base = kv_pool.data_ptr()
         pages = kv_pool.shape[0]
@@ -343,8 +350,10 @@ def kv_pool_geometry(kv_pool: torch.Tensor) -> tuple[int, int, int, int]:
     page_size = kv_pool.shape[2]
     row_stride = kv_pool.stride(2)
     if page_stride != page_size * row_stride:
-        raise ValueError(f"pool page stride {page_stride} != page_size {page_size} * row stride {row_stride}")
-    return base, pages * page_size, row_stride, layer_in_pool
+        raise ValueError(
+            f"pool page stride {page_stride} != page_size {page_size} * row stride {row_stride}"
+        )
+    return base, pages * page_size, row_stride, layer_in_pool, layers_in_pool > 1
 
 
 def mla_latent_append(
@@ -382,10 +391,19 @@ def mla_latent_append(
     if num_tokens % batch:
         raise ValueError("every request must contribute the same number of query tokens")
     seq_len_q = num_tokens // batch
-    for name, t in (("q_pe", q_pe), ("compressed_kv", compressed_kv), ("k_pe", k_pe), ("fused_q", fused_q)):
+    for name, t in (
+        ("q_pe", q_pe),
+        ("compressed_kv", compressed_kv),
+        ("k_pe", k_pe),
+        ("fused_q", fused_q),
+    ):
         if t.dtype != torch.bfloat16 or t.stride(-1) != 1 or t.data_ptr() % 16:
             raise ValueError(f"{name} must be bf16, unit last stride, 16B aligned")
-    if not fused_q.is_contiguous() or tuple(fused_q.shape) != (num_tokens, num_heads, latent + rope):
+    if not fused_q.is_contiguous() or tuple(fused_q.shape) != (
+        num_tokens,
+        num_heads,
+        latent + rope,
+    ):
         raise ValueError("fused_q must be a contiguous [T, H, latent + rope] tensor")
     strides = (q_pe.stride(0), q_pe.stride(1), compressed_kv.stride(0), k_pe.stride(0))
     if any(s % VEC for s in strides) or latent % VEC or rope % VEC:
@@ -395,23 +413,36 @@ def mla_latent_append(
     if kv_lens.dtype != torch.int32 or not kv_lens.is_contiguous() or kv_lens.numel() < batch:
         raise ValueError("kv_lens must be a contiguous int32 [B] tensor")
 
-    base, pool_rows, row_stride, layer_in_pool = kv_pool_geometry(kv_pool)
+    base, pool_rows, row_stride, layer_in_pool, interleaved = kv_pool_geometry(kv_pool)
     page_size = kv_pool.shape[2]
-    if kv_pool.dtype != torch.bfloat16 or base % 16 or row_stride % VEC or kv_pool.shape[-1] < latent + rope:
-        raise ValueError("kv_pool must be a bf16, 16B-aligned pool with rows of at least latent + rope")
+    if (
+        kv_pool.dtype != torch.bfloat16
+        or base % 16
+        or row_stride % VEC
+        or kv_pool.shape[-1] < latent + rope
+    ):
+        raise ValueError(
+            "kv_pool must be a bf16, 16B-aligned pool with rows of at least latent + rope"
+        )
 
-    write_pt = layer_in_pool != 0
+    write_pt = interleaved
     if write_pt:
         if page_table_out is None:
             page_table_out = torch.empty_strided(
                 (max_blocks, batch), (1, max_blocks), dtype=torch.int32, device=q_pe.device
             )
         elif page_table_out.dtype != torch.int32 or page_table_out.stride() != (1, max_blocks):
-            raise ValueError("page_table_out must be int32 [max_blocks, B] with strides (1, max_blocks)")
+            raise ValueError(
+                "page_table_out must be int32 [max_blocks, B] with strides (1, max_blocks)"
+            )
         result = page_table_out
     else:
         result = page_table_rows.transpose(0, 1)
-    write_meta = cu_q_seqlens is not None and cu_kv_seqlens is not None and fmha_scheduler_counter is not None
+    write_meta = (
+        cu_q_seqlens is not None
+        and cu_kv_seqlens is not None
+        and fmha_scheduler_counter is not None
+    )
     if write_meta and (cu_q_seqlens.numel() < batch + 1 or cu_kv_seqlens.numel() < batch + 1):
         raise ValueError("cu_q_seqlens / cu_kv_seqlens need batch + 1 entries")
 
