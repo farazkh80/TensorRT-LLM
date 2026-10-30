@@ -509,46 +509,26 @@ def pack_conv_weight(w_q_t: torch.Tensor, w_k_t: torch.Tensor, w_v_t: torch.Tens
     return torch.stack((w_q_t, w_k_t, w_v_t)).float().contiguous()
 
 
-def kda_decode_t1(
-    x: torch.Tensor,
-    conv_weight: torch.Tensor,
-    conv_state: torch.Tensor,
-    raw_gate: torch.Tensor,
-    raw_beta: torch.Tensor,
-    A_log: torch.Tensor,
-    dt_bias: torch.Tensor,
-    state_indices: torch.Tensor,
-    state: torch.Tensor,
-    output_gate: torch.Tensor,
-    norm_weight: torch.Tensor,
-    output: torch.Tensor,
-    *,
-    lower_bound: float,
-    norm_eps: float,
-    scale: float = D**-0.5,
-    v_split: int | None = None,
-    warps: int | None = None,
-    stage_smem: bool | None = None,
-    min_blocks: int | None = None,
-    early_state: bool = False,
-    use_pdl: bool = True,
-) -> torch.Tensor:
-    """Fused T=1 KDA decode; updates ``conv_state`` and ``state`` rows in place.
-
-    x [B, 3*H*128] (q | k | v projection columns, any row stride), conv_weight FP32
-    [3, 4, H*128] (``pack_conv_weight``), conv_state BF16 [slots, 3*H*128, 3] with
-    strides (s, 3, 1), raw_gate BF16 [B, H*128], raw_beta BF16 [B, H] (any row stride),
-    A_log FP32 [H], dt_bias FP32 [H*128], state_indices int32 [B], state FP32
-    [slots, H, 128, 128], output_gate BF16 [B, H, 128] (any token stride),
-    norm_weight FP32 [128], output BF16 [B, H, 128].
-    """
+def unsupported(
+    x,
+    conv_weight,
+    conv_state,
+    raw_gate,
+    raw_beta,
+    A_log,
+    dt_bias,
+    state_indices,
+    state,
+    output_gate,
+    norm_weight,
+    output,
+) -> str | None:
+    """Name of the first ``kda_decode_t1`` argument with an unsupported layout or dtype, else None."""
+    if x.ndim != 2 or x.shape[1] % (3 * D):
+        return "x"
     B, three_d = x.shape
     heads = three_d // (3 * D)
     d = heads * D
-    if B == 0:
-        return output
-    if lower_bound is None or not lower_bound < 0:
-        raise ValueError("kda_decode_t1 implements the negative lower-bound gate only")
     checks = (
         (
             x.dtype == torch.bfloat16
@@ -628,7 +608,65 @@ def kda_decode_t1(
     )
     for ok, name in checks:
         if not ok:
-            raise ValueError(f"kda_decode_t1: unsupported {name} layout or dtype")
+            return name
+    return None
+
+
+def kda_decode_t1(
+    x: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_state: torch.Tensor,
+    raw_gate: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state_indices: torch.Tensor,
+    state: torch.Tensor,
+    output_gate: torch.Tensor,
+    norm_weight: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    lower_bound: float,
+    norm_eps: float,
+    scale: float = D**-0.5,
+    v_split: int | None = None,
+    warps: int | None = None,
+    stage_smem: bool | None = None,
+    min_blocks: int | None = None,
+    early_state: bool = False,
+    use_pdl: bool = True,
+) -> torch.Tensor:
+    """Fused T=1 KDA decode; updates ``conv_state`` and ``state`` rows in place.
+
+    x [B, 3*H*128] (q | k | v projection columns, any row stride), conv_weight FP32
+    [3, 4, H*128] (``pack_conv_weight``), conv_state BF16 [slots, 3*H*128, 3] with
+    strides (s, 3, 1), raw_gate BF16 [B, H*128], raw_beta BF16 [B, H] (any row stride),
+    A_log FP32 [H], dt_bias FP32 [H*128], state_indices int32 [B], state FP32
+    [slots, H, 128, 128], output_gate BF16 [B, H, 128] (any token stride),
+    norm_weight FP32 [128], output BF16 [B, H, 128].
+    """
+    B = x.shape[0]
+    heads = x.shape[1] // (3 * D)
+    if B == 0:
+        return output
+    if lower_bound is None or not lower_bound < 0:
+        raise ValueError("kda_decode_t1 implements the negative lower-bound gate only")
+    reason = unsupported(
+        x,
+        conv_weight,
+        conv_state,
+        raw_gate,
+        raw_beta,
+        A_log,
+        dt_bias,
+        state_indices,
+        state,
+        output_gate,
+        norm_weight,
+        output,
+    )
+    if reason is not None:
+        raise ValueError(f"kda_decode_t1: unsupported {reason} layout or dtype")
     default_split, default_warps, default_smem = pick_config(B)
     if v_split is None:
         v_split = default_split
