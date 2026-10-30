@@ -20,8 +20,8 @@ is live, including 0; a negative slot skips both cache updates and writes zeros)
   state      [slots, H, 128 (V), 128 (K)] FP32.
 
 Grid (H * v_split, B) with ``v_split`` CTAs per (request, head) forming a
-cluster. Each CTA owns 128 / v_split state rows; 16 / v_split warps hold eight
-complete rows each in registers (lane l owns keys 4l..4l+3). With v_split > 1
+cluster. Each CTA owns 128 / v_split state rows split evenly over its warps;
+lane l owns keys 4l..4l+3 of every row of its warp. With v_split > 1
 the RMSNorm sum of squares is exchanged through distributed shared memory, and
 only cluster rank 0 writes the conv cache.
 """
@@ -41,7 +41,7 @@ F32 = cutlass.Float32
 BF16 = cutlass.BFloat16
 
 D = 128
-ROWS_PER_WARP = 8
+MAX_ASYNC_GROUPS = 8
 CONV_ITEMS = 3 * D // 4
 SETUP_ITEMS = CONV_ITEMS + D
 L2_EPS = 1.0e-6
@@ -91,13 +91,20 @@ class KdaDecodeT1:
         use_pdl: bool,
         stage_smem: bool,
         min_blocks: int,
+        warps: int,
     ):
         assert v_split in (1, 2, 4)
         self.heads = heads
         self.v_split = v_split
-        self.warps = 16 // v_split
+        self.warps = warps
         self.threads = self.warps * 32
         self.rows_per_cta = D // v_split
+        self.rows_per_warp = self.rows_per_cta // warps
+        assert self.rows_per_warp * warps == self.rows_per_cta and self.threads >= 4 * 32
+        assert stage_smem or self.rows_per_warp <= 8
+        # cp.async commit groups per thread; rows are consumed as their group lands.
+        self.groups = min(self.rows_per_warp, MAX_ASYNC_GROUPS)
+        self.rows_per_group = self.rows_per_warp // self.groups
         self.lower_bound = lower_bound
         self.q_scale = q_scale
         self.norm_eps = norm_eps
@@ -189,15 +196,15 @@ class KdaDecodeT1:
             )
         else:
             copy_g2r = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), F32, num_bits_per_copy=128)
-        for r in range(ROWS_PER_WARP):
-            local_row = warp * ROWS_PER_WARP + r
+        for r in range(self.rows_per_warp):
+            local_row = warp * self.rows_per_warp + r
             src = _aligned(state[(None, lane, row_base + local_row, head, slot)], 16)
             if self.stage_smem:
                 cute.copy(copy_g2s, src, _aligned(state_s[(None, lane, local_row)], 16))
+                if (r + 1) % self.rows_per_group == 0:
+                    cute.arch.cp_async_commit_group()
             else:
                 cute.copy(copy_g2r, src, state_regs[(None, r)])
-        if self.stage_smem:
-            cute.arch.cp_async_commit_group()
 
     @cute.kernel
     def kernel(
@@ -239,10 +246,8 @@ class KdaDecodeT1:
         is_live = slot_req >= 0
         slot = cute.max(slot_req, cutlass.Int32(0))
 
-        # Each thread stages its own eight state row slices (registers, or shared memory
-        # through cp.async so they stay in flight during the setup stage without
-        # holding registers); only the issuing thread reads them back.
-        state_regs = cute.make_rmem_tensor((4, ROWS_PER_WARP), F32)
+        # Only the thread that stages a state row reads it back, so staging needs no CTA barrier.
+        state_regs = cute.make_rmem_tensor((4, self.rows_per_warp), F32)
         state_s = None
         if cutlass.const_expr(self.stage_smem):
             state_s = smem.allocate_tensor(
@@ -354,12 +359,12 @@ class KdaDecodeT1:
             k[e] = k[e] * k_factor
         beta = scalars[0]
 
-        if cutlass.const_expr(self.stage_smem):
-            cute.arch.cp_async_wait_group(0)
-        for r in cutlass.range_constexpr(ROWS_PER_WARP):
-            local_row = warp * ROWS_PER_WARP + r
+        for r in cutlass.range_constexpr(self.rows_per_warp):
+            local_row = warp * self.rows_per_warp + r
             v_row = row_base + local_row
             if cutlass.const_expr(self.stage_smem):
+                if cutlass.const_expr(r % self.rows_per_group == 0):
+                    cute.arch.cp_async_wait_group(self.groups - 1 - r // self.rows_per_group)
                 cute.autovec_copy(state_s[(None, lane, local_row)], state_regs[(None, r)])
             hk = F32(0.0)
             for e in cutlass.range_constexpr(4):
@@ -436,6 +441,7 @@ def _compile(
     use_pdl: bool,
     stage_smem: bool,
     min_blocks: int,
+    warps: int,
 ):
     d = heads * D
     rows, slots, conv_slots = cute.sym_int(), cute.sym_int(), cute.sym_int()
@@ -475,23 +481,27 @@ def _compile(
         make_fake_stream(use_tvm_ffi_env_stream=True),
     )
     op = KdaDecodeT1(
-        heads, v_split, lower_bound, q_scale, norm_eps, early_state, use_pdl, stage_smem, min_blocks
+        heads,
+        v_split,
+        lower_bound,
+        q_scale,
+        norm_eps,
+        early_state,
+        use_pdl,
+        stage_smem,
+        min_blocks,
+        warps,
     )
     return cute.compile(op, *args, options="--enable-tvm-ffi")
 
 
-@cache
-def _num_sms(device_index: int) -> int:
-    return torch.cuda.get_device_properties(device_index).multi_processor_count
-
-
-def pick_v_split(batch: int, heads: int, device_index: int) -> int:
-    """Split V rows across a cluster until the grid covers the SMs."""
-    sms = _num_sms(device_index)
-    for v_split in (1, 2):
-        if batch * heads * v_split >= sms:
-            return v_split
-    return 4
+def pick_config(batch: int) -> tuple[int, int, bool]:
+    """(v_split, warps, stage_smem) for a decode batch at H=96."""
+    if batch == 1:
+        return 1, 16, False
+    if batch < 4:
+        return 1, 16, True
+    return 1, 8, True
 
 
 def pack_conv_weight(w_q_t: torch.Tensor, w_k_t: torch.Tensor, w_v_t: torch.Tensor) -> torch.Tensor:
@@ -517,7 +527,8 @@ def kda_decode_t1(
     norm_eps: float,
     scale: float = D**-0.5,
     v_split: int | None = None,
-    stage_smem: bool = True,
+    warps: int | None = None,
+    stage_smem: bool | None = None,
     min_blocks: int | None = None,
     early_state: bool = False,
     use_pdl: bool = True,
@@ -618,10 +629,15 @@ def kda_decode_t1(
     for ok, name in checks:
         if not ok:
             raise ValueError(f"kda_decode_t1: unsupported {name} layout or dtype")
+    default_split, default_warps, default_smem = pick_config(B)
     if v_split is None:
-        v_split = pick_v_split(B, heads, x.device.index)
+        v_split = default_split
+    if stage_smem is None:
+        stage_smem = default_smem
+    if warps is None:
+        warps = default_warps if v_split == 1 and stage_smem else 16 // v_split
     if min_blocks is None:
-        min_blocks = 1024 // (512 // v_split)
+        min_blocks = 1024 // (32 * warps)
     fn = _compile(
         heads,
         v_split,
@@ -632,6 +648,7 @@ def kda_decode_t1(
         use_pdl,
         stage_smem,
         min_blocks,
+        warps,
     )
     fn(
         x,
