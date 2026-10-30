@@ -42,6 +42,13 @@ BF16 = cutlass.BFloat16
 
 D = 128
 MAX_ASYNC_GROUPS = 8
+
+
+def cta_smem_bytes(warps: int, smem_rows: int) -> int:
+    """Dynamic shared memory of one CTA: 4 KB of vectors plus the staged state rows."""
+    return 4096 + warps * smem_rows * D * 4
+
+
 CONV_ITEMS = 3 * D // 4
 SETUP_ITEMS = CONV_ITEMS + D
 L2_EPS = 1.0e-6
@@ -89,7 +96,7 @@ class KdaDecodeT1:
         norm_eps: float,
         early_state: bool,
         use_pdl: bool,
-        stage_smem: bool,
+        reg_rows: int,
         min_blocks: int,
         warps: int,
     ):
@@ -101,19 +108,23 @@ class KdaDecodeT1:
         self.rows_per_cta = D // v_split
         self.rows_per_warp = self.rows_per_cta // warps
         assert self.rows_per_warp * warps == self.rows_per_cta and self.threads >= 4 * 32
-        assert stage_smem or self.rows_per_warp <= 8
-        # cp.async commit groups per thread; rows are consumed as their group lands.
-        self.groups = min(self.rows_per_warp, MAX_ASYNC_GROUPS)
-        self.rows_per_group = self.rows_per_warp // self.groups
+        # The first reg_rows rows of each warp load straight into registers; the rest are
+        # staged in shared memory by cp.async, in commit groups consumed as they land.
+        assert 0 <= reg_rows <= self.rows_per_warp
+        self.reg_rows = reg_rows
+        self.smem_rows = self.rows_per_warp - reg_rows
+        self.groups = max(
+            (g for g in range(1, MAX_ASYNC_GROUPS + 1) if self.smem_rows % g == 0), default=0
+        )
+        self.rows_per_group = self.smem_rows // self.groups if self.groups else 0
         self.lower_bound = lower_bound
         self.q_scale = q_scale
         self.norm_eps = norm_eps
         self.early_state = early_state
         self.use_pdl = use_pdl
-        self.stage_smem = stage_smem
         # Resident CTAs per SM requested from the register allocator (0: no bound).
         self.min_blocks = min_blocks
-        self.smem_bytes = 4096 + (self.rows_per_cta * D * 4 if stage_smem else 0)
+        self.smem_bytes = cta_smem_bytes(warps, self.smem_rows)
 
     @cute.jit
     def __call__(
@@ -188,23 +199,25 @@ class KdaDecodeT1:
         )
 
     def _load_state(self, state, state_s, state_regs, lane, warp, row_base, head, slot):
-        if self.stage_smem:
-            copy_g2s = cute.make_copy_atom(
-                cute.nvgpu.cpasync.CopyG2SOp(cache_mode=cute.nvgpu.LoadCacheMode.GLOBAL),
-                F32,
-                num_bits_per_copy=128,
-            )
-        else:
-            copy_g2r = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), F32, num_bits_per_copy=128)
+        copy_g2r = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), F32, num_bits_per_copy=128)
+        copy_g2s = cute.make_copy_atom(
+            cute.nvgpu.cpasync.CopyG2SOp(cache_mode=cute.nvgpu.LoadCacheMode.GLOBAL),
+            F32,
+            num_bits_per_copy=128,
+        )
         for r in range(self.rows_per_warp):
-            local_row = warp * self.rows_per_warp + r
-            src = _aligned(state[(None, lane, row_base + local_row, head, slot)], 16)
-            if self.stage_smem:
-                cute.copy(copy_g2s, src, _aligned(state_s[(None, lane, local_row)], 16))
-                if (r + 1) % self.rows_per_group == 0:
-                    cute.arch.cp_async_commit_group()
-            else:
+            src = _aligned(
+                state[(None, lane, row_base + warp * self.rows_per_warp + r, head, slot)], 16
+            )
+            if r < self.reg_rows:
                 cute.copy(copy_g2r, src, state_regs[(None, r)])
+            else:
+                j = r - self.reg_rows
+                cute.copy(
+                    copy_g2s, src, _aligned(state_s[(None, lane, warp * self.smem_rows + j)], 16)
+                )
+                if (j + 1) % self.rows_per_group == 0:
+                    cute.arch.cp_async_commit_group()
 
     @cute.kernel
     def kernel(
@@ -249,10 +262,10 @@ class KdaDecodeT1:
         # Only the thread that stages a state row reads it back, so staging needs no CTA barrier.
         state_regs = cute.make_rmem_tensor((4, self.rows_per_warp), F32)
         state_s = None
-        if cutlass.const_expr(self.stage_smem):
+        if cutlass.const_expr(self.smem_rows > 0):
             state_s = smem.allocate_tensor(
                 F32,
-                cute.make_layout((4, 32, self.rows_per_cta), stride=(1, 4, D)),
+                cute.make_layout((4, 32, self.warps * self.smem_rows), stride=(1, 4, D)),
                 byte_alignment=16,
             )
         if cutlass.const_expr(self.early_state):
@@ -362,10 +375,13 @@ class KdaDecodeT1:
         for r in cutlass.range_constexpr(self.rows_per_warp):
             local_row = warp * self.rows_per_warp + r
             v_row = row_base + local_row
-            if cutlass.const_expr(self.stage_smem):
-                if cutlass.const_expr(r % self.rows_per_group == 0):
-                    cute.arch.cp_async_wait_group(self.groups - 1 - r // self.rows_per_group)
-                cute.autovec_copy(state_s[(None, lane, local_row)], state_regs[(None, r)])
+            if cutlass.const_expr(r >= self.reg_rows):
+                j = r - self.reg_rows
+                if cutlass.const_expr(j % self.rows_per_group == 0):
+                    cute.arch.cp_async_wait_group(self.groups - 1 - j // self.rows_per_group)
+                cute.autovec_copy(
+                    state_s[(None, lane, warp * self.smem_rows + j)], state_regs[(None, r)]
+                )
             hk = F32(0.0)
             for e in cutlass.range_constexpr(4):
                 state_regs[e, r] = state_regs[e, r] * decay[e]
@@ -439,7 +455,7 @@ def _compile(
     norm_eps: float,
     early_state: bool,
     use_pdl: bool,
-    stage_smem: bool,
+    reg_rows: int,
     min_blocks: int,
     warps: int,
 ):
@@ -488,7 +504,7 @@ def _compile(
         norm_eps,
         early_state,
         use_pdl,
-        stage_smem,
+        reg_rows,
         min_blocks,
         warps,
     )
@@ -499,9 +515,26 @@ def pick_config(batch: int) -> tuple[int, int, bool]:
     """(v_split, warps, stage_smem) for a decode batch at H=96."""
     if batch == 1:
         return 1, 16, False
-    if batch < 4:
-        return 1, 16, True
-    return 1, 8, True
+    return 1, 16, True
+
+
+@cache
+def smem_per_sm(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).shared_memory_per_multiprocessor
+
+
+def staging_plan(device_index: int, v_split: int, warps: int, stage_smem: bool) -> tuple[int, int]:
+    """(reg_rows, min_blocks): fewest register-held rows that let 1024 / threads CTAs share an SM."""
+    rows_per_warp = D // v_split // warps
+    target = max(1, 1024 // (32 * warps))
+    budget = smem_per_sm(device_index)
+    if not stage_smem:
+        return rows_per_warp, target
+    for reg_rows in range(rows_per_warp + 1):
+        # 1 KB per CTA is reserved by the runtime.
+        if target * (cta_smem_bytes(warps, rows_per_warp - reg_rows) + 1024) <= budget:
+            return reg_rows, target
+    return rows_per_warp, target
 
 
 def pack_conv_weight(w_q_t: torch.Tensor, w_k_t: torch.Tensor, w_v_t: torch.Tensor) -> torch.Tensor:
@@ -632,6 +665,7 @@ def kda_decode_t1(
     v_split: int | None = None,
     warps: int | None = None,
     stage_smem: bool | None = None,
+    reg_rows: int | None = None,
     min_blocks: int | None = None,
     early_state: bool = False,
     use_pdl: bool = True,
@@ -674,8 +708,11 @@ def kda_decode_t1(
         stage_smem = default_smem
     if warps is None:
         warps = default_warps if v_split == 1 and stage_smem else 16 // v_split
+    plan_reg_rows, plan_min_blocks = staging_plan(x.device.index, v_split, warps, stage_smem)
+    if reg_rows is None:
+        reg_rows = plan_reg_rows
     if min_blocks is None:
-        min_blocks = 1024 // (32 * warps)
+        min_blocks = plan_min_blocks
     fn = _compile(
         heads,
         v_split,
@@ -684,7 +721,7 @@ def kda_decode_t1(
         float(norm_eps),
         early_state,
         use_pdl,
-        stage_smem,
+        reg_rows,
         min_blocks,
         warps,
     )
