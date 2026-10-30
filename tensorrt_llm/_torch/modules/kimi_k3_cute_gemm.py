@@ -10,7 +10,8 @@ points; the first entry whose max_m covers the runtime M is used. Backends:
 - ``fi_direct`` / ``fi_splitk``: FlashInfer's low-M CuTe DSL GEMMs (M <= 32 per launch; split-K runs M <= 64 as two
   launches). The in-tree split-K reduces bf16 partials in the output and loses precision, so no table entry uses it.
 
-A shape without an entry runs the ``rubin`` backend under the TRT-LLM autotuner.
+A shape without an entry runs the ``rubin`` backend under the TRT-LLM autotuner. Non-BF16 operands keep the
+cuBLAS matmul; empty problems launch nothing.
 """
 
 import functools
@@ -178,10 +179,14 @@ def linear(
     """
     m, k = x.shape
     n = weight.shape[0]
+    if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+        return torch.matmul(x, weight.t(), out=out)
     # DLPack export rejects tensors that require grad (nn.Linear parameters); detach() is a view.
     x, weight = x.detach(), weight.detach()
     if out is None:
         out = x.new_empty(m, n)
+    if m == 0 or n == 0:
+        return out
     backend, tactic = _select(_GEMM_TABLE.get((n, k)), m)
     dense = _row_major(x) and _row_major(out)
     if backend == "fi_direct" and dense:
@@ -225,9 +230,13 @@ def bmm(x: torch.Tensor, weight: torch.Tensor, out: Optional[torch.Tensor] = Non
     innermost."""
     b, m, k = x.shape
     n = weight.shape[1]
+    if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+        return torch.bmm(x, weight.transpose(1, 2), out=out)
     x, weight = x.detach(), weight.detach()
     if out is None:
         out = x.new_empty(b, m, n)
+    if b == 0 or m == 0 or n == 0:
+        return out
     _, tactic = _select(_BMM_TABLE.get((b, n, k)), m)
     _run_bmm(x, weight, out, tactic)
     return out
