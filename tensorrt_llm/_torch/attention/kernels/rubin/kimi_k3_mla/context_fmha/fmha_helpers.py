@@ -70,6 +70,7 @@ class FmhaStaticTileSchedulerParams:
         is_persistent: bool,
         problem_shape_mhb: cute.Shape,
         *,
+        lpt: bool = False,
         loc=None,
         ip=None,
     ):
@@ -83,6 +84,7 @@ class FmhaStaticTileSchedulerParams:
         """
         self.is_persistent = is_persistent
         self.problem_shape_mhb = problem_shape_mhb
+        self.lpt = lpt
         self._loc = loc
         self._ip = ip
 
@@ -99,7 +101,9 @@ class FmhaStaticTileSchedulerParams:
         for obj, n_items in zip([self.problem_shape_mhb], self._values_pos):
             obj_list.append(new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
-        return FmhaStaticTileSchedulerParams(self.is_persistent, *(tuple(obj_list)), loc=self._loc)
+        return FmhaStaticTileSchedulerParams(
+            self.is_persistent, *(tuple(obj_list)), lpt=self.lpt, loc=self._loc
+        )
 
 
 class FmhaStaticTileScheduler:
@@ -242,6 +246,15 @@ class FmhaStaticTileScheduler:
             )
         else:
             blk_coord = self._blk_coord
+            if self._params.lpt:
+                # Launch order is block-linear with m fastest; walk q tiles from the last (the longest causal
+                # rows) to the first across all heads and batches so the light tiles fill the tail wave.
+                m_cnt, h_cnt, b_cnt = self._grid_shape
+                hb_cnt = h_cnt * b_cnt
+                lin = blk_coord[0] + m_cnt * (blk_coord[1] + h_cnt * blk_coord[2])
+                m_rank = lin // hb_cnt
+                rest = lin - m_rank * hb_cnt
+                blk_coord = (m_cnt - 1 - m_rank, rest % h_cnt, rest // h_cnt)
 
         # cur_tile_coord is (mid, 0, (bid, hid))
         cur_tile_coord = (
@@ -318,6 +331,7 @@ def create_fmha_static_tile_scheduler(
 def create_fmha_static_tile_scheduler_params(
     is_persistent: bool,
     problem_shape_mhb: cute.Shape,
+    lpt: bool = False,
 ) -> FmhaStaticTileSchedulerParams:
     """
     Create FMHA static tile scheduler parameters.
@@ -330,7 +344,7 @@ def create_fmha_static_tile_scheduler_params(
     :return: New FmhaStaticTileSchedulerParams instance.
     :rtype: FmhaStaticTileSchedulerParams
     """
-    return FmhaStaticTileSchedulerParams(is_persistent, problem_shape_mhb)
+    return FmhaStaticTileSchedulerParams(is_persistent, problem_shape_mhb, lpt=lpt)
 
 
 def compute_grid(
@@ -338,6 +352,7 @@ def compute_grid(
     cta_tiler: Tuple[int, int, int],
     is_persistent: bool,
     is_2cta: bool = False,
+    lpt: bool = False,
 ) -> Tuple[FmhaStaticTileSchedulerParams, Tuple[int, int, int]]:
     """
     Compute grid parameters for FMHA operation.
@@ -372,6 +387,7 @@ def compute_grid(
             cute.size(o_shape[2][0]),
             cute.size(o_shape[2][1]),
         ),
+        lpt=lpt and not is_persistent,
     )
     grid = FmhaStaticTileScheduler.get_grid_shape(tile_sched_params)
 

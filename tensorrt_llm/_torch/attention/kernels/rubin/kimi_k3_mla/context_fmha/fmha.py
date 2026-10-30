@@ -118,6 +118,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         enable_ex2_emulation: bool,
         enable_skip_correction: bool,
         use_tma_store: bool = True,
+        tuning: Optional[dict] = None,
     ):
         """Initializes the configuration for a Blackwell Fused Multi-Head Attention (FMHA) kernel.
 
@@ -192,6 +193,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.enable_skip_correction = enable_skip_correction
         self.enable_ex2_emulation = enable_ex2_emulation
         self.use_tma_store = use_tma_store
+        # Overrides of _setup_attributes / register-split attributes (kv_stage, enable_sequence_barrier,
+        # enable_correction_double_buffer, num_regs_*) and "lpt" (heaviest causal q tiles launch first).
+        self.tuning = dict(tuning or {})
 
         self.softmax0_warp_ids = (0, 1, 2, 3)
         self.softmax1_warp_ids = (4, 5, 6, 7)
@@ -347,6 +351,10 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.enable_sequence_barrier = False
         # Optional double buffering for correction rescale.
         self.enable_correction_double_buffer = False
+        for name, value in self.tuning.items():
+            if name != "lpt":
+                assert hasattr(self, name), f"unknown FMHA tuning attribute {name}"
+                setattr(self, name, value)
 
     @cute.jit
     def __call__(
@@ -486,6 +494,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             cute.shape((s_q_max, d, ((h_r, h_k), b))),
             self.cta_tiler,
             self.is_persistent,
+            lpt=self.tuning.get("lpt", False),
         )
         self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
         self.k_major_mode = utils.LayoutEnum.from_tensor(k).mma_major_mode()
@@ -625,6 +634,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.tma_copy_k_bytes = k_copy_size
         self.tma_copy_v_bytes = v_copy_size
 
+        # sO only backs the TMA-store epilogue; the st.global epilogue leaves it unused.
+        sO_cosize = cute.cosize(o_smem_layout_staged) if self.use_tma_store else 64
+
         @cute.struct
         class SharedStorage:
             # Pipeline barriers
@@ -644,7 +656,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             tmem_holding_buf: Int32
             # Smem tensors
             sO: cute.struct.Align[
-                cute.struct.MemRange[self.o_dtype, cute.cosize(o_smem_layout_staged)],
+                cute.struct.MemRange[self.o_dtype, sO_cosize],
                 self.buffer_align_bytes,
             ]
             sQ: cute.struct.Align[
@@ -948,7 +960,11 @@ class BlackwellFusedMultiHeadAttentionForward:
             v_smem_layout_staged.inner,
         )
         sV = cute.make_tensor(sV_ptr, v_smem_layout_staged.outer)
-        sO = storage.sO.get_tensor(o_smem_layout_staged.outer, swizzle=o_smem_layout_staged.inner)
+        sO = None
+        if cutlass.const_expr(self.use_tma_store):
+            sO = storage.sO.get_tensor(
+                o_smem_layout_staged.outer, swizzle=o_smem_layout_staged.inner
+            )
         s0_warp_wants_skip_softmax_exchange = (
             storage.s0_warp_wants_skip_softmax_exchange.get_tensor(cute.make_layout((4,)))
         )
