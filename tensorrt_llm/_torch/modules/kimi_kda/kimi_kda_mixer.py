@@ -22,7 +22,7 @@ import os
 import weakref
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 from fla.modules import ShortConvolution
@@ -620,6 +620,7 @@ class KimiKDALinearAttention(nn.Module):
         self,
         x: torch.Tensor,
         out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        before_up: Optional[Callable[[], None]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """``(beta, forget_gate, onorm_g)`` from the fused ``[f_a | (g_a) | b]`` GEMM.
 
@@ -627,7 +628,8 @@ class KimiKDALinearAttention(nn.Module):
         batched ``[f_b; g_b]`` GEMM) or ``None`` for the full-rank gate, whose
         output gate rides in the fused qkvg projection instead. Requires
         ``finalize_decode_weights`` to have published ``_bfa_proj_weight``.
-        ``out`` supplies the ``(bfa, gate)`` GEMM output buffers.
+        ``out`` supplies the ``(bfa, gate)`` GEMM output buffers; ``before_up``
+        runs between the two GEMMs.
         """
         hd, H = self.head_dim, self.num_heads
         if out is None:
@@ -635,6 +637,8 @@ class KimiKDALinearAttention(nn.Module):
         else:
             bfa_out, gate_out = out
             bfa = torch.matmul(x, self._bfa_proj_weight.t(), out=bfa_out)
+        if before_up is not None:
+            before_up()
         if self.use_full_rank_gate:
             if gate_out is None:
                 return bfa[..., hd : hd + H], self.f_b_proj(bfa[..., :hd]), None
@@ -792,7 +796,9 @@ class KimiKDALinearAttention(nn.Module):
 
         with maybe_stage(fgs, "kda.gate_proj"):
             if self._bfa_proj_weight is not None:
-                beta, g, onorm_lowrank = self._project_gate_inputs(x)
+                beta, g, onorm_lowrank = self._project_gate_inputs(
+                    x, before_up=fgs.mark_output if fgs is not None else None
+                )
                 if onorm_g is None:
                     onorm_g = onorm_lowrank
             else:
@@ -1093,9 +1099,13 @@ class KimiKDALinearAttention(nn.Module):
             self._projection_aux_stream if B <= _KDA_BFA_MULTISTREAM_MAX_ROWS else None
         )
         with maybe_stage(fgs, "kda.dec_proj"):
+            if fgs is not None and projection_aux_stream is not None:
+                projection_aux_stream = fgs.side_stream() or projection_aux_stream
             qkvg, (beta, g, onorm_lowrank) = maybe_execute_in_parallel(
                 _project_qkvg,
-                lambda: self._project_gate_inputs(x2d, out=gate_out),
+                lambda: self._project_gate_inputs(
+                    x2d, out=gate_out, before_up=fgs.mark_output if fgs is not None else None
+                ),
                 self._projection_fork_event,
                 self._projection_join_event,
                 projection_aux_stream,

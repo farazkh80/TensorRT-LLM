@@ -697,13 +697,20 @@ def _apply_attn_res_and_rmsnorm(
     proj: nn.Linear,
     norm: KimiK3RMSNorm,
     output_norm: nn.Module,
+    before_norm: Optional[Callable[[], None]] = None,
 ) -> torch.Tensor:
-    """Apply attention-residual selection and the next RMSNorm."""
+    """Apply attention-residual selection and the next RMSNorm.
+
+    ``before_norm`` runs between the two kernels of the unfused path.
+    """
     if _FUSED_ATTN_RES_ENABLED:
         fused = _apply_attn_res_rmsnorm_fused(prefix_sum, block_residual, proj, norm, output_norm)
         if fused is not None:
             return fused
-    return output_norm(_apply_attn_res(prefix_sum, block_residual, proj, norm))
+    hidden_states = _apply_attn_res(prefix_sum, block_residual, proj, norm)
+    if before_norm is not None:
+        before_norm()
+    return output_norm(hidden_states)
 
 
 def _apply_attn_res_add_and_rmsnorm(
@@ -2292,6 +2299,7 @@ class KimiLinearDecoderLayer(nn.Module):
                         self.self_attention_res_proj,
                         self.self_attention_res_norm,
                         self.input_layernorm,
+                        before_norm=fgs.mark_output if fgs is not None else None,
                     )
                 else:
                     hidden_states = self.input_layernorm(hidden_states)

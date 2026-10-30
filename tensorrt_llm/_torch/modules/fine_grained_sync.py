@@ -9,7 +9,8 @@ that decides whether the consumer waits for the producer to complete.
 
 ``ORACLE`` edges do not wait for the producer to complete. The consumer waits
 only until the producer starts (for a producer with nested stages, until its
-last nested stage starts, which is the kernel group that writes the output),
+last nested stage starts, which is the kernel group that writes the output)
+and reaches every point it marks with :meth:`StreamManager.mark_output`,
 then reads the output buffer as if every tile were already valid. This is the
 best-case overlap a fine-grained-sync (data-as-flag) consumer could reach with
 zero validity-check and buffer re-arm cost; waiting for the start keeps the
@@ -32,6 +33,12 @@ Configuration is read from the environment when the manager is first used:
   other stage runs inline on its calling stream (default: all stages).
 - ``TLLM_FGS_ORACLE_FROM``: ``start`` (default) or ``none``; with ``none`` an
   ``ORACLE`` consumer does not wait for its producer at all.
+- ``TLLM_FGS_ORACLE_ORDER``: ``priority`` (default) or ``none``. A start event
+  only says the producer's stream reached the stage, not that its kernel got
+  SMs, so a wide consumer could otherwise take the GPU before its producer.
+  With ``priority`` each stage runs on a lane whose priority falls with its
+  depth along ``ORACLE`` edges, so when both are pending the block scheduler
+  dispatches the producer first and the consumer fills the SMs it leaves.
 """
 
 from __future__ import annotations
@@ -44,6 +51,9 @@ from enum import Enum
 from typing import Dict, FrozenSet, Iterator, List, Mapping, Optional, Set, Tuple
 
 import torch
+
+# Distinct lane priorities for ORACLE chain depths 0..3; deeper stages share the lowest one.
+_PRIORITY_LEVELS = 4
 
 
 class EdgePolicy(str, Enum):
@@ -60,6 +70,7 @@ class FineGrainedSyncConfig:
     num_lanes: int = 2
     stages: Optional[FrozenSet[str]] = None
     oracle_waits_for_start: bool = True
+    oracle_ordered: bool = True
 
     def __post_init__(self) -> None:
         if self.num_lanes < 1:
@@ -83,12 +94,16 @@ class FineGrainedSyncConfig:
         oracle_from = os.environ.get("TLLM_FGS_ORACLE_FROM", "start").strip().lower()
         if oracle_from not in ("start", "none"):
             raise ValueError(f"TLLM_FGS_ORACLE_FROM must be start or none, got {oracle_from!r}")
+        order = os.environ.get("TLLM_FGS_ORACLE_ORDER", "priority").strip().lower()
+        if order not in ("priority", "none"):
+            raise ValueError(f"TLLM_FGS_ORACLE_ORDER must be priority or none, got {order!r}")
         return cls(
             default_policy=EdgePolicy(mode),
             edge_policies=edge_policies,
             num_lanes=int(os.environ.get("TLLM_FGS_NUM_LANES", "2")),
             stages=frozenset(s.strip() for s in stages.split(",")) if stages else None,
             oracle_waits_for_start=oracle_from == "start",
+            oracle_ordered=order == "priority",
         )
 
 
@@ -121,9 +136,22 @@ class StreamManager:
         self, config: FineGrainedSyncConfig, device: Optional[torch.device] = None
     ) -> None:
         self.config = config
-        self._lanes = [torch.cuda.Stream(device=device) for _ in range(config.num_lanes)]
+        # num_lanes lanes per priority level; level 0 has the highest priority.
+        self._levels = _PRIORITY_LEVELS if config.oracle_ordered else 1
+        self._lane_level = [lvl for lvl in range(self._levels) for _ in range(config.num_lanes)]
+        self._lanes = [
+            torch.cuda.Stream(device=device, priority=lvl - (self._levels - 1))
+            for lvl in self._lane_level
+        ]
+        self._side = [
+            torch.cuda.Stream(device=device, priority=lvl - (self._levels - 1))
+            for lvl in range(self._levels)
+        ]
+        self._depth: Dict[str, int] = {}
         self._done_events: Dict[str, torch.cuda.Event] = {}
-        self._start_events: Dict[str, torch.cuda.Event] = {}
+        # Start event, then one per mark_output() of the stage's latest run.
+        self._release_events: Dict[str, List[torch.cuda.Event]] = {}
+        self._num_released: Dict[str, int] = {}
         self._last_child: Dict[str, str] = {}
         self._stage_lane: Dict[str, int] = {}
         self._origin: Optional[torch.cuda.Stream] = None
@@ -131,6 +159,7 @@ class StreamManager:
         self._kept: List[torch.Tensor] = []
         self._graph_kept: List[torch.Tensor] = []
         self._open_stages: List[Tuple[int, List[str]]] = []
+        self._open_info: List[Tuple[str, int]] = []
         self._lane_last_use = [0] * len(self._lanes)
         self._clock = 0
 
@@ -160,6 +189,7 @@ class StreamManager:
             self._recorded.clear()
             self._kept.clear()
             self._open_stages.clear()
+            self._open_info.clear()
 
     @contextmanager
     def stage(self, name: str, after: Tuple[str, ...] = ()) -> Iterator[None]:
@@ -175,7 +205,12 @@ class StreamManager:
                     enclosing.wait_event(self._done_events[producer])
             yield
             return
-        lane_index = self._pick_lane(name, after)
+        depth = self._open_info[-1][1] if self._open_info else 0
+        for producer in after:
+            if producer in self._recorded:
+                oracle = self.config.policy(producer, name) is EdgePolicy.ORACLE
+                depth = max(depth, self._depth[producer] + oracle)
+        lane_index = self._pick_lane(name, after, min(depth, self._levels - 1))
         lane = self._lanes[lane_index]
         lane.wait_stream(enclosing)
         for producer in after:
@@ -186,18 +221,22 @@ class StreamManager:
                     source = producer
                     while source in self._last_child:
                         source = self._last_child[source]
-                    lane.wait_event(self._start_events[source])
+                    for event in self._release_events[source][: self._num_released[source]]:
+                        lane.wait_event(event)
                 continue
             if self._stage_lane[producer] != lane_index:
                 lane.wait_event(self._done_events[producer])
-        start = self._start_events.get(name)
-        if start is None:
-            start = self._start_events[name] = torch.cuda.Event()
-        start.record(lane)
+        events = self._release_events.get(name)
+        if events is None:
+            events = self._release_events[name] = [torch.cuda.Event()]
+        events[0].record(lane)
+        self._num_released[name] = 1
         self._open_stages.append((lane_index, []))
+        self._open_info.append((name, depth))
         with torch.cuda.stream(lane):
             yield
         children = self._open_stages.pop()[1]
+        self._open_info.pop()
         for child in children:
             if self._stage_lane[child] != lane_index:
                 lane.wait_event(self._done_events[child])
@@ -210,11 +249,12 @@ class StreamManager:
             event = self._done_events[name] = torch.cuda.Event()
         event.record(lane)
         self._stage_lane[name] = lane_index
+        self._depth[name] = depth
         self._recorded.add(name)
         if self._open_stages:
             self._open_stages[-1][1].append(name)
 
-    def _pick_lane(self, name: str, after: Tuple[str, ...]) -> int:
+    def _pick_lane(self, name: str, after: Tuple[str, ...], level: int) -> int:
         # A consumer on its producer's lane is serialized by stream order, which
         # would silently turn an ORACLE edge into a STANDALONE one. A STANDALONE
         # consumer instead reuses its producer's lane to avoid a cross-lane wait.
@@ -227,19 +267,46 @@ class StreamManager:
             if self.config.policy(p, name) is EdgePolicy.ORACLE
         }
         excluded.update(lane for lane, _ in self._open_stages)
+        pool = [i for i in range(len(self._lanes)) if self._lane_level[i] == level]
         standalone_lanes = [
-            self._stage_lane[p] for p in producers if self._stage_lane[p] not in excluded
+            self._stage_lane[p]
+            for p in producers
+            if self._stage_lane[p] in pool and self._stage_lane[p] not in excluded
         ]
         if standalone_lanes:
             lane_index = standalone_lanes[0]
         else:
-            candidates = [i for i in range(len(self._lanes)) if i not in excluded]
-            lane_index = min(
-                candidates or range(len(self._lanes)), key=lambda i: self._lane_last_use[i]
-            )
+            candidates = [i for i in pool if i not in excluded]
+            lane_index = min(candidates or pool, key=lambda i: self._lane_last_use[i])
         self._clock += 1
         self._lane_last_use[lane_index] = self._clock
         return lane_index
+
+    def mark_output(self) -> None:
+        """Hold the open stage's ``ORACLE`` consumers until this point too.
+
+        Call it right before an output kernel that is not the stage's first, on
+        the stream that launches it (e.g. a norm after a residual mix, or a GEMM
+        on a side stream); consumers wait for the stage's start and every mark.
+        """
+        if not self._open_info:
+            return
+        name = self._open_info[-1][0]
+        events, count = self._release_events[name], self._num_released[name]
+        if count == len(events):
+            events.append(torch.cuda.Event())
+        events[count].record(torch.cuda.current_stream())
+        self._num_released[name] = count + 1
+
+    def side_stream(self) -> Optional[torch.cuda.Stream]:
+        """A stream at the open stage's priority for work forked off its lane; None outside a stage.
+
+        Forked work on a default-priority stream would lose SMs to every
+        ``ORACLE`` consumer and could run after them.
+        """
+        if not self._open_stages:
+            return None
+        return self._side[self._lane_level[self._open_stages[-1][0]]]
 
     def keep(self, *tensors: Optional[torch.Tensor]) -> None:
         self._kept.extend(t for t in tensors if isinstance(t, torch.Tensor))
