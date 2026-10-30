@@ -17,6 +17,11 @@
 Rounding follows the two ATen kernels it replaces (``g.sigmoid()`` then ``o * s``):
 s = bf16(1 / (1 + expf(-float(g)))) with IEEE expf / division, then out = bf16(float(o) * float(s)).
 The product of two bf16 values is exact in fp32, so the only rounding steps are the two bf16 casts.
+
+With ``fast`` the sigmoid is first evaluated with ex2.approx / rcp.approx. For g > -80 that value is within
+2^-17 (relative) of the IEEE one, about 60 fp32 ulps, so both round to the same bf16 unless the fast value lies
+within 256 ulps of a bf16 rounding midpoint; those elements (about 0.8%), g <= -80 (the rcp.approx flush range)
+and NaN fall back to the IEEE formula. The bf16 result is therefore identical to the exact path.
 """
 
 from typing import Callable, Optional
@@ -29,31 +34,86 @@ from cutlass.base_dsl.dsl import BaseDSL
 from cutlass.cute.runtime import make_ptr
 
 THREADS = 256
-VEC = 8  # bf16 elements per 16-byte access
+LOG2E = 1.4426950408889634
+MIDPOINT_GUARD_ULPS = 256
+
+
+@cute.jit
+def _sigmoid_bf16_as_f32(g: cutlass.Float32, fast: cutlass.Constexpr) -> cutlass.Float32:
+    s = cutlass.Float32(0.0)
+    if cutlass.const_expr(fast):
+        s = cute.arch.rcp_approx(
+            cutlass.Float32(1.0) + cute.math.exp2(g * cutlass.Float32(-LOG2E), fastmath=True)
+        )
+        low = cutlass.Vector.from_elements((s,), cutlass.Float32).bitcast(cutlass.Int32)[0] & cutlass.Int32(0xFFFF)
+        off = low - cutlass.Int32(0x8000)
+        if (
+            g <= cutlass.Float32(-80.0)
+            or g != g
+            or (off <= cutlass.Int32(MIDPOINT_GUARD_ULPS) and off >= cutlass.Int32(-MIDPOINT_GUARD_ULPS))
+        ):
+            s = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.math.exp(-g, fastmath=False))
+    else:
+        s = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.math.exp(-g, fastmath=False))
+    return s.to(cutlass.BFloat16).to(cutlass.Float32)
+
+
+def _gate_chunk(o_arr, g_arr, out_arr, idx, vec, fast):
+    o = o_arr.load(idx, vec, alignment=2 * vec).to(cutlass.Float32)
+    g = g_arr.load(idx, vec, alignment=2 * vec).to(cutlass.Float32)
+    res = []
+    for e in cutlass.range_constexpr(vec):
+        res.append(o[e] * _sigmoid_bf16_as_f32(g[e], fast))
+    out_arr.store(
+        cutlass.Vector.from_elements(tuple(res), dtype=cutlass.Float32).to(cutlass.BFloat16),
+        idx=idx,
+        vector_size=vec,
+        alignment=2 * vec,
+    )
 
 
 @cute.kernel
-def _output_gate_kernel(mO: cute.Tensor, mG: cute.Tensor, mOut: cute.Tensor, num_vecs: cutlass.Int64):
+def _output_gate_kernel(
+    mO: cute.Tensor,
+    mG: cute.Tensor,
+    mOut: cute.Tensor,
+    num_vecs: cutlass.Int64,
+    vec: cutlass.Constexpr,
+    unroll: cutlass.Constexpr,
+    fast: cutlass.Constexpr,
+):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
     o_arr = cutlass.make_array_view(mO)
     g_arr = cutlass.make_array_view(mG)
     out_arr = cutlass.make_array_view(mOut)
-    vec = cutlass.Int64(bidx) * cutlass.Int64(THREADS) + cutlass.Int64(tidx)
-    if vec < num_vecs:
-        idx = vec * cutlass.Int64(VEC)
-        o = o_arr.load(idx, VEC, alignment=16).to(cutlass.Float32)
-        g = g_arr.load(idx, VEC, alignment=16).to(cutlass.Float32)
-        res = []
-        for e in cutlass.range_constexpr(VEC):
-            s = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.math.exp(-g[e], fastmath=False))
-            res.append(o[e] * s.to(cutlass.BFloat16).to(cutlass.Float32))
-        out_arr.store(
-            cutlass.Vector.from_elements(tuple(res), dtype=cutlass.Float32).to(cutlass.BFloat16),
-            idx=idx,
-            vector_size=VEC,
-            alignment=16,
-        )
+    first = cutlass.Int64(bidx) * cutlass.Int64(THREADS * unroll) + cutlass.Int64(tidx)
+    if cutlass.Int64(bidx + 1) * cutlass.Int64(THREADS * unroll) <= num_vecs:
+        # Full CTA: issue every load of the thread before any math so `unroll` vectors per operand are in flight.
+        os = []
+        gs = []
+        for u in cutlass.range_constexpr(unroll):
+            idx = (first + cutlass.Int64(u * THREADS)) * cutlass.Int64(vec)
+            os.append(o_arr.load(idx, vec, alignment=2 * vec))
+            gs.append(g_arr.load(idx, vec, alignment=2 * vec))
+        for u in cutlass.range_constexpr(unroll):
+            idx = (first + cutlass.Int64(u * THREADS)) * cutlass.Int64(vec)
+            o = os[u].to(cutlass.Float32)
+            g = gs[u].to(cutlass.Float32)
+            res = []
+            for e in cutlass.range_constexpr(vec):
+                res.append(o[e] * _sigmoid_bf16_as_f32(g[e], fast))
+            out_arr.store(
+                cutlass.Vector.from_elements(tuple(res), dtype=cutlass.Float32).to(cutlass.BFloat16),
+                idx=idx,
+                vector_size=vec,
+                alignment=2 * vec,
+            )
+    else:
+        for u in cutlass.range_constexpr(unroll):
+            v = first + cutlass.Int64(u * THREADS)
+            if v < num_vecs:
+                _gate_chunk(o_arr, g_arr, out_arr, v * cutlass.Int64(vec), vec, fast)
 
 
 @cute.jit
@@ -64,22 +124,30 @@ def _output_gate_host(
     stream: cuda.CUstream,
     num_vecs: cutlass.Int64,
     num_ctas: cutlass.Int32,
+    vec: cutlass.Constexpr,
+    unroll: cutlass.Constexpr,
+    fast: cutlass.Constexpr,
 ):
-    layout = cute.make_layout((num_ctas, THREADS * VEC), stride=(THREADS * VEC, 1))
+    layout = cute.make_layout((num_ctas, THREADS * unroll * vec), stride=(THREADS * unroll * vec, 1))
     _output_gate_kernel(
         cute.make_tensor(o_ptr, layout),
         cute.make_tensor(g_ptr, layout),
         cute.make_tensor(out_ptr, layout),
         num_vecs,
+        vec,
+        unroll,
+        fast,
     ).launch(grid=(num_ctas, 1, 1), block=(THREADS, 1, 1), stream=stream)
 
 
-_COMPILED: list[Callable] = []
+# (elements per access, accesses per thread per operand, fast sigmoid with exact fallback)
+DEFAULT_CONFIG = (16, 2, True)
+_COMPILED: dict[tuple, Callable] = {}
 
 
-def _ptrs(*tensors):
+def _ptrs(align, *tensors):
     return [
-        make_ptr(cutlass.BFloat16, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+        make_ptr(cutlass.BFloat16, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
         for t in tensors
     ]
 
@@ -92,29 +160,34 @@ def supported(o: torch.Tensor, g: torch.Tensor) -> bool:
         and o.is_cuda
         and o.is_contiguous()
         and g.is_contiguous()
-        and o.numel() % VEC == 0
-        and o.data_ptr() % 16 == 0
-        and g.data_ptr() % 16 == 0
+        and o.numel() % 16 == 0
+        and o.data_ptr() % 32 == 0
+        and g.data_ptr() % 32 == 0
     )
 
 
-def mla_output_gate(o: torch.Tensor, g: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
+def mla_output_gate(
+    o: torch.Tensor, g: torch.Tensor, out: Optional[torch.Tensor] = None, config: tuple = DEFAULT_CONFIG
+) -> torch.Tensor:
     """out = o * sigmoid(g), bf16, bit-matching ``o * g.sigmoid()``. ``out`` may alias ``o``."""
     if not supported(o, g):
-        raise ValueError("mla_output_gate needs contiguous, 16B-aligned bf16 o / g of equal shape")
+        raise ValueError("mla_output_gate needs contiguous, 32B-aligned bf16 o / g of equal shape")
     if out is None:
         out = torch.empty_like(o)
-    elif not (out.shape == o.shape and out.dtype == o.dtype and out.is_contiguous() and out.data_ptr() % 16 == 0):
-        raise ValueError("out must be a contiguous, 16B-aligned bf16 tensor shaped like o")
-    num_vecs = o.numel() // VEC
+    elif not (out.shape == o.shape and out.dtype == o.dtype and out.is_contiguous() and out.data_ptr() % 32 == 0):
+        raise ValueError("out must be a contiguous, 32B-aligned bf16 tensor shaped like o")
+    vec, unroll, fast = config
+    num_vecs = o.numel() // vec
     if num_vecs == 0:
         return out
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    ptrs = _ptrs(o, g, out)
-    if not _COMPILED:
+    ptrs = _ptrs(2 * vec, o, g, out)
+    fn = _COMPILED.get(config)
+    if fn is None:
         with BaseDSL.enable_pyir():
-            _COMPILED.append(
-                cute.compile(_output_gate_host, *ptrs, stream, cutlass.Int64(1), cutlass.Int32(1))
+            fn = cute.compile(
+                _output_gate_host, *ptrs, stream, cutlass.Int64(1), cutlass.Int32(1), vec, unroll, fast
             )
-    _COMPILED[0](*ptrs, stream, cutlass.Int64(num_vecs), cutlass.Int32(-(-num_vecs // THREADS)))
+        _COMPILED[config] = fn
+    fn(*ptrs, stream, cutlass.Int64(num_vecs), cutlass.Int32(-(-num_vecs // (THREADS * unroll))))
     return out
