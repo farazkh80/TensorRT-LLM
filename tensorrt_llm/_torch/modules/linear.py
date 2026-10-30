@@ -50,6 +50,7 @@ from ..locality_domain_utils import _copy_to_new_cuda_allocation
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      is_torch_compiling, replace_parameter_and_save_metadata,
                      unswizzle_sf)
+from . import kimi_k3_cute_gemm
 from .low_m_gemm import _should_apply_low_m_gemm, apply_low_m_gemm
 
 
@@ -690,6 +691,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
               bias: Optional[torch.Tensor],
               weight: Optional[torch.Tensor] = None):
         weight = module.weight if weight is None else weight
+        if (bias is None and getattr(module, "_k3_cute_gemm", False)
+                and kimi_k3_cute_gemm.enabled()
+                and weight.dtype == torch.bfloat16):
+            input_2d = input.reshape(-1, input.shape[-1])
+            return kimi_k3_cute_gemm.linear(input_2d, weight).view(
+                *input.shape[:-1], weight.shape[0])
         # The opt-in low-M dispatcher routes to the built-in CuTe-DSL low-m GEMM
         # kernel and returns None to fall through to the normal GEMM path.
         # Skip when use_custom_cublas_mm is set: that path may allocate output
