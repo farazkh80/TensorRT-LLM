@@ -178,6 +178,8 @@ def linear(
     """
     m, k = x.shape
     n = weight.shape[0]
+    # DLPack export rejects tensors that require grad (nn.Linear parameters); detach() is a view.
+    x, weight = x.detach(), weight.detach()
     if out is None:
         out = x.new_empty(m, n)
     backend, tactic = _select(_GEMM_TABLE.get((n, k)), m)
@@ -223,6 +225,7 @@ def bmm(x: torch.Tensor, weight: torch.Tensor, out: Optional[torch.Tensor] = Non
     innermost."""
     b, m, k = x.shape
     n = weight.shape[1]
+    x, weight = x.detach(), weight.detach()
     if out is None:
         out = x.new_empty(b, m, n)
     _, tactic = _select(_BMM_TABLE.get((b, n, k)), m)
