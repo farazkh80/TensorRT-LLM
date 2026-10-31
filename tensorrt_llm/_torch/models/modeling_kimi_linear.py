@@ -460,6 +460,18 @@ _CUTE_NORM_ENABLED = os.environ.get(KIMI_K3_CUTE_NORM_ENV, "0") == "1"
 if _CUTE_NORM_ENABLED:
     from ..modules.kimi_k3_attn_res.attn_res_mix_cute import attn_res_mix as _cute_attn_res_mix
 
+KIMI_K3_CUTE_NORM_FOLD_ENV = "TLLM_K3_CUTE_NORM_FOLD"
+"""With ``TLLM_K3_CUTE_NORM=1``, set to ``1`` to fold each layer's closing ``prefix + MoE output`` add into the next
+layer's attention-residual kernel, which also writes a snapshot layer's prefix straight into the bank. The MoE output
+is untouched and the fused add is the same bf16 rounding of the fp32 sum, so results match the unfolded CuTe path
+bitwise. Layers that cannot fold (FGS stages, DSpark capture, token-sliced helix layers, no snapshot yet) add first,
+as stock does.
+"""
+
+_CUTE_NORM_FOLD_ENABLED = (
+    _CUTE_NORM_ENABLED and os.environ.get(KIMI_K3_CUTE_NORM_FOLD_ENV, "0") == "1"
+)
+
 
 def _persistent_attn_res_applicable(M: int, H: int, N: int) -> bool:
     """Shape gate for the persistent kernel: H == 7168 and 2 <= N <= 9.
@@ -521,6 +533,7 @@ def _cute_attn_res(
     norm: KimiK3RMSNorm,
     output_norm: Optional[nn.Module] = None,
     addend: Optional[torch.Tensor] = None,
+    updated: Optional[torch.Tensor] = None,
 ):
     M, H = prefix_sum.shape
     N = int(block_residual.shape[0]) + 1
@@ -545,6 +558,7 @@ def _cute_attn_res(
         norm.weight.to(torch.bfloat16).contiguous(),
         float(norm.eps),
         addend=addend,
+        updated=updated,
         **kwargs,
     )
 
@@ -2323,7 +2337,9 @@ class KimiLinearDecoderLayer(nn.Module):
         attn_metadata: AttentionMetadata,
         capture: Optional[Tuple[Any, int]] = None,
         helix_a2a: Optional[KimiK3HelixA2A] = None,
-    ) -> Tuple[torch.Tensor, int]:
+        residual_addend: Optional[torch.Tensor] = None,
+        defer_residual_add: bool = False,
+    ) -> Tuple:
         """Port of HF ``KimiDecoderLayer._forward_attn_residual`` (per token).
 
         ``block_residual`` is a preallocated snapshot bank in kernel-native
@@ -2339,6 +2355,12 @@ class KimiLinearDecoderLayer(nn.Module):
 
         On a ``token_sliced`` layer M is this rank's chunk of the batch and
         ``helix_a2a`` moves rows between that chunk and the full batch.
+
+        ``residual_addend`` is the previous layer's deferred MoE output: the
+        incoming prefix sum is ``hidden_states + residual_addend``. With
+        ``defer_residual_add`` this layer returns ``(prefix_sum, num_snapshots,
+        moe_output)`` and leaves the closing add to the next consumer (or
+        returns ``None`` as the addend when it had to add itself).
         """
         sliced = helix_a2a if self.token_sliced else None
         num_tokens = attn_metadata.num_tokens if sliced is not None else None
@@ -2360,6 +2382,17 @@ class KimiLinearDecoderLayer(nn.Module):
             fgs.active or attn_metadata.num_contexts != 0 or is_in_breakable_cuda_graph()
         ):
             fgs = None
+        fold_in = (
+            residual_addend is not None
+            and sliced is None
+            and fgs is None
+            and capture is None
+            and num_snapshots > 0
+            and _cute_attn_res_applicable(hidden_states, valid_block_residual, residual_addend)
+        )
+        if residual_addend is not None and not fold_in:
+            hidden_states = hidden_states + residual_addend
+            prefix_sum = hidden_states
         with fgs.region() if fgs is not None else nullcontext():
             with maybe_stage(fgs, "layer.pre_norm"):
                 if capture is not None:
@@ -2379,6 +2412,21 @@ class KimiLinearDecoderLayer(nn.Module):
                     tapped = hidden_states if _AUX_ATTN_RES_STREAM_ENABLED else prefix_sum
                     capture[0].maybe_capture_hidden_states(capture[1], _full_rows(tapped), None)
                     hidden_states = self.input_layernorm(hidden_states)
+                elif fold_in:
+                    snapshot_slot = (
+                        block_residual[num_snapshots]
+                        if self.layer_idx % self.attn_res_block_size == 0
+                        else None
+                    )
+                    prefix_sum, hidden_states = _cute_attn_res(
+                        prefix_sum,
+                        valid_block_residual,
+                        self.self_attention_res_proj,
+                        self.self_attention_res_norm,
+                        self.input_layernorm,
+                        addend=residual_addend,
+                        updated=snapshot_slot,
+                    )
                 elif num_snapshots > 0:
                     hidden_states = _apply_attn_res_and_rmsnorm(
                         prefix_sum,
@@ -2394,7 +2442,8 @@ class KimiLinearDecoderLayer(nn.Module):
                 fgs.keep(hidden_states)
 
             if self.layer_idx % self.attn_res_block_size == 0:
-                block_residual[num_snapshots].copy_(prefix_sum)
+                if not fold_in:
+                    block_residual[num_snapshots].copy_(prefix_sum)
                 num_snapshots += 1
                 valid_block_residual = block_residual[:num_snapshots]
                 prefix_sum = None
@@ -2438,7 +2487,11 @@ class KimiLinearDecoderLayer(nn.Module):
         else:
             hidden_states = self.mlp(hidden_states)
 
+        if defer_residual_add and sliced is None:
+            return prefix_sum, num_snapshots, hidden_states
         prefix_sum = prefix_sum + hidden_states
+        if defer_residual_add:
+            return prefix_sum, num_snapshots, None
         return prefix_sum, num_snapshots
 
     def skip_forward(
@@ -2558,6 +2611,7 @@ class KimiLinearModel(DecoderModel):
             hidden_states.shape[1],
         )
         num_snapshots = 0
+        residual_addend = None
         capture_set = (
             getattr(spec_metadata, "_capture_layer_set", None)
             if spec_metadata is not None
@@ -2582,17 +2636,35 @@ class KimiLinearModel(DecoderModel):
             ):
                 capture = (spec_metadata, self.layers[i - 1].layer_idx)
             if i == self.helix_a2a_first_layer:
+                if residual_addend is not None:
+                    hidden_states = hidden_states + residual_addend
+                    residual_addend = None
                 # Rows are rank-replicated up to here: keep this rank's chunk.
                 hidden_states = self.helix_a2a.scatter_rows(hidden_states, num_tokens)
                 block_residual = self.helix_a2a.scatter_rows(block_residual, num_tokens)
-            hidden_states, num_snapshots = layer(
-                hidden_states,
-                block_residual,
-                num_snapshots,
-                attn_metadata,
-                capture=capture,
-                helix_a2a=self.helix_a2a,
-            )
+            if _CUTE_NORM_FOLD_ENABLED:
+                hidden_states, num_snapshots, residual_addend = layer(
+                    hidden_states,
+                    block_residual,
+                    num_snapshots,
+                    attn_metadata,
+                    capture=capture,
+                    helix_a2a=self.helix_a2a,
+                    residual_addend=residual_addend,
+                    defer_residual_add=True,
+                )
+            else:
+                hidden_states, num_snapshots = layer(
+                    hidden_states,
+                    block_residual,
+                    num_snapshots,
+                    attn_metadata,
+                    capture=capture,
+                    helix_a2a=self.helix_a2a,
+                )
+        if residual_addend is not None and spec_metadata is not None:
+            hidden_states = hidden_states + residual_addend
+            residual_addend = None
         sliced = self.helix_a2a is not None
 
         # The last layer has no successor, so this one recompute is
@@ -2617,13 +2689,23 @@ class KimiLinearModel(DecoderModel):
                     tail = self.helix_a2a.all_gather(tail, num_tokens)
                 spec_metadata.maybe_capture_hidden_states(last.layer_idx, tail, None)
 
-        hidden_states = _apply_attn_res_and_rmsnorm(
-            hidden_states,
-            block_residual[:num_snapshots],
-            self.output_attn_res_proj,
-            self.output_attn_res_norm,
-            self.norm,
-        )
+        if residual_addend is not None:
+            hidden_states = _apply_attn_res_add_and_rmsnorm(
+                hidden_states,
+                residual_addend,
+                block_residual[:num_snapshots],
+                self.output_attn_res_proj,
+                self.output_attn_res_norm,
+                self.norm,
+            )[1]
+        else:
+            hidden_states = _apply_attn_res_and_rmsnorm(
+                hidden_states,
+                block_residual[:num_snapshots],
+                self.output_attn_res_proj,
+                self.output_attn_res_norm,
+                self.norm,
+            )
         if sliced:
             hidden_states = self.helix_a2a.all_gather(hidden_states, num_tokens)
         return hidden_states
