@@ -465,7 +465,7 @@ KIMI_K3_CUTE_NORM_FOLD_ENV = "TLLM_K3_CUTE_NORM_FOLD"
 layer's attention-residual kernel, which also writes a snapshot layer's prefix straight into the bank. The MoE output
 is untouched and the fused add is the same bf16 rounding of the fp32 sum, so results match the unfolded CuTe path
 bitwise. Layers that cannot fold (FGS stages, DSpark capture, token-sliced helix layers, no snapshot yet) add first,
-as stock does.
+as stock does. Without ``TLLM_K3_CUTE_NORM=1`` it has no effect.
 """
 
 _CUTE_NORM_FOLD_ENABLED = (
@@ -2383,7 +2383,8 @@ class KimiLinearDecoderLayer(nn.Module):
         ):
             fgs = None
         fold_in = (
-            residual_addend is not None
+            _CUTE_NORM_ENABLED
+            and residual_addend is not None
             and sliced is None
             and fgs is None
             and capture is None
