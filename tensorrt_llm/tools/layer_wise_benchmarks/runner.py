@@ -502,12 +502,15 @@ class Runner:
             # valid rows, and no `position_ids` -- MLA derives RoPE positions from
             # `attn_metadata`. `create_run_pack` passes the bank through the
             # `residual` slot and seeds the count for a mid-model slice.
+            from tensorrt_llm._torch.modules.kimi_k3_fgs import edges as k3_fgs_edges
+
             block_residual = residual
-            for layer_idx in layer_indices:
-                layer = model.model.layers[layer_idx]
-                hidden_states, num_snapshots = layer(
-                    hidden_states, block_residual, num_snapshots, attn_metadata
-                )
+            with k3_fgs_edges.model_scope():
+                for layer_idx in layer_indices:
+                    layer = model.model.layers[layer_idx]
+                    hidden_states, num_snapshots = layer(
+                        hidden_states, block_residual, num_snapshots, attn_metadata
+                    )
             return hidden_states, block_residual
 
         # Layers carrying a snapshot stack take `block_residual` where the generic

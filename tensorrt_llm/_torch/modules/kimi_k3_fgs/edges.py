@@ -1,0 +1,135 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Fine-grained-sync edges on the Kimi K3 decode o_proj inputs (``TLLM_K3_FGS``).
+
+``off`` (default) keeps today's kernels. ``early`` builds the producers of the
+o_proj inputs (KDA decode core, MLA output gate) in their fine-grained-sync
+producer mode, which releases PDL dependents at kernel entry; the o_proj
+consumer still waits for producer completion. ``lamport`` additionally hands
+those producers a sentinel-armed slot of an :class:`EdgeWorkspaces` edge when the
+decode batch is in ``[MIN_ROWS, MAX_ROWS]``; ``kimi_k3_cute_gemm.linear`` recognizes
+the slot, runs the report_valid consumer on it and releases it, which re-arms the
+slot on the workspaces' reset stream.
+
+Modules ``declare`` their edges at construction. The model forward runs under
+``model_scope``, which registers the declared edges on first use (outside a CUDA
+graph capture) and brackets the whole forward with one ``EdgeWorkspaces.scope``,
+so the two slots of an edge alternate across layers and the reset stream joins
+once at the end. Outside a scope, or for a batch outside the row window,
+``acquire`` returns None and the producer writes its usual buffer.
+"""
+
+import os
+import threading
+from contextlib import contextmanager
+from typing import Dict, Iterator, Optional
+
+import torch
+
+from ....logger import logger
+
+ENV = "TLLM_K3_FGS"
+MODES = ("off", "early", "lamport")
+# Below 16 rows the report_valid consumer is slower than the early-trigger path with a waiting consumer.
+MIN_ROWS = int(os.environ.get("TLLM_K3_FGS_MIN_ROWS", "16"))
+MAX_ROWS = int(os.environ.get("TLLM_K3_FGS_MAX_ROWS", "64"))
+
+_declared: Dict[str, int] = {}
+_local = threading.local()
+
+
+def mode() -> str:
+    value = os.environ.get(ENV, "off").strip().lower() or "off"
+    if value not in MODES:
+        raise ValueError(f"{ENV}={value!r}; valid: {', '.join(MODES)}")
+    return value
+
+
+def producer_early() -> bool:
+    """Whether o_proj-input producers use their fine-grained-sync producer build."""
+    return mode() != "off"
+
+
+def declare(name: str, width: int) -> None:
+    """Declare a [rows, width] bf16 edge; registered by the next ``model_scope`` outside capture."""
+    if mode() == "lamport":
+        _declared[name] = width
+
+
+def _state():
+    if not hasattr(_local, "workspaces"):
+        from ..fine_grained_sync import EdgeWorkspaces
+
+        _local.workspaces = EdgeWorkspaces()
+        _local.live = {}
+    return _local.workspaces, _local.live
+
+
+@contextmanager
+def model_scope() -> Iterator[None]:
+    """Bracket one model forward; a no-op unless ``lamport`` and an edge was declared."""
+    if mode() != "lamport" or not _declared:
+        yield
+        return
+    workspaces, _ = _state()
+    if workspaces.in_scope:
+        yield
+        return
+    missing = [name for name in _declared if name not in workspaces]
+    if missing and not torch.cuda.is_current_stream_capturing():
+        for name in missing:
+            workspaces.workspace(name, (MAX_ROWS, _declared[name]), torch.bfloat16, slots=2)
+        logger.info(f"{ENV}=lamport: edge slots {workspaces.ledger()}")
+    elif missing:
+        logger.warning_once(
+            f"{ENV}=lamport: edges {missing} are first used inside a CUDA graph capture and"
+            " cannot be registered there; their producers keep their own buffers (run one"
+            " eager forward first)",
+            key="k3_fgs_unregistered",
+        )
+    try:
+        with workspaces.scope():
+            yield
+    finally:
+        _local.live.clear()
+
+
+def acquire(name: str, rows: int):
+    """The next armed slot of ``name`` truncated to ``rows``, or None to keep the producer's own buffer.
+
+    Only ``kimi_k3_cute_gemm.linear`` consumes and releases a slot, so none is handed out while it is off.
+    """
+    if mode() != "lamport" or not MIN_ROWS <= rows <= MAX_ROWS or not hasattr(_local, "workspaces"):
+        return None
+    from .. import kimi_k3_cute_gemm
+
+    if not kimi_k3_cute_gemm.enabled() or not kimi_k3_cute_gemm.fgs_dsl():
+        return None
+    workspaces, live = _state()
+    if not workspaces.in_scope or name not in workspaces:
+        return None
+    lease = workspaces.acquire(name, rows=rows)
+    live[lease.tensor.data_ptr()] = lease
+    return lease
+
+
+def lease_for(x: torch.Tensor):
+    """The live lease whose slot ``x`` is (same base and rows), else None."""
+    live = getattr(_local, "live", None)
+    if not live:
+        return None
+    lease = live.get(x.data_ptr())
+    if lease is None or lease.tensor.shape[0] != x.shape[0]:
+        return None
+    return lease
+
+
+def release(lease) -> None:
+    """Release the slot after its only reader (o_proj) was launched on the current stream."""
+    workspaces, live = _state()
+    live.pop(lease.tensor.data_ptr(), None)
+    workspaces.release(lease)
+
+
+def ledger() -> Optional[list]:
+    return _local.workspaces.ledger() if hasattr(_local, "workspaces") else None

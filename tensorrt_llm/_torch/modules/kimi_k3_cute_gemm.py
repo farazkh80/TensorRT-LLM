@@ -9,6 +9,12 @@ points; the first entry whose max_m covers the runtime M is used. Backends:
   is a strided view (the GEMM runner would copy it).
 - ``fi_direct`` / ``fi_splitk``: FlashInfer's low-M CuTe DSL GEMMs (M <= 32 per launch; split-K runs M <= 64 as two
   launches). The in-tree split-K reduces bf16 partials in the output and loses precision, so no table entry uses it.
+- ``vsplitk``: the FlashInfer split-K kernel vendored in ``kimi_k3_fgs``, requesting only its tactic's shared memory
+  so two CTAs share an SM (bit-exact with ``fi_splitk`` at the same tile and split). Entries carry
+  ``(vendored tactic, fi_splitk tactic)``; ``TLLM_K3_CUTE_GEMM_X5=0``, or a CuTe DSL older than 4.9, runs the second.
+
+An input that is a live ``TLLM_K3_FGS=lamport`` edge slot (``kimi_k3_fgs.edges``) runs the report_valid consumer
+(``kimi_k3_fgs.splitk_gemm_fgs``) instead of the table entry and releases the slot.
 
 A shape without an entry runs the ``rubin`` backend under the TRT-LLM autotuner. Non-BF16 operands keep the
 cuBLAS matmul; empty problems launch nothing.
@@ -49,10 +55,10 @@ _GEMM_TABLE: Dict[Tuple[int, int], List[Tuple[int, str, Optional[tuple]]]] = {
     ],
     (7168, 12288): [
         (1, "fi_direct", (256, 2, 1)),
-        (2, "fi_splitk", (128, 8, 3, 6)),
-        (4, "fi_splitk", (128, 8, 3, 6)),
-        (8, "fi_splitk", (128, 8, 3, 6)),
-        (16, "fi_splitk", (64, 16, 3, 10)),
+        (2, "vsplitk", ((128, 8, 3, 5), (128, 8, 3, 6))),
+        (4, "vsplitk", ((128, 8, 3, 5), (128, 8, 3, 6))),
+        (8, "vsplitk", ((128, 8, 3, 5), (128, 8, 3, 6))),
+        (16, "vsplitk", ((64, 16, 3, 5), (64, 16, 3, 10))),
         (32, "rubin", ("base", False, (64, 64), (1, 2), 0, 1)),
         (64, "rubin", ("base", False, (64, 64), (1, 2), 0, 1)),
         (1 << 30, "rubin", ("base", True, (256, 256), (2, 1), 0, 1)),
@@ -139,6 +145,29 @@ def _pdl() -> bool:
 
 
 @functools.lru_cache(maxsize=None)
+def fgs_dsl() -> bool:
+    """Whether the CuTe DSL builds the vendored split-K kernel (v1 mbarriers, launch carveout: 4.9)."""
+    import cutlass.cute as cute
+
+    return hasattr(cute.arch, "mbarrier_v1_init")
+
+
+@functools.lru_cache(maxsize=None)
+def _x5() -> bool:
+    return os.environ.get("TLLM_K3_CUTE_GEMM_X5", "1") == "1" and fgs_dsl()
+
+
+# Preferred smem carveout (percent) of the vendored split-K launches.
+_VSPLITK_CARVEOUT = 100
+# Report_valid consumer tactic per launch rows (<= 8, <= 16, <= 32) and whether it requests only its footprint.
+_FGS_TACTICS = (
+    (8, (128, 8, 3, 5), True),
+    (16, (64, 16, 3, 5), True),
+    (32, (64, 32, 3, 8), False),
+)
+
+
+@functools.lru_cache(maxsize=None)
 def _gemm_runner(out_dtype: torch.dtype):
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLBf16RubinGemmRunner
 
@@ -155,7 +184,7 @@ def _bmm_runner():
 def _usable(backend: str, tactic: Optional[tuple], m: int) -> bool:
     if backend == "fi_direct":
         return m <= _FI_MAX_M and m % tactic[2] == 0
-    if backend == "fi_splitk":
+    if backend in ("fi_splitk", "vsplitk"):
         return m <= 2 * _FI_MAX_M
     return True
 
@@ -169,6 +198,25 @@ def _select(entries, m: int):
 
 def _row_major(t: torch.Tensor) -> bool:
     return t.stride(-1) == 1 and t.stride(0) == t.shape[-1]
+
+
+def _fgs_consume(x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor) -> None:
+    """o_proj on a live edge slot: report_valid loads, retry warp, no griddepcontrol.wait."""
+    from .kimi_k3_fgs.splitk_gemm_fgs import SplitKTactic, run_splitk_dense_fgs
+
+    for r in range(0, x.shape[0], _FI_MAX_M):
+        rows = min(_FI_MAX_M, x.shape[0] - r)
+        _, tactic, exact = next(t for t in _FGS_TACTICS if rows <= t[0])
+        run_splitk_dense_fgs(
+            x[r : r + rows],
+            weight.t(),
+            None,
+            out[r : r + rows],
+            _pdl(),
+            SplitKTactic(*tactic),
+            exact_smem=exact,
+            smem_carveout=_VSPLITK_CARVEOUT if exact else None,
+        )
 
 
 def linear(
@@ -188,12 +236,42 @@ def linear(
         out = x.new_empty(m, n)
     if m == 0 or n == 0:
         return out
-    backend, tactic = _select(_GEMM_TABLE.get((n, k)), m)
     dense = _row_major(x) and _row_major(out)
+    if dense and n == 7168 and k == 12288:
+        from .kimi_k3_fgs import edges as fgs_edges
+
+        lease = fgs_edges.lease_for(x)
+        if lease is not None:
+            _fgs_consume(x, weight, out)
+            fgs_edges.release(lease)
+            return out
+    backend, tactic = _select(_GEMM_TABLE.get((n, k)), m)
+    if backend == "vsplitk" and not _x5():
+        backend, tactic = "fi_splitk", tactic[1]
     if backend == "fi_direct" and dense:
         from flashinfer.gemm.kernels.dense_bf16_gemm_direct import DirectTactic, run_direct_dense
 
         return run_direct_dense(x, weight.t(), out, _pdl(), DirectTactic(*tactic))
+    if backend == "vsplitk" and dense:
+        from .kimi_k3_fgs.splitk_gemm_fgs import SplitKTactic, run_splitk_dense_fgs
+
+        for r in range(0, m, _FI_MAX_M):
+            run_splitk_dense_fgs(
+                x[r : r + _FI_MAX_M],
+                weight.t(),
+                None,
+                out[r : r + _FI_MAX_M],
+                _pdl(),
+                SplitKTactic(*tactic[0]),
+                report_valid=False,
+                retry_warp=False,
+                pdl_wait_activation=True,
+                exact_smem=True,
+                smem_carveout=_VSPLITK_CARVEOUT,
+            )
+        return out
+    if backend == "vsplitk":
+        backend, tactic = "fi_splitk", tactic[1]
     if backend == "fi_splitk" and dense:
         from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import (
             SplitKTactic,

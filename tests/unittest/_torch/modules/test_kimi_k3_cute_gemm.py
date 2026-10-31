@@ -70,6 +70,23 @@ def test_linear_strided_a(m: int) -> None:
     )
 
 
+@pytest.mark.parametrize("m", [2, 7, 16])
+def test_linear_x5_matches_flashinfer_launch(m: int, monkeypatch) -> None:
+    # o_proj M <= 16: the vendored tactic-sized launch and FlashInfer's own share the tile and split.
+    if not k3_gemm.fgs_dsl():
+        pytest.skip("the vendored split-K launch needs CuTe DSL 4.9")
+    torch.manual_seed(m)
+    x = torch.randn(m, 12288, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(7168, 12288, device="cuda", dtype=torch.bfloat16) * 0.05
+    outs = []
+    for x5 in ("1", "0"):
+        monkeypatch.setenv("TLLM_K3_CUTE_GEMM_X5", x5)
+        k3_gemm._x5.cache_clear()
+        outs.append(k3_gemm.linear(x, w))
+    k3_gemm._x5.cache_clear()
+    assert torch.equal(outs[0], outs[1])
+
+
 @pytest.mark.parametrize("t", [65, 8192])
 @pytest.mark.parametrize("row", [192, 256, 128], ids=["k_nope", "v_kv", "v_contiguous"])
 def test_bmm_broadcast_a(row: int, t: int) -> None:
