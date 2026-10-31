@@ -349,6 +349,8 @@ class SplitKFgsGemmKernel:
         retry_warp: bool,
         pdl_wait_activation: bool,
         retry_limit: int = 0,
+        exact_smem: bool = False,
+        smem_carveout: int | None = None,
     ) -> None:
         if report_valid and not retry_warp:
             raise ValueError("report_valid needs retry_warp to re-issue invalid stages")
@@ -369,6 +371,20 @@ class SplitKFgsGemmKernel:
         # its sentinel data (counted in retry_count[1]), so a never-published
         # stage cannot hang the kernel. Diagnostic builds only; 0 retries forever.
         self.retry_limit = retry_limit
+        # FlashInfer requests the whole SM100 capacity, which keeps every other
+        # CTA off the SM; exact_smem requests the tactic's footprint (plus the
+        # worst-case padding to the 1 KiB-aligned A buffer) instead.
+        self.launch_smem = (
+            _align_up(
+                _smem_bytes(tactic, tactic.ab_stages) + _AB_BUFFER_ALIGN_BYTES,
+                _MAILBOX_ALIGN_BYTES,
+            )
+            if exact_smem
+            else _SMEM_CAPACITY_BYTES
+        )
+        self.launch_attrs = (
+            {} if smem_carveout is None else {"preferred_smem_carveout": smem_carveout}
+        )
 
         self.threads_per_cta = 256
         self.epilog_threads = 128
@@ -406,9 +422,10 @@ class SplitKFgsGemmKernel:
             ),
             block=(self.threads_per_cta, 1, 1),
             cluster=self.cluster_shape,
-            smem=cute.Int64(utils.get_smem_capacity_in_bytes("sm_100")),
+            smem=cute.Int64(self.launch_smem),
             stream=stream,
             use_pdl=self.use_pdl,
+            **self.launch_attrs,
         )
 
     @cute.experimental.kernel
@@ -1090,6 +1107,8 @@ def _get_compiled_splitk_kernel(
     retry_warp: bool,
     pdl_wait_activation: bool,
     retry_limit: int,
+    exact_smem: bool,
+    smem_carveout: int | None,
 ):
     if dtype not in _SUPPORTED_TORCH_DTYPES:
         raise ValueError(f"split-K dense GEMM supports {_SUPPORTED_TORCH_DTYPES}; got {dtype}")
@@ -1104,6 +1123,8 @@ def _get_compiled_splitk_kernel(
             retry_warp=retry_warp,
             pdl_wait_activation=pdl_wait_activation,
             retry_limit=retry_limit,
+            exact_smem=exact_smem,
+            smem_carveout=smem_carveout,
         )
         stream = _cuda.CUstream(_torch.cuda.current_stream().cuda_stream)
         if has_bias:
@@ -1168,12 +1189,16 @@ def run_splitk_dense_fgs(
     pdl_wait_activation: bool = False,
     retry_counter: _torch.Tensor | None = None,
     retry_limit: int = 0,
+    exact_smem: bool = False,
+    smem_carveout: int | None = None,
 ):
     """Run ``A[M,K] @ B[K,N]`` with the ``mm_bf16`` layouts; ``a`` is the FGS-checked operand.
 
     ``retry_counter`` (int32, ``RETRY_COUNTER_SLOTS`` elements) accumulates the
     activation re-issues and, with ``retry_limit``, the stages released invalid
-    after a CTA exceeded its re-issue budget.
+    after a CTA exceeded its re-issue budget. ``exact_smem`` and
+    ``smem_carveout`` (percent, CUDA preferred carveout) let a consumer CTA share
+    an SM with a concurrently running producer.
     """
     validate_tactic(tactic, *_validate_runtime_tensors(a, b, bias, out))
     if retry_counter is None:
@@ -1198,6 +1223,8 @@ def run_splitk_dense_fgs(
             retry_warp=retry_warp,
             pdl_wait_activation=pdl_wait_activation,
             retry_limit=retry_limit,
+            exact_smem=exact_smem,
+            smem_carveout=smem_carveout,
         )
         compiled(
             *(tensors[:4] if has_bias else tensors[:3]),

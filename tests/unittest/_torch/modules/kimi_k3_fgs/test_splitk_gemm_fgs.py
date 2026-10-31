@@ -70,6 +70,30 @@ def test_ready_inputs_match_plain(m: int, variant: str) -> None:
     assert counter.tolist() == [0, 0]
 
 
+@pytest.mark.parametrize("stages", [2, 6, 10])
+def test_coresident_consumer_matches_plain(stages: int) -> None:
+    """Fewer stages and a tactic-sized smem request change neither the result nor the retry count."""
+    x, w = _inputs(16, seed=stages)
+    counter = torch.zeros(fgs.RETRY_COUNTER_SLOTS, dtype=torch.int32, device="cuda")
+    out = torch.full((16, N), float("nan"), device="cuda", dtype=torch.bfloat16)
+    fgs.run_splitk_dense_fgs(
+        x,
+        w.t(),
+        None,
+        out,
+        True,
+        fgs.SplitKTactic(64, 16, 3, stages),
+        retry_counter=counter,
+        exact_smem=True,
+        smem_carveout=100,
+        **VARIANTS["fgs"],
+    )
+    plain = _run(x, w, "plain")
+    torch.cuda.synchronize()
+    assert torch.equal(out.view(torch.int16), plain.view(torch.int16))
+    assert counter.tolist() == [0, 0]
+
+
 @dsl_user_op
 def _copy16(dst: Int64, src: Int64, *, loc=None, ip=None):
     llvm.inline_asm(
