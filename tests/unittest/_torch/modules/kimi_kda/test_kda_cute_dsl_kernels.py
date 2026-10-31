@@ -126,7 +126,7 @@ class _DecodeInputs:
             update_conv_cache=True,
         )
 
-    def run_cute(self, conv, state, out, slots=None):
+    def run_cute(self, conv, state, out, slots=None, **kwargs):
         fused_decode.kda_decode_t1(
             self.x,
             self.packed_w,
@@ -143,6 +143,7 @@ class _DecodeInputs:
             lower_bound=LOWER_BOUND,
             norm_eps=EPS,
             scale=SCALE,
+            **kwargs,
         )
 
     def reference(self):
@@ -233,6 +234,59 @@ def test_decode_cuda_graph_replays_new_slots(batch: int) -> None:
     assert torch.equal(out, out_e)
     assert torch.equal(t.state, state_e)
     assert torch.equal(t.conv, conv_e)
+
+
+_BF16_NEG_ZERO = -32768
+
+
+@pytest.mark.parametrize(
+    "producer",
+    [
+        dict(),
+        dict(fgs_persistent=True),
+        dict(fgs_persistent=True, fgs_order="head"),
+        dict(fgs_persistent=True, fgs_ctas=212),
+    ],
+    ids=["grid", "persistent_batch", "persistent_head", "persistent_212"],
+)
+@pytest.mark.parametrize("inputs", ["random", "signed_zero_output"])
+@pytest.mark.parametrize("batch", [1, 4, 16, 33])
+@torch.no_grad()
+def test_decode_fgs_producer_matches_default(batch: int, inputs: str, producer: dict) -> None:
+    """fgs_producer output equals the default build's with -0.0 mapped to +0.0, covers every
+    16-B chunk of a -0.0-initialized buffer and writes nothing past H*128 in a padded row."""
+    t = _DecodeInputs(batch, seed=90 + batch)
+    if inputs == "signed_zero_output":
+        # Zero state and v with q < 0 give o = -0.0; signed norm weights and a very negative
+        # output gate make the default build store -0.0 (also from underflowing products).
+        t.conv.zero_()
+        t.state.zero_()
+        t.qkvg[:, :DIM] = -t.qkvg[:, :DIM].abs() - 0.5
+        t.qkvg[:, 2 * DIM : 3 * DIM] = 0
+        t.qkvg[:, 3 * DIM :: 3] = -100.0
+        t.w[0][3] = t.w[0][3].abs() + 0.1
+        t.packed_w = fused_decode.pack_conv_weight(*t.w)
+        t.norm_w = torch.tensor([1.0, -1.0, -1e-41, -1e-30], device="cuda").repeat(D // 4)
+    slots = t.slots.clone()
+    if batch > 1:
+        slots[-1] = -1
+
+    def run(**kwargs):
+        rows = torch.full((batch, DIM + 64), -0.0, device="cuda", dtype=torch.bfloat16)
+        conv, state = t.conv.clone(), t.state.clone()
+        t.run_cute(conv, state, rows[:, :DIM].view(batch, H, D), slots=slots, **kwargs)
+        return rows.view(torch.int16), conv, state
+
+    ref, conv_ref, state_ref = run()
+    out, conv, state = run(fgs_producer=True, **producer)
+    expected = torch.where(ref[:, :DIM] == _BF16_NEG_ZERO, 0, ref[:, :DIM])
+    if inputs == "signed_zero_output":
+        assert (ref[:, :DIM] == _BF16_NEG_ZERO).any()
+    assert torch.equal(out[:, :DIM], expected)
+    assert not (out[:, :DIM] == _BF16_NEG_ZERO).any()
+    assert (out[:, DIM:] == _BF16_NEG_ZERO).all()
+    assert torch.equal(state, state_ref)
+    assert torch.equal(conv, conv_ref)
 
 
 @pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
