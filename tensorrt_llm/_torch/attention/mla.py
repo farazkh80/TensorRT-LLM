@@ -60,6 +60,7 @@ from .backends import (
     TrtllmAttention,
     TrtllmAttentionMetadata,
 )
+from .backends.fmha.cute_dsl_mla_context import CuteDslMlaContextFmha
 from .backends.interface import AttentionBackend, PositionalEmbeddingParams, PredefinedAttentionMask
 from .backends.sparse.hooks import get_sparse_mla_hooks
 from .backends.utils import create_attention
@@ -1166,6 +1167,13 @@ class MLA(nn.Module):
                 output[:num_ctx_tokens, :],
                 latent_cache_ctx,
             )
+            if getattr(attn_metadata, "_k3_ctx_latent", None) is not None:
+                # Only cute_dsl_mla_context writes the cache from the split halves; another library ran.
+                attn_metadata._k3_ctx_latent = None
+                raise RuntimeError(
+                    f"MLA layer {self.mha.layer_idx}: the latent cache concat was skipped for "
+                    "cute_dsl_mla_context, but another FMHA library served the context call"
+                )
 
         if num_generations > 0:
             assert q_gen is not None
@@ -1244,12 +1252,19 @@ class MLA(nn.Module):
             and attn_metadata.num_contexts > 0
             and attn_metadata.num_generations == 0
             and self.num_context_heads == self.num_heads_tp
+            and self._k3_ctx_fmha_loaded()
             and not self.is_lite
             and not self.apply_rotary_emb
             and not getattr(self.mha, "has_fp8_kv_cache", False)
             and getattr(attn_metadata, "helix_position_offsets", None) is None
             and not self.mha.has_cached_kv_for_mla_context(attn_metadata)
             and not self.mha.is_chunked_prefill_for_mla_context(attn_metadata)
+        )
+
+    def _k3_ctx_fmha_loaded(self) -> bool:
+        manager = getattr(self.mha, "_fmha_manager", None)
+        return manager is not None and any(
+            isinstance(fmha, CuteDslMlaContextFmha) for fmha in manager.fmha_libs
         )
 
     def _k3_ctx_contiguous_v(
@@ -1263,6 +1278,7 @@ class MLA(nn.Module):
                 latent_cache is not None
                 or getattr(attn_metadata, "_k3_ctx_latent", (None,))[0] == self.mha.layer_idx
             )
+            and self.num_context_heads == self.num_heads_tp
             and not getattr(self.mha, "has_fp8_kv_cache", False)
             and getattr(attn_metadata, "num_ctx_cached_tokens", 0) == 0
             and getattr(attn_metadata, "helix_position_offsets", None) is None
@@ -2085,6 +2101,9 @@ class MLA(nn.Module):
             helix_v_up=helix_v_up,
             **kwargs,
         )
+        if k3_page_table is not None:
+            # Unconsumed (another library served the call): never let a later step pick it up.
+            attn_metadata._k3_cute_mla_page_table = None
         fused_q = None
 
         if helix_v_up:

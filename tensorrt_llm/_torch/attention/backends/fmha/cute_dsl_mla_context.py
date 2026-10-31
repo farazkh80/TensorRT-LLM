@@ -121,6 +121,7 @@ class CuteDslMlaContextFmha(PhasedFmha):
             and forward_args.attention_sinks is None
             and metadata.beam_width == 1
             and getattr(metadata, "helix_position_offsets", None) is None
+            and not getattr(metadata, "enable_helix", False)
             and not metadata.is_cross
         )
 
