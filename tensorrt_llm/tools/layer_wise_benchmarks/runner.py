@@ -503,11 +503,31 @@ class Runner:
             # `attn_metadata`. `create_run_pack` passes the bank through the
             # `residual` slot and seeds the count for a mid-model slice.
             block_residual = residual
+            # A decoder that folds each layer's closing residual add into the next layer
+            # returns the add's operand instead; finish the last one here.
+            fold = getattr(
+                inspect.getmodule(model.model.layers[layer_indices[0]]),
+                "_CUTE_NORM_FOLD_ENABLED",
+                False,
+            )
+            residual_addend = None
             for layer_idx in layer_indices:
                 layer = model.model.layers[layer_idx]
-                hidden_states, num_snapshots = layer(
-                    hidden_states, block_residual, num_snapshots, attn_metadata
-                )
+                if fold:
+                    hidden_states, num_snapshots, residual_addend = layer(
+                        hidden_states,
+                        block_residual,
+                        num_snapshots,
+                        attn_metadata,
+                        residual_addend=residual_addend,
+                        defer_residual_add=True,
+                    )
+                else:
+                    hidden_states, num_snapshots = layer(
+                        hidden_states, block_residual, num_snapshots, attn_metadata
+                    )
+            if residual_addend is not None:
+                hidden_states = hidden_states + residual_addend
             return hidden_states, block_residual
 
         # Layers carrying a snapshot stack take `block_residual` where the generic
