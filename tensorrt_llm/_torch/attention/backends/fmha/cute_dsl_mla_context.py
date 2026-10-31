@@ -21,8 +21,9 @@ workspace and are not read after the call) and the trtllm-gen context FMHA. Call
 latent cache, cached-prefix / chunked prefill, softmax stats) run ``FallbackFmha`` unchanged.
 
 The latent row arrives either as ``forward_args.latent_cache`` or, when ``MLA`` skipped the concat, as its two halves
-in ``metadata._k3_ctx_latent = (layer_idx, compressed_kv, k_pe)``. A layer with those halves is always claimed, so
-the concat is materialized here before any fallback to ``thop.attention`` (which needs the contiguous row).
+in ``metadata._k3_ctx_latent = (layer_idx, compressed_kv, k_pe)``. A layer with those halves, or with the
+contiguous V that ``MLA`` writes for this library, is always claimed, so the concat and the kv-shaped V are
+restored here before any fallback to ``thop.attention``.
 """
 
 import math
@@ -88,7 +89,9 @@ class CuteDslMlaContextFmha(PhasedFmha):
         *,
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
-        if phase == FmhaPhase.CONTEXT and self._latent_parts(metadata) is not None:
+        if phase == FmhaPhase.CONTEXT and (
+            self._latent_parts(metadata) is not None or self._has_contiguous_v(v)
+        ):
             return True
         return self._serves(q, metadata, forward_args, phase=phase)
 
@@ -151,6 +154,16 @@ class CuteDslMlaContextFmha(PhasedFmha):
         finally:
             if parts is not None:
                 metadata._k3_ctx_latent = None
+
+    def _has_contiguous_v(self, v: Optional[torch.Tensor]) -> bool:
+        """MLA wrote V contiguous for this library; only its fallback restores the layout thop expects."""
+        attn = self.attn
+        return (
+            getattr(attn, "_k3_cute_ctx", False)
+            and v is not None
+            and v.dim() == 2
+            and v.stride(0) == attn.num_heads * attn.v_head_dim
+        )
 
     def _fallback_v(self, v: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         """Restore the kv-shaped V layout the thop MLA context path expects (row stride H * (nope + v))."""

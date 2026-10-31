@@ -1274,6 +1274,7 @@ class MLA(nn.Module):
         return (
             getattr(self.mha, "_k3_cute_ctx", False)
             and k3_cute_mla_enabled("ctx")
+            and self._k3_ctx_fmha_loaded()
             and (
                 latent_cache is not None
                 or getattr(attn_metadata, "_k3_ctx_latent", (None,))[0] == self.mha.layer_idx

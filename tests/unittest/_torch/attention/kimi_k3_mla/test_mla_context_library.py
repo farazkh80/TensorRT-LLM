@@ -109,3 +109,41 @@ def test_flagged_layer_runs_cute_context(cute_ctx_calls, lens) -> None:
     e_stock, e_cute = err(outs[0], ref), err(outs[1], ref)
     assert e_cute[2] and e_cute[3]
     assert e_cute[0] <= 1.05 * e_stock[0], f"CuTe rel-L2 {e_cute[0]:.2e} vs stock {e_stock[0]:.2e}"
+
+
+def test_declined_call_with_contiguous_v_falls_back(cute_ctx_calls, monkeypatch) -> None:
+    """A flagged call the library does not serve still owns the contiguous V and restores the kv-shaped layout."""
+    lens = [100, 1000, 64]
+    torch.manual_seed(0)
+    total = sum(lens)
+    bf = torch.bfloat16
+    q = torch.empty(total, H * D, dtype=bf, device="cuda").uniform_(-1, 1)
+    latent = torch.empty(total, LAT + ROPE, dtype=bf, device="cuda").uniform_(-1, 1)
+    k0 = torch.empty(total, H * D, dtype=bf, device="cuda").uniform_(-1, 1)
+    kv_buf = torch.empty(total, H * (NOPE + DV), dtype=bf, device="cuda").uniform_(-1, 1)
+    v_kv_shaped = kv_buf[:, H * NOPE :]
+    monkeypatch.setattr(CuteDslMlaContextFmha, "_serves", lambda *args, **kwargs: False)
+    outs, caches = [], []
+    for flagged, v in ((False, v_kv_shaped), (True, v_kv_shaped.contiguous())):
+        layer, kv_cache_manager, metadata = build_context_layer(lens, 2, 1)
+        try:
+            layer._k3_cute_ctx = flagged
+            for i in range(2):
+                kv_cache_manager.get_buffers(i).zero_()
+            out = layer.forward(
+                q.clone(),
+                k0.clone(),
+                v,
+                metadata,
+                attention_input_type=AttentionInputType.context_only,
+                latent_cache=latent,
+            )
+            torch.cuda.synchronize()
+            outs.append(out.clone())
+            caches.append([kv_cache_manager.get_buffers(i).clone() for i in range(2)])
+        finally:
+            kv_cache_manager.shutdown()
+    assert not cute_ctx_calls
+    assert torch.equal(bits(outs[0]), bits(outs[1]))
+    for i in range(2):
+        assert torch.equal(bits(caches[0][i]), bits(caches[1][i])), f"cache layer {i}"
