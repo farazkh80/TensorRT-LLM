@@ -58,8 +58,6 @@ def _run(x, w, variant: str, counter=None, pdl=True):
 @pytest.mark.parametrize("m", [1, 4, 16, 32])
 @pytest.mark.parametrize("variant", list(VARIANTS))
 def test_ready_inputs_match_plain(m: int, variant: str) -> None:
-    if variant == "fgs" and m % TACTICS[m].mma_n:
-        pytest.skip("OOB activation rows inside the TMA box: validity semantics probed separately")
     x, w = _inputs(m, seed=m)
     counter = torch.zeros(fgs.RETRY_COUNTER_SLOTS, dtype=torch.int32, device="cuda")
     out = _run(x, w, variant, counter)

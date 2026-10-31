@@ -20,7 +20,8 @@ Compile-time consumer roles, with the FlashInfer warp layout kept unchanged:
 - ``report_valid``: the activation TMA checks the bf16/fp16 ``-0.0`` sentinel per
   16 B (``SentinelPattern.PER_16BYTES_8000``). A stage whose primary phase
   completes with sentinel data is re-armed and re-loaded by warp 3 into the
-  same stage. Requires ``retry_warp``.
+  same stage. Requires ``retry_warp``. Only the first element of each 16 B
+  chunk is compared, and box rows beyond M (TMA zero fill) report valid.
 - ``pdl_wait_activation``: ``griddepcontrol.wait`` before the first activation
   load. Weights are always loaded before it.
 
