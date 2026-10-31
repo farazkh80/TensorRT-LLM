@@ -12,4 +12,3 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""SM107 tuning of the Blackwell CuTe DSL FMHA (FlashInfer 0.6.18 cute_dsl/attention/fmha) for the Kimi K3 MLA context."""

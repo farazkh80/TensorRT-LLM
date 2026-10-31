@@ -46,7 +46,7 @@ from cutlass.cute.typing import Int8, Int32, Int64, Float32
 from cutlass.base_dsl.arch import Arch
 from cutlass.cutlass_dsl import BaseDSL
 
-from . import fmha_helpers as fmha_utils
+from .helpers import fmha_helpers as fmha_utils
 
 """
 A fused multi-head attention (FMHA) example for the NVIDIA Blackwell SM100 architecture using CUTE DSL

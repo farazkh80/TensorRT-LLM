@@ -30,11 +30,11 @@ from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cute.typing import Float32, Int32
 
 try:
-    from .context_fmha import fmha_helpers as fmha_utils
     from .context_fmha.fmha import BlackwellFusedMultiHeadAttentionForward
+    from .context_fmha.helpers import fmha_helpers as fmha_utils
 except ImportError:
-    from context_fmha import fmha_helpers as fmha_utils
     from context_fmha.fmha import BlackwellFusedMultiHeadAttentionForward
+    from context_fmha.helpers import fmha_helpers as fmha_utils
 
 HEAD_DIM_QK = 192
 HEAD_DIM_V = 128

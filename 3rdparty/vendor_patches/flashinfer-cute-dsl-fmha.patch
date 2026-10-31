@@ -1,0 +1,184 @@
+diff --git a/fmha.py b/fmha.py
+index 5c2866ad1647d3daf34f49a9c8f38c0825e083b4..a66682dda75ce470692c4c7c950beaa7acf0169d 100644
+--- a/fmha.py
++++ b/fmha.py
+@@ -118,6 +118,7 @@ class BlackwellFusedMultiHeadAttentionForward:
+         enable_ex2_emulation: bool,
+         enable_skip_correction: bool,
+         use_tma_store: bool = True,
++        tuning: Optional[dict] = None,
+     ):
+         """Initializes the configuration for a Blackwell Fused Multi-Head Attention (FMHA) kernel.
+ 
+@@ -192,6 +193,10 @@ class BlackwellFusedMultiHeadAttentionForward:
+         self.enable_skip_correction = enable_skip_correction
+         self.enable_ex2_emulation = enable_ex2_emulation
+         self.use_tma_store = use_tma_store
++        # Overrides of _setup_attributes / register-split attributes (kv_stage, enable_sequence_barrier,
++        # enable_correction_double_buffer, num_regs_*), "lpt" (longest causal q tiles first; snaked over CTAs when
++        # persistent) and "persistent" (read by the caller, which passes it as is_persistent).
++        self.tuning = dict(tuning or {})
+ 
+         self.softmax0_warp_ids = (0, 1, 2, 3)
+         self.softmax1_warp_ids = (4, 5, 6, 7)
+@@ -347,6 +352,10 @@ class BlackwellFusedMultiHeadAttentionForward:
+         self.enable_sequence_barrier = False
+         # Optional double buffering for correction rescale.
+         self.enable_correction_double_buffer = False
++        for name, value in self.tuning.items():
++            if name not in ("lpt", "persistent"):
++                assert hasattr(self, name), f"unknown FMHA tuning attribute {name}"
++                setattr(self, name, value)
+ 
+     @cute.jit
+     def __call__(
+@@ -486,6 +495,7 @@ class BlackwellFusedMultiHeadAttentionForward:
+             cute.shape((s_q_max, d, ((h_r, h_k), b))),
+             self.cta_tiler,
+             self.is_persistent,
++            lpt=self.tuning.get("lpt", False),
+         )
+         self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
+         self.k_major_mode = utils.LayoutEnum.from_tensor(k).mma_major_mode()
+@@ -625,6 +635,9 @@ class BlackwellFusedMultiHeadAttentionForward:
+         self.tma_copy_k_bytes = k_copy_size
+         self.tma_copy_v_bytes = v_copy_size
+ 
++        # sO only backs the TMA-store epilogue; the st.global epilogue leaves it unused.
++        sO_cosize = cute.cosize(o_smem_layout_staged) if self.use_tma_store else 64
++
+         @cute.struct
+         class SharedStorage:
+             # Pipeline barriers
+@@ -644,7 +657,7 @@ class BlackwellFusedMultiHeadAttentionForward:
+             tmem_holding_buf: Int32
+             # Smem tensors
+             sO: cute.struct.Align[
+-                cute.struct.MemRange[self.o_dtype, cute.cosize(o_smem_layout_staged)],
++                cute.struct.MemRange[self.o_dtype, sO_cosize],
+                 self.buffer_align_bytes,
+             ]
+             sQ: cute.struct.Align[
+@@ -948,7 +961,11 @@ class BlackwellFusedMultiHeadAttentionForward:
+             v_smem_layout_staged.inner,
+         )
+         sV = cute.make_tensor(sV_ptr, v_smem_layout_staged.outer)
+-        sO = storage.sO.get_tensor(o_smem_layout_staged.outer, swizzle=o_smem_layout_staged.inner)
++        sO = None
++        if cutlass.const_expr(self.use_tma_store):
++            sO = storage.sO.get_tensor(
++                o_smem_layout_staged.outer, swizzle=o_smem_layout_staged.inner
++            )
+         s0_warp_wants_skip_softmax_exchange = (
+             storage.s0_warp_wants_skip_softmax_exchange.get_tensor(cute.make_layout((4,)))
+         )
+diff --git a/helpers/fmha_helpers.py b/helpers/fmha_helpers.py
+index f2034556e1d8040e440252bc3088bfb96e6d3f72..f4afa90d274d487a7eb8e39b37a28639475f1f33 100644
+--- a/helpers/fmha_helpers.py
++++ b/helpers/fmha_helpers.py
+@@ -70,6 +70,7 @@ class FmhaStaticTileSchedulerParams:
+         is_persistent: bool,
+         problem_shape_mhb: cute.Shape,
+         *,
++        lpt: bool = False,
+         loc=None,
+         ip=None,
+     ):
+@@ -83,6 +84,7 @@ class FmhaStaticTileSchedulerParams:
+         """
+         self.is_persistent = is_persistent
+         self.problem_shape_mhb = problem_shape_mhb
++        self.lpt = lpt
+         self._loc = loc
+         self._ip = ip
+ 
+@@ -99,7 +101,9 @@ class FmhaStaticTileSchedulerParams:
+         for obj, n_items in zip([self.problem_shape_mhb], self._values_pos):
+             obj_list.append(new_from_mlir_values(obj, values[:n_items]))
+             values = values[n_items:]
+-        return FmhaStaticTileSchedulerParams(self.is_persistent, *(tuple(obj_list)), loc=self._loc)
++        return FmhaStaticTileSchedulerParams(
++            self.is_persistent, *(tuple(obj_list)), lpt=self.lpt, loc=self._loc
++        )
+ 
+ 
+ class FmhaStaticTileScheduler:
+@@ -229,19 +233,36 @@ class FmhaStaticTileScheduler:
+         :return: WorkTileInfo containing tile coordinates and validity flag.
+         :rtype: WorkTileInfo
+         """
+-        is_valid = (
+-            self._current_work_linear_idx < self._num_blocks
+-            if self._is_persistent
+-            else self._is_first_block
+-        )
++        work_idx = self._current_work_linear_idx
++        if self._is_persistent and self._params.lpt:
++            # Snake the CTAs over rounds of the longest-first order below, so every CTA's tiles sum to about the
++            # same causal work. Each round is a full permutation of its slots, so the tiles stay covered once.
++            n_cta = self.num_persistent_sm
++            rnd = work_idx // n_cta
++            slot = work_idx - rnd * n_cta
++            work_idx = rnd * n_cta + slot + (rnd & 1) * (n_cta - 1 - 2 * slot)
++        is_valid = work_idx < self._num_blocks if self._is_persistent else self._is_first_block
+ 
+         blk_coord = (0, 0, 0)
+-        if self._is_persistent:
+-            blk_coord = self._problem_shape_mhb.get_hier_coord(
+-                self._current_work_linear_idx, loc=loc, ip=ip
+-            )
++        if self._is_persistent and self._params.lpt:
++            m_cnt, h_cnt, b_cnt = self._params.problem_shape_mhb
++            hb_cnt = h_cnt * b_cnt
++            m_rank = work_idx // hb_cnt
++            rest = work_idx - m_rank * hb_cnt
++            blk_coord = (m_cnt - 1 - m_rank, rest % h_cnt, rest // h_cnt)
++        elif self._is_persistent:
++            blk_coord = self._problem_shape_mhb.get_hier_coord(work_idx, loc=loc, ip=ip)
+         else:
+             blk_coord = self._blk_coord
++            if self._params.lpt:
++                # Launch order is block-linear with m fastest; walk q tiles from the last (the longest causal
++                # rows) to the first across all heads and batches so the light tiles fill the tail wave.
++                m_cnt, h_cnt, b_cnt = self._grid_shape
++                hb_cnt = h_cnt * b_cnt
++                lin = blk_coord[0] + m_cnt * (blk_coord[1] + h_cnt * blk_coord[2])
++                m_rank = lin // hb_cnt
++                rest = lin - m_rank * hb_cnt
++                blk_coord = (m_cnt - 1 - m_rank, rest % h_cnt, rest // h_cnt)
+ 
+         # cur_tile_coord is (mid, 0, (bid, hid))
+         cur_tile_coord = (
+@@ -318,6 +339,7 @@ def create_fmha_static_tile_scheduler(
+ def create_fmha_static_tile_scheduler_params(
+     is_persistent: bool,
+     problem_shape_mhb: cute.Shape,
++    lpt: bool = False,
+ ) -> FmhaStaticTileSchedulerParams:
+     """
+     Create FMHA static tile scheduler parameters.
+@@ -330,7 +352,7 @@ def create_fmha_static_tile_scheduler_params(
+     :return: New FmhaStaticTileSchedulerParams instance.
+     :rtype: FmhaStaticTileSchedulerParams
+     """
+-    return FmhaStaticTileSchedulerParams(is_persistent, problem_shape_mhb)
++    return FmhaStaticTileSchedulerParams(is_persistent, problem_shape_mhb, lpt=lpt)
+ 
+ 
+ def compute_grid(
+@@ -338,6 +360,7 @@ def compute_grid(
+     cta_tiler: Tuple[int, int, int],
+     is_persistent: bool,
+     is_2cta: bool = False,
++    lpt: bool = False,
+ ) -> Tuple[FmhaStaticTileSchedulerParams, Tuple[int, int, int]]:
+     """
+     Compute grid parameters for FMHA operation.
+@@ -372,6 +395,7 @@ def compute_grid(
+             cute.size(o_shape[2][0]),
+             cute.size(o_shape[2][1]),
+         ),
++        lpt=lpt,
+     )
+     grid = FmhaStaticTileScheduler.get_grid_shape(tile_sched_params)
+ 
