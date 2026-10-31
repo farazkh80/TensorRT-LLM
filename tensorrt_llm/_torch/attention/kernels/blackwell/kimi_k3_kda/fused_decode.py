@@ -888,7 +888,7 @@ def kda_decode_t1(
     use_pdl: bool = True,
     fgs_producer: bool = False,
     fgs_persistent: bool = False,
-    fgs_head_group: int = 1,
+    fgs_head_group: int | None = None,
     fgs_ctas: int | None = None,
 ) -> torch.Tensor:
     """Fused T=1 KDA decode; updates ``conv_state`` and ``state`` rows in place.
@@ -906,7 +906,8 @@ def kda_decode_t1(
     -0.0 sentinel: each chunk (8 channels of one head) is written exactly once by one
     16-B store, never as -0.0 (rows with a negative slot publish +0.0), and work
     items are issued for all rows of ``fgs_head_group`` heads before the next group
-    (1: rows fastest; H: heads fastest, the default build's order). The kernel never
+    (default H: heads fastest, the default build's order; 1: rows fastest, which costs
+    2-5 % at B 16-64 on Rubin). The kernel never
     writes the sentinel; resetting the buffer to -0.0 between steps is the caller's
     job, as is launching the consumer with PDL (dependents are released at kernel
     entry). ``fgs_persistent`` launches at most one wave (``fgs_ctas``, default every
@@ -940,6 +941,8 @@ def kda_decode_t1(
         raise ValueError("kda_decode_t1: fgs_producer needs 16-B aligned output rows")
     if fgs_persistent and not fgs_producer:
         raise ValueError("kda_decode_t1: fgs_persistent needs fgs_producer")
+    if fgs_head_group is None:
+        fgs_head_group = heads
     if fgs_producer and heads % fgs_head_group:
         raise ValueError("kda_decode_t1: fgs_head_group must divide the head count")
     if all(v is None for v in (v_split, warps, stage_smem, reg_rows, ring, min_blocks)):
@@ -996,6 +999,7 @@ def kda_decode_t1(
         ring,
         early_trigger=fgs_producer,
         store16=fgs_producer,
+        hw_pzo=fgs_producer,
         head_group=fgs_head_group if fgs_producer else 0,
         persistent_ctas=persistent_ctas,
     )
