@@ -41,12 +41,14 @@ HEAD_DIM_V = 128
 
 # SM107 (328 KiB smem): the st.global epilogue frees sO, so four K/V stages of a D=192 tile fit next to the
 # two Q stages. The correction warps mostly wait on O, so registers move from them to the softmax warps, which
-# release P to the MMA.
+# release P to the MMA. rescale_threshold 0 rescales O whenever a row max grows: with the default 8, P is taken
+# against a stale max, so the dominant P can be up to 2^8 and is rounded in bf16 instead of being exactly 1.
 DEFAULT_TUNING = (
     ("kv_stage", 4),
     ("num_regs_softmax", 200),
     ("num_regs_correction", 80),
     ("num_regs_other", 32),
+    ("rescale_threshold", 0.0),
 )
 
 
