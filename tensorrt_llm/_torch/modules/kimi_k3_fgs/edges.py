@@ -11,18 +11,21 @@ decode batch is in ``[MIN_ROWS, MAX_ROWS]``; ``kimi_k3_cute_gemm.linear`` recogn
 the slot, runs the report_valid consumer on it and releases it, which re-arms the
 slot on the workspaces' reset stream.
 
-Modules ``declare`` their edges at construction. The model forward runs under
-``model_scope``, which registers the declared edges on first use (outside a CUDA
-graph capture) and brackets the whole forward with one ``EdgeWorkspaces.scope``,
-so the two slots of an edge alternate across layers and the reset stream joins
-once at the end. Outside a scope, or for a batch outside the row window,
+Modules ``declare`` their edges at construction, once per layer. The model
+forward runs under ``model_scope``, which registers the declared edges on first
+use (outside a CUDA graph capture) and brackets the whole forward with one
+``EdgeWorkspaces.scope``; the reset stream joins once at the end. With
+``TLLM_FGS_RESET_POLICY=release`` (default) an edge has two slots that alternate
+across layers and each release re-arms its slot; with ``step`` an edge has one
+slot per declaring layer and the step's slots are re-armed by one batched fill
+after the last release. Outside a scope, or for a batch outside the row window,
 ``acquire`` returns None and the producer writes its usual buffer.
 """
 
 import os
 import threading
 from contextlib import contextmanager
-from typing import Dict, Iterator, Optional
+from typing import Dict, Iterator, Optional, Set, Tuple
 
 import torch
 
@@ -32,9 +35,11 @@ ENV = "TLLM_K3_FGS"
 MODES = ("off", "early", "lamport")
 # Below 16 rows the report_valid consumer is slower than the early-trigger path with a waiting consumer.
 MIN_ROWS = int(os.environ.get("TLLM_K3_FGS_MIN_ROWS", "16"))
-MAX_ROWS = int(os.environ.get("TLLM_K3_FGS_MAX_ROWS", "64"))
+# Above 16 rows the consumer runs 32-row split-K tiles, slower than the table's GEMM at 64 rows.
+MAX_ROWS = int(os.environ.get("TLLM_K3_FGS_MAX_ROWS", "16"))
 
-_declared: Dict[str, int] = {}
+# Edge name -> (row width, layers that declared it).
+_declared: Dict[str, Tuple[int, Set[int]]] = {}
 _local = threading.local()
 
 
@@ -50,17 +55,20 @@ def producer_early() -> bool:
     return mode() != "off"
 
 
-def declare(name: str, width: int) -> None:
-    """Declare a [rows, width] bf16 edge; registered by the next ``model_scope`` outside capture."""
+def declare(name: str, width: int, layer_idx: int) -> None:
+    """Declare a [rows, width] bf16 edge used once per step by ``layer_idx``.
+
+    Registered by the next ``model_scope`` outside capture.
+    """
     if mode() == "lamport":
-        _declared[name] = width
+        _declared.setdefault(name, (width, set()))[1].add(layer_idx)
 
 
 def _state():
     if not hasattr(_local, "workspaces"):
         from ..fine_grained_sync import EdgeWorkspaces
 
-        _local.workspaces = EdgeWorkspaces()
+        _local.workspaces = EdgeWorkspaces.from_env()
         _local.live = {}
     return _local.workspaces, _local.live
 
@@ -77,8 +85,13 @@ def model_scope() -> Iterator[None]:
         return
     missing = [name for name in _declared if name not in workspaces]
     if missing and not torch.cuda.is_current_stream_capturing():
+        from ..fine_grained_sync import ResetPolicy
+
+        per_step = workspaces.reset_policy is ResetPolicy.STEP
         for name in missing:
-            workspaces.workspace(name, (MAX_ROWS, _declared[name]), torch.bfloat16, slots=2)
+            width, layers = _declared[name]
+            slots = len(layers) if per_step else 2
+            workspaces.workspace(name, (MAX_ROWS, width), torch.bfloat16, slots=slots)
         logger.info(f"{ENV}=lamport: edge slots {workspaces.ledger()}")
     elif missing:
         logger.warning_once(

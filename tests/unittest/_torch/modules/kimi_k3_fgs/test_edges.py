@@ -13,6 +13,7 @@ from tensorrt_llm._torch.modules.kimi_k3_fgs import edges
 
 N, K = 7168, 12288
 EDGE = "test.core_o"
+LAYERS = 3
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -29,7 +30,8 @@ def lamport(monkeypatch):
     monkeypatch.setenv("TLLM_K3_CUTE_GEMM", "1")
     monkeypatch.setattr(edges, "_declared", {})
     monkeypatch.setattr(edges, "_local", threading.local())
-    edges.declare(EDGE, K)
+    for layer_idx in range(LAYERS):
+        edges.declare(EDGE, K, layer_idx)
     yield
 
 
@@ -54,14 +56,15 @@ def _assert_close(out: torch.Tensor, x: torch.Tensor, w: torch.Tensor) -> None:
     assert ((out.float() - ref).norm() / ref.norm()).item() < 1e-2
 
 
-def _assert_armed(m: int) -> None:
+def _assert_armed() -> None:
     torch.cuda.synchronize()
     for slot in edges._state()[0][EDGE].slots:
-        assert bool((slot[:m].view(torch.int16) == -0x8000).all()), "slot not re-armed"
+        assert bool((slot.view(torch.int16) == -0x8000).all()), "slot not re-armed"
 
 
 @pytest.mark.parametrize("m", [16, 32, 64])
-def test_lease_consume_release_eager(lamport, m: int) -> None:
+def test_lease_consume_release_eager(lamport, monkeypatch, m: int) -> None:
+    monkeypatch.setattr(edges, "MAX_ROWS", 64)
     x, w = _inputs(m, m)
     out = torch.empty(m, N, device="cuda", dtype=torch.bfloat16)
     with edges.model_scope():
@@ -71,10 +74,10 @@ def test_lease_consume_release_eager(lamport, m: int) -> None:
     if m == 16:
         # Same tile and split as the table entry at M = 16: bit-exact.
         assert torch.equal(out, kimi_k3_cute_gemm.linear(x, w))
-    _assert_armed(m)
+    _assert_armed()
 
 
-@pytest.mark.parametrize("m", [1, 4, 65])
+@pytest.mark.parametrize("m", [1, 4, 17])
 def test_rows_outside_window_keep_own_buffer(lamport, m: int) -> None:
     x, w = _inputs(m, m)
     out = torch.empty(m, N, device="cuda", dtype=torch.bfloat16)
@@ -87,7 +90,7 @@ def test_off_is_inert(monkeypatch) -> None:
     monkeypatch.setenv(edges.ENV, "off")
     monkeypatch.setattr(edges, "_declared", {})
     monkeypatch.setattr(edges, "_local", threading.local())
-    edges.declare(EDGE, K)
+    edges.declare(EDGE, K, 0)
     assert not edges._declared
     with edges.model_scope():
         assert edges.acquire(EDGE, 16) is None
@@ -100,10 +103,12 @@ def test_unreleased_slot_raises(lamport) -> None:
             assert edges.acquire(EDGE, 16) is not None
 
 
-def test_graph_replays(lamport) -> None:
-    m, layers = 16, 3
+@pytest.mark.parametrize("policy", ["release", "step"])
+def test_graph_replays(lamport, monkeypatch, policy: str) -> None:
+    monkeypatch.setenv("TLLM_FGS_RESET_POLICY", policy)
+    m = 16
     x_static, w = _inputs(m, 0)
-    outs = [torch.empty(m, N, device="cuda", dtype=torch.bfloat16) for _ in range(layers)]
+    outs = [torch.empty(m, N, device="cuda", dtype=torch.bfloat16) for _ in range(LAYERS)]
 
     def forward():
         with edges.model_scope():
@@ -124,4 +129,4 @@ def test_graph_replays(lamport) -> None:
         ref = kimi_k3_cute_gemm.linear(x, w)
         for out in outs:
             assert torch.equal(out, ref)
-    _assert_armed(m)
+    _assert_armed()
