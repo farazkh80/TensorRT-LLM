@@ -94,6 +94,35 @@ def test_coresident_consumer_matches_plain(stages: int) -> None:
     assert counter.tolist() == [0, 0]
 
 
+def test_timeline_stamps_ready_inputs() -> None:
+    """The timeline build gives the same output and per-CTA stamps start <= first valid <= last valid."""
+    x, w = _inputs(16, seed=5)
+    tactic = TACTICS[16]
+    counter = torch.zeros(fgs.timeline_slots(tactic, 16, N), dtype=torch.int32, device="cuda")
+    out = torch.full((16, N), float("nan"), device="cuda", dtype=torch.bfloat16)
+    fgs.run_splitk_dense_fgs(
+        x,
+        w.t(),
+        None,
+        out,
+        True,
+        tactic,
+        retry_counter=counter,
+        timeline=True,
+        **VARIANTS["fgs"],
+    )
+    plain = _run(x, w, "plain")
+    torch.cuda.synchronize()
+    assert torch.equal(out.view(torch.int16), plain.view(torch.int16))
+    assert counter[:2].tolist() == [0, 0]
+    stamps = counter[2:].view(-1, fgs.TIMELINE_FIELDS).long()
+    # Differences of 32-bit %globaltimer_lo values, unwrapped.
+    first = (stamps[:, 1] - stamps[:, 0]) % (1 << 32)
+    last = (stamps[:, 3] - stamps[:, 1]) % (1 << 32)
+    assert bool((first < 1_000_000).all()) and bool((last < 1_000_000).all())
+    assert bool((stamps[:, 2] == 0).all()) and bool((stamps[:, 4] == 0).all())
+
+
 @dsl_user_op
 def _copy16(dst: Int64, src: Int64, *, loc=None, ip=None):
     llvm.inline_asm(

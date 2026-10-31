@@ -335,6 +335,12 @@ OWNER_RANK = 0
 #: Warp that validates and re-issues activation stages.
 RETRY_WARP = 3
 
+#: Slots of the retry counter: activation re-issues, stages released invalid after retry_limit.
+RETRY_COUNTER_SLOTS = 2
+
+#: Per-CTA timeline entries after the counters (see SplitKFgsGemmKernel.retry_warp_loop).
+TIMELINE_FIELDS = 5
+
 
 class SplitKFgsGemmKernel:
     """BF16/FP16 GEMM with a cluster-local split-K reduction and an optional FGS activation consumer."""
@@ -351,9 +357,12 @@ class SplitKFgsGemmKernel:
         retry_limit: int = 0,
         exact_smem: bool = False,
         smem_carveout: int | None = None,
+        timeline: bool = False,
     ) -> None:
         if report_valid and not retry_warp:
             raise ValueError("report_valid needs retry_warp to re-issue invalid stages")
+        if timeline and not retry_warp:
+            raise ValueError("timeline is recorded by the retry warp")
         if retry_limit and not report_valid:
             raise ValueError("retry_limit applies only with report_valid")
         self.acc_dtype = cutlass.Float32
@@ -367,6 +376,7 @@ class SplitKFgsGemmKernel:
         self.report_valid = report_valid
         self.retry_warp = retry_warp
         self.pdl_wait_activation = pdl_wait_activation
+        self.timeline = timeline
         # Per-CTA re-issue budget after which an invalid stage is released with
         # its sentinel data (counted in retry_count[1]), so a never-published
         # stage cannot hang the kernel. Diagnostic builds only; 0 retries forever.
@@ -614,6 +624,7 @@ class SplitKFgsGemmKernel:
                     k_tile_start,
                     k_tile_count,
                     mRetry,
+                    bidx + block_idx[1] * cute.arch.grid_dim()[0],
                 )
         elif warp_idx >= 4:
             self.epilog_warp(
@@ -704,6 +715,7 @@ class SplitKFgsGemmKernel:
         k_tile_start: cutlass.Int32,
         k_tile_count: cutlass.Int32,
         mRetry: cute.Tensor,
+        cta_id: cutlass.Int32,
     ):
         """Release each activation stage once its primary phase completes with valid data.
 
@@ -713,6 +725,11 @@ class SplitKFgsGemmKernel:
         released; bit s of ``parity`` is the primary-phase parity stage s
         completes next. Invalid stages are re-armed and re-loaded into the same
         stage and revisited on the next sweep, so several stages can retry at once.
+
+        With ``timeline`` the CTA stores ``TIMELINE_FIELDS`` %globaltimer_lo stamps
+        and counts after the two counters: retry-warp start, first tile valid,
+        last re-issued tile valid (0 if none), last tile valid, and the tiles
+        valid before that last re-issued one.
         """
         stages = self.num_ab_stage
         tx_bytes = cute.size_in_bytes(
@@ -725,6 +742,14 @@ class SplitKFgsGemmKernel:
         parity = Int32(0)
         retries = Int32(0)
         unchecked = Int32(0)
+        t_start = Int32(0)
+        t_first = Int32(0)
+        t_ready = Int32(0)
+        valid_tiles = Int32(0)
+        tiles_before_ready = Int32(0)
+        reissued = Int32(0)
+        if cutlass.const_expr(self.timeline):
+            t_start = cute.arch.globaltimer_lo()
         while base < k_tile_count:
             stage = base_stage
             for i in cutlass.range(stages, unroll=1):
@@ -755,6 +780,8 @@ class SplitKFgsGemmKernel:
                                         bar_full + stage, tx_bytes
                                     )
                                     cute.arch.mbarrier_arrive(bar_full + stage)
+                                if cutlass.const_expr(self.timeline):
+                                    reissued = reissued | bit
                                 cute_ext.tma_load(
                                     g_tile[None, None, k_tile_start + base + i],
                                     s_tile[None, None, None, stage],
@@ -768,6 +795,15 @@ class SplitKFgsGemmKernel:
                             done = done | bit
                             with cute.arch.elect_one():
                                 cute.arch.mbarrier_arrive(bar_empty + stage)
+                            if cutlass.const_expr(self.timeline):
+                                now = cute.arch.globaltimer_lo()
+                                if valid_tiles == 0:
+                                    t_first = now
+                                if (reissued & bit) != 0:
+                                    t_ready = now
+                                    tiles_before_ready = valid_tiles
+                                    reissued = reissued ^ bit
+                                valid_tiles = valid_tiles + 1
                 stage = stage + 1
                 if stage == stages:
                     stage = Int32(0)
@@ -783,6 +819,12 @@ class SplitKFgsGemmKernel:
                 cute.arch.atomic_add(mRetry.iterator, retries)
             if unchecked > 0:
                 cute.arch.atomic_add(mRetry.iterator + 1, unchecked)
+        if cutlass.const_expr(self.timeline):
+            t_last = cute.arch.globaltimer_lo()
+            stamps = mRetry.iterator + RETRY_COUNTER_SLOTS + cta_id * TIMELINE_FIELDS
+            with cute.arch.elect_one():
+                for j, value in enumerate((t_start, t_first, t_ready, t_last, tiles_before_ready)):
+                    cute.arch.store(stamps + j, value)
 
     @cute.experimental.jit
     def mma_warp(
@@ -973,9 +1015,6 @@ class SplitKFgsGemmKernel:
 
 _SUPPORTED_TORCH_DTYPES = (_torch.bfloat16, _torch.float16)
 
-#: Slots of the retry counter: activation re-issues, stages released invalid after retry_limit.
-RETRY_COUNTER_SLOTS = 2
-
 
 @cute.experimental.jit
 def _bmm_no_bias(
@@ -1040,13 +1079,21 @@ def _make_layout_tensor(
     ).permute([permutation.index(dim) for dim in range(len(shape))])
 
 
-def _retry_tensor(retry_counter: _torch.Tensor):
-    return from_dlpack(retry_counter, assumed_align=4)
+def _retry_tensor(retry_counter: _torch.Tensor, timeline: bool):
+    tensor = from_dlpack(retry_counter, assumed_align=4)
+    return tensor.mark_layout_dynamic() if timeline else tensor
+
+
+def timeline_slots(tactic: SplitKTactic, m: int, n: int) -> int:
+    """Elements of a ``timeline`` retry counter for one ``A[m, K] @ B[K, n]`` launch."""
+    ctas = -(-n // tactic.mma_m) * -(-m // tactic.mma_n) * tactic.split_k
+    return RETRY_COUNTER_SLOTS + TIMELINE_FIELDS * ctas
 
 
 def _make_compile_repr_tensors(
     dtype: _torch.dtype,
     has_bias: bool,
+    timeline: bool,
     a_leading: int,
     b_leading: int,
     c_leading: int,
@@ -1060,7 +1107,12 @@ def _make_compile_repr_tensors(
             ((batch, n, m), c_leading),
         )
     )
-    retry = _retry_tensor(_torch.zeros(RETRY_COUNTER_SLOTS, dtype=_torch.int32, device="cuda"))
+    retry = _retry_tensor(
+        _torch.zeros(RETRY_COUNTER_SLOTS + TIMELINE_FIELDS, dtype=_torch.int32, device="cuda")
+        if timeline
+        else _torch.zeros(RETRY_COUNTER_SLOTS, dtype=_torch.int32, device="cuda"),
+        timeline,
+    )
     if not has_bias:
         return (*tensors, None, retry)
     return (
@@ -1109,12 +1161,13 @@ def _get_compiled_splitk_kernel(
     retry_limit: int,
     exact_smem: bool,
     smem_carveout: int | None,
+    timeline: bool,
 ):
     if dtype not in _SUPPORTED_TORCH_DTYPES:
         raise ValueError(f"split-K dense GEMM supports {_SUPPORTED_TORCH_DTYPES}; got {dtype}")
 
     with _torch.cuda.device(device_index):
-        compile_tensors = _make_compile_repr_tensors(dtype, has_bias, *leading_dims)
+        compile_tensors = _make_compile_repr_tensors(dtype, has_bias, timeline, *leading_dims)
         kernel = SplitKFgsGemmKernel(
             tactic=tactic,
             use_pdl=use_pdl,
@@ -1125,6 +1178,7 @@ def _get_compiled_splitk_kernel(
             retry_limit=retry_limit,
             exact_smem=exact_smem,
             smem_carveout=smem_carveout,
+            timeline=timeline,
         )
         stream = _cuda.CUstream(_torch.cuda.current_stream().cuda_stream)
         if has_bias:
@@ -1191,6 +1245,7 @@ def run_splitk_dense_fgs(
     retry_limit: int = 0,
     exact_smem: bool = False,
     smem_carveout: int | None = None,
+    timeline: bool = False,
 ):
     """Run ``A[M,K] @ B[K,N]`` with the ``mm_bf16`` layouts; ``a`` is the FGS-checked operand.
 
@@ -1198,17 +1253,22 @@ def run_splitk_dense_fgs(
     activation re-issues and, with ``retry_limit``, the stages released invalid
     after a CTA exceeded its re-issue budget. ``exact_smem`` and
     ``smem_carveout`` (percent, CUDA preferred carveout) let a consumer CTA share
-    an SM with a concurrently running producer.
+    an SM with a concurrently running producer. ``timeline`` (diagnostic) also
+    stores per-CTA load stamps; the counter then needs ``timeline_slots``
+    elements.
     """
-    validate_tactic(tactic, *_validate_runtime_tensors(a, b, bias, out))
-    if retry_counter is None:
+    m, n, k = _validate_runtime_tensors(a, b, bias, out)
+    validate_tactic(tactic, m, n, k)
+    slots = timeline_slots(tactic, m, n) if timeline else RETRY_COUNTER_SLOTS
+    if retry_counter is None and not timeline:
         retry_counter = _scratch_retry_counter(a.device)
     elif (
-        retry_counter.dtype != _torch.int32
-        or retry_counter.numel() != RETRY_COUNTER_SLOTS
+        retry_counter is None
+        or retry_counter.dtype != _torch.int32
+        or retry_counter.numel() != slots
         or retry_counter.device != a.device
     ):
-        raise ValueError(f"retry_counter must be int32[{RETRY_COUNTER_SLOTS}] on {a.device}")
+        raise ValueError(f"retry_counter must be int32[{slots}] on {a.device}")
     has_bias = bias is not None
     with _torch.cuda.device(a.device):
         tensors = _to_cute_swap(a, b, out, bias)
@@ -1225,10 +1285,11 @@ def run_splitk_dense_fgs(
             retry_limit=retry_limit,
             exact_smem=exact_smem,
             smem_carveout=smem_carveout,
+            timeline=timeline,
         )
         compiled(
             *(tensors[:4] if has_bias else tensors[:3]),
-            _retry_tensor(retry_counter),
+            _retry_tensor(retry_counter, timeline),
             _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream),
         )
     return out
