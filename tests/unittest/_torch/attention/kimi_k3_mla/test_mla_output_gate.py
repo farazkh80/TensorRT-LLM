@@ -69,3 +69,73 @@ def test_output_gate_in_place(config) -> None:
     expected = o * g.sigmoid()
     mla_output_gate(o, g, out=o, config=config)
     assert torch.equal(expected.view(torch.int16), o.view(torch.int16))
+
+
+NEG_ZERO = -32768  # bf16 -0.0 as int16, the fine-grained-sync sentinel
+
+
+def _run_producer(o: torch.Tensor, g: torch.Tensor, config=None) -> torch.Tensor:
+    """fgs_producer into a sentinel-filled slot; checks it equals ATen with -0.0 as +0.0 and holds no -0.0."""
+    expected = o * g.sigmoid()
+    expected.view(torch.int16)[expected.view(torch.int16) == NEG_ZERO] = 0
+    slot = torch.full_like(o, -0.0)
+    mla_output_gate(o, g, out=slot, config=config, fgs_producer=True)
+    bits = slot.view(torch.int16)
+    assert not bool((bits == NEG_ZERO).any()), "fgs_producer stored -0.0"
+    same = (bits == expected.view(torch.int16)) | (torch.isnan(expected) & torch.isnan(slot))
+    assert bool(same.all()), f"{int((~same).sum())} elements differ from ATen (-0.0 as +0.0)"
+    return slot
+
+
+@pytest.mark.parametrize("config", [None, DECODE_CONFIG, (8, 4, True)], ids=str)
+@pytest.mark.parametrize("m", [1, 4, 16, 64, 8192])
+def test_output_gate_fgs_producer_random(m: int, config) -> None:
+    torch.manual_seed(m)
+    o = torch.randn(m, N, dtype=torch.bfloat16, device="cuda")
+    g = (torch.randn(m, N, device="cuda") * 4).to(torch.bfloat16)
+    _run_producer(o, g, config)
+
+
+def test_output_gate_fgs_producer_every_bf16_gate_value() -> None:
+    torch.manual_seed(0)
+    every = (
+        torch.arange(-32768, 32768, dtype=torch.int32).to(torch.int16).view(torch.bfloat16).cuda()
+    )
+    pad = torch.zeros(-every.numel() % N, dtype=torch.bfloat16, device="cuda")
+    g = torch.cat([every, pad]).view(-1, N)
+    o = torch.randn(g.shape, dtype=torch.bfloat16, device="cuda")
+    _run_producer(o, g)
+
+
+def test_output_gate_fgs_producer_negative_zeros() -> None:
+    """Inputs whose product is -0.0: o = -0.0, o = +-0.0 with tiny gates, and negative products that underflow."""
+    torch.manual_seed(0)
+    edge = torch.tensor(EDGE, dtype=torch.bfloat16, device="cuda")
+    g_edge = edge.repeat(N // len(EDGE) + 1)[:N]
+    tiny = torch.tensor(
+        [-1e-38, -1e-30, -1e-20, -3e-39, -9.2e-41], dtype=torch.bfloat16, device="cuda"
+    )
+    o = torch.empty(6, N, dtype=torch.bfloat16, device="cuda")
+    g = torch.empty_like(o)
+    o[0], g[0] = -0.0, g_edge
+    o[1], g[1] = 0.0, g_edge
+    o[2], g[2] = -1.0, -200.0
+    o[3], g[3] = tiny.repeat(N // len(tiny) + 1)[:N], -100.0
+    o[4], g[4] = tiny.repeat(N // len(tiny) + 1)[:N], g_edge
+    o[5], g[5] = torch.randn(N, device="cuda").to(torch.bfloat16).abs().neg(), -90.0
+    expected = o * g.sigmoid()
+    assert bool((expected.view(torch.int16) == NEG_ZERO).any()), (
+        "the inputs must produce -0.0 in ATen"
+    )
+    _run_producer(o, g)
+
+
+def test_output_gate_fgs_producer_rejects_unsafe_calls() -> None:
+    o = torch.randn(16, N, dtype=torch.bfloat16, device="cuda")
+    g = torch.randn(16, N, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError):
+        mla_output_gate(o, g, fgs_producer=True)
+    with pytest.raises(ValueError):
+        mla_output_gate(o, g, out=o, fgs_producer=True)
+    with pytest.raises(ValueError):
+        mla_output_gate(o, g, out=torch.empty_like(o), config=(16, 2, True), fgs_producer=True)
