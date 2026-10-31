@@ -12,6 +12,14 @@ column slice of the fused qkvg projection). Row r reads z at token r // H, head 
 
 Sixteen lanes own one row (eight BF16 channels, one 16-byte load per operand);
 each thread keeps ``rows_per_thread`` rows in flight before reducing.
+
+``fgs_consumer`` reads o from a fine-grained-sync slot instead of waiting for the
+producer grid: each 16-byte chunk of o counts as written once its element 0 is not
+the BF16 -0.0 sentinel (the producer writes every chunk with one 16-byte store and
+never stores -0.0). Unwritten chunks are reloaded with ``ld.relaxed.gpu`` after an
+exponential ``nanosleep`` backoff; after ``max_spins`` reloads a thread falls back
+to ``griddepcontrol.wait`` (producer grid complete) and takes the value it then
+reads. Optional ``stats`` (int32 [2]) accumulates reloads and fallbacks.
 """
 
 from functools import cache
@@ -20,7 +28,10 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
+from cutlass._mlir import ir
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 F32 = cutlass.Float32
 BF16 = cutlass.BFloat16
@@ -29,15 +40,62 @@ HEAD_DIM = 128
 VEC = 8
 LANES_PER_ROW = HEAD_DIM // VEC
 ROWS_PER_WARP_STEP = 32 // LANES_PER_ROW
+BF16_NEG_ZERO = 0x8000
+SPIN_NS_MIN = 32
+SPIN_NS_MAX = 2048
+
+
+@dsl_user_op
+def _ld_relaxed_v4(addr, reload, *, loc=None, ip=None):
+    """16-byte ``ld.relaxed.gpu.global`` (not served from a stale L1 line) as four int32;
+    a ``reload`` is never merged with or hoisted above an earlier load of the address."""
+    res = llvm.inline_asm(
+        ir.Type.parse("!llvm.struct<(i32,i32,i32,i32)>"),
+        [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)],
+        "ld.relaxed.gpu.global.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l,~{memory}" if reload else "=r,=r,=r,=r,l",
+        has_side_effects=reload,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return [cutlass.Int32(llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(4)]
+
+
+@dsl_user_op
+def _nanosleep(ns, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [cutlass.Int32(ns).ir_value(loc=loc, ip=ip)],
+        "nanosleep.u32 $0;",
+        "r",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 
 class GatedRmsNorm:
-    def __init__(self, heads: int, rows_per_thread: int, warps: int, use_pdl: bool):
+    def __init__(
+        self,
+        heads: int,
+        rows_per_thread: int,
+        warps: int,
+        use_pdl: bool,
+        fgs_consumer: bool = False,
+        max_spins: int = 0,
+        with_stats: bool = False,
+    ):
         self.heads = heads
         self.rows_per_thread = rows_per_thread
         self.warps = warps
         self.use_pdl = use_pdl
         self.rows_per_cta = warps * ROWS_PER_WARP_STEP * rows_per_thread
+        assert not fgs_consumer or use_pdl
+        self.fgs_consumer = fgs_consumer
+        self.max_spins = max_spins
+        self.with_stats = with_stats
 
     @cute.jit
     def __call__(
@@ -47,15 +105,19 @@ class GatedRmsNorm:
         weight: cute.Tensor,
         out: cute.Tensor,
         eps: F32,
+        stats: cute.Tensor | None,
         stream: cuda.CUstream,
     ):
         rows = x.shape[0]
         grid = (rows + self.rows_per_cta - 1) // self.rows_per_cta
-        self.kernel(x, z, weight, out, eps).launch(
+        # The retry loop must not cost the default build's occupancy (full SM of threads).
+        min_blocks = 1024 // (self.warps * 32) if self.fgs_consumer else 0
+        self.kernel(x, z, weight, out, eps, stats).launch(
             grid=[grid, 1, 1],
             block=[self.warps * 32, 1, 1],
             stream=stream,
             use_pdl=self.use_pdl,
+            min_blocks_per_mp=min_blocks,
         )
 
     @cute.kernel
@@ -66,6 +128,7 @@ class GatedRmsNorm:
         weight: cute.Tensor,
         out: cute.Tensor,
         eps: F32,
+        stats: cute.Tensor | None,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -87,7 +150,7 @@ class GatedRmsNorm:
         w_reg = cute.make_rmem_tensor((VEC,), weight.element_type)
         cute.copy(copy_w, cute.local_tile(weight, (VEC,), (col // VEC,)), w_reg)
 
-        if cutlass.const_expr(self.use_pdl):
+        if cutlass.const_expr(self.use_pdl and not self.fgs_consumer):
             cute.arch.griddepcontrol_wait()
 
         x_regs = []
@@ -101,10 +164,48 @@ class GatedRmsNorm:
             if r < rows:
                 tok = r // self.heads
                 head = r - tok * self.heads
-                cute.copy(copy_x, cute.local_tile(x[r, None], (VEC,), (col // VEC,)), x_reg)
+                x_chunk = cute.local_tile(x[r, None], (VEC,), (col // VEC,))
+                if cutlass.const_expr(self.fgs_consumer):
+                    x_bits = cute.recast_tensor(x_reg, cutlass.Int32)
+                    words = _ld_relaxed_v4(x_chunk.iterator.toint(), False)
+                    for w in cutlass.range_constexpr(4):
+                        x_bits[w] = words[w]
+                else:
+                    cute.copy(copy_x, x_chunk, x_reg)
                 cute.copy(copy_x, cute.local_tile(z[tok, head, None], (VEC,), (col // VEC,)), z_reg)
             x_regs.append(x_reg)
             z_regs.append(z_reg)
+
+        if cutlass.const_expr(self.fgs_consumer):
+            spins = cutlass.Int32(0)
+            waited = cutlass.Int32(0)
+            for i in cutlass.range_constexpr(self.rows_per_thread):
+                r = row0 + i * ROWS_PER_WARP_STEP
+                if r < rows:
+                    x_bits = cute.recast_tensor(x_regs[i], cutlass.Int32)
+                    x_addr = cute.local_tile(x[r, None], (VEC,), (col // VEC,)).iterator.toint()
+                    # After a fallback wait a sentinel loaded before it is reloaded once.
+                    pending = (x_bits[0] & 0xFFFF) == BF16_NEG_ZERO
+                    sleep_ns = cutlass.Int32(SPIN_NS_MIN)
+                    while pending:
+                        if waited == 0:
+                            if spins >= self.max_spins:
+                                # The producer grid has completed: its value is final.
+                                cute.arch.griddepcontrol_wait()
+                                waited = cutlass.Int32(1)
+                            else:
+                                _nanosleep(sleep_ns)
+                                sleep_ns = cute.min(sleep_ns * 2, cutlass.Int32(SPIN_NS_MAX))
+                        spins = spins + 1
+                        words = _ld_relaxed_v4(x_addr, True)
+                        for w in cutlass.range_constexpr(4):
+                            x_bits[w] = words[w]
+                        pending = ((x_bits[0] & 0xFFFF) == BF16_NEG_ZERO) & (waited == 0)
+            if cutlass.const_expr(self.with_stats):
+                if spins > 0:
+                    cute.arch.atomic_add(stats.iterator, spins)
+                if waited > 0:
+                    cute.arch.atomic_add(stats.iterator + 1, waited)
 
         for i in cutlass.range_constexpr(self.rows_per_thread):
             r = row0 + i * ROWS_PER_WARP_STEP
@@ -135,7 +236,14 @@ _TORCH_TO_CUTE = {torch.bfloat16: BF16, torch.float32: F32}
 
 @cache
 def _compile(
-    heads: int, weight_dtype: torch.dtype, rows_per_thread: int, warps: int, use_pdl: bool
+    heads: int,
+    weight_dtype: torch.dtype,
+    rows_per_thread: int,
+    warps: int,
+    use_pdl: bool,
+    fgs_consumer: bool = False,
+    max_spins: int = 0,
+    with_stats: bool = False,
 ):
     rows, tokens = cute.sym_int(), cute.sym_int()
     x = make_fake_tensor(
@@ -154,7 +262,10 @@ def _compile(
     out = make_fake_tensor(
         BF16, (rows, HEAD_DIM), stride=(cute.sym_int64(divisibility=VEC), 1), assumed_align=16
     )
-    op = GatedRmsNorm(heads, rows_per_thread, warps, use_pdl)
+    stats = None
+    if with_stats:
+        stats = make_fake_tensor(cutlass.Int32, (2,), stride=(1,), assumed_align=8)
+    op = GatedRmsNorm(heads, rows_per_thread, warps, use_pdl, fgs_consumer, max_spins, with_stats)
     return cute.compile(
         op,
         x,
@@ -162,6 +273,7 @@ def _compile(
         weight,
         out,
         F32(1e-5),
+        stats,
         make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
@@ -222,11 +334,19 @@ def kda_gated_rmsnorm(
     *,
     config: tuple[int, int] | None = None,
     use_pdl: bool | None = None,
+    fgs_consumer: bool = False,
+    fgs_max_spins: int = 1 << 16,
+    fgs_stats: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sigmoid-gated RMSNorm of ``x [T*H, 128]`` with ``z [T, H, 128]``; returns ``[T*H, 128]``.
 
     ``out`` may be any ``[T*H, 128]`` BF16 view with 16-byte aligned rows (for example the
     caller's graph-owned core buffer), which removes the separate copy.
+
+    ``fgs_consumer`` reads ``x`` as a fine-grained-sync slot (see the module docstring):
+    the kernel launches with PDL and does not wait for the producer grid; ``x`` must be
+    armed with -0.0 before the producer runs and ``out`` must not alias it.
+    ``fgs_stats`` (int32 [2], zeroed by the caller) accumulates reloads and fallbacks.
     """
     if not supports(x, z, weight, out):
         raise ValueError(
@@ -243,6 +363,22 @@ def kda_gated_rmsnorm(
     grid = -(-rows // (warps * ROWS_PER_WARP_STEP * rows_per_thread))
     if use_pdl is None:
         use_pdl = grid < _num_sms(device_index)
-    fn = _compile(heads, weight.dtype, rows_per_thread, warps, bool(use_pdl))
-    fn(x, z, weight, out, eps)
+    if fgs_consumer:
+        if out.data_ptr() == x.data_ptr():
+            raise ValueError("kda_gated_rmsnorm: fgs_consumer needs out separate from x")
+        use_pdl = True
+    with_stats = fgs_stats is not None
+    if with_stats and (fgs_stats.dtype != torch.int32 or fgs_stats.numel() < 2):
+        raise ValueError("kda_gated_rmsnorm: fgs_stats must be an int32 tensor of 2 elements")
+    fn = _compile(
+        heads,
+        weight.dtype,
+        rows_per_thread,
+        warps,
+        bool(use_pdl),
+        fgs_consumer,
+        fgs_max_spins if fgs_consumer else 0,
+        with_stats,
+    )
+    fn(x, z, weight, out, eps, fgs_stats)
     return out

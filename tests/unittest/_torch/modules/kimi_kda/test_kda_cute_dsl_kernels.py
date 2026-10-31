@@ -325,6 +325,70 @@ def test_gated_rmsnorm_matches_triton(
     torch.testing.assert_close(cute.float(), stock.float(), rtol=2 * 2**-8, atol=1e-3)
 
 
+def _canonical_bf16(t: torch.Tensor) -> torch.Tensor:
+    bits = t.view(torch.int16)
+    return torch.where(bits == _BF16_NEG_ZERO, 0, bits).view(torch.bfloat16)
+
+
+def _norm_inputs(tokens: int, seed: int):
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    o = torch.randn(tokens * H, D, device="cuda", generator=gen).to(torch.bfloat16)
+    qkvg = (torch.randn(tokens, 4 * DIM, device="cuda", generator=gen) * 3.0).to(torch.bfloat16)
+    w = 1.0 + 0.2 * torch.randn(D, device="cuda", generator=gen)
+    return _canonical_bf16(o), qkvg[:, 3 * DIM :].view(tokens, H, D), w
+
+
+@pytest.mark.parametrize("tokens", [1, 64, 1000])
+@torch.no_grad()
+def test_gated_rmsnorm_fgs_consumer_ready_input(tokens: int) -> None:
+    """A fully written slot: same bits as the default build and no reload."""
+    o, z, w = _norm_inputs(tokens, seed=tokens)
+    ref = gated_rmsnorm.kda_gated_rmsnorm(o, z, w, EPS)
+    stats = torch.zeros(2, device="cuda", dtype=torch.int32)
+    out = gated_rmsnorm.kda_gated_rmsnorm(o, z, w, EPS, fgs_consumer=True, fgs_stats=stats)
+    assert torch.equal(out.view(torch.int16), ref.view(torch.int16))
+    assert stats.tolist() == [0, 0]
+
+
+@pytest.mark.parametrize("order", ["forward", "reverse"])
+@torch.no_grad()
+def test_gated_rmsnorm_fgs_consumer_waits_for_late_chunks(order: str) -> None:
+    """The slot starts as -0.0 and another stream publishes it in token blocks after a delay."""
+    tokens, block = 64, 16
+    o, z, w = _norm_inputs(tokens, seed=5)
+    ref = gated_rmsnorm.kda_gated_rmsnorm(o, z, w, EPS)
+    slot = torch.full_like(o, -0.0)
+    stats = torch.zeros(2, device="cuda", dtype=torch.int32)
+    writer = torch.cuda.Stream()
+    writer.wait_stream(torch.cuda.current_stream())
+    starts = list(range(0, tokens, block))
+    if order == "reverse":
+        starts.reverse()
+    with torch.cuda.stream(writer):
+        for start in starts:
+            torch.cuda._sleep(200_000)
+            rows = slice(start * H, (start + block) * H)
+            slot[rows].copy_(o[rows])
+    out = gated_rmsnorm.kda_gated_rmsnorm(slot, z, w, EPS, fgs_consumer=True, fgs_stats=stats)
+    torch.cuda.synchronize()
+    assert torch.equal(out.view(torch.int16), ref.view(torch.int16))
+    assert stats[0].item() > 0 and stats[1].item() == 0
+
+
+@torch.no_grad()
+def test_gated_rmsnorm_fgs_consumer_falls_back_to_grid_wait() -> None:
+    """Chunks that stay -0.0 past the spin budget are taken as final after griddepcontrol.wait."""
+    o, z, w = _norm_inputs(64, seed=9)
+    o.view(torch.int16)[::5, ::8] = _BF16_NEG_ZERO
+    ref = gated_rmsnorm.kda_gated_rmsnorm(o, z, w, EPS)
+    stats = torch.zeros(2, device="cuda", dtype=torch.int32)
+    out = gated_rmsnorm.kda_gated_rmsnorm(
+        o, z, w, EPS, fgs_consumer=True, fgs_max_spins=4, fgs_stats=stats
+    )
+    assert torch.equal(out.view(torch.int16), ref.view(torch.int16))
+    assert stats[1].item() > 0
+
+
 @pytest.mark.parametrize("pad", [0, 64])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @torch.no_grad()
