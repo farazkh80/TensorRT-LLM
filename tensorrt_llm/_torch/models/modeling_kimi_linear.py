@@ -447,6 +447,19 @@ def _read_fused_attn_res_max_tokens() -> int:
 _ATTN_RES_TOPOLOGY = _read_attn_res_topology()
 _FUSED_ATTN_RES_MAX_TOKENS = _read_fused_attn_res_max_tokens()
 
+KIMI_K3_CUTE_NORM_ENV = "TLLM_K3_CUTE_NORM"
+"""Set to ``1`` to run every attention-residual mix (and the residual add / RMSNorm fused with it) through the
+CuTe DSL ``attn_res_mix`` kernel instead of the C++ ``attn_res_*`` ops, ATen add and FlashInfer RMSNorm.
+
+Each site keeps the output rounding of the stock path it replaces: KimiK3RMSNorm double rounding where the stock
+C++ fused kernel would run, FlashInfer single rounding elsewhere. Read at import; a missing kernel module fails
+the import rather than silently measuring stock.
+"""
+
+_CUTE_NORM_ENABLED = os.environ.get(KIMI_K3_CUTE_NORM_ENV, "0") == "1"
+if _CUTE_NORM_ENABLED:
+    from ..modules.kimi_k3_attn_res.attn_res_mix_cute import attn_res_mix as _cute_attn_res_mix
+
 
 def _persistent_attn_res_applicable(M: int, H: int, N: int) -> bool:
     """Shape gate for the persistent kernel: H == 7168 and 2 <= N <= 9.
@@ -472,6 +485,68 @@ def _use_persistent_attn_res(M: int, H: int, N: int) -> bool:
     if _ATTN_RES_TOPOLOGY == "persistent":
         return True
     return _ATTN_RES_TOPOLOGY == "split" and M > _FUSED_ATTN_RES_MAX_TOKENS
+
+
+def _cute_attn_res_applicable(
+    prefix_sum: torch.Tensor, block_residual: torch.Tensor, addend: Optional[torch.Tensor] = None
+) -> bool:
+    if prefix_sum.dim() != 2 or not prefix_sum.is_cuda:
+        return False
+    M, H = prefix_sum.shape
+    tensors = (
+        (prefix_sum, block_residual) if addend is None else (prefix_sum, block_residual, addend)
+    )
+    return (
+        M >= 1
+        and H == 7168
+        and 1 <= block_residual.shape[0] <= 11
+        and tuple(block_residual.shape[1:]) == (M, H)
+        and (addend is None or addend.shape == prefix_sum.shape)
+        and all(t.dtype is torch.bfloat16 and t.is_contiguous() for t in tensors)
+    )
+
+
+def _cute_norm_mode(M: int, H: int, N: int) -> str:
+    """Rounding of the stock path at this shape: C++ fused kernels (double) or FlashInfer RMSNorm (single)."""
+    stock_fuses = _FUSED_ATTN_RES_ENABLED and (
+        _use_persistent_attn_res(M, H, N) or (M <= _FUSED_ATTN_RES_MAX_TOKENS and N <= 12)
+    )
+    return "kimi" if stock_fuses else "flashinfer"
+
+
+def _cute_attn_res(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    proj: nn.Linear,
+    norm: KimiK3RMSNorm,
+    output_norm: Optional[nn.Module] = None,
+    addend: Optional[torch.Tensor] = None,
+):
+    M, H = prefix_sum.shape
+    N = int(block_residual.shape[0]) + 1
+    kwargs = {}
+    if output_norm is not None:
+        kwargs = dict(
+            out_norm_weight=output_norm.weight.to(torch.bfloat16).contiguous(),
+            out_norm_eps=_rms_norm_eps(output_norm),
+            norm_mode=_cute_norm_mode(M, H, N),
+        )
+    _note_attn_res_fusion(
+        f"cute{'+add' if addend is not None else ''}{'+norm' if output_norm is not None else ''}",
+        True,
+        M,
+        H,
+        N,
+    )
+    return _cute_attn_res_mix(
+        prefix_sum,
+        block_residual,
+        proj.weight.reshape(-1).to(torch.bfloat16).contiguous(),
+        norm.weight.to(torch.bfloat16).contiguous(),
+        float(norm.eps),
+        addend=addend,
+        **kwargs,
+    )
 
 
 def _apply_attn_res_fused(
@@ -675,6 +750,8 @@ def _apply_attn_res(
     contract dispatch directly to the in-tree ``trtllm::attn_res_fwd`` op.
     Only the fallback boundary restores the HF ``[M, K, H]`` layout.
     """
+    if _CUTE_NORM_ENABLED and _cute_attn_res_applicable(prefix_sum, block_residual):
+        return _cute_attn_res(prefix_sum, block_residual, proj, norm)
     if _FUSED_ATTN_RES_ENABLED:
         fused = _apply_attn_res_fused(prefix_sum, block_residual, proj, norm)
         if fused is not None:
@@ -703,6 +780,14 @@ def _apply_attn_res_and_rmsnorm(
 
     ``before_norm`` runs between the two kernels of the unfused path.
     """
+    if _CUTE_NORM_ENABLED and _cute_attn_res_applicable(prefix_sum, block_residual):
+        M, H = prefix_sum.shape
+        # Fuse wherever stock fuses; keep the split (and the before_norm hook) where stock splits.
+        if before_norm is None or _cute_norm_mode(M, H, int(block_residual.shape[0]) + 1) == "kimi":
+            return _cute_attn_res(prefix_sum, block_residual, proj, norm, output_norm)
+        hidden_states = _cute_attn_res(prefix_sum, block_residual, proj, norm)
+        before_norm()
+        return output_norm(hidden_states)
     if _FUSED_ATTN_RES_ENABLED:
         fused = _apply_attn_res_rmsnorm_fused(prefix_sum, block_residual, proj, norm, output_norm)
         if fused is not None:
@@ -722,6 +807,8 @@ def _apply_attn_res_add_and_rmsnorm(
     output_norm: nn.Module,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Add an attention output to the running residual, then select and norm."""
+    if _CUTE_NORM_ENABLED and _cute_attn_res_applicable(prefix_sum, block_residual, addend):
+        return _cute_attn_res(prefix_sum, block_residual, proj, norm, output_norm, addend)
     if _FUSED_ATTN_RES_ENABLED:
         fused = _apply_attn_res_add_rmsnorm_fused(
             prefix_sum, addend, block_residual, proj, norm, output_norm
