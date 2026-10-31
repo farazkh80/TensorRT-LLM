@@ -66,6 +66,21 @@ from .backends.utils import create_attention
 from .rotary_embedding import RotaryEmbedding
 
 
+@functools.lru_cache(maxsize=None)
+def k3_cute_mla_enabled(part: str) -> bool:
+    """TLLM_K3_CUTE_MLA: "1"/"all" enables every Kimi K3 MLA CuTe DSL kernel, or a comma list of parts."""
+    value = os.environ.get("TLLM_K3_CUTE_MLA", "0")
+    return value in ("1", "all") or part in value.split(",")
+
+
+def _k3_cute_gemm_module():
+    try:
+        from ..modules import kimi_k3_cute_gemm
+    except ImportError:
+        return None
+    return kimi_k3_cute_gemm
+
+
 def _slice_hidden_states_to_num_tokens(hidden_states, num_tokens: int):
     """Drop CUDA-graph padding by slicing hidden_states to num_tokens rows.
 
@@ -1099,13 +1114,17 @@ class MLA(nn.Module):
                 self.aux_stream,
             )
 
-        projected_q, latent_cache = maybe_execute_in_parallel(
-            lambda: self._project_q_by_phase(q, num_ctx_tokens),
-            lambda: torch.concat([compressed_kv, k_pe], dim=-1),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
+        if self._k3_latent_append_active(attn_metadata, num_tokens):
+            projected_q = self._project_q_by_phase(q, num_ctx_tokens)
+            latent_cache = None
+        else:
+            projected_q, latent_cache = maybe_execute_in_parallel(
+                lambda: self._project_q_by_phase(q, num_ctx_tokens),
+                lambda: torch.concat([compressed_kv, k_pe], dim=-1),
+                self.ln_events[0],
+                self.ln_events[1],
+                self.aux_stream,
+            )
 
         q_ctx, q_gen = projected_q
 
@@ -1144,7 +1163,7 @@ class MLA(nn.Module):
             assert q_gen is not None
             compressed_kv_gen = compressed_kv[num_ctx_tokens:, ...]
             k_pe_gen = k_pe[num_ctx_tokens:, ...]
-            if latent_cache_gen is None:
+            if latent_cache_gen is None and latent_cache is not None:
                 latent_cache_gen = latent_cache[num_ctx_tokens:, ...]
 
             if self.llama_4_scaling:
@@ -1243,8 +1262,13 @@ class MLA(nn.Module):
             v_out = v.unflatten(-1, (self.num_context_heads, self.v_head_dim)).transpose(0, 1)
             # cuBLAS consumes the transposed weights and writes strided
             # outputs directly, without materializing contiguous copies.
-            torch.ops.trtllm.bmm_out(ckv, w_k.transpose(1, 2), k_nope_out)
-            torch.ops.trtllm.bmm_out(ckv, w_v.transpose(1, 2), v_out)
+            k3_gemm = _k3_cute_gemm_module() if getattr(self, "_k3_cute_gemm_bmm", False) else None
+            if k3_gemm is not None and k3_gemm.enabled():
+                k3_gemm.bmm(ckv, w_k, k_nope_out)
+                k3_gemm.bmm(ckv, w_v, v_out)
+            else:
+                torch.ops.trtllm.bmm_out(ckv, w_k.transpose(1, 2), k_nope_out)
+                torch.ops.trtllm.bmm_out(ckv, w_v.transpose(1, 2), v_out)
         else:
             kv = self._project_context_kv(compressed_kv)
             k_nope, v = kv.split(
@@ -1634,10 +1658,71 @@ class MLA(nn.Module):
             q, compressed_kv, k_pe, position_ids, attn_metadata, output, latent_cache
         )
 
+    def _k3_latent_append_active(self, attn_metadata: AttentionMetadata, num_tokens: int) -> bool:
+        """Decode-only batch on a BF16 latent cache with the identity rope (Kimi K3 sets the flag)."""
+        return (
+            getattr(self, "_k3_cute_latent_append", False)
+            and k3_cute_mla_enabled("append")
+            and attn_metadata.num_contexts == 0
+            and attn_metadata.num_generations > 0
+            and num_tokens == attn_metadata.num_generations
+            and not self.apply_rotary_emb
+            and self.sparse_params is None
+            and self.kv_cache_dtype != "fp8_ds_mla"
+            and not getattr(self.mqa, "has_fp8_kv_cache", False)
+            and not getattr(self.mqa, "has_fp4_kv_cache", False)
+            and getattr(attn_metadata, "helix_position_offsets", None) is None
+            and not getattr(attn_metadata, "is_ragged_verify", False)
+            and getattr(self, "k_b_proj_trans", None) is not None
+            and self.k_b_proj_trans.dtype == torch.bfloat16
+        )
+
+    def _k3_latent_append(
+        self,
+        fused_q: torch.Tensor,
+        q_pe: torch.Tensor,
+        compressed_kv: torch.Tensor,
+        k_pe: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        page_table_out: torch.Tensor,
+        cu_q_seqlens: torch.Tensor,
+        cu_kv_seqlens: torch.Tensor,
+        fmha_scheduler_counter: torch.Tensor,
+    ) -> None:
+        """CuTe DSL replacement of concat + mla_rope_generation + the decode page-table add.
+
+        The page table it produces is handed to CuteDslMlaFmha through the metadata, keyed by layer and rows.
+        """
+        from .kernels.rubin.kimi_k3_mla.mla_latent_append import mla_latent_append
+
+        meta = attn_metadata
+        num_ctx, num_gen = meta.num_contexts, meta.num_generations
+        local_layer_idx = self.mqa.get_local_layer_idx(meta)
+        pool_idx = int(meta.host_kv_cache_pool_mapping[local_layer_idx, 0])
+        rows = meta.kv_cache_block_offsets[pool_idx, num_ctx : num_ctx + num_gen, 0, :]
+        page_table = mla_latent_append(
+            q_pe,
+            compressed_kv,
+            k_pe,
+            fused_q,
+            meta.kv_cache_manager.get_buffers(self.mqa.layer_idx),
+            rows,
+            meta.kv_lens_cuda_runtime[num_ctx : num_ctx + num_gen].to(torch.int32),
+            page_table_out=page_table_out,
+            cu_q_seqlens=cu_q_seqlens,
+            cu_kv_seqlens=cu_kv_seqlens,
+            fmha_scheduler_counter=fmha_scheduler_counter.view(torch.int32),
+        )
+        meta._k3_cute_mla_page_table = (self.mqa.layer_idx, rows.data_ptr(), num_gen, page_table)
+
     def _bmm_bf16_out(
         self, a, b_no_transpose, b_transposed, output, locality_domain_weight_shards=None
     ):
         """BMM with optional CuTe DSL bf16 acceleration on Blackwell/SM107."""
+        k3_gemm = _k3_cute_gemm_module() if getattr(self, "_k3_cute_gemm_bmm", False) else None
+        if k3_gemm is not None and k3_gemm.enabled():
+            k3_gemm.bmm(a, b_no_transpose, output)
+            return
         if (
             self.use_cute_dsl_bf16_bmm
             and get_sm_version() == 107
@@ -1817,8 +1902,27 @@ class MLA(nn.Module):
             fuse_fp4_q_quant = fp4_mla
             fp4_rope_kwargs = {"fuse_fp4_q_quant": True} if fuse_fp4_q_quant else {}
 
+            k3_page_table = None
+            if latent_cache is None and self._k3_latent_append_active(attn_metadata, num_tokens):
+                k3_rows = attn_metadata.kv_cache_block_offsets.shape[-1]
+                k3_page_table = torch.empty_strided(
+                    (k3_rows, num_seqs), (1, k3_rows), dtype=torch.int32, device=q.device
+                )
+
             def _mla_gen_rope():
-                if self.apply_rotary_emb:
+                if k3_page_table is not None:
+                    self._k3_latent_append(
+                        fused_q,
+                        q_pe,
+                        compressed_kv,
+                        k_pe,
+                        attn_metadata,
+                        k3_page_table,
+                        cu_q_seqlens,
+                        cu_kv_seqlens,
+                        fmha_scheduler_counter,
+                    )
+                elif self.apply_rotary_emb:
                     # Non-fused backends (Vanilla / FlashInfer) do not fuse RoPE
                     # in the attention kernel. Reuse apply_rope, which rotates
                     # q's q_pe slice in place, then copy rotated k_pe into the
@@ -1907,6 +2011,12 @@ class MLA(nn.Module):
             )
         else:
             raise RuntimeError("MLA absorption requires k_b_proj_trans")
+
+        if k3_page_table is not None:
+            # The CuTe append already wrote the cache rows and the trtllm-gen scheduler buffers. thop.attention's
+            # generation branch (the fallback when CuteDslMlaFmha is not selected) requires a latent_cache tensor
+            # but never reads it (only the context MLA path does, attentionOp.cpp enqueueContext).
+            latent_cache = fused_q.new_empty((0, self.kv_lora_rank + self.qk_rope_head_dim))
 
         helix_v_up = self._helix_v_up_before_exchange
         attn_out_latent = self._attn_forward_gen(
