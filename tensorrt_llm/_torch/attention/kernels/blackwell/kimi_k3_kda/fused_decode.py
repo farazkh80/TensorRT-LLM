@@ -521,11 +521,11 @@ def _compile(
     return cute.compile(op, *args, options="--enable-tvm-ffi")
 
 
-def pick_config(batch: int) -> tuple[int, int, bool]:
-    """(v_split, warps, stage_smem) for a decode batch at H=96."""
-    if batch == 1:
-        return 1, 16, False
-    return 1, 16, True
+def pick_config(batch: int) -> dict:
+    """Launch configuration for a decode batch at H=96, tuned on Rubin (228 KB shared memory per SM)."""
+    if batch < 4:
+        return dict(v_split=1, warps=16, ring=4, min_blocks=2)
+    return dict(v_split=1, warps=8, ring=8, min_blocks=4)
 
 
 @cache
@@ -717,13 +717,20 @@ def kda_decode_t1(
     )
     if reason is not None:
         raise ValueError(f"kda_decode_t1: unsupported {reason} layout or dtype")
-    default_split, default_warps, default_smem = pick_config(B)
+    if all(v is None for v in (v_split, warps, stage_smem, reg_rows, ring, min_blocks)):
+        cfg = pick_config(B)
+        v_split, warps, ring, min_blocks = (
+            cfg["v_split"],
+            cfg["warps"],
+            cfg["ring"],
+            cfg["min_blocks"],
+        )
     if v_split is None:
-        v_split = default_split
+        v_split = 1
     if stage_smem is None:
-        stage_smem = default_smem
+        stage_smem = True
     if warps is None:
-        warps = default_warps if v_split == 1 and stage_smem else 16 // v_split
+        warps = 16 // v_split
     device_index = x.device.index
     plan_reg_rows, plan_ring, plan_min_blocks = staging_plan(
         device_index, v_split, warps, stage_smem
