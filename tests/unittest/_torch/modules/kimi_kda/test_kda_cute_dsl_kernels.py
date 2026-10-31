@@ -243,11 +243,12 @@ _BF16_NEG_ZERO = -32768
     "producer",
     [
         dict(),
+        dict(fgs_head_group=8),
         dict(fgs_persistent=True),
-        dict(fgs_persistent=True, fgs_order="head"),
+        dict(fgs_persistent=True, fgs_head_group=96),
         dict(fgs_persistent=True, fgs_ctas=212),
     ],
-    ids=["grid", "persistent_batch", "persistent_head", "persistent_212"],
+    ids=["grid", "grid_head_group8", "persistent_batch", "persistent_head", "persistent_212"],
 )
 @pytest.mark.parametrize("inputs", ["random", "signed_zero_output"])
 @pytest.mark.parametrize("batch", [1, 4, 16, 33])
