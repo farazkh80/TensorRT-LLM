@@ -157,10 +157,10 @@ def test_reset_bitexact_and_row_bound(backend):
         assert count_non_sentinel(f32.slots[slot]) == 0, backend
 
 
-def _slow_reader_run(backend, reader_joined):
-    edges = _edges(backend)
+def _slow_reader_run(backend, reader_joined, policy="release"):
+    edges = _edges(backend, reset_policy=fgs().ResetPolicy(policy))
     n = 4 << 20
-    edges.workspace("e", (n,), torch.bfloat16)
+    edges.workspace("e", (n,), torch.bfloat16, slots=1 if policy == "step" else 2)
     src = torch.randn(n, device="cuda", dtype=torch.bfloat16)
     src.view(torch.int16)[src.view(torch.int16) == -0x8000] = 0
     out = torch.empty_like(src)
@@ -179,13 +179,14 @@ def _slow_reader_run(backend, reader_joined):
     return clobbered, torch.equal(out.view(torch.int16), src.view(torch.int16)), edges
 
 
+@_parametrize("policy", ["release", "step"])
 @_parametrize("backend", ["fill", "cute"])
-def test_release_waits_for_slow_reader(backend):
-    clobbered, intact, edges = _slow_reader_run(backend, reader_joined=True)
+def test_release_waits_for_slow_reader(backend, policy="release"):
+    clobbered, intact, edges = _slow_reader_run(backend, True, policy)
     assert intact and clobbered == 0, "reset clobbered a slot its last reader was still reading"
-    assert count_non_sentinel(edges["e"].slots[0]) == 0
+    assert count_non_sentinel(edges["e"].storage) == 0
     # Control: releasing on the producer's stream only must visibly clobber the reader.
-    clobbered, intact, _ = _slow_reader_run(backend, reader_joined=False)
+    clobbered, intact, _ = _slow_reader_run(backend, False, policy)
     assert not intact and clobbered > 0, "control did not clobber; the test cannot detect a race"
 
 
@@ -375,11 +376,13 @@ def _layered_reference(x, layers=5):
     return x
 
 
+@_parametrize("policy", ["release", "step"])
 @_parametrize("backend", _backends())
-def test_graph_capture_and_replays(backend):
-    edges = _edges(backend)
-    edges.workspace("a", (16, 4096), torch.bfloat16)
-    edges.workspace("b", (16, 4096), torch.bfloat16)
+def test_graph_capture_and_replays(backend, policy="release"):
+    edges = _edges(backend, reset_policy=fgs().ResetPolicy(policy))
+    slots = 5 if policy == "step" else 2
+    edges.workspace("a", (16, 4096), torch.bfloat16, slots=slots)
+    edges.workspace("b", (16, 4096), torch.bfloat16, slots=slots)
     x_in = torch.randn(16, 4096, device="cuda", dtype=torch.bfloat16)
     out = torch.empty_like(x_in)
     violations = torch.zeros((), dtype=torch.int64, device="cuda")
@@ -402,8 +405,7 @@ def test_graph_capture_and_replays(backend):
         torch.cuda.synchronize()
         assert torch.equal(out, _layered_reference(x_in)), "replay mismatch"
         for name in ("a", "b"):
-            for slot in edges[name].slots:
-                assert count_non_sentinel(slot) == 0, "replay ended with an unarmed slot"
+            assert count_non_sentinel(edges[name].storage) == 0, "replay ended with an unarmed slot"
 
     inputs = [torch.randn_like(x_in) for _ in range(10)]
     results = []
@@ -415,6 +417,101 @@ def test_graph_capture_and_replays(backend):
     for x, result in zip(inputs, results):
         assert torch.equal(result, _layered_reference(x)), "back-to-back replay mismatch"
     assert int(violations.item()) == 0, "a producer saw an unarmed slot during replay"
+
+
+@_parametrize("backend", _backends())
+def test_step_batched_reset(backend):
+    edges = _edges(backend, reset_policy=fgs().ResetPolicy.STEP)
+    a = edges.workspace("a", (64, 12288), torch.bfloat16, slots=12)
+    b = edges.workspace("b", (64, 3072), torch.bfloat16, slots=12)
+    flushes = edges.flushes
+    with edges.scope():
+        leases = []
+        for layer in range(12):
+            for name in ("a", "b"):
+                lease = edges.acquire(name, rows=16)
+                lease.tensor.normal_()
+                edges.release(lease)
+                leases.append(lease)
+            if layer == 0:
+                torch.cuda.synchronize()
+                assert count_non_sentinel(leases[0].tensor) > 0, "step policy reset a slot early"
+                assert edges.flushes == flushes
+        assert edges.flushes == flushes + 1, "no flush once every slot was dirty"
+        for ws in (a, b):
+            starts = [lease.tensor.data_ptr() for lease in leases if lease.workspace is ws]
+            step = 16 * ws.shape[1] * 2
+            assert starts == [starts[0] + i * step for i in range(12)], "slots are not packed"
+    assert edges.flushes == flushes + 1, "scope exit flushed again"
+    torch.cuda.synchronize()
+    for ws in (a, b):
+        assert count_non_sentinel(ws.storage) == 0, backend
+
+
+def test_step_reuse_rules():
+    edges = _edges("fill", reset_policy=fgs().ResetPolicy.STEP)
+    edges.workspace("a", (16, 1024), torch.bfloat16, slots=2)
+    edges.workspace("b", (16, 1024), torch.bfloat16, slots=2)
+    violations = torch.zeros((), dtype=torch.int64, device="cuda")
+    with edges.scope():
+        # A held slot of b keeps the step from being complete, so nothing flushes on its own.
+        lease_b = edges.acquire("b")
+        for _ in range(2):
+            lease = edges.acquire("a")
+            lease.tensor.fill_(1.0)
+            edges.release(lease)
+        assert edges.flushes == 0
+        try:
+            edges.acquire("a")
+            raise AssertionError("a dirty slot was reused before a flush")
+        except RuntimeError:
+            pass
+        edges.flush()
+        lease = edges.acquire("a")
+        assert (lease.slot, lease.gen) == (0, 2)
+        violations += non_sentinel(lease.tensor)
+        edges.release(lease)
+        edges.release(lease_b)
+    torch.cuda.synchronize()
+    assert int(violations.item()) == 0, "a flushed slot was handed out before its reset"
+    with edges.scope():
+        lease = edges.acquire("a", rows=8)
+        try:
+            edges.acquire("a", rows=16)
+            raise AssertionError("two row counts in one scope were accepted for packed slots")
+        except ValueError:
+            pass
+        edges.release(lease)
+    with edges.scope():
+        edges.release(edges.acquire("a", rows=16))
+    torch.cuda.synchronize()
+    for name in ("a", "b"):
+        assert count_non_sentinel(edges[name].storage) == 0
+
+
+def test_spans_fill_standalone():
+    fill = importlib.import_module(fgs().__name__.rsplit(".", 1)[0] + ".fine_grained_sync_fill")
+    guard = 4096
+    sizes = [1, 1025, 4096 * 4 + 7, 3, (1 << 18) + 5, 64]
+    for ctas in (1, 4, 1 << 30):
+        bufs, spans = [], []
+        for index, vecs in enumerate(sizes):
+            dtype, lane = (
+                (torch.float32, torch.int32) if index % 2 else (torch.bfloat16, torch.int16)
+            )
+            per_vec = 16 // torch.empty((), dtype=lane).element_size()
+            buf = torch.full((2 * guard + vecs * per_vec,), 0x1234, dtype=lane, device="cuda")
+            target = buf[guard : guard + vecs * per_vec].view(dtype)
+            word = -0x80000000 if dtype == torch.float32 else -0x7FFF8000
+            bufs.append((buf, vecs * per_vec))
+            spans.append((target, word))
+        fill.sentinel_fill_spans_(spans, max_ctas=ctas)
+        torch.cuda.synchronize()
+        for (buf, length), (target, _) in zip(bufs, spans):
+            assert count_non_sentinel(target) == 0, ctas
+            assert bool((buf[:guard] == 0x1234).all()) and bool(
+                (buf[guard + length :] == 0x1234).all()
+            ), "spans fill wrote outside its tensors"
 
 
 def test_memory_ledger():
@@ -524,15 +621,23 @@ TESTS = [
         for b in _backends()
     ],
     *[
-        (f"release_waits_slow_reader[{b}]", test_release_waits_for_slow_reader, (b,))
+        (f"release_waits_slow_reader[{b},{p}]", test_release_waits_for_slow_reader, (b, p))
         for b in ("fill", "cute")
+        for p in ("release", "step")
     ],
     ("fan_out_readers", test_fan_out_readers, ()),
     ("alias_views", test_alias_views, ()),
     ("reset_joins_all_writers", test_reset_joins_all_writers, ()),
     ("generations_slot_wrap", test_generations_and_slot_wrap, ()),
     ("producer_waits_for_reset", test_producer_waits_for_reset, ()),
-    *[(f"graph_capture_replays[{b}]", test_graph_capture_and_replays, (b,)) for b in _backends()],
+    *[
+        (f"graph_capture_replays[{b},{p}]", test_graph_capture_and_replays, (b, p))
+        for b in _backends()
+        for p in ("release", "step")
+    ],
+    ("spans_fill_standalone", test_spans_fill_standalone, ()),
+    *[(f"step_batched_reset[{b}]", test_step_batched_reset, (b,)) for b in _backends()],
+    ("step_reuse_rules", test_step_reuse_rules, ()),
     ("memory_ledger", test_memory_ledger, ()),
     ("stream_manager_lamport_region", test_stream_manager_lamport_region, ()),
     ("standalone_unchanged", test_standalone_unchanged, ()),
