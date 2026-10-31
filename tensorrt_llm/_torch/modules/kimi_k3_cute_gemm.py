@@ -71,7 +71,7 @@ _GEMM_TABLE: Dict[Tuple[int, int], List[Tuple[int, str, Optional[tuple]]]] = {
         (1 << 30, "rubin", ("base", True, (256, 256), (2, 1), 0, 1)),
     ],
     (12288, 512): [
-        (1 << 30, "rubin", ("base", True, (256, 224), (4, 2), 0, 1)),
+        (1 << 30, "rubin", ("base", True, (256, 256), (4, 1), 0, 1)),
     ],
     (12288, 7168): [
         (1, "fi_direct", (128, 2, 1)),
@@ -114,6 +114,7 @@ _BMM_TABLE: Dict[Tuple[int, int, int], List[Tuple[int, str, Optional[tuple]]]] =
         (16, "rubin", ("base", False, (64, 128), (1, 1), 0)),
         (32, "rubin", ("base", False, (64, 128), (1, 1), 0)),
         (64, "rubin", ("base", False, (64, 128), (1, 1), 0)),
+        (1 << 30, "rubin", ("base", True, (256, 128), (2, 1), 0)),
     ],
     (96, 512, 128): [
         (1, "rubin", ("base", False, (64, 128), (1, 1), 0)),
@@ -236,6 +237,16 @@ def bmm(x: torch.Tensor, weight: torch.Tensor, out: Optional[torch.Tensor] = Non
     if out is None:
         out = x.new_empty(b, m, n)
     if b == 0 or m == 0 or n == 0:
+        return out
+    if (
+        m > 64
+        and x.stride(0) == 0
+        and weight.is_contiguous()
+        and out.transpose(0, 1).is_contiguous()
+    ):
+        # A broadcast over the batch into a [M, B, N] output (MLA prefill kv_b): one GEMM on the stacked weights
+        # beats the batched kernel.
+        linear(x[0], weight.view(b * n, k), out.transpose(0, 1).view(m, b * n))
         return out
     _, tactic = _select(_BMM_TABLE.get((b, n, k)), m)
     _run_bmm(x, weight, out, tactic)
