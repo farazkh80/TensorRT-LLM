@@ -63,6 +63,38 @@ def _ld_relaxed_v4(addr, reload, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _ld_cg_v4(addr, *, loc=None, ip=None):
+    """16-byte ``ld.global.cg`` (L2 only) as four int32."""
+    res = llvm.inline_asm(
+        ir.Type.parse("!llvm.struct<(i32,i32,i32,i32)>"),
+        [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)],
+        "ld.global.cg.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l",
+        has_side_effects=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return [cutlass.Int32(llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(4)]
+
+
+@dsl_user_op
+def _globaltimer(*, loc=None, ip=None):
+    return cutlass.Int64(
+        llvm.inline_asm(
+            T.i64(),
+            [],
+            "mov.u64 $0, %globaltimer;",
+            "=l",
+            has_side_effects=True,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def _nanosleep(ns, *, loc=None, ip=None):
     llvm.inline_asm(
         None,
@@ -86,6 +118,10 @@ class GatedRmsNorm:
         fgs_consumer: bool = False,
         max_spins: int = 0,
         with_stats: bool = False,
+        persistent_ctas: int = 0,
+        min_blocks: int | None = None,
+        weak_first_load: bool = False,
+        with_timeline: bool = False,
     ):
         self.heads = heads
         self.rows_per_thread = rows_per_thread
@@ -93,9 +129,20 @@ class GatedRmsNorm:
         self.use_pdl = use_pdl
         self.rows_per_cta = warps * ROWS_PER_WARP_STEP * rows_per_thread
         assert not fgs_consumer or use_pdl
+        assert fgs_consumer or not (with_stats or persistent_ctas or weak_first_load)
         self.fgs_consumer = fgs_consumer
         self.max_spins = max_spins
         self.with_stats = with_stats
+        # persistent_ctas > 0: at most that many CTAs, each walking row blocks in order (the
+        # producer's token order). min_blocks bounds registers for the retry loop (default: a
+        # full SM of threads, as the default build reaches). weak_first_load issues the first
+        # load of a chunk as ld.global.cg instead of ld.relaxed.gpu; reloads stay relaxed.
+        self.persistent_ctas = persistent_ctas
+        if min_blocks is None:
+            min_blocks = 1024 // (warps * 32) if fgs_consumer else 0
+        self.min_blocks = min_blocks
+        self.weak_first_load = weak_first_load
+        self.with_timeline = with_timeline
 
     @cute.jit
     def __call__(
@@ -106,18 +153,19 @@ class GatedRmsNorm:
         out: cute.Tensor,
         eps: F32,
         stats: cute.Tensor | None,
+        timeline: cute.Tensor | None,
         stream: cuda.CUstream,
     ):
         rows = x.shape[0]
         grid = (rows + self.rows_per_cta - 1) // self.rows_per_cta
-        # The retry loop must not cost the default build's occupancy (full SM of threads).
-        min_blocks = 1024 // (self.warps * 32) if self.fgs_consumer else 0
-        self.kernel(x, z, weight, out, eps, stats).launch(
+        if cutlass.const_expr(self.persistent_ctas > 0):
+            grid = cute.min(grid, self.persistent_ctas)
+        self.kernel(x, z, weight, out, eps, stats, timeline).launch(
             grid=[grid, 1, 1],
             block=[self.warps * 32, 1, 1],
             stream=stream,
             use_pdl=self.use_pdl,
-            min_blocks_per_mp=min_blocks,
+            min_blocks_per_mp=self.min_blocks,
         )
 
     @cute.kernel
@@ -129,6 +177,7 @@ class GatedRmsNorm:
         out: cute.Tensor,
         eps: F32,
         stats: cute.Tensor | None,
+        timeline: cute.Tensor | None,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -152,7 +201,53 @@ class GatedRmsNorm:
 
         if cutlass.const_expr(self.use_pdl and not self.fgs_consumer):
             cute.arch.griddepcontrol_wait()
+        if cutlass.const_expr(self.with_timeline):
+            if tidx == 0:
+                cute.arch.atomic_min(timeline.iterator, _globaltimer())
 
+        spins = cutlass.Int32(0)
+        waited = cutlass.Int32(0)
+        if cutlass.const_expr(self.persistent_ctas > 0):
+            grid_x, _, _ = cute.arch.grid_dim()
+            blocks = (rows + self.rows_per_cta - 1) // self.rows_per_cta
+            for block in cutlass.range(bidx, blocks, grid_x):
+                block_row0 = (block * self.warps + warp) * (
+                    ROWS_PER_WARP_STEP * self.rows_per_thread
+                ) + (lane // LANES_PER_ROW)
+                spins, waited = self._block(
+                    x, z, out, eps, w_reg, copy_x, block_row0, col, spins, waited
+                )
+        else:
+            spins, waited = self._block(x, z, out, eps, w_reg, copy_x, row0, col, spins, waited)
+
+        if cutlass.const_expr(self.with_stats):
+            if spins > 0:
+                cute.arch.atomic_add(stats.iterator, spins)
+            if waited > 0:
+                cute.arch.atomic_add(stats.iterator + 1, waited)
+        if cutlass.const_expr(self.with_timeline):
+            cute.arch.barrier()
+            if tidx == 0:
+                cute.arch.atomic_max(timeline.iterator + 1, _globaltimer())
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_launch_dependents()
+
+    @cute.jit
+    def _block(
+        self,
+        x: cute.Tensor,
+        z: cute.Tensor,
+        out: cute.Tensor,
+        eps: F32,
+        w_reg: cute.Tensor,
+        copy_x,
+        row0,
+        col,
+        spins,
+        waited,
+    ):
+        """This thread's rows from ``row0``; returns the updated (reloads, fallback) counts."""
+        rows = x.shape[0]
         x_regs = []
         z_regs = []
         for i in cutlass.range_constexpr(self.rows_per_thread):
@@ -167,7 +262,10 @@ class GatedRmsNorm:
                 x_chunk = cute.local_tile(x[r, None], (VEC,), (col // VEC,))
                 if cutlass.const_expr(self.fgs_consumer):
                     x_bits = cute.recast_tensor(x_reg, cutlass.Int32)
-                    words = _ld_relaxed_v4(x_chunk.iterator.toint(), False)
+                    if cutlass.const_expr(self.weak_first_load):
+                        words = _ld_cg_v4(x_chunk.iterator.toint())
+                    else:
+                        words = _ld_relaxed_v4(x_chunk.iterator.toint(), False)
                     for w in cutlass.range_constexpr(4):
                         x_bits[w] = words[w]
                 else:
@@ -177,8 +275,6 @@ class GatedRmsNorm:
             z_regs.append(z_reg)
 
         if cutlass.const_expr(self.fgs_consumer):
-            spins = cutlass.Int32(0)
-            waited = cutlass.Int32(0)
             for i in cutlass.range_constexpr(self.rows_per_thread):
                 r = row0 + i * ROWS_PER_WARP_STEP
                 if r < rows:
@@ -201,11 +297,6 @@ class GatedRmsNorm:
                         for w in cutlass.range_constexpr(4):
                             x_bits[w] = words[w]
                         pending = ((x_bits[0] & 0xFFFF) == BF16_NEG_ZERO) & (waited == 0)
-            if cutlass.const_expr(self.with_stats):
-                if spins > 0:
-                    cute.arch.atomic_add(stats.iterator, spins)
-                if waited > 0:
-                    cute.arch.atomic_add(stats.iterator + 1, waited)
 
         for i in cutlass.range_constexpr(self.rows_per_thread):
             r = row0 + i * ROWS_PER_WARP_STEP
@@ -226,9 +317,7 @@ class GatedRmsNorm:
                 y_reg[c] = y.to(BF16)
             if r < rows:
                 cute.copy(copy_x, y_reg, cute.local_tile(out[r, None], (VEC,), (col // VEC,)))
-
-        if cutlass.const_expr(self.use_pdl):
-            cute.arch.griddepcontrol_launch_dependents()
+        return spins, waited
 
 
 _TORCH_TO_CUTE = {torch.bfloat16: BF16, torch.float32: F32}
@@ -244,6 +333,10 @@ def _compile(
     fgs_consumer: bool = False,
     max_spins: int = 0,
     with_stats: bool = False,
+    persistent_ctas: int = 0,
+    min_blocks: int | None = None,
+    weak_first_load: bool = False,
+    with_timeline: bool = False,
 ):
     rows, tokens = cute.sym_int(), cute.sym_int()
     x = make_fake_tensor(
@@ -265,7 +358,22 @@ def _compile(
     stats = None
     if with_stats:
         stats = make_fake_tensor(cutlass.Int32, (2,), stride=(1,), assumed_align=8)
-    op = GatedRmsNorm(heads, rows_per_thread, warps, use_pdl, fgs_consumer, max_spins, with_stats)
+    timeline = None
+    if with_timeline:
+        timeline = make_fake_tensor(cutlass.Int64, (2,), stride=(1,), assumed_align=16)
+    op = GatedRmsNorm(
+        heads,
+        rows_per_thread,
+        warps,
+        use_pdl,
+        fgs_consumer,
+        max_spins,
+        with_stats,
+        persistent_ctas,
+        min_blocks,
+        weak_first_load,
+        with_timeline,
+    )
     return cute.compile(
         op,
         x,
@@ -274,6 +382,7 @@ def _compile(
         out,
         F32(1e-5),
         stats,
+        timeline,
         make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
@@ -337,6 +446,8 @@ def kda_gated_rmsnorm(
     fgs_consumer: bool = False,
     fgs_max_spins: int = 1 << 16,
     fgs_stats: torch.Tensor | None = None,
+    fgs_ctas: int | None = None,
+    fgs_timeline: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sigmoid-gated RMSNorm of ``x [T*H, 128]`` with ``z [T, H, 128]``; returns ``[T*H, 128]``.
 
@@ -347,6 +458,10 @@ def kda_gated_rmsnorm(
     the kernel launches with PDL and does not wait for the producer grid; ``x`` must be
     armed with -0.0 before the producer runs and ``out`` must not alias it.
     ``fgs_stats`` (int32 [2], zeroed by the caller) accumulates reloads and fallbacks.
+    ``fgs_ctas`` caps the grid at that many CTAs, each walking row blocks in token order,
+    so the consumer can trail the producer on the SMs it leaves free instead of filling
+    every SM with waiting CTAs. ``fgs_timeline`` (int64 [2], caller sets [0] to INT64_MAX
+    and [1] to 0) receives the first CTA start and the last CTA end (``%globaltimer`` ns).
     """
     if not supports(x, z, weight, out):
         raise ValueError(
@@ -367,9 +482,12 @@ def kda_gated_rmsnorm(
         if out.data_ptr() == x.data_ptr():
             raise ValueError("kda_gated_rmsnorm: fgs_consumer needs out separate from x")
         use_pdl = True
-    with_stats = fgs_stats is not None
+    with_stats = fgs_consumer and fgs_stats is not None
     if with_stats and (fgs_stats.dtype != torch.int32 or fgs_stats.numel() < 2):
         raise ValueError("kda_gated_rmsnorm: fgs_stats must be an int32 tensor of 2 elements")
+    with_timeline = fgs_timeline is not None
+    if with_timeline and (fgs_timeline.dtype != torch.int64 or fgs_timeline.numel() < 2):
+        raise ValueError("kda_gated_rmsnorm: fgs_timeline must be an int64 tensor of 2 elements")
     fn = _compile(
         heads,
         weight.dtype,
@@ -379,6 +497,10 @@ def kda_gated_rmsnorm(
         fgs_consumer,
         fgs_max_spins if fgs_consumer else 0,
         with_stats,
+        (fgs_ctas or 0) if fgs_consumer else 0,
+        None,
+        False,
+        with_timeline,
     )
-    fn(x, z, weight, out, eps, fgs_stats)
+    fn(x, z, weight, out, eps, fgs_stats if with_stats else None, fgs_timeline)
     return out

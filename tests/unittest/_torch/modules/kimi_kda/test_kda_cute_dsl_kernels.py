@@ -338,21 +338,25 @@ def _norm_inputs(tokens: int, seed: int):
     return _canonical_bf16(o), qkvg[:, 3 * DIM :].view(tokens, H, D), w
 
 
+@pytest.mark.parametrize("ctas", [None, 8], ids=["full_grid", "8_ctas"])
 @pytest.mark.parametrize("tokens", [1, 64, 1000])
 @torch.no_grad()
-def test_gated_rmsnorm_fgs_consumer_ready_input(tokens: int) -> None:
+def test_gated_rmsnorm_fgs_consumer_ready_input(tokens: int, ctas: int | None) -> None:
     """A fully written slot: same bits as the default build and no reload."""
     o, z, w = _norm_inputs(tokens, seed=tokens)
     ref = gated_rmsnorm.kda_gated_rmsnorm(o, z, w, EPS)
     stats = torch.zeros(2, device="cuda", dtype=torch.int32)
-    out = gated_rmsnorm.kda_gated_rmsnorm(o, z, w, EPS, fgs_consumer=True, fgs_stats=stats)
+    out = gated_rmsnorm.kda_gated_rmsnorm(
+        o, z, w, EPS, fgs_consumer=True, fgs_stats=stats, fgs_ctas=ctas
+    )
     assert torch.equal(out.view(torch.int16), ref.view(torch.int16))
     assert stats.tolist() == [0, 0]
 
 
+@pytest.mark.parametrize("ctas", [None, 8], ids=["full_grid", "8_ctas"])
 @pytest.mark.parametrize("order", ["forward", "reverse"])
 @torch.no_grad()
-def test_gated_rmsnorm_fgs_consumer_waits_for_late_chunks(order: str) -> None:
+def test_gated_rmsnorm_fgs_consumer_waits_for_late_chunks(order: str, ctas: int | None) -> None:
     """The slot starts as -0.0 and another stream publishes it in token blocks after a delay."""
     tokens, block = 64, 16
     o, z, w = _norm_inputs(tokens, seed=5)
@@ -369,10 +373,14 @@ def test_gated_rmsnorm_fgs_consumer_waits_for_late_chunks(order: str) -> None:
             torch.cuda._sleep(200_000)
             rows = slice(start * H, (start + block) * H)
             slot[rows].copy_(o[rows])
-    out = gated_rmsnorm.kda_gated_rmsnorm(slot, z, w, EPS, fgs_consumer=True, fgs_stats=stats)
+    timeline = torch.tensor([2**63 - 1, 0], device="cuda", dtype=torch.int64)
+    out = gated_rmsnorm.kda_gated_rmsnorm(
+        slot, z, w, EPS, fgs_consumer=True, fgs_stats=stats, fgs_ctas=ctas, fgs_timeline=timeline
+    )
     torch.cuda.synchronize()
     assert torch.equal(out.view(torch.int16), ref.view(torch.int16))
     assert stats[0].item() > 0 and stats[1].item() == 0
+    assert 0 < timeline[0].item() < timeline[1].item()
 
 
 @torch.no_grad()
