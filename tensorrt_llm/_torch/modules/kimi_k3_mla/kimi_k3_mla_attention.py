@@ -231,6 +231,8 @@ class KimiK3MLAAttention(MLA):
         self.apply_rotary_emb = False
         # The identity table makes every MLA rope a copy, so the CuTe latent append may replace the rope kernel.
         self._k3_cute_latent_append = True
+        # Lets cute_dsl_mla_context serve this layer's context phase (TLLM_K3_CUTE_MLA=ctx).
+        self.mha._k3_cute_ctx = True
         # Taken by kimi_k3_cute_gemm when TLLM_K3_CUTE_GEMM=1.
         self._k3_cute_gemm_bmm = True
         for name in ("kv_a_proj_with_mqa", "q_a_proj", "q_b_proj", "o_proj", "g_proj"):

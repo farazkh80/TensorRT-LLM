@@ -1114,7 +1114,9 @@ class MLA(nn.Module):
                 self.aux_stream,
             )
 
-        if self._k3_latent_append_active(attn_metadata, num_tokens):
+        if self._k3_latent_append_active(attn_metadata, num_tokens) or self._k3_ctx_skip_concat(
+            attn_metadata
+        ):
             projected_q = self._project_q_by_phase(q, num_ctx_tokens)
             latent_cache = None
         else:
@@ -1133,7 +1135,13 @@ class MLA(nn.Module):
         if num_contexts > 0:
             compressed_kv_ctx = compressed_kv[:num_ctx_tokens, ...]
             k_pe_ctx = k_pe[:num_ctx_tokens, ...]
-            latent_cache_ctx = latent_cache[:num_ctx_tokens, ...]
+            latent_cache_ctx = None
+            if latent_cache is None:
+                # cute_dsl_mla_context reads the latent row from its two halves (it claims every call with these
+                # parts and materializes the concat itself when it falls back to thop.attention).
+                attn_metadata._k3_ctx_latent = (self.mha.layer_idx, compressed_kv_ctx, k_pe_ctx)
+            else:
+                latent_cache_ctx = latent_cache[:num_ctx_tokens, ...]
             if self.apply_rotary_emb:
                 assert position_ids is not None
                 # position_ids spans [ctx..., gen...] in mixed batches; slice to
@@ -1226,6 +1234,40 @@ class MLA(nn.Module):
             ]
         return w_k, w_v
 
+    def _k3_ctx_skip_concat(self, attn_metadata: AttentionMetadata) -> bool:
+        """Pure-context batch on the default dense path that cute_dsl_mla_context serves (no cached KV / chunking)."""
+        return (
+            getattr(self.mha, "_k3_cute_ctx", False)
+            and k3_cute_mla_enabled("ctx")
+            and isinstance(self.mha, TrtllmAttention)
+            and isinstance(attn_metadata, TrtllmAttentionMetadata)
+            and attn_metadata.num_contexts > 0
+            and attn_metadata.num_generations == 0
+            and self.num_context_heads == self.num_heads_tp
+            and not self.is_lite
+            and not self.apply_rotary_emb
+            and not getattr(self.mha, "has_fp8_kv_cache", False)
+            and getattr(attn_metadata, "helix_position_offsets", None) is None
+            and not self.mha.has_cached_kv_for_mla_context(attn_metadata)
+            and not self.mha.is_chunked_prefill_for_mla_context(attn_metadata)
+        )
+
+    def _k3_ctx_contiguous_v(
+        self, attn_metadata: AttentionMetadata, latent_cache: Optional[torch.Tensor]
+    ) -> bool:
+        """Context calls that cute_dsl_mla_context serves; its fallback restores the kv-shaped V otherwise."""
+        return (
+            getattr(self.mha, "_k3_cute_ctx", False)
+            and k3_cute_mla_enabled("ctx")
+            and (
+                latent_cache is not None
+                or getattr(attn_metadata, "_k3_ctx_latent", (None,))[0] == self.mha.layer_idx
+            )
+            and not getattr(self.mha, "has_fp8_kv_cache", False)
+            and getattr(attn_metadata, "num_ctx_cached_tokens", 0) == 0
+            and getattr(attn_metadata, "helix_position_offsets", None) is None
+        )
+
     def forward_context_default(
         self,
         q: torch.Tensor,
@@ -1256,8 +1298,12 @@ class MLA(nn.Module):
             # half; the k_nope half is never written or read.
             nope_cols = self.num_context_heads * self.qk_nope_head_dim
             v_cols = self.num_context_heads * self.v_head_dim
-            kv_buf = torch.empty(num_tokens, nope_cols + v_cols, dtype=q.dtype, device=q.device)
-            v = kv_buf[:, nope_cols:]
+            if self._k3_ctx_contiguous_v(attn_metadata, latent_cache):
+                # The CuTe DSL context FMHA (cute_dsl_mla_context) reads a contiguous [t, H, v_head] V.
+                v = torch.empty(num_tokens, v_cols, dtype=q.dtype, device=q.device)
+            else:
+                kv_buf = torch.empty(num_tokens, nope_cols + v_cols, dtype=q.dtype, device=q.device)
+                v = kv_buf[:, nope_cols:]
             # [H, t, v_head] view with strides (v_head, H*(qk_nope+v), 1)
             v_out = v.unflatten(-1, (self.num_context_heads, self.v_head_dim)).transpose(0, 1)
             # cuBLAS consumes the transposed weights and writes strided
