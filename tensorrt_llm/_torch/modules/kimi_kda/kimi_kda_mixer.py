@@ -17,6 +17,7 @@ cache-slot indexing, and speculative-verification state handling directly.
 
 from __future__ import annotations
 
+import functools
 import math
 import os
 import weakref
@@ -55,6 +56,37 @@ _KDA_INDEXED_STATE_POOL_ENABLED = os.environ.get("TLLM_KDA_ENABLE_INDEXED_STATE_
 # projection kernels. Verify intentionally counts B * num_steps because those
 # flattened token rows form the projection GEMMs' M dimension.
 _KDA_BFA_MULTISTREAM_MAX_ROWS = 128
+
+
+@functools.cache
+def _k3_cute_gemm_module():
+    try:
+        from .. import kimi_k3_cute_gemm
+    except ImportError:
+        return None
+    return kimi_k3_cute_gemm
+
+
+def _k3_linear(
+    tagged: bool, x: torch.Tensor, weight: torch.Tensor, out: Optional[torch.Tensor] = None
+) -> Optional[torch.Tensor]:
+    """``x @ weight^T`` through ``kimi_k3_cute_gemm`` (``TLLM_K3_CUTE_GEMM=1``) for a tagged BF16
+    projection; None when the caller should run its stock GEMM."""
+    gemm = _k3_cute_gemm_module() if tagged else None
+    if gemm is None or not gemm.enabled() or weight.dtype != torch.bfloat16:
+        return None
+    n = weight.shape[0]
+    y = gemm.linear(x.reshape(-1, x.shape[-1]), weight, None if out is None else out.view(-1, n))
+    return y.view(*x.shape[:-1], n) if out is None else out
+
+
+def _linear(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """``module(x)``; a tagged bias-free ``nn.Linear`` may take the CuTe DSL GEMM."""
+    if type(module) is nn.Linear and module.bias is None:
+        y = _k3_linear(getattr(module, "_k3_cute_gemm", False), x, module.weight)
+        if y is not None:
+            return y
+    return module(x)
 
 
 class _KdaPrequantizedCore(NamedTuple):
@@ -352,6 +384,27 @@ class KimiKDALinearAttention(nn.Module):
                 suffix += 1
             kda_layers[self.layer_idx_str] = weakref.ref(self)
             self.register_to_config = True
+        self._tag_k3_cute_gemm()
+
+    def _tag_k3_cute_gemm(self) -> None:
+        """Mark the attention-core projections that kimi_k3_cute_gemm may take (TLLM_K3_CUTE_GEMM=1)."""
+        self._k3_cute_gemm = True
+        for name in (
+            "qkvg_proj",
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "g_proj",
+            "o_proj",
+            "f_a_proj",
+            "f_b_proj",
+            "b_proj",
+            "g_a_proj",
+            "g_b_proj",
+        ):
+            module = getattr(self, name, None)
+            if isinstance(module, (nn.Linear, Linear)):
+                module._k3_cute_gemm = True
 
     def finalize_decode_weights(self) -> None:
         """Build fused projection weights and decode constants after weight load.
@@ -398,6 +451,7 @@ class KimiKDALinearAttention(nn.Module):
                 self.qkvg_split_sizes = [module.out_features for module in qkvg_modules]
             self._bfa_proj_weight = self._merge_projection_weights(bfa_modules, pad_rows_to=8)
             self._build_decode_kernel_constants()
+            self._tag_k3_cute_gemm()
 
     @staticmethod
     def _fuse_checkpoint_projections(modules: tuple[Linear, ...]) -> Linear:
@@ -593,7 +647,7 @@ class KimiKDALinearAttention(nn.Module):
         if isinstance(core, _KdaPrequantizedCore):
             out = self.o_proj.forward_prequantized(core.activation, core.scale)
         else:
-            out = self.o_proj(core.reshape(-1, self.proj_size))
+            out = _linear(self.o_proj, core.reshape(-1, self.proj_size))
         if self._o_allreduce is not None:
             # Head-sharded TP: every rank ran its head shard on the same
             # local batch; sum the row-sharded o_proj partials.
@@ -632,14 +686,24 @@ class KimiKDALinearAttention(nn.Module):
         runs between the two GEMMs.
         """
         hd, H = self.head_dim, self.num_heads
-        if out is None:
-            bfa, gate_out = torch.nn.functional.linear(x, self._bfa_proj_weight), None
-        else:
-            bfa_out, gate_out = out
-            bfa = torch.matmul(x, self._bfa_proj_weight.t(), out=bfa_out)
+        bfa_out, gate_out = out if out is not None else (None, None)
+        bfa = _k3_linear(self._k3_cute_gemm, x, self._bfa_proj_weight, bfa_out)
+        if bfa is None:
+            if out is None:
+                bfa = torch.nn.functional.linear(x, self._bfa_proj_weight)
+            else:
+                bfa = torch.matmul(x, self._bfa_proj_weight.t(), out=bfa_out)
         if before_up is not None:
             before_up()
         if self.use_full_rank_gate:
+            g = _k3_linear(
+                getattr(self.f_b_proj, "_k3_cute_gemm", False),
+                bfa[..., :hd],
+                self.f_b_proj.weight,
+                gate_out,
+            )
+            if g is not None:
+                return bfa[..., hd : hd + H], g, None
             if gate_out is None:
                 return bfa[..., hd : hd + H], self.f_b_proj(bfa[..., :hd]), None
             g = torch.matmul(bfa[..., :hd], self.f_b_proj.weight.t(), out=gate_out)
@@ -697,7 +761,9 @@ class KimiKDALinearAttention(nn.Module):
         d = self.proj_size
         if self._dispatch.prefill_kernel_path == "optimized" and self._fuse_prefill_conv:
             if self._qkvg_proj_weight is not None:
-                qkvg = torch.nn.functional.linear(x, self._qkvg_proj_weight)
+                qkvg = _k3_linear(self._k3_cute_gemm, x, self._qkvg_proj_weight)
+                if qkvg is None:
+                    qkvg = torch.nn.functional.linear(x, self._qkvg_proj_weight)
             elif self.qkvg_proj is not None:
                 qkvg = self.qkvg_proj(x)
             else:
@@ -1089,6 +1155,9 @@ class KimiKDALinearAttention(nn.Module):
 
         def _project_qkvg() -> torch.Tensor:
             if self._qkvg_proj_weight is not None:
+                qkvg = _k3_linear(self._k3_cute_gemm, x2d, self._qkvg_proj_weight, qkvg_out)
+                if qkvg is not None:
+                    return qkvg
                 if qkvg_out is None:
                     return torch.nn.functional.linear(x2d, self._qkvg_proj_weight)
                 return torch.matmul(x2d, self._qkvg_proj_weight.t(), out=qkvg_out)
@@ -1195,14 +1264,18 @@ class KimiKDALinearAttention(nn.Module):
             else _stage_state_rows(ssm_pool, slot_indices_long)
         )
 
-        q_proj = self.q_proj(x)
-        k_proj = self.k_proj(x)
-        v_proj = self.v_proj(x)
-        g_hidden = self.f_b_proj(self.f_a_proj(x))
-        beta = self.b_proj(x).float()
+        q_proj = _linear(self.q_proj, x)
+        k_proj = _linear(self.k_proj, x)
+        v_proj = _linear(self.v_proj, x)
+        g_hidden = _linear(self.f_b_proj, _linear(self.f_a_proj, x))
+        beta = _linear(self.b_proj, x).float()
 
         if self._dispatch.decode_kernel_path == "optimized":
-            onorm_g = self.g_proj(x) if self.use_full_rank_gate else self.g_b_proj(self.g_a_proj(x))
+            onorm_g = (
+                _linear(self.g_proj, x)
+                if self.use_full_rank_gate
+                else _linear(self.g_b_proj, _linear(self.g_a_proj, x))
+            )
 
             def _kernel_input(value: torch.Tensor) -> torch.Tensor:
                 return (
