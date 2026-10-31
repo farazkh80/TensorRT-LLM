@@ -35,7 +35,7 @@ _GEMM_TABLE: Dict[Tuple[int, int], List[Tuple[int, str, Optional[tuple]]]] = {
         (16, "fi_splitk", (64, 8, 4, 11)),
         (32, "fi_splitk", (64, 8, 4, 11)),
         (64, "fi_splitk", (64, 8, 4, 11)),
-        (1 << 30, "rubin", ("base", True, (256, 128), (4, 2), 0, 1)),
+        (1 << 30, "rubin", ("base", True, (256, 160), (2, 2), 0, 1)),
     ],
     (2112, 7168): [
         (1, "fi_splitk", (64, 8, 4, 11)),
@@ -45,7 +45,7 @@ _GEMM_TABLE: Dict[Tuple[int, int], List[Tuple[int, str, Optional[tuple]]]] = {
         (16, "fi_splitk", (64, 16, 4, 10)),
         (32, "fi_splitk", (64, 32, 4, 8)),
         (64, "rubin", ("base", False, (64, 32), (1, 1), 0, 1)),
-        (1 << 30, "rubin", ("base", True, (256, 256), (2, 1), 0, 1)),
+        (1 << 30, "rubin", ("base", True, (256, 160), (2, 2), 0, 1)),
     ],
     (7168, 12288): [
         (1, "fi_direct", (256, 2, 1)),
@@ -71,7 +71,7 @@ _GEMM_TABLE: Dict[Tuple[int, int], List[Tuple[int, str, Optional[tuple]]]] = {
         (1 << 30, "rubin", ("base", True, (256, 256), (2, 1), 0, 1)),
     ],
     (12288, 512): [
-        (1 << 30, "rubin", ("base", True, (256, 128), (4, 1), 0, 1)),
+        (1 << 30, "rubin", ("base", True, (256, 224), (4, 2), 0, 1)),
     ],
     (12288, 7168): [
         (1, "fi_direct", (128, 2, 1)),
