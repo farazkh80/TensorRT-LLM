@@ -147,8 +147,12 @@ def _output_gate_host(
     ).launch(grid=(num_ctas, 1, 1), block=(THREADS, 1, 1), stream=stream)
 
 
-# (elements per access, accesses per thread per operand, fast sigmoid with exact fallback)
-DEFAULT_CONFIG = (16, 2, True)
+# (elements per access, accesses per thread per operand, fast sigmoid with exact fallback).
+# Decode-sized inputs are latency bound and favour one narrow access per thread; prefill inputs
+# stream from HBM and favour wide, unrolled accesses.
+DECODE_CONFIG = (8, 1, False)
+PREFILL_CONFIG = (16, 2, True)
+DECODE_MAX_NUMEL = 64 * 96 * 128
 _COMPILED: dict[tuple, Callable] = {}
 
 
@@ -177,7 +181,7 @@ def mla_output_gate(
     o: torch.Tensor,
     g: torch.Tensor,
     out: Optional[torch.Tensor] = None,
-    config: tuple = DEFAULT_CONFIG,
+    config: Optional[tuple] = None,
 ) -> torch.Tensor:
     """out = o * sigmoid(g), bf16, bit-matching ``o * g.sigmoid()``. ``out`` may alias ``o``."""
     if not supported(o, g):
@@ -191,6 +195,8 @@ def mla_output_gate(
         and out.data_ptr() % 32 == 0
     ):
         raise ValueError("out must be a contiguous, 32B-aligned bf16 tensor shaped like o")
+    if config is None:
+        config = DECODE_CONFIG if o.numel() <= DECODE_MAX_NUMEL else PREFILL_CONFIG
     vec, unroll, fast = config
     num_vecs = o.numel() // vec
     if num_vecs == 0:
