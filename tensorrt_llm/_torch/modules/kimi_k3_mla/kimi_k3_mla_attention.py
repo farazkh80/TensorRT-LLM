@@ -25,6 +25,11 @@ from ...model_config import ModelConfig
 from ...utils import AuxStreamType
 from ..linear import Linear, TensorParallelMode
 
+try:
+    from ..kimi_k3_fgs import edges as k3_fgs_edges
+except ImportError:
+    k3_fgs_edges = None
+
 
 def _make_pos_embd_params(
     *,
@@ -239,6 +244,9 @@ class KimiK3MLAAttention(MLA):
             module = getattr(self, name, None)
             if isinstance(module, Linear):
                 module._k3_cute_gemm = True
+        # TLLM_K3_FGS=lamport: the output gate writes into a slot of this edge, read only by o_proj.
+        if self.use_output_gate and k3_fgs_edges is not None:
+            k3_fgs_edges.declare("mla.gated", self.o_proj.in_features, self.layer_idx)
 
     def _apply_output_gate(
         self,
@@ -257,6 +265,15 @@ class KimiK3MLAAttention(MLA):
                 )
 
                 if supported(attn_output, gate):
+                    if k3_fgs_edges is not None and k3_fgs_edges.producer_early():
+                        lease = k3_fgs_edges.acquire("mla.gated", attn_output.shape[0])
+                        # The producer build stores into a separate buffer, never in place.
+                        out = (
+                            torch.empty_like(attn_output)
+                            if lease is None
+                            else lease.tensor.view(attn_output.shape)
+                        )
+                        return mla_output_gate(attn_output, gate, out=out, fgs_producer=True)
                     return mla_output_gate(attn_output, gate)
             return attn_output * gate.sigmoid()
         return attn_output
