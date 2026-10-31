@@ -40,8 +40,14 @@ HEAD_DIM_QK = 192
 HEAD_DIM_V = 128
 
 # SM107 (328 KiB smem): the st.global epilogue frees sO, so four K/V stages of a D=192 tile fit next to the
-# two Q stages. Round 3 on ts3: kv_stage 4 at 770.6 us vs the cubin's 715.5 (launch-order LPT 778.0).
-DEFAULT_TUNING = (("kv_stage", 4),)
+# two Q stages. The correction warps mostly wait on O, so registers move from them to the softmax warps, which
+# release P to the MMA.
+DEFAULT_TUNING = (
+    ("kv_stage", 4),
+    ("num_regs_softmax", 200),
+    ("num_regs_correction", 80),
+    ("num_regs_other", 32),
+)
 
 
 @functools.cache
@@ -61,14 +67,19 @@ def _compile(num_heads: int, tuning: tuple):
     )
     sym_s_q, sym_s_k, sym_seq = cute.sym_int(), cute.sym_int(), cute.sym_int()
     bf16 = cutlass.BFloat16
-    q = make_fake_compact_tensor(bf16, (1, sym_s_q, num_heads, 1, HEAD_DIM_QK), stride_order=(4, 3, 2, 1, 0),
-                                 assumed_align=16)  # fmt: skip
-    k = make_fake_compact_tensor(bf16, (1, sym_s_k, num_heads, 1, HEAD_DIM_QK), stride_order=(4, 3, 2, 1, 0),
-                                 assumed_align=16)  # fmt: skip
-    v = make_fake_compact_tensor(bf16, (1, sym_s_k, num_heads, 1, HEAD_DIM_V), stride_order=(4, 3, 2, 1, 0),
-                                 assumed_align=16)  # fmt: skip
-    o = make_fake_compact_tensor(bf16, (1, sym_s_q, num_heads, 1, HEAD_DIM_V), stride_order=(4, 3, 2, 1, 0),
-                                 assumed_align=32)  # fmt: skip
+    order = (4, 3, 2, 1, 0)
+    q = make_fake_compact_tensor(
+        bf16, (1, sym_s_q, num_heads, 1, HEAD_DIM_QK), stride_order=order, assumed_align=16
+    )
+    k = make_fake_compact_tensor(
+        bf16, (1, sym_s_k, num_heads, 1, HEAD_DIM_QK), stride_order=order, assumed_align=16
+    )
+    v = make_fake_compact_tensor(
+        bf16, (1, sym_s_k, num_heads, 1, HEAD_DIM_V), stride_order=order, assumed_align=16
+    )
+    o = make_fake_compact_tensor(
+        bf16, (1, sym_s_q, num_heads, 1, HEAD_DIM_V), stride_order=order, assumed_align=32
+    )
     cu_q = make_fake_compact_tensor(Int32, (sym_seq,), assumed_align=16)
     cu_k = make_fake_compact_tensor(Int32, (sym_seq,), assumed_align=16)
     return cute.compile(
@@ -131,7 +142,16 @@ def mla_context_fmha(
     k5 = k.view(1, total, num_heads, 1, HEAD_DIM_QK)
     v5 = v.view(1, total, num_heads, 1, HEAD_DIM_V)
     o5 = o.view(1, total, num_heads, 1, HEAD_DIM_V)
-    problem = (cu_seqlens.numel() - 1, max_seqlen, total, max_seqlen, num_heads, num_heads, HEAD_DIM_QK, HEAD_DIM_V)
+    problem = (
+        cu_seqlens.numel() - 1,
+        max_seqlen,
+        total,
+        max_seqlen,
+        num_heads,
+        num_heads,
+        HEAD_DIM_QK,
+        HEAD_DIM_V,
+    )
     kernel(
         q5,
         k5,
