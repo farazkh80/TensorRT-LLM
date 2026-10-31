@@ -41,17 +41,14 @@ F32 = cutlass.Float32
 BF16 = cutlass.BFloat16
 
 D = 128
-MAX_ASYNC_GROUPS = 8
-
-
-def cta_smem_bytes(warps: int, smem_rows: int) -> int:
-    """Dynamic shared memory of one CTA: 4 KB of vectors plus the staged state rows."""
-    return 4096 + warps * smem_rows * D * 4
-
-
 CONV_ITEMS = 3 * D // 4
 SETUP_ITEMS = CONV_ITEMS + D
 L2_EPS = 1.0e-6
+
+
+def cta_smem_bytes(warps: int, ring: int) -> int:
+    """Dynamic shared memory of one CTA: 4 KB of vectors plus ``ring`` staged rows per warp."""
+    return 4096 + warps * ring * D * 4
 
 
 def _aligned(tensor, alignment):
@@ -99,6 +96,7 @@ class KdaDecodeT1:
         reg_rows: int,
         min_blocks: int,
         warps: int,
+        ring: int,
     ):
         assert v_split in (1, 2, 4)
         self.heads = heads
@@ -108,15 +106,15 @@ class KdaDecodeT1:
         self.rows_per_cta = D // v_split
         self.rows_per_warp = self.rows_per_cta // warps
         assert self.rows_per_warp * warps == self.rows_per_cta and self.threads >= 4 * 32
-        # The first reg_rows rows of each warp load straight into registers; the rest are
-        # staged in shared memory by cp.async, in commit groups consumed as they land.
+        # The first reg_rows rows of each warp load straight into registers. The rest stream
+        # through a per-thread ring of `ring` shared-memory row slots filled by cp.async, one
+        # commit group per row; a slot is refilled with the row `ring` ahead once its row is
+        # consumed, so up to `ring` rows per thread stay in flight.
         assert 0 <= reg_rows <= self.rows_per_warp
         self.reg_rows = reg_rows
         self.smem_rows = self.rows_per_warp - reg_rows
-        self.groups = max(
-            (g for g in range(1, MAX_ASYNC_GROUPS + 1) if self.smem_rows % g == 0), default=0
-        )
-        self.rows_per_group = self.smem_rows // self.groups if self.groups else 0
+        self.ring = min(ring, self.smem_rows)
+        assert self.smem_rows == 0 or self.ring >= 1
         self.lower_bound = lower_bound
         self.q_scale = q_scale
         self.norm_eps = norm_eps
@@ -124,7 +122,7 @@ class KdaDecodeT1:
         self.use_pdl = use_pdl
         # Resident CTAs per SM requested from the register allocator (0: no bound).
         self.min_blocks = min_blocks
-        self.smem_bytes = cta_smem_bytes(warps, self.smem_rows)
+        self.smem_bytes = cta_smem_bytes(warps, self.ring)
 
     @cute.jit
     def __call__(
@@ -198,26 +196,31 @@ class KdaDecodeT1:
             use_pdl=self.use_pdl,
         )
 
-    def _load_state(self, state, state_s, state_regs, lane, warp, row_base, head, slot):
-        copy_g2r = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), F32, num_bits_per_copy=128)
+    def _issue_ring_row(self, state, state_s, lane, warp, row_base, head, slot, j):
+        """cp.async staged row j of this thread's warp into ring slot j % ring and commit it."""
         copy_g2s = cute.make_copy_atom(
             cute.nvgpu.cpasync.CopyG2SOp(cache_mode=cute.nvgpu.LoadCacheMode.GLOBAL),
             F32,
             num_bits_per_copy=128,
         )
-        for r in range(self.rows_per_warp):
+        r = self.reg_rows + j
+        src = _aligned(
+            state[(None, lane, row_base + warp * self.rows_per_warp + r, head, slot)], 16
+        )
+        cute.copy(
+            copy_g2s, src, _aligned(state_s[(None, lane, warp * self.ring + j % self.ring)], 16)
+        )
+        cute.arch.cp_async_commit_group()
+
+    def _load_state(self, state, state_s, state_regs, lane, warp, row_base, head, slot):
+        copy_g2r = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), F32, num_bits_per_copy=128)
+        for r in range(self.reg_rows):
             src = _aligned(
                 state[(None, lane, row_base + warp * self.rows_per_warp + r, head, slot)], 16
             )
-            if r < self.reg_rows:
-                cute.copy(copy_g2r, src, state_regs[(None, r)])
-            else:
-                j = r - self.reg_rows
-                cute.copy(
-                    copy_g2s, src, _aligned(state_s[(None, lane, warp * self.smem_rows + j)], 16)
-                )
-                if (j + 1) % self.rows_per_group == 0:
-                    cute.arch.cp_async_commit_group()
+            cute.copy(copy_g2r, src, state_regs[(None, r)])
+        for j in range(self.ring):
+            self._issue_ring_row(state, state_s, lane, warp, row_base, head, slot, j)
 
     @cute.kernel
     def kernel(
@@ -265,7 +268,7 @@ class KdaDecodeT1:
         if cutlass.const_expr(self.smem_rows > 0):
             state_s = smem.allocate_tensor(
                 F32,
-                cute.make_layout((4, 32, self.warps * self.smem_rows), stride=(1, 4, D)),
+                cute.make_layout((4, 32, self.warps * self.ring), stride=(1, 4, D)),
                 byte_alignment=16,
             )
         if cutlass.const_expr(self.early_state):
@@ -375,17 +378,22 @@ class KdaDecodeT1:
         for r in cutlass.range_constexpr(self.rows_per_warp):
             local_row = warp * self.rows_per_warp + r
             v_row = row_base + local_row
-            if cutlass.const_expr(r >= self.reg_rows):
-                j = r - self.reg_rows
-                if cutlass.const_expr(j % self.rows_per_group == 0):
-                    cute.arch.cp_async_wait_group(self.groups - 1 - j // self.rows_per_group)
+            j = r - self.reg_rows
+            if cutlass.const_expr(j >= 0):
+                # Rows committed after row j: the rest of the ring, capped at the last row.
+                cute.arch.cp_async_wait_group(min(self.ring - 1, self.smem_rows - 1 - j))
                 cute.autovec_copy(
-                    state_s[(None, lane, warp * self.smem_rows + j)], state_regs[(None, r)]
+                    state_s[(None, lane, warp * self.ring + j % self.ring)], state_regs[(None, r)]
                 )
             hk = F32(0.0)
             for e in cutlass.range_constexpr(4):
                 state_regs[e, r] = state_regs[e, r] * decay[e]
                 hk += state_regs[e, r] * k[e]
+            if cutlass.const_expr(0 <= j and j + self.ring < self.smem_rows):
+                # Refill only after the slot's row has been consumed into registers.
+                self._issue_ring_row(
+                    state, state_s, lane, warp, row_base, head, slot, j + self.ring
+                )
             hk = cute.arch.warp_reduction_sum(hk)
             u = (mixed[2 * D + v_row] - hk) * beta
             hq = F32(0.0)
@@ -458,6 +466,7 @@ def _compile(
     reg_rows: int,
     min_blocks: int,
     warps: int,
+    ring: int,
 ):
     d = heads * D
     rows, slots, conv_slots = cute.sym_int(), cute.sym_int(), cute.sym_int()
@@ -507,6 +516,7 @@ def _compile(
         reg_rows,
         min_blocks,
         warps,
+        ring,
     )
     return cute.compile(op, *args, options="--enable-tvm-ffi")
 
@@ -523,18 +533,23 @@ def smem_per_sm(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).shared_memory_per_multiprocessor
 
 
-def staging_plan(device_index: int, v_split: int, warps: int, stage_smem: bool) -> tuple[int, int]:
-    """(reg_rows, min_blocks): fewest register-held rows that let 1024 / threads CTAs share an SM."""
+def staging_plan(
+    device_index: int, v_split: int, warps: int, stage_smem: bool
+) -> tuple[int, int, int]:
+    """(reg_rows, ring, min_blocks): the deepest shared-memory ring that lets 1024 / threads
+    CTAs share an SM, or every row in registers without staging."""
     rows_per_warp = D // v_split // warps
     target = max(1, 1024 // (32 * warps))
-    budget = smem_per_sm(device_index)
     if not stage_smem:
-        return rows_per_warp, target
-    for reg_rows in range(rows_per_warp + 1):
+        return rows_per_warp, 0, target
+    budget = smem_per_sm(device_index)
+    while target > 1:
         # 1 KB per CTA is reserved by the runtime.
-        if target * (cta_smem_bytes(warps, rows_per_warp - reg_rows) + 1024) <= budget:
-            return reg_rows, target
-    return rows_per_warp, target
+        if budget // target >= cta_smem_bytes(warps, 1) + 1024:
+            break
+        target -= 1
+    ring = (budget // target - 1024 - cta_smem_bytes(warps, 0)) // (warps * D * 4)
+    return 0, max(1, min(rows_per_warp, ring)), target
 
 
 def pack_conv_weight(w_q_t: torch.Tensor, w_k_t: torch.Tensor, w_v_t: torch.Tensor) -> torch.Tensor:
@@ -666,6 +681,7 @@ def kda_decode_t1(
     warps: int | None = None,
     stage_smem: bool | None = None,
     reg_rows: int | None = None,
+    ring: int | None = None,
     min_blocks: int | None = None,
     early_state: bool = False,
     use_pdl: bool = True,
@@ -708,11 +724,21 @@ def kda_decode_t1(
         stage_smem = default_smem
     if warps is None:
         warps = default_warps if v_split == 1 and stage_smem else 16 // v_split
-    plan_reg_rows, plan_min_blocks = staging_plan(x.device.index, v_split, warps, stage_smem)
+    device_index = x.device.index
+    plan_reg_rows, plan_ring, plan_min_blocks = staging_plan(
+        device_index, v_split, warps, stage_smem
+    )
     if reg_rows is None:
         reg_rows = plan_reg_rows
+    if ring is None:
+        ring = plan_ring
     if min_blocks is None:
         min_blocks = plan_min_blocks
+    ring = min(ring, D // v_split // warps - reg_rows)
+    if max(min_blocks, 1) * (cta_smem_bytes(warps, ring) + 1024) > smem_per_sm(device_index):
+        raise ValueError(
+            f"kda_decode_t1: {min_blocks} CTAs per SM do not fit the SM's shared memory"
+        )
     fn = _compile(
         heads,
         v_split,
@@ -724,6 +750,7 @@ def kda_decode_t1(
         reg_rows,
         min_blocks,
         warps,
+        ring,
     )
     fn(
         x,
