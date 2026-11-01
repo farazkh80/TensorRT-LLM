@@ -19,6 +19,9 @@ With ``TLLM_K3_FGS_PREFILL=1`` a prefill of ``TLLM_K3_FGS_PREFILL_MIN_ROWS`` to 
   qkvg GEMM --p_qkvg--> KdaConv | [f_a | b], f_b, BT16 prep (plain) | chain_dv2 --p_o--> gated norm
   --p_core--> o_proj --p_attn_o--> pre-MoE mix (pipe consumer)
 
+``TLLM_K3_FGS_PREFILL_EDGES`` (comma list of pk2, pk7, pk8, pk9; default all) keeps only the listed edges: a dropped
+edge is a plain boundary and its slot is neither declared nor reset.
+
 The pre-attention mix (pipe kernel, no producer mode) and BT16 prep (no consumer mode) are plain boundaries. The
 gated norm reads the gate columns of the p_qkvg slot unchecked: chain_dv2 is a plain launch, so the qkvg GEMM has
 completed when the norm starts.
@@ -59,8 +62,23 @@ def bfa_first() -> bool:
     return value == "before"
 
 
+_PREFILL_EDGE_IDS = {"pk2": P_QKVG, "pk7": P_O, "pk8": P_CORE, "pk9": P_ATTN_O}
+
+
 def prefill() -> bool:
     return edges.chain() and os.environ.get("TLLM_K3_FGS_PREFILL", "0") == "1"
+
+
+def prefill_edges() -> Tuple[str, ...]:
+    """The prefill edges ``TLLM_K3_FGS_PREFILL_EDGES`` keeps, in chain order."""
+    value = os.environ.get("TLLM_K3_FGS_PREFILL_EDGES", ",".join(_PREFILL_EDGE_IDS))
+    ids = {v.strip().lower() for v in value.split(",") if v.strip()}
+    unknown = ids - set(_PREFILL_EDGE_IDS)
+    if unknown:
+        raise ValueError(
+            f"TLLM_K3_FGS_PREFILL_EDGES: unknown {sorted(unknown)}; valid: {', '.join(_PREFILL_EDGE_IDS)}"
+        )
+    return tuple(name for edge_id, name in _PREFILL_EDGE_IDS.items() if edge_id in ids)
 
 
 def declare(layer_idx: int, hidden: int, bfa_width: int, proj_size: int, qkvg_width: int) -> None:
@@ -76,13 +94,9 @@ def declare(layer_idx: int, hidden: int, bfa_width: int, proj_size: int, qkvg_wi
     ):
         edges.declare(name, width, layer_idx)
     if prefill():
-        for name, width in (
-            (P_QKVG, qkvg_width),
-            (P_O, proj_size),
-            (P_CORE, proj_size),
-            (P_ATTN_O, hidden),
-        ):
-            edges.declare(name, width, layer_idx, max_rows=PREFILL_MAX_ROWS)
+        widths = {P_QKVG: qkvg_width, P_O: proj_size, P_CORE: proj_size, P_ATTN_O: hidden}
+        for name in prefill_edges():
+            edges.declare(name, widths[name], layer_idx, max_rows=PREFILL_MAX_ROWS)
 
 
 def acquire(name: str, rows: int, readers: int = 1):
@@ -123,16 +137,18 @@ def project(
 
 
 class Prefill:
-    """One KDA layer's prefill slots, from :func:`prefill_begin` to the gated norm."""
+    """One KDA layer's prefill slots, from :func:`prefill_begin` to the gated norm. A dropped edge has no slot."""
 
     def __init__(self, leases: Dict[str, object]):
         self.leases = leases
 
-    def slot(self, name: str) -> torch.Tensor:
-        return self.leases[name].tensor
+    def slot(self, name: str) -> Optional[torch.Tensor]:
+        lease = self.leases.get(name)
+        return None if lease is None else lease.tensor
 
     def consumed(self, name: str) -> None:
-        edges.consumed(self.leases[name])
+        if name in self.leases:
+            edges.consumed(self.leases[name])
 
 
 def prefill_begin(rows: int) -> Optional[Prefill]:
@@ -140,7 +156,10 @@ def prefill_begin(rows: int) -> Optional[Prefill]:
     if not prefill():
         return None
     leases = {}
+    kept = prefill_edges()
     for name, readers in ((P_QKVG, 2), (P_O, 1), (P_CORE, 1)):
+        if name not in kept:
+            continue
         lease = edges.acquire(
             name, rows, readers=readers, window=(PREFILL_MIN_ROWS, PREFILL_MAX_ROWS)
         )
@@ -184,7 +203,11 @@ def o_proj(core2d: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     batch (consumed by the pre-MoE mix)."""
     rows = core2d.shape[0]
     if prefill() and PREFILL_MIN_ROWS <= rows <= PREFILL_MAX_ROWS:
-        lease = edges.acquire(P_ATTN_O, rows, window=(PREFILL_MIN_ROWS, PREFILL_MAX_ROWS))
+        lease = (
+            edges.acquire(P_ATTN_O, rows, window=(PREFILL_MIN_ROWS, PREFILL_MAX_ROWS))
+            if P_ATTN_O in prefill_edges()
+            else None
+        )
     else:
         lease = acquire(ATTN_O, rows)
     return kimi_k3_cute_gemm.linear(core2d, weight, None if lease is None else lease.tensor)
