@@ -1077,7 +1077,9 @@ class SplitKFgsGemmKernel:
                 s_base = sD.iterator.toint()
                 g_base = gD_tile.iterator.toint()
                 ldc = cutlass.Int64(gD_tile.stride[1])
-                for c in cutlass.range(epi_tid, chunks_m * self.cta_n, self.epilog_threads, unroll=1):
+                for c in cutlass.range(
+                    epi_tid, chunks_m * self.cta_n, self.epilog_threads, unroll=1
+                ):
                     col = c // chunks_m
                     row = (c - col * chunks_m) * 8
                     if row < rows_left and col < cols_left:

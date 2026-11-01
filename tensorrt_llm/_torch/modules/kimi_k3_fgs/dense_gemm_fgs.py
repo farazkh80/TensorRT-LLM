@@ -107,7 +107,9 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
         if report_valid and not retry_warp:
             raise ValueError("report_valid needs retry_warp to re-issue invalid stages")
         if retry_warp and MBarrierScopeKind is None:
-            raise ValueError("the consumer roles need CuTe DSL 4.9 (v1 mbarriers, TMA report_valid)")
+            raise ValueError(
+                "the consumer roles need CuTe DSL 4.9 (v1 mbarriers, TMA report_valid)"
+            )
         if retry_poll not in ("try", "test"):
             raise ValueError(f"retry_poll must be 'try' or 'test', got {retry_poll!r}")
         self.pzo = pzo
@@ -179,7 +181,9 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
         if cutlass.const_expr(self.report_valid and self.use_2cta_instrs and self.is_a_mcast):
             raise NotImplementedError("report_valid with 2-CTA tiles and A multicast")
         if cutlass.const_expr(self.retry_warp and self.num_ab_stage > 30):
-            raise NotImplementedError(f"the retry warp tracks <= 30 stages in bitmasks, got {self.num_ab_stage}")
+            raise NotImplementedError(
+                f"the retry warp tracks <= 30 stages in bitmasks, got {self.num_ab_stage}"
+            )
 
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
 
@@ -806,10 +810,13 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
                                     if (mc_arrived & bit) == 0:
                                         if retry_is_signalling:
                                             cute.arch.mbarrier_arrive(
-                                                retry_cluster_mbar.get_barrier(stage), retry_dst_rank
+                                                retry_cluster_mbar.get_barrier(stage),
+                                                retry_dst_rank,
                                             )
                                         mc_arrived = mc_arrived | bit
-                                    do_reissue = retry_cluster_mbar.test_wait(stage, (mc_parity >> stage) & 1)
+                                    do_reissue = retry_cluster_mbar.test_wait(
+                                        stage, (mc_parity >> stage) & 1
+                                    )
                                 if do_reissue:
                                     parity = parity ^ bit
                                     if cutlass.const_expr(need_retry_sync):
@@ -828,7 +835,12 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
                                             )
                                             cute.arch.store_async_dsmem(
                                                 local_coord_ptr,
-                                                (stage, base + i, mma_tile_coord_mnl[0], mma_tile_coord_mnl[1]),
+                                                (
+                                                    stage,
+                                                    base + i,
+                                                    mma_tile_coord_mnl[0],
+                                                    mma_tile_coord_mnl[1],
+                                                ),
                                                 full_mbar_ptr,
                                                 peer_cta_rank,
                                             )
@@ -838,7 +850,9 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
                                                 full_mbar_ptr,
                                                 peer_cta_rank,
                                             )
-                                    ab_pipeline.retry_expect_tx(_Stage(stage), self.num_tma_load_bytes_a)
+                                    ab_pipeline.retry_expect_tx(
+                                        _Stage(stage), self.num_tma_load_bytes_a
+                                    )
                                     cute.copy(
                                         tma_atom_a,
                                         tAgA_slice[(None, base + i)],
@@ -974,10 +988,12 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
     ):
         """``wrapper_fgs`` with A and B (M / N, batch) strides; K is innermost."""
         a_tensor = cute.make_tensor(
-            a_ptr, layout=cute.make_layout((m, k, batch_size), stride=(a_stride_m, 1, a_stride_batch))
+            a_ptr,
+            layout=cute.make_layout((m, k, batch_size), stride=(a_stride_m, 1, a_stride_batch)),
         )
         b_tensor = cute.make_tensor(
-            b_ptr, layout=cute.make_layout((n, k, batch_size), stride=(b_stride_n, 1, b_stride_batch))
+            b_ptr,
+            layout=cute.make_layout((n, k, batch_size), stride=(b_stride_n, 1, b_stride_batch)),
         )
         self(a_tensor, b_tensor, c_tensor, stamps, retry_count, max_active_clusters, stream)
 
@@ -1066,7 +1082,9 @@ def run_gemm_fgs(
     b_ptr = make_ptr(cutlass.BFloat16, w.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
     c_mnl = out.permute(1, 2, 0)
     c_tensor = from_dlpack(c_mnl).mark_layout_dynamic(leading_dim=1)
-    stamps_tensor = from_dlpack(_scratch(a.device, "stamps", TIMELINE_MAX_CTAS)).mark_layout_dynamic()
+    stamps_tensor = from_dlpack(
+        _scratch(a.device, "stamps", TIMELINE_MAX_CTAS)
+    ).mark_layout_dynamic()
     retry_tensor = from_dlpack(retry_counter, assumed_align=4)
     stream = cuda.CUstream(torch.cuda.current_stream(a.device).cuda_stream)
     strides = (a.stride(1), a.stride(0), w.stride(1), w.stride(0))

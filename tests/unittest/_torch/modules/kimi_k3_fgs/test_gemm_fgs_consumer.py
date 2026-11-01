@@ -139,7 +139,9 @@ def run_stock(case: Case, a: torch.Tensor, out: torch.Tensor, w=None) -> None:
 
 
 def run_variant(case: Case, a, out, variant: str, counter=None, **extra) -> None:
-    fgs.run_gemm_fgs(a, case.w, out, case.tactic, retry_counter=counter, **VARIANTS[variant], **extra)
+    fgs.run_gemm_fgs(
+        a, case.w, out, case.tactic, retry_counter=counter, **VARIANTS[variant], **extra
+    )
 
 
 def bits(t: torch.Tensor) -> torch.Tensor:
@@ -206,7 +208,9 @@ class BlockWriter:
         self.block_rows, self.block_cols, self.threads = block_rows, block_cols, threads
 
     @cute.jit
-    def __call__(self, src, dst, ranks, flag, delay_ns: Int64, step_ns: Int64, stream: cuda.CUstream):
+    def __call__(
+        self, src, dst, ranks, flag, delay_ns: Int64, step_ns: Int64, stream: cuda.CUstream
+    ):
         self.kernel(src, dst, ranks, flag, delay_ns, step_ns).launch(
             grid=(cute.size(ranks), 1, 1), block=(self.threads, 1, 1), stream=stream
         )
@@ -250,8 +254,12 @@ class BlockWriter:
             r = c // chunks
             row = mb * self.block_rows + r
             col = kb * self.block_cols + (c - r * chunks) * 8
-            src_off = Int64(lb) * Int64(src.stride[0]) + Int64(row) * Int64(src.stride[1]) + Int64(col)
-            dst_off = Int64(lb) * Int64(dst.stride[0]) + Int64(row) * Int64(dst.stride[1]) + Int64(col)
+            src_off = (
+                Int64(lb) * Int64(src.stride[0]) + Int64(row) * Int64(src.stride[1]) + Int64(col)
+            )
+            dst_off = (
+                Int64(lb) * Int64(dst.stride[0]) + Int64(row) * Int64(dst.stride[1]) + Int64(col)
+            )
             _st_global_v4(dst_base + dst_off * 2, _ld_global_v4(src_base + src_off * 2))
         cute.arch.fence_acq_rel_gpu()
 
@@ -264,7 +272,9 @@ def num_blocks(a: torch.Tensor, block_rows: int, block_cols: int) -> int:
     return L * -(-M // block_rows) * -(-K // block_cols)
 
 
-def late_write(src, dst, ranks, delay_us: float, step_us: float, block_rows: int, block_cols: int, flag=None):
+def late_write(
+    src, dst, ranks, delay_us: float, step_us: float, block_rows: int, block_cols: int, flag=None
+):
     """Launch the writer on the current stream; without ``flag`` it starts at once."""
     if flag is None:
         flag = torch.ones(1, dtype=torch.int32, device="cuda")
@@ -277,7 +287,9 @@ def late_write(src, dst, ranks, delay_us: float, step_us: float, block_rows: int
         _WRITERS[key] = cute.compile(
             BlockWriter(block_rows, block_cols), *args, ranks_t, flag_t, Int64(0), Int64(0), stream
         )
-    _WRITERS[key](*args, ranks_t, flag_t, Int64(int(delay_us * 1e3)), Int64(int(step_us * 1e3)), stream)
+    _WRITERS[key](
+        *args, ranks_t, flag_t, Int64(int(delay_us * 1e3)), Int64(int(step_us * 1e3)), stream
+    )
 
 
 def block_shape(case: Case):
@@ -303,7 +315,9 @@ def ranks_for(pattern: str, n: int, seed: int = 0) -> torch.Tensor:
     return r.to(torch.int32).cuda()
 
 
-def run_hazard(case: Case, pattern: str, variant: str = "c", delay_us: float = 300.0, step_us: float = 2.0):
+def run_hazard(
+    case: Case, pattern: str, variant: str = "c", delay_us: float = 300.0, step_us: float = 2.0
+):
     """Writer on its own stream first, consumer second; returns (output buffer, re-issues, published A).
 
     The writer's clock starts at a flag the consumer's stream sets right before the consumer, so the first block
@@ -354,9 +368,11 @@ def test_ready_input_matches_in_tree_runner(name: str, variant: str) -> None:
 
 @pytest.mark.parametrize("name", ["qkvg_m16", "fb_m16_x4", "wuk_m16", "oproj_pf"])
 def test_middle_kernel_pzo_early_trigger(name: str) -> None:
-    """Consumer of its input and early-triggering PZO producer of its output: equal up to -0.0, which it never stores."""
+    """Consumer of its input and early-triggering PZO producer of its output: equal up to -0.0,
+    which it never stores."""
     case = Case(name)
-    case.w[:, :16] = case.w[:, :16].abs()  # -0.0 rows times positive weight rows give -0.0 without .pzo
+    # -0.0 rows times positive weight rows give -0.0 without .pzo
+    case.w[:, :16] = case.w[:, :16].abs()
     neg = case.base.clone()
     neg[: max(1, case.M // 4)] = -0.0
     a = case.with_a(neg)
@@ -382,7 +398,9 @@ def test_middle_kernel_pzo_early_trigger(name: str) -> None:
 
 
 @pytest.mark.parametrize("pattern", ["forward", "reverse", "random", "one_late"])
-@pytest.mark.parametrize("name", ["qkvg_m16", "fb_m16", "fb_m16_x4", "wuk_m16", "wuv_m16", "qkvg_pf", "oproj_pf"])
+@pytest.mark.parametrize(
+    "name", ["qkvg_m16", "fb_m16", "fb_m16_x4", "wuk_m16", "wuv_m16", "qkvg_pf", "oproj_pf"]
+)
 def test_late_out_of_order_producer(name: str, pattern: str) -> None:
     case = Case(name, seed=1)
     ref = reference(case)
@@ -390,7 +408,9 @@ def test_late_out_of_order_producer(name: str, pattern: str) -> None:
     assert published, f"{name}/{pattern}: the writer did not publish A"
     diff = int((bits(buf) != bits(ref)).sum())
     assert diff == 0, f"{name}/{pattern}: {diff} output elements differ ({reissues} re-issues)"
-    assert reissues > 0, f"{name}/{pattern}: the writer finished before the consumer read (no re-issue)"
+    assert reissues > 0, (
+        f"{name}/{pattern}: the writer finished before the consumer read (no re-issue)"
+    )
 
 
 @pytest.mark.parametrize("name", ["qkvg_m16", "oproj_pf"])

@@ -130,7 +130,10 @@ def model_scope(layers: Optional[Iterable[int]] = None) -> Iterator[None]:
         yield
         return
     run = None if layers is None else set(layers)
-    users = {name: declared if run is None else declared & run for name, (_, declared) in _declared.items()}
+    users = {
+        name: declared if run is None else declared & run
+        for name, (_, declared) in _declared.items()
+    }
     missing = [name for name in _declared if users[name] and name not in workspaces]
     if missing and not torch.cuda.is_current_stream_capturing():
         from ..fine_grained_sync import ResetPolicy
@@ -139,7 +142,9 @@ def model_scope(layers: Optional[Iterable[int]] = None) -> Iterator[None]:
         for name in missing:
             width = _declared[name][0]
             num_slots = len(users[name]) if per_step else 2
-            workspaces.workspace(name, (_rows.get(name, MAX_ROWS), width), torch.bfloat16, slots=num_slots)
+            workspaces.workspace(
+                name, (_rows.get(name, MAX_ROWS), width), torch.bfloat16, slots=num_slots
+            )
         logger.info(f"{ENV}={mode()}: edge slots {workspaces.ledger()}")
     elif missing:
         logger.warning_once(

@@ -166,7 +166,9 @@ def _late_copy16_kernel(dst: cute.Tensor, src: cute.Tensor, flag: cute.Tensor, d
 
 @cute.jit
 def _late_copy16(dst: cute.Tensor, src: cute.Tensor, flag: cute.Tensor, delay_ns: Int64, stream):
-    _late_copy16_kernel(dst, src, flag, delay_ns).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+    _late_copy16_kernel(dst, src, flag, delay_ns).launch(
+        grid=(1, 1, 1), block=(32, 1, 1), stream=stream
+    )
 
 
 def _late_publish(dst: torch.Tensor, src: torch.Tensor, delay_ns: int) -> torch.Tensor:

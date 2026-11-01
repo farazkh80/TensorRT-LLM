@@ -51,7 +51,9 @@ PREFILL_MAX_ROWS = int(os.environ.get("TLLM_K3_FGS_PREFILL_MAX_ROWS", "8256"))
 
 
 def bfa_first() -> bool:
-    value = os.environ.get("TLLM_K3_FGS_CHAIN_BFA") or ("after" if edges.mode() == "chain_after" else "before")
+    value = os.environ.get("TLLM_K3_FGS_CHAIN_BFA") or (
+        "after" if edges.mode() == "chain_after" else "before"
+    )
     if value not in ("before", "after"):
         raise ValueError(f"TLLM_K3_FGS_CHAIN_BFA={value!r}; valid: before, after")
     return value == "before"
@@ -74,7 +76,12 @@ def declare(layer_idx: int, hidden: int, bfa_width: int, proj_size: int, qkvg_wi
     ):
         edges.declare(name, width, layer_idx)
     if prefill():
-        for name, width in ((P_QKVG, qkvg_width), (P_O, proj_size), (P_CORE, proj_size), (P_ATTN_O, hidden)):
+        for name, width in (
+            (P_QKVG, qkvg_width),
+            (P_O, proj_size),
+            (P_CORE, proj_size),
+            (P_ATTN_O, hidden),
+        ):
             edges.declare(name, width, layer_idx, max_rows=PREFILL_MAX_ROWS)
 
 
@@ -134,7 +141,9 @@ def prefill_begin(rows: int) -> Optional[Prefill]:
         return None
     leases = {}
     for name, readers in ((P_QKVG, 2), (P_O, 1), (P_CORE, 1)):
-        lease = edges.acquire(name, rows, readers=readers, window=(PREFILL_MIN_ROWS, PREFILL_MAX_ROWS))
+        lease = edges.acquire(
+            name, rows, readers=readers, window=(PREFILL_MIN_ROWS, PREFILL_MAX_ROWS)
+        )
         if lease is None:
             for held in leases.values():
                 edges.release(held)
@@ -151,7 +160,11 @@ PREFILL_LOG_EVERY = 20
 def note_prefill(layer_idx: int, refusal: Optional[str]) -> None:
     """Count one prefill layer-forward; log each new outcome once and the totals periodically."""
     if not prefill_outcomes:
-        atexit.register(lambda: logger.info(f"TLLM_K3_FGS prefill chain layer-forwards: {dict(prefill_outcomes)}"))
+        atexit.register(
+            lambda: logger.info(
+                f"TLLM_K3_FGS prefill chain layer-forwards: {dict(prefill_outcomes)}"
+            )
+        )
     outcome = "on" if refusal is None else f"off: {refusal}"
     if outcome not in prefill_outcomes:
         logger.info(f"TLLM_K3_FGS prefill chain, first {outcome!r} at KDA layer {layer_idx}")

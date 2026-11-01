@@ -76,7 +76,14 @@ class Weights(NamedTuple):
 
 
 def declare(
-    layer_idx: int, hidden: int, q_lora: int, kv_lora: int, rope: int, heads: int, nope: int, v_dim: int
+    layer_idx: int,
+    hidden: int,
+    q_lora: int,
+    kv_lora: int,
+    rope: int,
+    heads: int,
+    nope: int,
+    v_dim: int,
 ) -> None:
     """Declare the chain edges of one MLA layer."""
     if not edges.chain():
@@ -145,7 +152,11 @@ class Chain:
 
 
 def begin(
-    owner, kv_pool: torch.Tensor, page_rows: torch.Tensor, kv_lens: torch.Tensor, max_requests: int,
+    owner,
+    kv_pool: torch.Tensor,
+    page_rows: torch.Tensor,
+    kv_lens: torch.Tensor,
+    max_requests: int,
     weights: Weights,
 ) -> Optional[Chain]:
     """Acquire every slot of one MLA layer's decode step and launch its step inputs, or return None (nothing held,
@@ -197,17 +208,34 @@ def run(chain: Chain) -> torch.Tensor:
     k.rmsnorm(qkv_a[:, :q_lora], w.q_a_norm, q_a_n, w.q_a_eps, fgs_consumer=True, fgs_producer=True)
     edges.consumed(leases[QKV_A])
     kv_c = chain.slot(KV_C)
-    k.rmsnorm(qkv_a[:, q_lora : q_lora + kv_lora], w.kv_a_norm, kv_c, w.kv_a_eps, fgs_consumer=True,
-              fgs_producer=True)
+    k.rmsnorm(
+        qkv_a[:, q_lora : q_lora + kv_lora],
+        w.kv_a_norm,
+        kv_c,
+        w.kv_a_eps,
+        fgs_consumer=True,
+        fgs_producer=True,
+    )
     edges.consumed(leases[QKV_A])
 
     q = chain.slot(Q).view(rows, heads, -1)
     kimi_k3_cute_gemm.linear(q_a_n, w.q_b, q.view(rows, -1))
     fused_q = chain.slot(FUSED_Q).view(rows, heads, -1)
-    kimi_k3_cute_gemm.bmm(q[..., :nope].transpose(0, 1), w.k_b, fused_q[..., :kv_lora].transpose(0, 1))
+    kimi_k3_cute_gemm.bmm(
+        q[..., :nope].transpose(0, 1), w.k_b, fused_q[..., :kv_lora].transpose(0, 1)
+    )
     d = chain.decode
-    k.latent_append(q[..., nope:], kv_c, qkv_a[:, q_lora + kv_lora :], fused_q, d.kv_pool, d.page_rows,
-                    d.kv_lens, fgs_consumer=True, fgs_producer=True)
+    k.latent_append(
+        q[..., nope:],
+        kv_c,
+        qkv_a[:, q_lora + kv_lora :],
+        fused_q,
+        d.kv_pool,
+        d.page_rows,
+        d.kv_lens,
+        fgs_consumer=True,
+        fgs_producer=True,
+    )
     for name in (Q, KV_C, QKV_A):
         edges.consumed(leases[name])
 
@@ -216,7 +244,9 @@ def run(chain: Chain) -> torch.Tensor:
     edges.consumed(leases[FUSED_Q])
     attn_out = chain.slot(ATTN_OUT)
     kimi_k3_cute_gemm.bmm(
-        latent.view(rows, heads, kv_lora).transpose(0, 1), w.v_b, attn_out.view(rows, heads, v_dim).transpose(0, 1)
+        latent.view(rows, heads, kv_lora).transpose(0, 1),
+        w.v_b,
+        attn_out.view(rows, heads, v_dim).transpose(0, 1),
     )
 
     gated = chain.slot(GATED)
@@ -229,9 +259,17 @@ def run(chain: Chain) -> torch.Tensor:
 
 
 def _kernels():
-    from ...attention.kernels.rubin.kimi_k3_mla import mla_latent_append, mla_output_gate, mla_rmsnorm
+    from ...attention.kernels.rubin.kimi_k3_mla import (
+        mla_latent_append,
+        mla_output_gate,
+        mla_rmsnorm,
+    )
 
-    return _Kernels(mla_rmsnorm.mla_rmsnorm, mla_latent_append.mla_latent_append, mla_output_gate.mla_output_gate)
+    return _Kernels(
+        mla_rmsnorm.mla_rmsnorm,
+        mla_latent_append.mla_latent_append,
+        mla_output_gate.mla_output_gate,
+    )
 
 
 class _Kernels(NamedTuple):
@@ -267,7 +305,9 @@ class _Decode:
     _compiled: Dict[tuple, object] = {}
 
     @classmethod
-    def build(cls, owner, kv_pool, page_rows, kv_lens, max_requests, weights) -> Optional["_Decode"]:
+    def build(
+        cls, owner, kv_pool, page_rows, kv_lens, max_requests, weights
+    ) -> Optional["_Decode"]:
         heads, kv_lora, _ = weights.k_b.shape
         rope = weights.fused_a.shape[0] - weights.q_a_norm.numel() - kv_lora
         if (
@@ -282,9 +322,21 @@ class _Decode:
             or page_rows.shape[0] > _PLAN_CAPACITY
         ):
             return None
-        return cls(owner, kv_pool, page_rows, kv_lens, max_requests, heads, kv_lora, rope, weights.softmax_scale)
+        return cls(
+            owner,
+            kv_pool,
+            page_rows,
+            kv_lens,
+            max_requests,
+            heads,
+            kv_lora,
+            rope,
+            weights.softmax_scale,
+        )
 
-    def __init__(self, owner, kv_pool, page_rows, kv_lens, max_requests, heads, kv_lora, rope, softmax_scale):
+    def __init__(
+        self, owner, kv_pool, page_rows, kv_lens, max_requests, heads, kv_lora, rope, softmax_scale
+    ):
         import cutlass
 
         from ...custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner as Runner
@@ -326,7 +378,10 @@ class _Decode:
             self.owner,
             ("page_table", max_blocks, batch, self.page_rows.device),
             lambda: torch.empty_strided(
-                (max_blocks, batch), (1, max_blocks), dtype=torch.int32, device=self.page_rows.device
+                (max_blocks, batch),
+                (1, max_blocks),
+                dtype=torch.int32,
+                device=self.page_rows.device,
             ),
         )
         self.page_table = mla_decode_page_table(self.kv_pool, self.page_rows, pt)
@@ -372,8 +427,10 @@ class _Decode:
             def ct(t, leading, align=16):
                 return from_dlpack(t, assumed_align=align).mark_layout_dynamic(leading_dim=leading)
 
-            o_ct = from_dlpack(o, assumed_align=16).mark_layout_dynamic(leading_dim=1).mark_compact_shape_dynamic(
-                mode=1, stride_order=(3, 2, 0, 1), divisibility=8
+            o_ct = (
+                from_dlpack(o, assumed_align=16)
+                .mark_layout_dynamic(leading_dim=1)
+                .mark_compact_shape_dynamic(mode=1, stride_order=(3, 2, 0, 1), divisibility=8)
             )
             fn = cute.compile(
                 mla.run_fgs,
@@ -389,7 +446,9 @@ class _Decode:
         page_table = self.page_table
         if page_table.shape[0] == 1 and page_table.shape[1] == 1:
             # A (1, 1) table has no extent > 1 to deduce the leading dimension from at call time.
-            page_table = from_dlpack(page_table, assumed_align=16).mark_layout_dynamic(leading_dim=0)
+            page_table = from_dlpack(page_table, assumed_align=16).mark_layout_dynamic(
+                leading_dim=0
+            )
         fn(q_latent, q_rope, self.c_latent, self.c_rope, page_table, o, self.lse, split_ws, self.split_kv,
            self.kv_lens, None, None, plan, self.softmax_scale, 1.0, None, stream)  # fmt: skip
 
@@ -420,7 +479,9 @@ def _split_plan(runner, kv_lens: torch.Tensor, batch: int, heads: int) -> torch.
         from ...attention.mla import k3_cute_mla_enabled
 
         if k3_cute_mla_enabled("plan"):
-            from ...attention.kernels.rubin.kimi_k3_mla.mla_split_kv_plan import launch_mla_split_kv_plan as launch
+            from ...attention.kernels.rubin.kimi_k3_mla.mla_split_kv_plan import (
+                launch_mla_split_kv_plan as launch,
+            )
         else:
             from ...attention.backends.fmha.cute_dsl_mla import launch_mla_split_kv_plan as launch
         plan = _shared("mla_split_plan", _PLAN_CAPACITY, torch.int32, kv_lens.device)[:batch]
