@@ -25,6 +25,17 @@ Compile-time consumer roles, with the FlashInfer warp layout kept unchanged:
 - ``pdl_wait_activation``: ``griddepcontrol.wait`` before the first activation
   load. Weights are always loaded before it.
 
+Compile-time producer roles (the output is a report_valid consumer's input):
+
+- ``pzo``: the output is narrowed with ``cvt.rn.pzo`` (-0.0 stored as +0.0).
+- ``early_trigger``: ``griddepcontrol.launch_dependents`` at kernel entry
+  instead of after the weight loads.
+- ``store16``: the TMEM fragment gives each thread 2 B per output element, so a
+  16 B output chunk would be written by several threads. The owner instead
+  stages its tile in shared memory (the A stage buffers, idle after the last
+  MMA) and stores it with one 16 B store per chunk, which a consumer that checks
+  element 0 per 16 B sees whole. Needs a row-major output with N % 8 == 0.
+
 The kernel never writes sentinels; the caller owns sentinel initialization of
 the activation buffer.
 """
@@ -328,12 +339,42 @@ def _store_shared_remote_v4(
     )
 
 
+@dsl_user_op
+def _ld_shared_v4(addr: Int32, *, loc=None, ip=None):
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [addr.ir_value(loc=loc, ip=ip)],
+        "ld.shared.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return [Int32(llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(4)]
+
+
+@dsl_user_op
+def _st_global_v4(addr, v, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [addr.ir_value(loc=loc, ip=ip)] + [x.ir_value(loc=loc, ip=ip) for x in v],
+        "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
 #: Rank that gathers partials and stores the output.
 OWNER_RANK = 0
 
 
 #: Warp that validates and re-issues activation stages.
 RETRY_WARP = 3
+
+#: Named barrier of the epilogue warps (store16 staging).
+EPILOG_BARRIER = 1
 
 #: Slots of the retry counter: activation re-issues, stages released invalid after retry_limit.
 RETRY_COUNTER_SLOTS = 2
@@ -358,6 +399,9 @@ class SplitKFgsGemmKernel:
         exact_smem: bool = False,
         smem_carveout: int | None = None,
         timeline: bool = False,
+        pzo: bool = False,
+        early_trigger: bool = False,
+        store16: bool = False,
     ) -> None:
         if report_valid and not retry_warp:
             raise ValueError("report_valid needs retry_warp to re-issue invalid stages")
@@ -377,6 +421,9 @@ class SplitKFgsGemmKernel:
         self.retry_warp = retry_warp
         self.pdl_wait_activation = pdl_wait_activation
         self.timeline = timeline
+        self.pzo = pzo
+        self.early_trigger = early_trigger and use_pdl
+        self.store16 = store16
         # Per-CTA re-issue budget after which an invalid stage is released with
         # its sentinel data (counted in retry_count[1]), so a never-published
         # stage cannot hang the kernel. Diagnostic builds only; 0 retries forever.
@@ -448,6 +495,8 @@ class SplitKFgsGemmKernel:
         mRetry: cute.Tensor,  # Int32 (re-issues, stages released invalid); dead without retry_warp
     ):
         """Allocate storage and dispatch the specialized warps."""
+        if cutlass.const_expr(self.early_trigger):
+            cute.arch.griddepcontrol_launch_dependents()
         stages = self.num_ab_stage
 
         ab_dtype = mA.element_type
@@ -641,6 +690,9 @@ class SplitKFgsGemmKernel:
                 mailbox,
                 bar_reduce,
                 split_rank,
+                sA.iterator,
+                cute.size(mC, mode=[0]) - bidx * self.cta_m,
+                cute.size(mC, mode=[1]) - n_idx * self.cta_n,
             )
 
     @cute.experimental.jit
@@ -684,7 +736,7 @@ class SplitKFgsGemmKernel:
             if stage == stages - 1:
                 empty_phase = empty_phase ^ 1
 
-        if cutlass.const_expr(is_a and self.use_pdl):
+        if cutlass.const_expr(is_a and self.use_pdl and not self.early_trigger):
             cute.arch.griddepcontrol_launch_dependents()
         if cutlass.const_expr(not is_a and self.has_bias):
             cute.arch.mbarrier_arrive(bar_tma_epilog)
@@ -894,6 +946,9 @@ class SplitKFgsGemmKernel:
         mailbox,
         bar_reduce,
         split_rank: cutlass.Int32,
+        stage_ptr,
+        rows_left: cutlass.Int32,
+        cols_left: cutlass.Int32,
     ):
         # Wait until MMA publishes the TMEM base pointer.
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
@@ -1006,9 +1061,35 @@ class SplitKFgsGemmKernel:
             if cutlass.const_expr(self.has_bias):
                 rAcc.store(rAcc.load() + rBiasAcc.load())
 
-            rD.store(rAcc.load().to(c_dtype))
-            # Preserve TMEM coordinates; the copy predicates output tails.
-            cute_ext.partition_and_copy(thr_t2r, rD, gD_epi[None, None, 0, 0])
+            if cutlass.const_expr(self.pzo):
+                rD.store(rAcc.load().to(c_dtype, pzo=True))
+            else:
+                rD.store(rAcc.load().to(c_dtype))
+            if cutlass.const_expr(self.store16):
+                # Kernel-M (public N) is contiguous in both the staged tile and the output.
+                sD = cute.make_tensor(
+                    cute.recast_ptr(stage_ptr, dtype=c_dtype),
+                    cute.make_layout((self.cta_m, self.cta_n), stride=(1, self.cta_m)),
+                )
+                cute_ext.partition_and_copy(thr_t2r, rD, sD)
+                cute.arch.barrier(barrier_id=EPILOG_BARRIER, number_of_threads=self.epilog_threads)
+                chunks_m = self.cta_m // 8
+                s_base = sD.iterator.toint()
+                g_base = gD_tile.iterator.toint()
+                ldc = cutlass.Int64(gD_tile.stride[1])
+                for c in cutlass.range(
+                    epi_tid, chunks_m * self.cta_n, self.epilog_threads, unroll=1
+                ):
+                    col = c // chunks_m
+                    row = (c - col * chunks_m) * 8
+                    if row < rows_left and col < cols_left:
+                        _st_global_v4(
+                            g_base + (cutlass.Int64(row) + cutlass.Int64(col) * ldc) * 2,
+                            _ld_shared_v4(s_base + (row + col * self.cta_m) * 2),
+                        )
+            else:
+                # Preserve TMEM coordinates; the copy predicates output tails.
+                cute_ext.partition_and_copy(thr_t2r, rD, gD_epi[None, None, 0, 0])
 
         # The reduction mbarrier covers remote stores; no cluster barrier needed.
 
@@ -1162,6 +1243,9 @@ def _get_compiled_splitk_kernel(
     exact_smem: bool,
     smem_carveout: int | None,
     timeline: bool,
+    pzo: bool = False,
+    early_trigger: bool = False,
+    store16: bool = False,
 ):
     if dtype not in _SUPPORTED_TORCH_DTYPES:
         raise ValueError(f"split-K dense GEMM supports {_SUPPORTED_TORCH_DTYPES}; got {dtype}")
@@ -1179,6 +1263,9 @@ def _get_compiled_splitk_kernel(
             exact_smem=exact_smem,
             smem_carveout=smem_carveout,
             timeline=timeline,
+            pzo=pzo,
+            early_trigger=early_trigger,
+            store16=store16,
         )
         stream = _cuda.CUstream(_torch.cuda.current_stream().cuda_stream)
         if has_bias:
@@ -1246,6 +1333,9 @@ def run_splitk_dense_fgs(
     exact_smem: bool = False,
     smem_carveout: int | None = None,
     timeline: bool = False,
+    pzo: bool = False,
+    early_trigger: bool = False,
+    store16: bool = False,
 ):
     """Run ``A[M,K] @ B[K,N]`` with the ``mm_bf16`` layouts; ``a`` is the FGS-checked operand.
 
@@ -1255,10 +1345,13 @@ def run_splitk_dense_fgs(
     ``smem_carveout`` (percent, CUDA preferred carveout) let a consumer CTA share
     an SM with a concurrently running producer. ``timeline`` (diagnostic) also
     stores per-CTA load stamps; the counter then needs ``timeline_slots``
-    elements.
+    elements. ``pzo``, ``early_trigger`` and ``store16`` are the producer roles
+    (module docstring).
     """
     m, n, k = _validate_runtime_tensors(a, b, bias, out)
     validate_tactic(tactic, m, n, k)
+    if store16 and (out.stride(-1) != 1 or n % 8):
+        raise ValueError("store16 needs a row-major output with N % 8 == 0")
     slots = timeline_slots(tactic, m, n) if timeline else RETRY_COUNTER_SLOTS
     if retry_counter is None and not timeline:
         retry_counter = _scratch_retry_counter(a.device)
@@ -1286,6 +1379,9 @@ def run_splitk_dense_fgs(
             exact_smem=exact_smem,
             smem_carveout=smem_carveout,
             timeline=timeline,
+            pzo=pzo,
+            early_trigger=early_trigger,
+            store16=store16,
         )
         compiled(
             *(tensors[:4] if has_bias else tensors[:3]),

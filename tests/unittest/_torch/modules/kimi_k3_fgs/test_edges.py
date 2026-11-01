@@ -130,3 +130,45 @@ def test_graph_replays(lamport, monkeypatch, policy: str) -> None:
         for out in outs:
             assert torch.equal(out, ref)
     _assert_armed()
+
+
+def test_slot_views_route_to_fgs_builds(lamport) -> None:
+    """bfa (split-K producer build) writes a slot; two f_b readers (in-tree consumer build on a strided view) consume
+    it back to back with PDL; the second reader releases and re-arms the slot."""
+    from tensorrt_llm._torch.modules.kimi_k3_fgs import dense_gemm_fgs
+
+    edge, m, k_in, width, n_fb = "test.bfa", 16, 7168, 224, 12288
+    edges.declare(edge, width, 0)
+    g = torch.Generator(device="cuda").manual_seed(7)
+    x = torch.randn(m, k_in, device="cuda", dtype=torch.bfloat16, generator=g)
+    x.masked_fill_(x == 0, 0.5)
+    w_bfa = torch.randn(width, k_in, device="cuda", dtype=torch.bfloat16, generator=g) * 0.02
+    w_fb = torch.randn(n_fb, 128, device="cuda", dtype=torch.bfloat16, generator=g) * 0.05
+    outs = [torch.empty(m, n_fb, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
+
+    with edges.model_scope():
+        lease = edges.acquire(edge, m, readers=2)
+        assert lease is not None
+        kimi_k3_cute_gemm.linear(x, w_bfa, lease.tensor)
+        kimi_k3_cute_gemm.linear(lease.tensor[:, :128], w_fb, outs[0])
+        assert edges._local.live
+        kimi_k3_cute_gemm.linear(lease.tensor[:, :128], w_fb, outs[1])
+        assert not edges._local.live
+
+    bfa = kimi_k3_cute_gemm.linear(x, w_bfa)
+    bfa.view(torch.int16).masked_fill_(bfa.view(torch.int16) == -0x8000, 0)
+    ref = torch.empty_like(outs[0])
+    dense_gemm_fgs.run_gemm_fgs(
+        bfa[:, :128].unsqueeze(0),
+        w_fb.unsqueeze(0),
+        ref.unsqueeze(0),
+        kimi_k3_cute_gemm._FGS_SMALL_TACTIC,
+        report_valid=False,
+        retry_warp=False,
+        wait_input=True,
+    )
+    torch.cuda.synchronize()
+    for out in outs:
+        assert torch.equal(out.view(torch.int16), ref.view(torch.int16))
+    for slot in edges._state()[0][edge].slots:
+        assert bool((slot.view(torch.int16) == -0x8000).all()), "slot not re-armed"

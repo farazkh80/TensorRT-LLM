@@ -13,8 +13,12 @@ points; the first entry whose max_m covers the runtime M is used. Backends:
   so two CTAs share an SM (bit-exact with ``fi_splitk`` at the same tile and split). Entries carry
   ``(vendored tactic, fi_splitk tactic)``; ``TLLM_K3_CUTE_GEMM_X5=0``, or a CuTe DSL older than 4.9, runs the second.
 
-An input that is a live ``TLLM_K3_FGS=lamport`` edge slot (``kimi_k3_fgs.edges``) runs the report_valid consumer
-(``kimi_k3_fgs.splitk_gemm_fgs``) instead of the table entry and releases the slot.
+An operand that is a view of a live ``TLLM_K3_FGS=lamport`` edge slot (``kimi_k3_fgs.edges``) selects the
+fine-grained-sync build of the table entry's kernel at its tactic: an input slot the report_valid consumer (no
+``griddepcontrol.wait``; the slot is consumed), an output slot the producer roles (.pzo, trigger at entry; split-K
+stores whole 16 B chunks). ``rubin`` runs ``kimi_k3_fgs.dense_gemm_fgs``, split-K entries
+``kimi_k3_fgs.splitk_gemm_fgs``, ``fi_direct`` rows FlashInfer's default split-K tactic; a strided input at split-K
+rows runs the ``rubin`` build at ``_FGS_SMALL_TACTIC``.
 
 A shape without an entry runs the ``rubin`` backend under the TRT-LLM autotuner. Non-BF16 operands keep the
 cuBLAS matmul; empty problems launch nothing.
@@ -165,6 +169,10 @@ _FGS_TACTICS = (
     (16, (64, 16, 3, 5), True),
     (32, (64, 32, 3, 8), False),
 )
+# Fine-grained-sync ``rubin`` builds where the table has no ``rubin`` tactic: decode rows (also strided inputs at
+# split-K rows, which the stock path autotunes) and prefill rows.
+_FGS_SMALL_TACTIC = ("base", False, (64, 128), (1, 1), 0, 1)
+_FGS_LARGE_TACTIC = ("base", True, (256, 256), (2, 1), 0, 1)
 
 
 @functools.lru_cache(maxsize=None)
@@ -219,6 +227,81 @@ def _fgs_consume(x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor) -> No
         )
 
 
+def _debug(site: str, m: int, path: str) -> None:
+    from .kimi_k3_fgs import edges as fgs_edges
+
+    if fgs_edges.DEBUG:
+        fgs_edges.debug(site, m, path)
+
+
+def _fgs_leases(*tensors):
+    """The live edge lease each tensor is a view of (None each when no edge is live)."""
+    from .kimi_k3_fgs import edges as fgs_edges
+
+    return tuple(fgs_edges.lease_containing(t) for t in tensors)
+
+
+def _fgs_rubin(x3, w3, out3, tactic, consume: bool, produce: bool) -> None:
+    from .kimi_k3_fgs.dense_gemm_fgs import run_gemm_fgs
+
+    if tactic is None:
+        tactic = _FGS_SMALL_TACTIC if x3.shape[1] <= 64 else _FGS_LARGE_TACTIC
+    run_gemm_fgs(
+        x3,
+        w3,
+        out3,
+        tactic,
+        report_valid=consume,
+        retry_warp=consume,
+        wait_input=not consume,
+        pzo=produce,
+        early_trigger=produce,
+        use_pdl=_pdl(),
+    )
+
+
+def _fgs_linear(x, weight, out, consume: bool, produce: bool) -> None:
+    """``linear`` on edge-slot operands: the fine-grained-sync build of the table entry's kernel."""
+    from .kimi_k3_fgs.splitk_gemm_fgs import SplitKTactic, default_tactic, run_splitk_dense_fgs
+
+    m, k = x.shape
+    n = weight.shape[0]
+    dense = _row_major(x) and _row_major(out)
+    # The decode o_proj consumer; prefill rows take the table's GEMM below.
+    if consume and not produce and dense and n == 7168 and k == 12288 and m <= 2 * _FI_MAX_M:
+        _fgs_consume(x, weight, out)
+        return
+    backend, tactic = _select(_GEMM_TABLE.get((n, k)), m)
+    if backend == "rubin" or not dense:
+        if backend != "rubin":
+            tactic = _FGS_SMALL_TACTIC
+        _fgs_rubin(x.unsqueeze(0), weight.unsqueeze(0), out.unsqueeze(0), tactic, consume, produce)
+        return
+    exact = backend == "vsplitk"
+    for r in range(0, m, _FI_MAX_M):
+        rows = min(_FI_MAX_M, m - r)
+        if backend == "fi_direct":
+            launch_tactic = default_tactic(rows, n, k)
+        else:
+            launch_tactic = SplitKTactic(*(tactic[0] if exact else tactic))
+        run_splitk_dense_fgs(
+            x[r : r + rows],
+            weight.t(),
+            None,
+            out[r : r + rows],
+            _pdl(),
+            launch_tactic,
+            report_valid=consume,
+            retry_warp=consume,
+            pdl_wait_activation=not consume,
+            exact_smem=exact,
+            smem_carveout=_VSPLITK_CARVEOUT if exact else None,
+            pzo=produce,
+            early_trigger=produce,
+            store16=produce,
+        )
+
+
 def linear(
     x: torch.Tensor, weight: torch.Tensor, out: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
@@ -237,17 +320,19 @@ def linear(
     if m == 0 or n == 0:
         return out
     dense = _row_major(x) and _row_major(out)
-    if dense and n == 7168 and k == 12288:
+    in_lease, out_lease = _fgs_leases(x, out)
+    if in_lease is not None or out_lease is not None:
         from .kimi_k3_fgs import edges as fgs_edges
 
-        lease = fgs_edges.lease_for(x)
-        if lease is not None:
-            _fgs_consume(x, weight, out)
-            fgs_edges.release(lease)
-            return out
+        _fgs_linear(x, weight, out, in_lease is not None, out_lease is not None)
+        _debug(f"linear N={n} K={k}", m, f"fgs consume={in_lease is not None} produce={out_lease is not None}")
+        if in_lease is not None:
+            fgs_edges.consumed(in_lease)
+        return out
     backend, tactic = _select(_GEMM_TABLE.get((n, k)), m)
     if backend == "vsplitk" and not _x5():
         backend, tactic = "fi_splitk", tactic[1]
+    _debug(f"linear N={n} K={k}", m, f"{backend} {tactic}{'' if dense else ' strided'} pdl={_pdl()}")
     if backend == "fi_direct" and dense:
         from flashinfer.gemm.kernels.dense_bf16_gemm_direct import DirectTactic, run_direct_dense
 
@@ -327,6 +412,16 @@ def bmm(x: torch.Tensor, weight: torch.Tensor, out: Optional[torch.Tensor] = Non
         linear(x[0], weight.view(b * n, k), out.transpose(0, 1).view(m, b * n))
         return out
     _, tactic = _select(_BMM_TABLE.get((b, n, k)), m)
+    in_lease, out_lease = _fgs_leases(x, out)
+    if in_lease is not None or out_lease is not None:
+        from .kimi_k3_fgs import edges as fgs_edges
+
+        _fgs_rubin(x, weight, out, tactic, in_lease is not None, out_lease is not None)
+        _debug(f"bmm B={b} N={n} K={k}", m, f"fgs consume={in_lease is not None} produce={out_lease is not None}")
+        if in_lease is not None:
+            fgs_edges.consumed(in_lease)
+        return out
+    _debug(f"bmm B={b} N={n} K={k}", m, f"rubin {tactic}")
     _run_bmm(x, weight, out, tactic)
     return out
 
