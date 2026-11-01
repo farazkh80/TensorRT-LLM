@@ -8,6 +8,8 @@ inputs, and requires the CuTe error against an fp64 reference to be no worse tha
 KimiK3RMSNorm rounding, and ATen add + ``attn_res_fwd`` + ``RMSNorm`` for the FlashInfer rounding.
 """
 
+import functools
+
 import pytest
 import torch
 
@@ -15,7 +17,7 @@ from tensorrt_llm._torch.modules.kimi_k3_attn_res.attn_res_mix_cute import (
     attn_res_mix,
     default_config,
     is_attn_res_mix_cute_available,
-    make_fgs_workspace,
+    make_fgs_counters,
 )
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
@@ -198,7 +200,7 @@ def test_non_default_configs(num_tokens, num_candidates, config, grid_x) -> None
     )
 
 
-def _fgs_call(x, attn, add, workspace, **kwargs):
+def _fgs_call(x, attn, add, counters, **kwargs):
     out = torch.empty_like(x["prefix"])
     updated = torch.empty_like(x["prefix"]) if add else None
     return attn_res_mix(
@@ -213,12 +215,12 @@ def _fgs_call(x, attn, add, workspace, **kwargs):
         out=out,
         updated=updated,
         fgs_consumer=True,
-        fgs_workspace=workspace,
+        fgs_counters=counters,
         **kwargs,
     )
 
 
-def _default_call(x, attn, add):
+def _default_call(x, attn, add, **kwargs):
     return attn_res_mix(
         x["prefix"] if add else attn,
         x["bank"],
@@ -228,6 +230,7 @@ def _default_call(x, attn, add):
         addend=attn if add else None,
         out_norm_weight=x["out_w"],
         out_norm_eps=EPS,
+        **kwargs,
     )
 
 
@@ -235,32 +238,43 @@ def _as_tuple(result):
     return result if isinstance(result, tuple) else (result,)
 
 
-@pytest.mark.parametrize("fgs_claim,fgs_ctas", [(4, 0), (1, 0), (8, 64)])
+@functools.lru_cache(maxsize=None)
+def _sleep_cycles_per_us() -> float:
+    torch.cuda._sleep(1_000_000)
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start.record()
+    torch.cuda._sleep(10_000_000)
+    end.record()
+    end.synchronize()
+    return 10_000_000 / (start.elapsed_time(end) * 1e3)
+
+
 @pytest.mark.parametrize("add", [True, False], ids=["add_norm", "snapshot_norm"])
-@pytest.mark.parametrize("num_tokens,num_candidates", [(300, 2), (300, 7), (8192, 9)])
+@pytest.mark.parametrize(
+    "num_tokens,num_candidates", [(1, 2), (16, 9), (64, 5), (300, 2), (300, 7), (8192, 9)]
+)
 @torch.no_grad()
-def test_fgs_consumer_ready_input_matches_default(
-    num_tokens, num_candidates, add, fgs_claim, fgs_ctas
-) -> None:
+def test_fgs_consumer_ready_input_matches_default(num_tokens, num_candidates, add) -> None:
     x = _inputs(num_tokens, num_candidates, seed=3)
     attn = x["addend"] if add else x["prefix"]
-    workspace = make_fgs_workspace()
-    got = _fgs_call(x, attn, add, workspace, fgs_claim=fgs_claim, fgs_ctas=fgs_ctas)
+    counters = make_fgs_counters()
+    got = _fgs_call(x, attn, add, counters)
     ref = _default_call(x, attn, add)
     for a, b in zip(_as_tuple(got), _as_tuple(ref)):
         assert torch.equal(a, b)
-    assert workspace.tolist() == [0] * 8, "counters must return to 0 and nothing may be re-read"
+    assert counters.tolist() == [0] * 4, "ready input must never be re-read"
 
 
 @pytest.mark.parametrize("order", ["forward", "reverse", "random"])
 @pytest.mark.parametrize("add", [True, False], ids=["add_norm", "snapshot_norm"])
+@pytest.mark.parametrize("num_tokens,block", [(64, 8), (1024, 128)], ids=["reg", "pipe"])
 @torch.no_grad()
-def test_fgs_consumer_late_rows_match_default(add: bool, order: str) -> None:
-    """The attention output starts as -0.0 sentinels and is published in 128-row blocks from another stream."""
-    num_tokens, block = 1024, 128
+def test_fgs_consumer_late_rows_match_default(num_tokens: int, block: int, add: bool, order: str):
+    """The attention output starts as -0.0 sentinels and is published block by block from another stream."""
     x = _inputs(num_tokens, 3, seed=4)
     attn = x["addend"] if add else x["prefix"]
     ref = _default_call(x, attn, add)
+    _fgs_call(x, attn, add, make_fgs_counters())
     blocks = list(range(num_tokens // block))
     if order == "reverse":
         blocks.reverse()
@@ -271,38 +285,43 @@ def test_fgs_consumer_late_rows_match_default(add: bool, order: str) -> None:
         ]
     buf = torch.empty_like(attn)
     buf.view(torch.int16).fill_(-32768)
+    counters = make_fgs_counters()
+    rate = _sleep_cycles_per_us()
+    torch.cuda.synchronize()
+    # Hold both streams until everything is queued, so the consumer really starts before the rows land.
+    torch.cuda._sleep(int(2000 * rate))
     ready = torch.cuda.Event()
     ready.record()
     producer, consumer = torch.cuda.Stream(), torch.cuda.Stream()
-    workspace = make_fgs_workspace()
-    cycles = int(20e-6 * torch.cuda.get_device_properties(0).clock_rate * 1e3)
     with torch.cuda.stream(producer):
         producer.wait_event(ready)
         for b in blocks:
-            torch.cuda._sleep(cycles)
+            torch.cuda._sleep(int(20 * rate))
             buf[b * block : (b + 1) * block].copy_(attn[b * block : (b + 1) * block])
     with torch.cuda.stream(consumer):
         consumer.wait_event(ready)
-        got = _fgs_call(x, buf, add, workspace)
+        got = _fgs_call(x, buf, add, counters)
     torch.cuda.synchronize()
     for a, b in zip(_as_tuple(got), _as_tuple(ref)):
         assert torch.equal(a, b)
-    counters = workspace.tolist()
-    assert counters[:4] == [0] * 4 and counters[5] == 0
+    waits, rounds, fallbacks, _ = counters.tolist()
+    assert waits > 0 and rounds >= waits, counters.tolist()
+    assert fallbacks == 0
 
 
 @pytest.mark.parametrize("mode", ["graph", "eager"])
+@pytest.mark.parametrize("num_tokens", [64, 1024], ids=["reg", "pipe"])
 @torch.no_grad()
-def test_fgs_consumer_back_to_back_calls_share_workspace(mode: str) -> None:
-    """24 launches on one workspace without a reset in between, replayed 3 times when captured in a graph."""
-    num_tokens, calls, replays = 1024, 24, 3
+def test_fgs_consumer_back_to_back_calls(num_tokens: int, mode: str) -> None:
+    """24 consumers back to back: without the PDL wait each may start while the previous one still runs."""
+    calls, replays = 24, 3
     inputs = [_inputs(num_tokens, 3, seed=10 + i) for i in range(2)]
     refs = [_default_call(x, x["addend"], True) for x in inputs]
     outs = [
         (torch.empty_like(inputs[0]["prefix"]), torch.empty_like(inputs[0]["prefix"]))
         for _ in range(calls)
     ]
-    workspace = make_fgs_workspace()
+    counters = make_fgs_counters()
 
     def run():
         for i, (updated, out) in enumerate(outs):
@@ -319,7 +338,7 @@ def test_fgs_consumer_back_to_back_calls_share_workspace(mode: str) -> None:
                 out=out,
                 updated=updated,
                 fgs_consumer=True,
-                fgs_workspace=workspace,
+                fgs_counters=counters,
             )
 
     run()
@@ -339,16 +358,36 @@ def test_fgs_consumer_back_to_back_calls_share_workspace(mode: str) -> None:
         for i, got in enumerate(outs):
             for a, b in zip(got, refs[i % 2]):
                 assert torch.equal(a, b), f"call {i}"
-        assert workspace.tolist() == [0] * 8
+    assert counters.tolist() == [0] * 4
+
+
+@pytest.mark.parametrize("norm", [True, False], ids=["norm", "mix"])
+@pytest.mark.parametrize("num_tokens", [1, 16, 64])
+@torch.no_grad()
+def test_fgs_producer_matches_default_without_negative_zero(num_tokens: int, norm: bool) -> None:
+    """Columns where every input is -0.0 come out as -0.0 by default; the producer build writes +0.0."""
+    x = _inputs(num_tokens, 4, seed=6)
+    for key in ("prefix", "addend"):
+        x[key][:, :64] = -0.0
+    x["bank"][:, :, :64] = -0.0
+    kwargs = dict(out_norm_weight=x["out_w"] if norm else None)
+    args = (x["prefix"], x["bank"], x["res_w"], x["rms_w"], EPS)
+    ref = attn_res_mix(*args, addend=x["addend"], out_norm_eps=EPS, **kwargs)
+    got = attn_res_mix(*args, addend=x["addend"], out_norm_eps=EPS, fgs_producer=True, **kwargs)
+    for a, b in zip(got, ref):
+        assert torch.equal(a, b)
+        assert (b.view(torch.int16) == -32768).any(), "the inputs must produce -0.0 by default"
+        assert not (a.view(torch.int16) == -32768).any()
 
 
 @pytest.mark.parametrize("num_tokens", [16, 300, 8192])
 @torch.no_grad()
 def test_fgs_build_leaves_default_dispatch_intact(num_tokens: int) -> None:
-    """The FGS build has its own host entry; the default one must keep its argument list and results."""
+    """The FGS builds have their own host entries; the default one must keep its argument list and results."""
     x = _inputs(num_tokens, 5, seed=5)
-    if num_tokens > 64:
-        _fgs_call(x, x["addend"], True, make_fgs_workspace())
+    _fgs_call(x, x["addend"], True, make_fgs_counters())
+    if num_tokens <= 64:
+        _default_call(x, x["addend"], True, fgs_producer=True)
     updated, out = attn_res_mix(
         x["prefix"],
         x["bank"],
