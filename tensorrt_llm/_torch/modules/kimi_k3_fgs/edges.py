@@ -20,6 +20,7 @@ output slot its producer build (.pzo, trigger at entry). A slot acquired with
 PDL chain of slot edges (``kda_chain``): pre-attention mix -> x_norm -> [f_a | b]
 and qkvg GEMMs -> f_b GEMM -> KdaDecodeT1 -> o_proj -> pre-MoE mix. The MoE input
 stays a plain buffer. ``chain_after`` launches [f_a | b] and f_b behind qkvg instead of ahead of it.
+Both chain modes also run each decode MLA layer as one chain (``mla_chain``), with its own row window.
 
 Modules ``declare`` their edges at construction, once per layer. The model
 forward runs under ``model_scope``, which registers the declared edges on first
@@ -50,6 +51,8 @@ MAX_ROWS = int(os.environ.get("TLLM_K3_FGS_MAX_ROWS", "16"))
 
 # Edge name -> (row width, layers that declared it).
 _declared: Dict[str, Tuple[int, Set[int]]] = {}
+# Edge name -> slot rows, when a declaring module's row window ends above MAX_ROWS.
+_rows: Dict[str, int] = {}
 _local = threading.local()
 
 
@@ -74,13 +77,15 @@ def producer_early() -> bool:
     return mode() != "off"
 
 
-def declare(name: str, width: int, layer_idx: int) -> None:
+def declare(name: str, width: int, layer_idx: int, max_rows: Optional[int] = None) -> None:
     """Declare a [rows, width] bf16 edge used once per step by ``layer_idx``.
 
-    Registered by the next ``model_scope`` outside capture.
+    Registered by the next ``model_scope`` outside capture, with ``max(MAX_ROWS, max_rows)`` slot rows.
     """
     if slots():
         _declared.setdefault(name, (width, set()))[1].add(layer_idx)
+        if max_rows is not None and max_rows > _rows.get(name, MAX_ROWS):
+            _rows[name] = max_rows
 
 
 def _state():
@@ -90,6 +95,7 @@ def _state():
         _local.workspaces = EdgeWorkspaces.from_env()
         _local.live = {}
         _local.readers = {}
+        _local.step = {}
     return _local.workspaces, _local.live
 
 
@@ -111,7 +117,7 @@ def model_scope() -> Iterator[None]:
         for name in missing:
             width, layers = _declared[name]
             num_slots = len(layers) if per_step else 2
-            workspaces.workspace(name, (MAX_ROWS, width), torch.bfloat16, slots=num_slots)
+            workspaces.workspace(name, (_rows.get(name, MAX_ROWS), width), torch.bfloat16, slots=num_slots)
         logger.info(f"{ENV}=lamport: edge slots {workspaces.ledger()}")
     elif missing:
         logger.warning_once(
@@ -126,15 +132,24 @@ def model_scope() -> Iterator[None]:
     finally:
         _local.live.clear()
         _local.readers.clear()
+        _local.step.clear()
 
 
-def acquire(name: str, rows: int, readers: int = 1):
+def step_cache() -> dict:
+    """Scratch dict of the open ``model_scope`` (cleared when it closes): work done once per forward."""
+    _state()
+    return _local.step
+
+
+def acquire(name: str, rows: int, readers: int = 1, window: Optional[Tuple[int, int]] = None):
     """The next armed slot of ``name`` truncated to ``rows``, or None to keep the producer's own buffer.
 
-    The slot is released after ``readers`` consuming launches (``consumed``). Slots are handed out only while
-    ``kimi_k3_cute_gemm`` is on, which consumes every GEMM input slot.
+    ``window`` is the (min, max) row range the edge serves (default ``MIN_ROWS``, ``MAX_ROWS``). The slot is released
+    after ``readers`` consuming launches (``consumed``). Slots are handed out only while ``kimi_k3_cute_gemm`` is on,
+    which consumes every GEMM input slot.
     """
-    if not slots() or not MIN_ROWS <= rows <= MAX_ROWS or not hasattr(_local, "workspaces"):
+    low, high = (MIN_ROWS, MAX_ROWS) if window is None else window
+    if not slots() or not low <= rows <= high or not hasattr(_local, "workspaces"):
         return None
     from .. import kimi_k3_cute_gemm
 
