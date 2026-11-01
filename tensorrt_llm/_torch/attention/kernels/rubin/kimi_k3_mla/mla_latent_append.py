@@ -303,7 +303,9 @@ def _latent_append_kernel(
                     + cutlass.Int64(latent)
                     + cutlass.Int64(v * cutlass.Int32(VEC))
                 )
-                fused_q.store(qpe.load(src, VEC, alignment=16), idx=dst, vector_size=VEC, alignment=16)
+                fused_q.store(
+                    qpe.load(src, VEC, alignment=16), idx=dst, vector_size=VEC, alignment=16
+                )
         elif bidx < ctas_q + ctas_kv:
             gid = (bidx - ctas_q) * cutlass.Int32(THREADS) + tidx
             if gid < num_tokens * cutlass.Int32(row_vecs):
@@ -323,7 +325,8 @@ def _latent_append_kernel(
                     if v < cutlass.Int32(latent_vecs):
                         pool.store(
                             ckv.load(
-                                cutlass.Int64(t) * ckv_stride + cutlass.Int64(v * cutlass.Int32(VEC)),
+                                cutlass.Int64(t) * ckv_stride
+                                + cutlass.Int64(v * cutlass.Int32(VEC)),
                                 VEC,
                                 alignment=16,
                             ),
@@ -335,7 +338,9 @@ def _latent_append_kernel(
                         pool.store(
                             kpe.load(
                                 cutlass.Int64(t) * kpe_stride
-                                + cutlass.Int64((v - cutlass.Int32(latent_vecs)) * cutlass.Int32(VEC)),
+                                + cutlass.Int64(
+                                    (v - cutlass.Int32(latent_vecs)) * cutlass.Int32(VEC)
+                                ),
                                 VEC,
                                 alignment=16,
                             ),
@@ -345,7 +350,9 @@ def _latent_append_kernel(
                         )
         elif bidx < ctas_q + ctas_kv + ctas_pt:
             if cutlass.const_expr(write_pt):
-                _write_page_table(mPtIn, mPtOut, batch, ctas_q + ctas_kv, max_blocks, pt_in_stride, page_offset)
+                _write_page_table(
+                    mPtIn, mPtOut, batch, ctas_q + ctas_kv, max_blocks, pt_in_stride, page_offset
+                )
         else:
             if cutlass.const_expr(write_meta):
                 _write_meta(mKvLens, mCuQ, mCuKv, mCounter, batch, seq_len_q, num_heads)
@@ -716,7 +723,9 @@ def mla_decode_page_table(
             (max_blocks, batch), (1, max_blocks), dtype=torch.int32, device=page_table_rows.device
         )
     elif page_table_out.dtype != torch.int32 or page_table_out.stride() != (1, max_blocks):
-        raise ValueError("page_table_out must be int32 [max_blocks, B] with strides (1, max_blocks)")
+        raise ValueError(
+            "page_table_out must be int32 [max_blocks, B] with strides (1, max_blocks)"
+        )
     pt = page_table_rows.data_ptr()
     addrs = (base, base, base, base, base, pt, pt, page_table_out.data_ptr(), pt, pt, pt, pt)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)

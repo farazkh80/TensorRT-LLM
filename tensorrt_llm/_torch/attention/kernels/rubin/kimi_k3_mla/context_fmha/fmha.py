@@ -1876,10 +1876,12 @@ class BlackwellFusedMultiHeadAttentionForward:
             seqlen_k = mK_kdl.shape[0]
             if cutlass.const_expr(cum_seqlen_q is not None):
                 seqlen_q = cum_seqlen_q[batch_coord + 1] - cum_seqlen_q[batch_coord]
-                continue_cond = not fmha_utils.FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
-                    self.cta_tiler[0],
-                    curr_block_coord[0],
-                    seqlen_q,
+                continue_cond = (
+                    not fmha_utils.FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
+                        self.cta_tiler[0],
+                        curr_block_coord[0],
+                        seqlen_q,
+                    )
                 )
             if not continue_cond:
                 if cutlass.const_expr(cum_seqlen_k is not None):
@@ -1890,10 +1892,16 @@ class BlackwellFusedMultiHeadAttentionForward:
                 mK_kdl_ = mK_kdl
                 mV_dkl_ = mV_dkl
                 if cutlass.const_expr(cum_seqlen_q is not None):
-                    mQ_qdl_ = cute.domain_offset((cum_seqlen_q[batch_coord], 0, ((0, 0), 0)), mQ_qdl)
+                    mQ_qdl_ = cute.domain_offset(
+                        (cum_seqlen_q[batch_coord], 0, ((0, 0), 0)), mQ_qdl
+                    )
                 if cutlass.const_expr(cum_seqlen_k is not None):
-                    mK_kdl_ = cute.domain_offset((cum_seqlen_k[batch_coord], 0, ((0, 0), 0)), mK_kdl)
-                    mV_dkl_ = cute.domain_offset((0, cum_seqlen_k[batch_coord], ((0, 0), 0)), mV_dkl)
+                    mK_kdl_ = cute.domain_offset(
+                        (cum_seqlen_k[batch_coord], 0, ((0, 0), 0)), mK_kdl
+                    )
+                    mV_dkl_ = cute.domain_offset(
+                        (0, cum_seqlen_k[batch_coord], ((0, 0), 0)), mV_dkl
+                    )
                 gQ_qdl = cute.flat_divide(mQ_qdl_, cute.select(self.qk_mma_tiler, mode=[0, 2]))
                 tQsQ, tQgQ_qdl = cute.nvgpu.cpasync.tma_partition(
                     tma_atom_q,

@@ -65,9 +65,7 @@ def _v4(asm, addr, side_effects, constraints, loc, ip):
 @dsl_user_op
 def ld_cg_v4(addr, *, loc=None, ip=None):
     """16-byte ``ld.global.cg`` as four int32 (first load of an FGS chunk)."""
-    return _v4(
-        "ld.global.cg.v4.b32 {$0, $1, $2, $3}, [$4];", addr, False, "=r,=r,=r,=r,l", loc, ip
-    )
+    return _v4("ld.global.cg.v4.b32 {$0, $1, $2, $3}, [$4];", addr, False, "=r,=r,=r,=r,l", loc, ip)
 
 
 @dsl_user_op
@@ -249,7 +247,14 @@ def nanosleep(ns, *, loc=None, ip=None):
 @dsl_user_op
 def trap(*, loc=None, ip=None):
     llvm.inline_asm(
-        None, [], "trap;", "", has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip
+        None,
+        [],
+        "trap;",
+        "",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -266,7 +271,9 @@ def words_pending(words, base, f32: bool):
 
 
 @cute.jit
-def load_chunks(words: cute.Tensor, addrs: cute.Tensor, n: cutlass.Constexpr, active: cutlass.Boolean):
+def load_chunks(
+    words: cute.Tensor, addrs: cute.Tensor, n: cutlass.Constexpr, active: cutlass.Boolean
+):
     """First load of ``n`` 16-B chunks into the int32 rmem tensor ``words`` (4 per chunk); inactive lanes load
     nothing and hold zeros, so they never count as pending."""
     for c in cutlass.range_constexpr(4 * n):

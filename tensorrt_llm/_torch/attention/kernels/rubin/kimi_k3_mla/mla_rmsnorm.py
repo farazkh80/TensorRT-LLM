@@ -42,9 +42,25 @@ import torch
 from cutlass import Float32, Int32, Int64
 
 try:
-    from .mla_fgs import SPIN_NS_MAX, SPIN_NS_MIN, STATS_LEN, any_pending, bf16x2_pzo, nanosleep, trap
+    from .mla_fgs import (
+        SPIN_NS_MAX,
+        SPIN_NS_MIN,
+        STATS_LEN,
+        any_pending,
+        bf16x2_pzo,
+        nanosleep,
+        trap,
+    )
 except ImportError:
-    from mla_fgs import SPIN_NS_MAX, SPIN_NS_MIN, STATS_LEN, any_pending, bf16x2_pzo, nanosleep, trap
+    from mla_fgs import (
+        SPIN_NS_MAX,
+        SPIN_NS_MIN,
+        STATS_LEN,
+        any_pending,
+        bf16x2_pzo,
+        nanosleep,
+        trap,
+    )
 
 COPY_BITS = 128
 
@@ -290,7 +306,9 @@ class MlaRMSNormKernel:
             cute.arch.cp_async_wait_group(0)
             cute.autovec_copy(tXsX, tXrX)
         elif cutlass.const_expr(self.fgs_consumer):
-            self._load_x_fgs(mStats, tXgX, tXrX, tXpX, tWgW, tWrW, tWpW, copy_atom_sync, row_in_bounds)
+            self._load_x_fgs(
+                mStats, tXgX, tXrX, tXpX, tWgW, tWrW, tWpW, copy_atom_sync, row_in_bounds
+            )
         else:
             tXrX.store(cute.zeros_like(tXrX, dtype=mX.element_type))
             if row_in_bounds:
@@ -406,7 +424,16 @@ def _compiled(
     stats = cute.runtime.make_fake_compact_tensor(Int32, (STATS_LEN,), assumed_align=4)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     return cute.compile(
-        kernel, x, w, y, stats, Int64(1), Float32(1e-6), enable_pdl, stream, options="--enable-tvm-ffi"
+        kernel,
+        x,
+        w,
+        y,
+        stats,
+        Int64(1),
+        Float32(1e-6),
+        enable_pdl,
+        stream,
+        options="--enable-tvm-ffi",
     )
 
 
@@ -433,7 +460,12 @@ def mla_rmsnorm(
     ``fgs_consumer`` / ``fgs_producer``: see the module docstring; ``fgs_stats`` (int32 [4]) accumulates the
     consumer's reload sweeps / waiting warps; ``fgs_spin_limit`` > 0 traps after that many sweeps (diagnostic).
     """
-    if x.dim() != 2 or out.shape != x.shape or x.dtype != torch.bfloat16 or out.dtype != torch.bfloat16:
+    if (
+        x.dim() != 2
+        or out.shape != x.shape
+        or x.dtype != torch.bfloat16
+        or out.dtype != torch.bfloat16
+    ):
         raise ValueError("mla_rmsnorm needs 2-D bf16 x / out of equal shape")
     M, H = x.shape
     if x.stride(1) != 1 or out.stride(1) != 1 or x.data_ptr() % 16 or out.data_ptr() % 16:

@@ -70,7 +70,6 @@ import cutlass.cute as cute
 import cutlass.cute.nvgpu.cpasync as cpasync
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
-from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
@@ -306,17 +305,25 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         self._fgs_red = fgs_reduction or pdl_early
         if self._fgs_split or self._fgs_red:
             if self.is_var_q or self.emit_softmax_stats:
-                raise ValueError("FGS MLA decode supports fixed-Q decode without softmax stats only")
+                raise ValueError(
+                    "FGS MLA decode supports fixed-Q decode without softmax stats only"
+                )
             if self.is_persistent and fgs_consumer:
                 raise ValueError("FGS MLA decode consumer supports the non-persistent grid only")
         if fgs_partials not in ("lse", "all"):
             raise ValueError(f"fgs_partials must be 'lse' or 'all', got {fgs_partials!r}")
         if fgs_consumer and getattr(pipeline, "PipelineTmaUmmaRetry", None) is None:
-            raise ValueError("fgs_consumer needs a CuTe DSL with TMA report_valid (PipelineTmaUmmaRetry)")
+            raise ValueError(
+                "fgs_consumer needs a CuTe DSL with TMA report_valid (PipelineTmaUmmaRetry)"
+            )
         if fgs_reduction and "split" in self.fgs_launch and not fgs_producer:
-            raise ValueError("fgs_reduction reads sentinel-checked partials: the split kernel needs fgs_producer")
+            raise ValueError(
+                "fgs_reduction reads sentinel-checked partials: the split kernel needs fgs_producer"
+            )
         if fgs_stats and not (fgs_consumer or fgs_reduction):
-            raise ValueError("fgs_stats counts consumer waits: enable fgs_consumer or fgs_reduction")
+            raise ValueError(
+                "fgs_stats counts consumer waits: enable fgs_consumer or fgs_reduction"
+            )
 
     @cute.jit
     def __call__(
@@ -338,8 +345,25 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         output_scale: cutlass.Float32,
         stream: cuda.CUstream,
     ):
-        self.run_fgs(q_latent, q_rope, c_latent, c_rope, page_table, o, lse, workspace, split_kv, cache_seqs,
-                     kv_bounds, cum_seq_lens_q, block_split_kvs, softmax_scale, output_scale, None, stream)
+        self.run_fgs(
+            q_latent,
+            q_rope,
+            c_latent,
+            c_rope,
+            page_table,
+            o,
+            lse,
+            workspace,
+            split_kv,
+            cache_seqs,
+            kv_bounds,
+            cum_seq_lens_q,
+            block_split_kvs,
+            softmax_scale,
+            output_scale,
+            None,
+            stream,
+        )
 
     @cute.jit
     def run_fgs(
@@ -368,8 +392,25 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
             stats = None
         self._fgs_c_latent = c_latent
         self._fgs_stats_tensor = stats
-        self._run(q_latent, q_rope, c_latent, c_rope, page_table, o, lse, None, workspace, split_kv, cache_seqs,
-                  kv_bounds, cum_seq_lens_q, block_split_kvs, softmax_scale, output_scale, stream)
+        self._run(
+            q_latent,
+            q_rope,
+            c_latent,
+            c_rope,
+            page_table,
+            o,
+            lse,
+            None,
+            workspace,
+            split_kv,
+            cache_seqs,
+            kv_bounds,
+            cum_seq_lens_q,
+            block_split_kvs,
+            softmax_scale,
+            output_scale,
+            stream,
+        )
 
     def split_kv_kernel(self, *args):
         if "split" not in self.fgs_launch:
@@ -377,7 +418,9 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         if not self._fgs_split:
             return _Base.split_kv_kernel(self, *args)
         extra = _EXTRA_SMEM if self.fgs_consumer else 0
-        return _PdlLaunch(self._fgs_split_kv_kernel(*args, self._fgs_c_latent, self._fgs_stats_tensor), extra)
+        return _PdlLaunch(
+            self._fgs_split_kv_kernel(*args, self._fgs_c_latent, self._fgs_stats_tensor), extra
+        )
 
     def reduction_kernel(self, *args):
         if "reduction" not in self.fgs_launch:
@@ -510,37 +553,55 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
             self.load_kv_stage,
             self.tma_copy_kc_bytes,
         )
-        mma_s_pipeline = self.make_and_init_mma_s_pipeline(storage.mma_s_mbar_ptr.data_ptr(), cta_layout_vmnk)
-        p_mma_pipeline = self.make_and_init_p_mma_pipeline(storage.p_mma_mbar_ptr.data_ptr(), cta_layout_vmnk)
+        mma_s_pipeline = self.make_and_init_mma_s_pipeline(
+            storage.mma_s_mbar_ptr.data_ptr(), cta_layout_vmnk
+        )
+        p_mma_pipeline = self.make_and_init_p_mma_pipeline(
+            storage.p_mma_mbar_ptr.data_ptr(), cta_layout_vmnk
+        )
         p_cor_pipeline = self.make_and_init_p_cor_pipeline(storage.p_cor_mbar_ptr.data_ptr())
-        mma_o_pipeline = self.make_and_init_mma_o_pipeline(storage.mma_o_mbar_ptr.data_ptr(), cta_layout_vmnk)
+        mma_o_pipeline = self.make_and_init_mma_o_pipeline(
+            storage.mma_o_mbar_ptr.data_ptr(), cta_layout_vmnk
+        )
         load_pt_pipeline = self.make_and_init_load_pt_pipeline(storage.load_pt_mbar_ptr.data_ptr())
 
         if cutlass.const_expr(self.fgs_consumer):
             if warp_idx == self.empty_warp_ids[0]:
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_init(fgs_storage.msg_mbar.data_ptr(), 1)
-                    cute.arch.mbarrier_init(fgs_storage.msg_mbar.data_ptr() + 1, self.threads_per_warp)
+                    cute.arch.mbarrier_init(
+                        fgs_storage.msg_mbar.data_ptr() + 1, self.threads_per_warp
+                    )
 
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mnk, is_relaxed=True)
 
         sQ = storage.smem_q_latent.get_tensor(
-            q_latent_smem_layout_staged.outer, swizzle=q_latent_smem_layout_staged.inner)
+            q_latent_smem_layout_staged.outer, swizzle=q_latent_smem_layout_staged.inner
+        )
         sQ_rope = storage.smem_q_rope.get_tensor(
-            q_rope_smem_layout_staged.outer, swizzle=q_rope_smem_layout_staged.inner)
-        sKC = storage.smem_kc.get_tensor(kc_smem_layout_staged.outer, swizzle=kc_smem_layout_staged.inner)
+            q_rope_smem_layout_staged.outer, swizzle=q_rope_smem_layout_staged.inner
+        )
+        sKC = storage.smem_kc.get_tensor(
+            kc_smem_layout_staged.outer, swizzle=kc_smem_layout_staged.inner
+        )
         sKC_for_tma = storage.smem_kc.get_tensor(
-            kc_smem_layout_for_tma.outer, swizzle=kc_smem_layout_for_tma.inner)
+            kc_smem_layout_for_tma.outer, swizzle=kc_smem_layout_for_tma.inner
+        )
         sVC_ptr = cute.recast_ptr(sKC.iterator, vc_smem_layout_staged.inner)
         sVC = cute.make_tensor(sVC_ptr, vc_smem_layout_staged.outer)
         sVC_for_tma = cute.make_tensor(sVC_ptr, vc_smem_layout_for_tma.outer)
-        sP = storage.smem_p.get_tensor(p_smem_layout_staged.outer, swizzle=p_smem_layout_staged.inner)
+        sP = storage.smem_p.get_tensor(
+            p_smem_layout_staged.outer, swizzle=p_smem_layout_staged.inner
+        )
         sPT = storage.smem_page_table.get_tensor(
-            cute.make_layout((self.mma_qk_tiler[1] // 2, self.load_pt_stage)))
+            cute.make_layout((self.mma_qk_tiler[1] // 2, self.load_pt_stage))
+        )
         softmax_smem_exchange = storage.softmax_smem_exchange.get_tensor(
-            cute.make_layout(self.num_compute_warps * self.threads_per_warp))
+            cute.make_layout(self.num_compute_warps * self.threads_per_warp)
+        )
         epilogue_smem_exchange = storage.epilogue_smem_exchange.get_tensor(
-            cute.make_layout(self.num_compute_warps * self.threads_per_warp))
+            cute.make_layout(self.num_compute_warps * self.threads_per_warp)
+        )
 
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mnk)
 
@@ -572,14 +633,17 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         if warp_idx == self.load_pt_warp_id:
             cute.arch.setmaxregister_decrease(self.other_reg_num)
             load_pt_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.load_pt_stage)
+                pipeline.PipelineUserType.Producer, self.load_pt_stage
+            )
             tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
+                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+            )
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
                 k_index, k_tile_count, local_split_kv, _, _, _ = self.get_k_tile_count(
-                    split_kv, cache_seqs, cum_seq_lens_q, block_split_kvs, blk_coord)
+                    split_kv, cache_seqs, cum_seq_lens_q, block_split_kvs, blk_coord
+                )
                 if k_tile_count > 0:
                     load_pt_common_params = SimpleNamespace(
                         blk_coord=blk_coord,
@@ -594,30 +658,38 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
                     )
                     if cutlass.const_expr(self.fgs_consumer):
                         load_pt_producer_state = self._fgs_load_page_table(
-                            load_pt_common_params, k_index, k_tile_count, load_pt_producer_state)
+                            load_pt_common_params, k_index, k_tile_count, load_pt_producer_state
+                        )
                     else:
                         load_pt_producer_state = self.load_page_table(
-                            load_pt_common_params, k_index, k_tile_count, load_pt_producer_state)
+                            load_pt_common_params, k_index, k_tile_count, load_pt_producer_state
+                        )
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
             load_pt_pipeline.producer_tail(load_pt_producer_state)
         if warp_idx == self.load_tma_warp_id:
             cute.arch.setmaxregister_decrease(self.other_reg_num)
             load_q_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.load_q_stage)
+                pipeline.PipelineUserType.Producer, self.load_q_stage
+            )
             load_kv_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.load_kv_stage)
+                pipeline.PipelineUserType.Producer, self.load_kv_stage
+            )
             load_pt_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.load_pt_stage)
+                pipeline.PipelineUserType.Consumer, self.load_pt_stage
+            )
             load_pt_release_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.load_pt_stage)
+                pipeline.PipelineUserType.Consumer, self.load_pt_stage
+            )
             tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
+                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+            )
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
                 k_index, k_tile_count, local_split_kv, q_begin, _, _ = self.get_k_tile_count(
-                    split_kv, cache_seqs, cum_seq_lens_q, block_split_kvs, blk_coord)
+                    split_kv, cache_seqs, cum_seq_lens_q, block_split_kvs, blk_coord
+                )
                 if k_tile_count > 0:
                     tma_common_params = SimpleNamespace(
                         blk_coord=blk_coord,
@@ -679,22 +751,29 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             load_q_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.load_q_stage)
+                pipeline.PipelineUserType.Consumer, self.load_q_stage
+            )
             load_kv_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.load_kv_stage)
+                pipeline.PipelineUserType.Consumer, self.load_kv_stage
+            )
             mma_s_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.mma_s_stage)
+                pipeline.PipelineUserType.Producer, self.mma_s_stage
+            )
             p_mma_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.p_mma_stage)
+                pipeline.PipelineUserType.Consumer, self.p_mma_stage
+            )
             mma_o_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.mma_o_stage)
+                pipeline.PipelineUserType.Producer, self.mma_o_stage
+            )
             tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
+                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+            )
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
                 k_index, k_tile_count, local_split_kv, _, _, _ = self.get_k_tile_count(
-                    split_kv, cache_seqs, cum_seq_lens_q, block_split_kvs, blk_coord)
+                    split_kv, cache_seqs, cum_seq_lens_q, block_split_kvs, blk_coord
+                )
                 if k_tile_count > 0:
                     mma_common_params = SimpleNamespace(
                         blk_coord=blk_coord,
@@ -748,20 +827,25 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         if warp_idx >= self.compute_warp_ids[0] and warp_idx <= self.compute_warp_ids[-1]:
             cute.arch.setmaxregister_increase(self.softmax_reg_num)
             mma_s_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.mma_s_stage)
+                pipeline.PipelineUserType.Consumer, self.mma_s_stage
+            )
             p_mma_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.p_mma_stage)
+                pipeline.PipelineUserType.Producer, self.p_mma_stage
+            )
             p_cor_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.p_cor_stage)
+                pipeline.PipelineUserType.Producer, self.p_cor_stage
+            )
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
+                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+            )
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
                 k_index, k_tile_count, local_split_kv, q_begin, q_len, _ = self.get_k_tile_count(
-                    split_kv, cache_seqs, cum_seq_lens_q, block_split_kvs, blk_coord)
+                    split_kv, cache_seqs, cum_seq_lens_q, block_split_kvs, blk_coord
+                )
                 if k_tile_count > 0:
                     compute_common_params = SimpleNamespace(
                         blk_coord=blk_coord,
@@ -802,18 +886,24 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         if warp_idx >= self.correction_warp_ids[0] and warp_idx <= self.correction_warp_ids[-1]:
             cute.arch.setmaxregister_increase(self.correction_reg_num)
             p_cor_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.p_cor_stage)
+                pipeline.PipelineUserType.Consumer, self.p_cor_stage
+            )
             mma_o_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.mma_o_stage)
+                pipeline.PipelineUserType.Consumer, self.mma_o_stage
+            )
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
+                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+            )
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
-                k_index, k_tile_count, local_split_kv, q_begin, q_len, valid_q_rows = self.get_k_tile_count(
-                    split_kv, cache_seqs, cum_seq_lens_q, block_split_kvs, blk_coord)
+                k_index, k_tile_count, local_split_kv, q_begin, q_len, valid_q_rows = (
+                    self.get_k_tile_count(
+                        split_kv, cache_seqs, cum_seq_lens_q, block_split_kvs, blk_coord
+                    )
+                )
                 if k_tile_count > 0:
                     compute_common_params = SimpleNamespace(
                         blk_coord=blk_coord,
@@ -841,9 +931,12 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
                         mLSE=mLSE,
                     )
                     if cutlass.const_expr(self.is_var_split_kv and mAccO is not None):
-                        direct_common_params = SimpleNamespace(**{**vars(compute_common_params), "mAccO": None})
+                        direct_common_params = SimpleNamespace(
+                            **{**vars(compute_common_params), "mAccO": None}
+                        )
                         direct_epilogue_params = SimpleNamespace(
-                            **{**vars(compute_epilogue_params), "mAccLSE": None})
+                            **{**vars(compute_epilogue_params), "mAccLSE": None}
+                        )
                         if local_split_kv == 1:
                             p_cor_consumer_state, mma_o_consumer_state = self.correction(
                                 direct_common_params,
@@ -874,7 +967,9 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         return
 
     @cute.jit
-    def _fgs_q_partitions(self, p: SimpleNamespace, v: cutlass.Int32, q_tile: cutlass.Int32, batch: cutlass.Int32):
+    def _fgs_q_partitions(
+        self, p: SimpleNamespace, v: cutlass.Int32, q_tile: cutlass.Int32, batch: cutlass.Int32
+    ):
         """Q latent / rope TMA partitions of CTA ``v`` of the pair for one (q tile, request); see ``load_tma``."""
         gQL = cute.flat_divide(p.mQL, cute.select(self.mma_qk_tiler, mode=[0, 2]))
         gQR = cute.flat_divide(p.mQR, cute.select(self.mma_qk_rope_tiler, mode=[0, 2]))
@@ -901,7 +996,9 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
 
     @cute.jit
     def _fgs_reissue_q(self, p: SimpleNamespace, q_tile: cutlass.Int32, batch: cutlass.Int32):
-        tQLgQL, tQsQ, tQRgQR, tQsQ_rope = self._fgs_q_partitions(p, p.mma_tile_coord_v, q_tile, batch)
+        tQLgQL, tQsQ, tQRgQR, tQsQ_rope = self._fgs_q_partitions(
+            p, p.mma_tile_coord_v, q_tile, batch
+        )
         self._fgs_issue_q_tma_load(
             p.tma_atom_q_latent,
             tQLgQL,
@@ -933,16 +1030,20 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         q_full = q_pipe.sync_object_full.get_barrier(0)
         msg = p.msg
         tile_sched = create_mla_static_tile_scheduler(
-            p.tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
+            p.tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+        )
         work_tile = tile_sched.initial_work_tile_info()
-        q_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.load_q_stage)
+        q_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.load_q_stage
+        )
         empty_phase = cutlass.Int32(1)
         sent = cutlass.Int32(0)
         reissues = cutlass.Int32(0)
         while work_tile.is_valid_tile:
             blk_coord = work_tile.tile_idx
             k_tile_count = self.get_k_tile_count(
-                p.split_kv, p.cache_seqs, p.cum_seq_lens_q, p.block_split_kvs, blk_coord)[1]
+                p.split_kv, p.cache_seqs, p.cum_seq_lens_q, p.block_split_kvs, blk_coord
+            )[1]
             if k_tile_count > 0:
                 sleep_ns = cutlass.Int32(SPIN_NS_MIN)
                 pending = cutlass.Boolean(True)
@@ -962,9 +1063,14 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
                     sent = sent + 1
                     with cute.arch.elect_one():
                         cute.arch.mbarrier_arrive_and_expect_tx(
-                            msg_full, _MSG_BYTES, peer, relaxed=True, scope=_cluster_scope())
+                            msg_full, _MSG_BYTES, peer, relaxed=True, scope=_cluster_scope()
+                        )
                         cute.arch.store_async_dsmem(
-                            msg, (code, blk_coord[1], blk_coord[2], cutlass.Int32(0)), msg_full, peer)
+                            msg,
+                            (code, blk_coord[1], blk_coord[2], cutlass.Int32(0)),
+                            msg_full,
+                            peer,
+                        )
                     if invalid:
                         q_pipe.retry_expect_tx(q_state, self.tma_copy_q_bytes)
                         self._fgs_reissue_q(p, blk_coord[1], blk_coord[2])
@@ -988,14 +1094,16 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         msg_empty = p.msg_mbar + 1
         peer = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) ^ 1
         tile_sched = create_mla_static_tile_scheduler(
-            p.tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
+            p.tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+        )
         work_tile = tile_sched.initial_work_tile_info()
         msg = p.msg
         full_phase = cutlass.Int32(0)
         while work_tile.is_valid_tile:
             blk_coord = work_tile.tile_idx
             k_tile_count = self.get_k_tile_count(
-                p.split_kv, p.cache_seqs, p.cum_seq_lens_q, p.block_split_kvs, blk_coord)[1]
+                p.split_kv, p.cache_seqs, p.cum_seq_lens_q, p.block_split_kvs, blk_coord
+            )[1]
             if k_tile_count > 0:
                 pending = cutlass.Boolean(True)
                 while pending:
@@ -1025,20 +1133,33 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         tma_bar_ptr,
     ):
         for i in cutlass.range(self.iterations_qk_latent):
-            cute.copy(tma_atom_q_latent, tQLgQL[None, i], tQsQ[None, (i, 0)], tma_bar_ptr=tma_bar_ptr,
-                      report_valid=True)
+            cute.copy(
+                tma_atom_q_latent,
+                tQLgQL[None, i],
+                tQsQ[None, (i, 0)],
+                tma_bar_ptr=tma_bar_ptr,
+                report_valid=True,
+            )
         for i in cutlass.range(self.iterations_qk_rope):
-            cute.copy(tma_atom_q_rope, tQRgQR[None, i], tQsQ_rope[None, i], tma_bar_ptr=tma_bar_ptr,
-                      report_valid=True)
+            cute.copy(
+                tma_atom_q_rope,
+                tQRgQR[None, i],
+                tQsQ_rope[None, i],
+                tma_bar_ptr=tma_bar_ptr,
+                report_valid=True,
+            )
 
     @cute.jit
-    def _fgs_poll_cache_row(self, common_params: SimpleNamespace, row: cutlass.Int32, lane: cutlass.Int32):
+    def _fgs_poll_cache_row(
+        self, common_params: SimpleNamespace, row: cutlass.Int32, lane: cutlass.Int32
+    ):
         """Warp-uniform wait until no element of cache row ``row`` of this request is the bf16 sentinel."""
         n = (ROW_CHUNKS + self.threads_per_warp - 1) // self.threads_per_warp
         mCLraw = common_params.mCLraw
         page = common_params.mPTfull[row // self.page_size, common_params.blk_coord[2]]
-        elem = (cutlass.Int64(page) * cutlass.Int64(mCLraw.stride[2])
-                + cutlass.Int64(row % self.page_size) * cutlass.Int64(mCLraw.stride[0]))
+        elem = cutlass.Int64(page) * cutlass.Int64(mCLraw.stride[2]) + cutlass.Int64(
+            row % self.page_size
+        ) * cutlass.Int64(mCLraw.stride[0])
         row_addr = mCLraw.iterator.toint() + elem * (mCLraw.element_type.width // 8)
         words = cute.make_rmem_tensor(cute.make_layout(4 * n), cutlass.Int32)
         addrs = cute.make_rmem_tensor(cute.make_layout(n), cutlass.Int64)
@@ -1050,7 +1171,9 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
             addrs[j] = row_addr + cutlass.Int64(chunk) * 16
         load_chunks(words, addrs, n, cutlass.Boolean(True))
         if cutlass.const_expr(self.fgs_stats):
-            row_stats = cute.make_tensor(common_params.mStats.iterator + _STATS_ROW, cute.make_layout(4))
+            row_stats = cute.make_tensor(
+                common_params.mStats.iterator + _STATS_ROW, cute.make_layout(4)
+            )
             poll_chunks(words, addrs, n, False, self.spin_limit, row_stats, True)
         else:
             poll_chunks(words, addrs, n, False, self.spin_limit, words, False)
@@ -1077,11 +1200,13 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
                 cutlass.Int32,
                 num_bits_per_copy=cutlass.Int32.width,
             )
-            mPT_for_copy = cute.flat_divide(mPT, (1, ))
-            sPT_for_copy = cute.flat_divide(common_params.sPT, (1, ))
+            mPT_for_copy = cute.flat_divide(mPT, (1,))
+            sPT_for_copy = cute.flat_divide(common_params.sPT, (1,))
             for i in range(elem_per_thread):
                 idx = i * self.threads_per_warp + tidx
-                if cute.elem_less(k_index * page_per_tile + idx, mPT.shape[0]) and cute.elem_less(idx, page_per_tile):
+                if cute.elem_less(k_index * page_per_tile + idx, mPT.shape[0]) and cute.elem_less(
+                    idx, page_per_tile
+                ):
                     cute.copy(
                         atom_async_copy,
                         mPT_for_copy[None, k_index * page_per_tile + idx],
@@ -1116,8 +1241,9 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
     ):
         # ``load_tma_qk_one_k_tile`` plus a proxy fence before the TMA loads of a tile that holds current rows: the
         # page-table warp observed them with generic loads before publishing this stage.
-        page_per_tile = (self.mma_qk_tiler[1] // self.page_size + qk_params.tiled_mma_qk.thr_id.shape - 1) // (
-            qk_params.tiled_mma_qk.thr_id.shape)
+        page_per_tile = (
+            self.mma_qk_tiler[1] // self.page_size + qk_params.tiled_mma_qk.thr_id.shape - 1
+        ) // (qk_params.tiled_mma_qk.thr_id.shape)
         common_params.load_pt_pipeline.consumer_wait(load_pt_consumer_state)
         page_table_stage = load_pt_consumer_state.index
         load_pt_consumer_state.advance()
@@ -1127,8 +1253,12 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         k_idx = cute.make_rmem_tensor(cute.make_layout(page_per_tile), cutlass.Int32)
         for i in cutlass.range_constexpr(page_per_tile):
             k_idx[i] = (
-                common_params.sPT[0, page_table_stage] if self.mma_qk_tiler[1] // self.page_size == 1 else
-                common_params.sPT[i + common_params.blk_coord[0] * page_per_tile, page_table_stage])
+                common_params.sPT[0, page_table_stage]
+                if self.mma_qk_tiler[1] // self.page_size == 1
+                else common_params.sPT[
+                    i + common_params.blk_coord[0] * page_per_tile, page_table_stage
+                ]
+            )
         if cutlass.const_expr(load_q):
             common_params.load_q_pipeline.producer_acquire(load_q_producer_state)
             tma_bar_ptr = common_params.load_q_pipeline.producer_get_barrier(load_q_producer_state)
@@ -1177,7 +1307,9 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         if cutlass.const_expr(epilogue_params.mAccLSE is not None):
             mLSE = epilogue_params.mAccLSE[None, common_params.blk_coord[3], None, None]
         gLSE = cute.local_tile(mLSE, (cta_rows, 1, 1), coord, (1, 1, 1))
-        cLSE = cute.local_tile(cute.make_identity_tensor(mLSE.shape), (cta_rows, 1, 1), coord, (1, 1, 1))
+        cLSE = cute.local_tile(
+            cute.make_identity_tensor(mLSE.shape), (cta_rows, 1, 1), coord, (1, 1, 1)
+        )
         return gLSE, cLSE
 
     @cute.jit
@@ -1199,17 +1331,24 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         if cutlass.const_expr(self.warps_in_n == 2):
             common_params.smem_exchange[tidx] = row_sum
             self.epilogue_exchange_sync_bar.arrive_and_wait()
-            row_sum = row_sum + common_params.smem_exchange[
-                (tidx + 64) % (self.num_compute_warps * self.threads_per_warp)]
+            row_sum = (
+                row_sum
+                + common_params.smem_exchange[
+                    (tidx + 64) % (self.num_compute_warps * self.threads_per_warp)
+                ]
+            )
         common_params.mma_o_pipeline.consumer_wait(mma_o_consumer_state)
         lse = cute.math.log2(row_sum, fastmath=True) + epilogue_params.softmax_scale_log2 * row_max
         gLSE, cLSE = self._fgs_lse_tile(common_params, epilogue_params)
         for iter_n in cutlass.range_constexpr(self.iterations_pv_n):
-            tmem_load_tiled_copy, tAcc, tTR_tAcc, tTR_gO, tTR_cO, tTR_rAcc = self._tmem_load_partition(
-                common_params, common_params.tiled_mma_pv, iter_n)
+            tmem_load_tiled_copy, tAcc, tTR_tAcc, tTR_gO, tTR_cO, tTR_rAcc = (
+                self._tmem_load_partition(common_params, common_params.tiled_mma_pv, iter_n)
+            )
             cute.copy(tmem_load_tiled_copy, tTR_tAcc, tTR_rAcc)
             for i in cutlass.range(cute.size(tTR_rAcc), vectorize=True, unroll_full=True):
-                tTR_rAcc[i] = tTR_rAcc[i] * epilogue_params.output_scale * cute.arch.rcp_approx(row_sum)
+                tTR_rAcc[i] = (
+                    tTR_rAcc[i] * epilogue_params.output_scale * cute.arch.rcp_approx(row_sum)
+                )
             tR2G_rO_src = None
             if cutlass.const_expr(common_params.mAccO is None):
                 tR2G_rO_src = cute.make_fragment_like(tTR_gO, self.o_dtype)
@@ -1233,7 +1372,9 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
             self.epilogue_exchange_sync_bar.arrive_and_wait()
             if tidx < cute.size(gLSE):
                 if cute.elem_less(cLSE[tidx][0], common_params.H):
-                    _st_relaxed_f32((gLSE.iterator + cute.crd2idx(tidx, gLSE.layout)).toint(), canon_f32(lse))
+                    _st_relaxed_f32(
+                        (gLSE.iterator + cute.crd2idx(tidx, gLSE.layout)).toint(), canon_f32(lse)
+                    )
         cute.arch.fence_view_async_tmem_load()
         common_params.mma_o_pipeline.consumer_release(mma_o_consumer_state)
         mma_o_consumer_state.advance()
@@ -1270,7 +1411,9 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.reducer_max_splits * self.acc_dtype.width // 8, 16)
         smem_lse_scale = cute.make_tensor(
-            cute.recast_ptr(storage, dtype=self.acc_dtype), cute.make_layout(self.reducer_max_splits))
+            cute.recast_ptr(storage, dtype=self.acc_dtype),
+            cute.make_layout(self.reducer_max_splits),
+        )
 
         flat_q_row = bidy * self.num_heads + head_idx
         q_tile = flat_q_row >> 7
@@ -1304,7 +1447,9 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
                             bits[i] = _ld_cg_b32(addrs[i])
                 if cutlass.const_expr(check_lse):
                     if cutlass.const_expr(with_stats):
-                        lse_stats = cute.make_tensor(mStats.iterator + _STATS_RED_LSE, cute.make_layout(4))
+                        lse_stats = cute.make_tensor(
+                            mStats.iterator + _STATS_RED_LSE, cute.make_layout(4)
+                        )
                         _poll_words(bits, addrs, lse_per_thread, self.spin_limit, lse_stats, True)
                     else:
                         _poll_words(bits, addrs, lse_per_thread, self.spin_limit, bits, False)
@@ -1325,14 +1470,19 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
                 for i in cutlass.range_constexpr(lse_per_thread):
                     sum_lse += cute.math.exp2(local_lse[i] - lse_max, fastmath=True)
                 sum_lse = cute.arch.warp_reduction_sum(sum_lse)
-                global_lse = (lse_max + cute.math.log2(sum_lse, fastmath=True)
-                              if not sum_lse == self.lse_dtype(0.0) or sum_lse != sum_lse else self.lse_dtype.inf)
+                global_lse = (
+                    lse_max + cute.math.log2(sum_lse, fastmath=True)
+                    if not sum_lse == self.lse_dtype(0.0) or sum_lse != sum_lse
+                    else self.lse_dtype.inf
+                )
                 if d_tile_idx == 0 and tidx == 0:
                     mLSE[head_idx, bidy, bidz] = canon_f32(global_lse)
                 for i in cutlass.range_constexpr(lse_per_thread):
                     split_kv_idx = tidx + i * self.threads_per_warp
                     if cute.elem_less(split_kv_idx, local_split_kv):
-                        smem_lse_scale[split_kv_idx] = cute.math.exp2(local_lse[i] - global_lse, fastmath=True)
+                        smem_lse_scale[split_kv_idx] = cute.math.exp2(
+                            local_lse[i] - global_lse, fastmath=True
+                        )
 
             pipeline.sync(barrier_id=4)
 
@@ -1351,14 +1501,22 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
                     split_idx = g + u
                     if split_idx >= local_split_kv:
                         split_idx = g
-                    chunk_addr[u] = (gAccO.iterator + cute.crd2idx((split_idx, e0), gAccO.layout)).toint()
+                    chunk_addr[u] = (
+                        gAccO.iterator + cute.crd2idx((split_idx, e0), gAccO.layout)
+                    ).toint()
                 load_chunks(words, chunk_addr, _RED_UNROLL, active)
                 if cutlass.const_expr(check_o):
                     if cutlass.const_expr(with_stats):
-                        o_stats = cute.make_tensor(mStats.iterator + _STATS_RED_O, cute.make_layout(4))
-                        poll_chunks(words, chunk_addr, _RED_UNROLL, True, self.spin_limit, o_stats, True)
+                        o_stats = cute.make_tensor(
+                            mStats.iterator + _STATS_RED_O, cute.make_layout(4)
+                        )
+                        poll_chunks(
+                            words, chunk_addr, _RED_UNROLL, True, self.spin_limit, o_stats, True
+                        )
                     else:
-                        poll_chunks(words, chunk_addr, _RED_UNROLL, True, self.spin_limit, words, False)
+                        poll_chunks(
+                            words, chunk_addr, _RED_UNROLL, True, self.spin_limit, words, False
+                        )
                 for u in cutlass.range_constexpr(_RED_UNROLL):
                     if g + u < local_split_kv:
                         for j in cutlass.range_constexpr(4):
@@ -1368,7 +1526,9 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
             n0 = cute.arch.shuffle_sync_down(w0, 1)
             n1 = cute.arch.shuffle_sync_down(w1, 1)
             if active and lane % 2 == 0:
-                out_addr = (mO.iterator + cute.crd2idx((head_idx, e0, bidy, bidz), mO.layout)).toint()
+                out_addr = (
+                    mO.iterator + cute.crd2idx((head_idx, e0, bidy, bidz), mO.layout)
+                ).toint()
                 st_global_v4(out_addr, w0, w1, n0, n1)
         return
 
@@ -1410,11 +1570,21 @@ def _fill_partials_kernel(
     if cutlass.const_expr(block_split_kvs is not None):
         if local == 1:
             local = cutlass.Int32(0)
-    lse_off = cutlass.Int64(batch) * cutlass.Int64(seq_q_tiles * rows) * cutlass.Int64(split_kv) * LATENT_DIM
+    lse_off = (
+        cutlass.Int64(batch)
+        * cutlass.Int64(seq_q_tiles * rows)
+        * cutlass.Int64(split_kv)
+        * LATENT_DIM
+    )
     for split in cutlass.range(local):
         row = cutlass.Int64(bs * rows + h) * cutlass.Int64(split_kv) + cutlass.Int64(split)
-        st_global_v4(ws_base + (row * LATENT_DIM + cutlass.Int64(tidx) * 4) * 4,
-                     F32_SENTINEL, F32_SENTINEL, F32_SENTINEL, F32_SENTINEL)
+        st_global_v4(
+            ws_base + (row * LATENT_DIM + cutlass.Int64(tidx) * 4) * 4,
+            F32_SENTINEL,
+            F32_SENTINEL,
+            F32_SENTINEL,
+            F32_SENTINEL,
+        )
         if tidx == 0:
             _st_global_b32(ws_base + (lse_off + row) * 4, F32_SENTINEL)
 
@@ -1432,8 +1602,9 @@ def _fill_partials_host(
     kv_tile: cutlass.Constexpr,
     rows: cutlass.Constexpr,
 ):
-    _fill_partials_kernel(ws_base, cache_seqs, block_split_kvs, split_kv, kv_tile, rows, seq_q_tiles, batch).launch(
-        grid=(heads, batch * seq_q_tiles, 1), block=(LATENT_DIM // 4, 1, 1), stream=stream)
+    _fill_partials_kernel(
+        ws_base, cache_seqs, block_split_kvs, split_kv, kv_tile, rows, seq_q_tiles, batch
+    ).launch(grid=(heads, batch * seq_q_tiles, 1), block=(LATENT_DIM // 4, 1, 1), stream=stream)
 
 
 @cute.kernel
@@ -1462,14 +1633,26 @@ def _fill_lse_kernel(
     if cutlass.const_expr(block_split_kvs is not None):
         read = read & (local != 1)
     if read:
-        lse_base = ws_base + (cutlass.Int64(batch) * cutlass.Int64(seq_q_tiles * rows) * cutlass.Int64(split_kv)
-                              * LATENT_DIM) * 4
+        lse_base = (
+            ws_base
+            + (
+                cutlass.Int64(batch)
+                * cutlass.Int64(seq_q_tiles * rows)
+                * cutlass.Int64(split_kv)
+                * LATENT_DIM
+            )
+            * 4
+        )
         tile_base = cutlass.Int64(bs) * cutlass.Int64(rows) * cutlass.Int64(split_kv)
         for idx in cutlass.range(tidx, heads * local, _FILL_LSE_THREADS):
             row = idx // local
             split = idx - row * local
-            _st_global_b32(lse_base + (tile_base + cutlass.Int64(row) * cutlass.Int64(split_kv)
-                                       + cutlass.Int64(split)) * 4, F32_SENTINEL)
+            _st_global_b32(
+                lse_base
+                + (tile_base + cutlass.Int64(row) * cutlass.Int64(split_kv) + cutlass.Int64(split))
+                * 4,
+                F32_SENTINEL,
+            )
 
 
 @cute.jit
@@ -1485,8 +1668,9 @@ def _fill_lse_host(
     kv_tile: cutlass.Constexpr,
     rows: cutlass.Constexpr,
 ):
-    _fill_lse_kernel(ws_base, cache_seqs, block_split_kvs, split_kv, heads, kv_tile, rows, seq_q_tiles,
-                     batch).launch(grid=(batch * seq_q_tiles, 1, 1), block=(_FILL_LSE_THREADS, 1, 1), stream=stream)
+    _fill_lse_kernel(
+        ws_base, cache_seqs, block_split_kvs, split_kv, heads, kv_tile, rows, seq_q_tiles, batch
+    ).launch(grid=(batch * seq_q_tiles, 1, 1), block=(_FILL_LSE_THREADS, 1, 1), stream=stream)
 
 
 @cute.kernel
@@ -1506,7 +1690,9 @@ def _fill_rows_kernel(
         page = page_table[row // page_size, b]
         elem = cutlass.Int64(page) * page_stride + cutlass.Int64(row % page_size) * row_stride
         sentinel = cutlass.Int32((BF16_SENTINEL | (BF16_SENTINEL << 16)) - (1 << 32))
-        st_global_v4(pool_base + elem * 2 + cutlass.Int64(tidx) * 16, sentinel, sentinel, sentinel, sentinel)
+        st_global_v4(
+            pool_base + elem * 2 + cutlass.Int64(tidx) * 16, sentinel, sentinel, sentinel, sentinel
+        )
 
 
 @cute.jit
@@ -1521,8 +1707,9 @@ def _fill_rows_host(
     page_size: cutlass.Constexpr,
     seq_len_q: cutlass.Constexpr,
 ):
-    _fill_rows_kernel(pool_base, row_stride, page_stride, page_table, cache_seqs, page_size, seq_len_q).launch(
-        grid=(batch, seq_len_q, 1), block=(96, 1, 1), stream=stream)
+    _fill_rows_kernel(
+        pool_base, row_stride, page_stride, page_table, cache_seqs, page_size, seq_len_q
+    ).launch(grid=(batch, seq_len_q, 1), block=(96, 1, 1), stream=stream)
 
 
 _FILL_CACHE = {}
@@ -1540,8 +1727,16 @@ def _from_torch(t, leading_dim=0, align=4):
     return from_dlpack(t, assumed_align=align).mark_layout_dynamic(leading_dim=leading_dim)
 
 
-def fill_partials_sentinel(split_workspace, num_heads: int, seq_q_tiles: int, cache_seqs, split_kv: int,
-                           block_split_kvs=None, kv_tile: int = 128, rows: int = 128):
+def fill_partials_sentinel(
+    split_workspace,
+    num_heads: int,
+    seq_q_tiles: int,
+    cache_seqs,
+    split_kv: int,
+    block_split_kvs=None,
+    kv_tile: int = 128,
+    rows: int = 128,
+):
     """Sentinel-fill the split-KV partials (O and LSE) the reduction reads (``fgs_partials="all"``; one launch,
     one CTA per row and request, graph-capturable).
 
@@ -1567,8 +1762,16 @@ def fill_partials_sentinel(split_workspace, num_heads: int, seq_q_tiles: int, ca
     fn(*args)
 
 
-def fill_lse_sentinel(split_workspace, num_heads: int, seq_q_tiles: int, cache_seqs, split_kv: int,
-                      block_split_kvs=None, kv_tile: int = 128, rows: int = 128):
+def fill_lse_sentinel(
+    split_workspace,
+    num_heads: int,
+    seq_q_tiles: int,
+    cache_seqs,
+    split_kv: int,
+    block_split_kvs=None,
+    kv_tile: int = 128,
+    rows: int = 128,
+):
     """Sentinel-fill only the partial LSE entries the reduction will read (``fgs_partials="lse"``; one launch,
     one CTA per request and q tile, graph-capturable). Same arguments as ``fill_partials_sentinel``."""
     batch = int(cache_seqs.shape[0])

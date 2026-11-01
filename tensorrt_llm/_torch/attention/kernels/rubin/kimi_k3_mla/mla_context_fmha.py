@@ -105,7 +105,9 @@ def _compile(
     cu_q = make_fake_compact_tensor(Int32, (sym_seq,), assumed_align=16)
     cu_k = make_fake_compact_tensor(Int32, (sym_seq,), assumed_align=16)
     fgs = fgs_consumer or fgs_producer
-    extra = (make_fake_compact_tensor(Int32, (FGS_STATS_LEN,), assumed_align=16),) if fgs_stats else ()
+    extra = (
+        (make_fake_compact_tensor(Int32, (FGS_STATS_LEN,), assumed_align=16),) if fgs_stats else ()
+    )
     return cute.compile(
         fmha,
         q,
@@ -171,7 +173,9 @@ def mla_context_fmha(
         or fgs_stats.shape != (FGS_STATS_LEN,)
         or fgs_stats.device != q.device
     ):
-        raise ValueError(f"fgs_stats must be int32[{FGS_STATS_LEN}] on {q.device} with fgs_consumer")
+        raise ValueError(
+            f"fgs_stats must be int32[{FGS_STATS_LEN}] on {q.device} with fgs_consumer"
+        )
     fgs = fgs_consumer or fgs_producer
     total, num_heads, _ = q.shape
     key = tuple(sorted((tuning if tuning is not None else dict(DEFAULT_TUNING)).items()))

@@ -157,7 +157,9 @@ def _gate_consumer(
             g = cutlass.Vector.from_elements(tuple(gw), cutlass.Int32).bitcast(cutlass.BFloat16)
             res = []
             for e in cutlass.range_constexpr(vec):
-                res.append(o[e].to(cutlass.Float32) * _sigmoid_bf16_as_f32(g[e].to(cutlass.Float32), fast))
+                res.append(
+                    o[e].to(cutlass.Float32) * _sigmoid_bf16_as_f32(g[e].to(cutlass.Float32), fast)
+                )
             _store_out(out_arr, out_base, v * cutlass.Int64(vec), res, vec, producer, hw_pzo)
 
 

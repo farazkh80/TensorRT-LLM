@@ -161,7 +161,11 @@ def _append_fgs(
         else:
             for h in cutlass.range_constexpr(hpt):
                 st_global_v4(
-                    dst + cutlass.Int64(2 * h) * k_head_stride, words[0], words[1], words[2], words[3]
+                    dst + cutlass.Int64(2 * h) * k_head_stride,
+                    words[0],
+                    words[1],
+                    words[2],
+                    words[3],
                 )
 
 
@@ -496,7 +500,17 @@ def mla_context_append(
     )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     spin_limit = fgs_spin_limit if fgs_consumer else 0
-    key = (num_heads, latent, rope, nope, page_size, fgs_consumer, fgs_producer, spin_limit, with_stats)
+    key = (
+        num_heads,
+        latent,
+        rope,
+        nope,
+        page_size,
+        fgs_consumer,
+        fgs_producer,
+        spin_limit,
+        with_stats,
+    )
     fn = _compiled(key, addrs, stream)
     i32, i64 = cutlass.Int32, cutlass.Int64
     fn(
