@@ -51,7 +51,9 @@ QKV source as a fine-grained-sync slot instead of waiting for the producer grid:
 16-byte chunk counts as written once its element 0 is not the BF16 -0.0 sentinel. Each
 pack of ring tokens is checked after its cp.async group retires; the halo rows and the
 final-state rows of run 0 (gathered after the loop) are loaded with ``ld.relaxed.gpu``
-and checked the same way. The wait is warp-uniform: while any lane holds an unwritten
+and checked the same way. The exact-SiLU recompute keeps ``ld.global.nc``: it only
+reads rows its warp has already seen written (every chunk of each 128-B line it reads),
+so no line can be cached before its final value lands. The wait is warp-uniform: while any lane holds an unwritten
 chunk the whole warp sleeps and reloads its chunks with ``ld.relaxed.gpu`` (ring tokens
 are written back into their slot), and leaves the loop together; after ``max_spins``
 rounds it falls back to ``griddepcontrol.wait`` and takes the values it then reads.
@@ -538,11 +540,7 @@ class KdaConv:
     def loadw(self, src, src_base, row, cc, xw: cute.Tensor, off: cutlass.Constexpr):
         """Load source channels [cc, cc+8) of `row` as 4 packed BF16x2 words into xw[off:off+4]."""
         if cutlass.const_expr(self.src_vec):
-            addr = src_base + (cutlass.Int64(row) * self.SR + cc) * 2
-            if cutlass.const_expr(self.fgs_consumer):
-                w = ld_v4_relaxed(addr)
-            else:
-                w = ld_v4(addr)
+            w = ld_v4(src_base + (cutlass.Int64(row) * self.SR + cc) * 2)
             for j in cutlass.range_constexpr(4):
                 xw[off + j] = w[j]
         else:
