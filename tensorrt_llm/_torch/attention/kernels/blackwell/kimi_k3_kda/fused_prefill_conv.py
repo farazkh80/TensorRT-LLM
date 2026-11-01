@@ -53,10 +53,11 @@ pack of ring tokens is checked after its cp.async group retires; the halo rows a
 final-state rows of run 0 (gathered after the loop) are loaded with ``ld.relaxed.gpu``
 and checked the same way. The exact-SiLU recompute keeps ``ld.global.nc``: it only
 reads rows its warp has already seen written (every chunk of each 128-B line it reads),
-so no line can be cached before its final value lands. The wait is warp-uniform: while any lane holds an unwritten
-chunk the whole warp sleeps and reloads its chunks with ``ld.relaxed.gpu`` (ring tokens
-are written back into their slot), and leaves the loop together; after ``max_spins``
-rounds it falls back to ``griddepcontrol.wait`` and takes the values it then reads.
+so no line can be cached before its final value lands. The wait is warp-uniform: while
+any lane holds an unwritten chunk the whole warp sleeps and reloads its chunks with
+``ld.relaxed.gpu`` (ring tokens are written back into their slot), and leaves the loop
+together; after ``max_spins`` rounds it falls back to ``griddepcontrol.wait`` and takes
+the values it then reads.
 ``fgs_producer`` publishes q/k/v for a consumer with the same check: PDL dependents are
 released at entry, -0.0 is never stored (cvt.rn.pzo; raw copies map 0x8000 to 0), and
 each 16-byte chunk is stored once: a token group is staged in shared memory and stored
