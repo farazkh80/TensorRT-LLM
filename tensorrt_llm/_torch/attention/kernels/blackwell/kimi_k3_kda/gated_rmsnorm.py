@@ -16,10 +16,13 @@ each thread keeps ``rows_per_thread`` rows in flight before reducing.
 ``fgs_consumer`` reads o from a fine-grained-sync slot instead of waiting for the
 producer grid: each 16-byte chunk of o counts as written once its element 0 is not
 the BF16 -0.0 sentinel (the producer writes every chunk with one 16-byte store and
-never stores -0.0). Unwritten chunks are reloaded with ``ld.relaxed.gpu`` after an
-exponential ``nanosleep`` backoff; after ``max_spins`` reloads a thread falls back
-to ``griddepcontrol.wait`` (producer grid complete) and takes the value it then
-reads. Optional ``stats`` (int32 [2]) accumulates reloads and fallbacks.
+never stores -0.0). The wait is warp-uniform: while any lane of the warp holds an
+unwritten chunk, the whole warp sleeps (exponential ``nanosleep`` backoff) and
+reloads all of its chunks with ``ld.relaxed.gpu``, and the warp leaves the loop
+together, so the shuffles that follow see a converged warp. After ``max_spins``
+rounds the warp falls back to ``griddepcontrol.wait`` (producer grid complete) and
+takes the values it then reads. Optional ``stats`` (int32 [2]) accumulates reload
+rounds per thread and fallbacks per thread.
 """
 
 from functools import cache
@@ -79,6 +82,22 @@ def _ld_cg_v4(addr, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _ld_weak_v4(addr, *, loc=None, ip=None):
+    """16-byte ``ld.global`` (may be served from L1) as four int32."""
+    res = llvm.inline_asm(
+        ir.Type.parse("!llvm.struct<(i32,i32,i32,i32)>"),
+        [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)],
+        "ld.global.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l",
+        has_side_effects=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return [cutlass.Int32(llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(4)]
+
+
+@dsl_user_op
 def _globaltimer(*, loc=None, ip=None):
     return cutlass.Int64(
         llvm.inline_asm(
@@ -122,6 +141,7 @@ class GatedRmsNorm:
         min_blocks: int | None = None,
         weak_first_load: bool = False,
         with_timeline: bool = False,
+        l1_first_load: bool = False,
     ):
         self.heads = heads
         self.rows_per_thread = rows_per_thread
@@ -129,19 +149,25 @@ class GatedRmsNorm:
         self.use_pdl = use_pdl
         self.rows_per_cta = warps * ROWS_PER_WARP_STEP * rows_per_thread
         assert not fgs_consumer or use_pdl
-        assert fgs_consumer or not (with_stats or persistent_ctas or weak_first_load)
+        assert fgs_consumer or not (
+            with_stats or persistent_ctas or weak_first_load or l1_first_load
+        )
+        assert not (weak_first_load and l1_first_load)
         self.fgs_consumer = fgs_consumer
         self.max_spins = max_spins
         self.with_stats = with_stats
         # persistent_ctas > 0: at most that many CTAs, each walking row blocks in order (the
         # producer's token order). min_blocks bounds registers for the retry loop (default: a
         # full SM of threads, as the default build reaches). weak_first_load issues the first
-        # load of a chunk as ld.global.cg instead of ld.relaxed.gpu; reloads stay relaxed.
+        # load of a chunk as ld.global.cg, l1_first_load as a plain ld.global, instead of
+        # ld.relaxed.gpu; reloads stay relaxed (L1 bypassed), so a stale L1 line can only
+        # delay a chunk, never return a value the producer has not written.
         self.persistent_ctas = persistent_ctas
         if min_blocks is None:
             min_blocks = 1024 // (warps * 32) if fgs_consumer else 0
         self.min_blocks = min_blocks
         self.weak_first_load = weak_first_load
+        self.l1_first_load = l1_first_load
         self.with_timeline = with_timeline
 
     @cute.jit
@@ -264,6 +290,8 @@ class GatedRmsNorm:
                     x_bits = cute.recast_tensor(x_reg, cutlass.Int32)
                     if cutlass.const_expr(self.weak_first_load):
                         words = _ld_cg_v4(x_chunk.iterator.toint())
+                    elif cutlass.const_expr(self.l1_first_load):
+                        words = _ld_weak_v4(x_chunk.iterator.toint())
                     else:
                         words = _ld_relaxed_v4(x_chunk.iterator.toint(), False)
                     for w in cutlass.range_constexpr(4):
@@ -275,28 +303,40 @@ class GatedRmsNorm:
             z_regs.append(z_reg)
 
         if cutlass.const_expr(self.fgs_consumer):
+            # Rows past the end reload the last row (in bounds) and never count as unwritten.
+            addrs = []
+            bad = cutlass.Boolean(False)
             for i in cutlass.range_constexpr(self.rows_per_thread):
                 r = row0 + i * ROWS_PER_WARP_STEP
-                if r < rows:
+                x_bits = cute.recast_tensor(x_regs[i], cutlass.Int32)
+                addrs.append(
+                    cute.local_tile(
+                        x[cute.min(r, rows - 1), None], (VEC,), (col // VEC,)
+                    ).iterator.toint()
+                )
+                bad = bad | ((r < rows) & ((x_bits[0] & 0xFFFF) == BF16_NEG_ZERO))
+            pending = cute.arch.vote_any_sync(bad)
+            sleep_ns = cutlass.Int32(SPIN_NS_MIN)
+            rounds = cutlass.Int32(0)
+            while pending:
+                if waited > 0 or rounds >= self.max_spins:
+                    # The producer grid has completed: the values read next are final.
+                    cute.arch.griddepcontrol_wait()
+                    waited = cutlass.Int32(1)
+                else:
+                    _nanosleep(sleep_ns)
+                    sleep_ns = cute.min(sleep_ns * 2, cutlass.Int32(SPIN_NS_MAX))
+                rounds = rounds + 1
+                bad = cutlass.Boolean(False)
+                for i in cutlass.range_constexpr(self.rows_per_thread):
+                    r = row0 + i * ROWS_PER_WARP_STEP
                     x_bits = cute.recast_tensor(x_regs[i], cutlass.Int32)
-                    x_addr = cute.local_tile(x[r, None], (VEC,), (col // VEC,)).iterator.toint()
-                    # After a fallback wait a sentinel loaded before it is reloaded once.
-                    pending = (x_bits[0] & 0xFFFF) == BF16_NEG_ZERO
-                    sleep_ns = cutlass.Int32(SPIN_NS_MIN)
-                    while pending:
-                        if waited == 0:
-                            if spins >= self.max_spins:
-                                # The producer grid has completed: its value is final.
-                                cute.arch.griddepcontrol_wait()
-                                waited = cutlass.Int32(1)
-                            else:
-                                _nanosleep(sleep_ns)
-                                sleep_ns = cute.min(sleep_ns * 2, cutlass.Int32(SPIN_NS_MAX))
-                        spins = spins + 1
-                        words = _ld_relaxed_v4(x_addr, True)
-                        for w in cutlass.range_constexpr(4):
-                            x_bits[w] = words[w]
-                        pending = ((x_bits[0] & 0xFFFF) == BF16_NEG_ZERO) & (waited == 0)
+                    words = _ld_relaxed_v4(addrs[i], True)
+                    for w in cutlass.range_constexpr(4):
+                        x_bits[w] = cutlass.Int32(cutlass.select_(r < rows, words[w], x_bits[w]))
+                    bad = bad | ((r < rows) & ((x_bits[0] & 0xFFFF) == BF16_NEG_ZERO))
+                pending = cute.arch.vote_any_sync(bad) & (waited == 0)
+            spins = spins + rounds
 
         for i in cutlass.range_constexpr(self.rows_per_thread):
             r = row0 + i * ROWS_PER_WARP_STEP
@@ -337,6 +377,7 @@ def _compile(
     min_blocks: int | None = None,
     weak_first_load: bool = False,
     with_timeline: bool = False,
+    l1_first_load: bool = False,
 ):
     rows, tokens = cute.sym_int(), cute.sym_int()
     x = make_fake_tensor(
@@ -373,6 +414,7 @@ def _compile(
         min_blocks,
         weak_first_load,
         with_timeline,
+        l1_first_load,
     )
     return cute.compile(
         op,
