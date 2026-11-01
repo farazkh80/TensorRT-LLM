@@ -1,5 +1,18 @@
 schema_version: 1
 vendors:
+  flashinfer-cute-dsl-fmha:
+    url: https://github.com/flashinfer-ai/flashinfer.git
+    tag: v0.6.18
+    commit: 69ff11fc4954396d98326656dc85debd2223f637
+    source: flashinfer/cute_dsl/attention/fmha
+    destination: tensorrt_llm/_torch/attention/kernels/rubin/kimi_k3_mla/context_fmha
+    include:
+    - __init__.py
+    - fmha.py
+    - helpers/*.py
+    patch: 3rdparty/vendor_patches/flashinfer-cute-dsl-fmha.patch
+    patch_digest: sha256:8e985f3817af8797efe8c73f724e75b2a57e4ad5254ea25dba4eb8a5f99207e4
+    digest: sha256-tree-v1:7e00e61ae4bfbfe7cc95db9d0707cc8c9a80f79eadd6cf1c5ac15007c324fa1c
   flashinfer-kda-bt16:
     url: https://github.com/flashinfer-ai/flashinfer.git
     branch: main

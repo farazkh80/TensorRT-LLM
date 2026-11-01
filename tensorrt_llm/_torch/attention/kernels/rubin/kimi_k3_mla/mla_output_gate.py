@@ -1,0 +1,325 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Kimi K3 MLA output gate ``o * sigmoid(g)`` as one CuTe DSL elementwise kernel.
+
+Rounding matches ATen's ``o * g.sigmoid()`` (two kernels):
+s = bf16(1 / (1 + expf(-float(g)))) with IEEE expf / division, then out = bf16(float(o) * float(s)).
+The product of two bf16 values is exact in fp32, so the only rounding steps are the two bf16 casts.
+
+With ``fast`` the sigmoid is first evaluated with ex2.approx / rcp.approx. For g > -80 that value is within
+2^-17 (relative) of the IEEE one, about 60 fp32 ulps, so both round to the same bf16 unless the fast value lies
+within 256 ulps of a bf16 rounding midpoint; those elements (about 0.8%), g <= -80 (the rcp.approx flush range)
+and NaN fall back to the IEEE formula. The bf16 result is therefore identical to the exact path.
+
+``fgs_producer`` publishes the output to a fine-grained-sync consumer that validates each 16-B chunk by its first
+element (bf16 -0.0 = not written yet): every 16-B chunk is one ``st.global.v4``, -0.0 is stored as +0.0, and the
+grid triggers its dependents on entry and waits for its own inputs (PDL). The output buffer is the framework's
+sentinel-initialized slot; the kernel never writes sentinels.
+"""
+
+from typing import Callable, Optional
+
+import cuda.bindings.driver as cuda
+import cutlass
+import cutlass.cute as cute
+import torch
+from cutlass._mlir.dialects import llvm
+from cutlass.base_dsl.dsl import BaseDSL
+from cutlass.cute.runtime import make_ptr
+from cutlass.cutlass_dsl import T, dsl_user_op
+
+from tensorrt_llm._utils import get_sm_version
+
+THREADS = 256
+LOG2E = 1.4426950408889634
+MIDPOINT_GUARD_ULPS = 256
+
+
+@cute.jit
+def _sigmoid_bf16_as_f32(g: cutlass.Float32, fast: cutlass.Constexpr) -> cutlass.Float32:
+    s = cutlass.Float32(0.0)
+    if cutlass.const_expr(fast):
+        s = cute.arch.rcp_approx(
+            cutlass.Float32(1.0) + cute.math.exp2(g * cutlass.Float32(-LOG2E), fastmath=True)
+        )
+        bits = cutlass.Vector.from_elements((s,), cutlass.Float32).bitcast(cutlass.Int32)[0]
+        off = (bits & cutlass.Int32(0xFFFF)) - cutlass.Int32(0x8000)
+        if (
+            g <= cutlass.Float32(-80.0)
+            or g != g
+            or (
+                off <= cutlass.Int32(MIDPOINT_GUARD_ULPS)
+                and off >= cutlass.Int32(-MIDPOINT_GUARD_ULPS)
+            )
+        ):
+            s = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.math.exp(-g, fastmath=False))
+    else:
+        s = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.math.exp(-g, fastmath=False))
+    return s.to(cutlass.BFloat16).to(cutlass.Float32)
+
+
+_PZO_SW = (
+    "{ .reg .b16 l, h; .reg .pred p; cvt.rn.bf16x2.f32 $0, $1, $2; mov.b32 {l, h}, $0; "
+    "setp.eq.b16 p, l, 0x8000; selp.b16 l, 0, l, p; "
+    "setp.eq.b16 p, h, 0x8000; selp.b16 h, 0, h, p; mov.b32 $0, {l, h}; }"
+)
+# The same conversion in one instruction (sm_107).
+_PZO_HW = "cvt.rn.pzo.bf16x2.f32 $0, $1, $2;"
+
+
+@dsl_user_op
+def _bf16x2_pzo(lo, hi, hw, *, loc=None, ip=None):
+    """Round two f32 to a packed bf16x2 (``lo`` in the low half) like ``cvt.rn``, with -0.0 -> +0.0."""
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                cutlass.Float32(hi).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(lo).ir_value(loc=loc, ip=ip),
+            ],
+            _PZO_HW if hw else _PZO_SW,
+            "=r,f,f",
+            has_side_effects=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _store_global_v4(addr, w0, w1, w2, w3, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)]
+        + [cutlass.Int32(w).ir_value(loc=loc, ip=ip) for w in (w0, w1, w2, w3)],
+        "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r,~{memory}",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+def _store_out(out_arr, out_base, idx, res, vec, producer, hw_pzo):
+    if cutlass.const_expr(producer):
+        # One 16-B store per chunk: the consumer checks only the chunk's first element.
+        for c in range(vec // 8):
+            w = [_bf16x2_pzo(res[8 * c + 2 * p], res[8 * c + 2 * p + 1], hw_pzo) for p in range(4)]
+            addr = out_base + (idx + cutlass.Int64(8 * c)) * cutlass.Int64(2)
+            _store_global_v4(addr, w[0], w[1], w[2], w[3])
+    else:
+        out_arr.store(
+            cutlass.Vector.from_elements(tuple(res), dtype=cutlass.Float32).to(cutlass.BFloat16),
+            idx=idx,
+            vector_size=vec,
+            alignment=2 * vec,
+        )
+
+
+def _gate_chunk(o_arr, g_arr, out_arr, out_base, idx, vec, fast, producer, hw_pzo):
+    o = o_arr.load(idx, vec, alignment=2 * vec).to(cutlass.Float32)
+    g = g_arr.load(idx, vec, alignment=2 * vec).to(cutlass.Float32)
+    res = []
+    for e in range(vec):
+        res.append(o[e] * _sigmoid_bf16_as_f32(g[e], fast))
+    _store_out(out_arr, out_base, idx, res, vec, producer, hw_pzo)
+
+
+@cute.kernel
+def _output_gate_kernel(
+    mO: cute.Tensor,
+    mG: cute.Tensor,
+    mOut: cute.Tensor,
+    num_vecs: cutlass.Int64,
+    vec: cutlass.Constexpr,
+    unroll: cutlass.Constexpr,
+    fast: cutlass.Constexpr,
+    producer: cutlass.Constexpr,
+    hw_pzo: cutlass.Constexpr,
+):
+    if cutlass.const_expr(producer):
+        cute.arch.griddepcontrol_launch_dependents()
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+    o_arr = cutlass.make_array_view(mO)
+    g_arr = cutlass.make_array_view(mG)
+    out_arr = cutlass.make_array_view(mOut)
+    out_base = cutlass.Int64(0)
+    if cutlass.const_expr(producer):
+        out_base = mOut.iterator.toint()
+        cute.arch.griddepcontrol_wait()
+    first = cutlass.Int64(bidx) * cutlass.Int64(THREADS * unroll) + cutlass.Int64(tidx)
+    if cutlass.Int64(bidx + 1) * cutlass.Int64(THREADS * unroll) <= num_vecs:
+        # Full CTA: issue every load of the thread before any math so `unroll` vectors per operand are in flight.
+        os = []
+        gs = []
+        for u in cutlass.range_constexpr(unroll):
+            idx = (first + cutlass.Int64(u * THREADS)) * cutlass.Int64(vec)
+            os.append(o_arr.load(idx, vec, alignment=2 * vec))
+            gs.append(g_arr.load(idx, vec, alignment=2 * vec))
+        for u in cutlass.range_constexpr(unroll):
+            idx = (first + cutlass.Int64(u * THREADS)) * cutlass.Int64(vec)
+            o = os[u].to(cutlass.Float32)
+            g = gs[u].to(cutlass.Float32)
+            res = []
+            for e in cutlass.range_constexpr(vec):
+                res.append(o[e] * _sigmoid_bf16_as_f32(g[e], fast))
+            _store_out(out_arr, out_base, idx, res, vec, producer, hw_pzo)
+    else:
+        for u in cutlass.range_constexpr(unroll):
+            v = first + cutlass.Int64(u * THREADS)
+            if v < num_vecs:
+                _gate_chunk(
+                    o_arr,
+                    g_arr,
+                    out_arr,
+                    out_base,
+                    v * cutlass.Int64(vec),
+                    vec,
+                    fast,
+                    producer,
+                    hw_pzo,
+                )
+
+
+@cute.jit
+def _output_gate_host(
+    o_ptr: cute.Pointer,
+    g_ptr: cute.Pointer,
+    out_ptr: cute.Pointer,
+    stream: cuda.CUstream,
+    num_vecs: cutlass.Int64,
+    num_ctas: cutlass.Int32,
+    vec: cutlass.Constexpr,
+    unroll: cutlass.Constexpr,
+    fast: cutlass.Constexpr,
+    producer: cutlass.Constexpr,
+    hw_pzo: cutlass.Constexpr,
+):
+    layout = cute.make_layout(
+        (num_ctas, THREADS * unroll * vec), stride=(THREADS * unroll * vec, 1)
+    )
+    _output_gate_kernel(
+        cute.make_tensor(o_ptr, layout),
+        cute.make_tensor(g_ptr, layout),
+        cute.make_tensor(out_ptr, layout),
+        num_vecs,
+        vec,
+        unroll,
+        fast,
+        producer,
+        hw_pzo,
+    ).launch(grid=(num_ctas, 1, 1), block=(THREADS, 1, 1), stream=stream, use_pdl=producer)
+
+
+# (elements per access, accesses per thread per operand, fast sigmoid with exact fallback).
+# Decode-sized inputs are latency bound and favour one narrow access per thread; prefill inputs
+# stream from HBM and favour wide, unrolled accesses.
+DECODE_CONFIG = (8, 1, False)
+PREFILL_CONFIG = (16, 2, True)
+DECODE_MAX_NUMEL = 64 * 96 * 128
+# fgs_producer stores 16-B chunks, so it keeps 8 elements per access.
+PRODUCER_PREFILL_CONFIG = (8, 4, True)
+_COMPILED: dict[tuple, Callable] = {}
+
+
+def _ptrs(align, *tensors):
+    return [
+        make_ptr(cutlass.BFloat16, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
+        for t in tensors
+    ]
+
+
+def supported(o: torch.Tensor, g: torch.Tensor) -> bool:
+    return (
+        o.dtype == torch.bfloat16
+        and g.dtype == torch.bfloat16
+        and o.shape == g.shape
+        and o.is_cuda
+        and o.is_contiguous()
+        and g.is_contiguous()
+        and o.numel() % 16 == 0
+        and o.data_ptr() % 32 == 0
+        and g.data_ptr() % 32 == 0
+    )
+
+
+def mla_output_gate(
+    o: torch.Tensor,
+    g: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    config: Optional[tuple] = None,
+    *,
+    fgs_producer: bool = False,
+) -> torch.Tensor:
+    """out = o * sigmoid(g), bf16, bit-matching ``o * g.sigmoid()``. ``out`` may alias ``o``.
+
+    With ``fgs_producer`` the result is ``o * g.sigmoid()`` with -0.0 stored as +0.0, ``out`` is required (the
+    consumer's slot) and must not overlap ``o`` or ``g``, and ``config`` must use 8 elements per access.
+    """
+    if not supported(o, g):
+        raise ValueError("mla_output_gate needs contiguous, 32B-aligned bf16 o / g of equal shape")
+    if fgs_producer:
+        if out is None:
+            raise ValueError("mla_output_gate: fgs_producer needs the consumer's out slot")
+        nbytes = out.numel() * out.element_size()
+        for src in (o, g):
+            if (
+                out.data_ptr() < src.data_ptr() + nbytes
+                and src.data_ptr() < out.data_ptr() + nbytes
+            ):
+                raise ValueError("mla_output_gate: fgs_producer out must not overlap o or g")
+    if out is None:
+        out = torch.empty_like(o)
+    elif not (
+        out.shape == o.shape
+        and out.dtype == o.dtype
+        and out.is_contiguous()
+        and out.data_ptr() % 32 == 0
+    ):
+        raise ValueError("out must be a contiguous, 32B-aligned bf16 tensor shaped like o")
+    if config is None:
+        prefill = PRODUCER_PREFILL_CONFIG if fgs_producer else PREFILL_CONFIG
+        config = DECODE_CONFIG if o.numel() <= DECODE_MAX_NUMEL else prefill
+    vec, unroll, fast = config
+    if fgs_producer and vec != 8:
+        raise ValueError("mla_output_gate: fgs_producer stores 16-B chunks (8 elements per access)")
+    num_vecs = o.numel() // vec
+    if num_vecs == 0:
+        return out
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    ptrs = _ptrs(2 * vec, o, g, out)
+    hw_pzo = fgs_producer and get_sm_version() == 107
+    key = (config, fgs_producer, hw_pzo)
+    fn = _COMPILED.get(key)
+    if fn is None:
+        with BaseDSL.enable_pyir():
+            fn = cute.compile(
+                _output_gate_host,
+                *ptrs,
+                stream,
+                cutlass.Int64(1),
+                cutlass.Int32(1),
+                vec,
+                unroll,
+                fast,
+                fgs_producer,
+                hw_pzo,
+            )
+        _COMPILED[key] = fn
+    fn(*ptrs, stream, cutlass.Int64(num_vecs), cutlass.Int32(-(-num_vecs // (THREADS * unroll))))
+    return out
