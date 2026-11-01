@@ -357,12 +357,23 @@ def test_gated_rmsnorm_fgs_consumer_ready_input(tokens: int, ctas: int | None) -
 @pytest.mark.parametrize("order", ["forward", "reverse"])
 @torch.no_grad()
 def test_gated_rmsnorm_fgs_consumer_waits_for_late_chunks(order: str, ctas: int | None) -> None:
-    """The slot starts as -0.0 and another stream publishes it in token blocks after a delay."""
+    """The slot starts as -0.0 and another stream publishes it in token blocks after a delay.
+
+    Whether the consumer reaches a chunk before its block lands depends on scheduling, so only
+    the result is checked; test_gated_rmsnorm_fgs_consumer_falls_back_to_grid_wait covers reloads.
+    """
     tokens, block = 64, 16
     o, z, w = _norm_inputs(tokens, seed=5)
     ref = gated_rmsnorm.kda_gated_rmsnorm(o, z, w, EPS)
-    slot = torch.full_like(o, -0.0)
     stats = torch.zeros(2, device="cuda", dtype=torch.int32)
+    timeline = torch.tensor([2**63 - 1, 0], device="cuda", dtype=torch.int64)
+    # Compile before the writer starts so the consumer launches while the writer still sleeps.
+    gated_rmsnorm.kda_gated_rmsnorm(
+        o, z, w, EPS, fgs_consumer=True, fgs_stats=stats, fgs_ctas=ctas, fgs_timeline=timeline
+    )
+    stats.zero_()
+    timeline.copy_(torch.tensor([2**63 - 1, 0]))
+    slot = torch.full_like(o, -0.0)
     writer = torch.cuda.Stream()
     writer.wait_stream(torch.cuda.current_stream())
     starts = list(range(0, tokens, block))
@@ -373,13 +384,12 @@ def test_gated_rmsnorm_fgs_consumer_waits_for_late_chunks(order: str, ctas: int 
             torch.cuda._sleep(200_000)
             rows = slice(start * H, (start + block) * H)
             slot[rows].copy_(o[rows])
-    timeline = torch.tensor([2**63 - 1, 0], device="cuda", dtype=torch.int64)
     out = gated_rmsnorm.kda_gated_rmsnorm(
         slot, z, w, EPS, fgs_consumer=True, fgs_stats=stats, fgs_ctas=ctas, fgs_timeline=timeline
     )
     torch.cuda.synchronize()
     assert torch.equal(out.view(torch.int16), ref.view(torch.int16))
-    assert stats[0].item() > 0 and stats[1].item() == 0
+    assert stats[1].item() == 0
     assert 0 < timeline[0].item() < timeline[1].item()
 
 
