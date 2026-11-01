@@ -44,20 +44,25 @@ CASES = {
     "qkvg2": (2, 49152, 7168, (64, 4, 2)),
 }
 DEFAULT = dict(check_valid=False, pdl_wait_activation=True)
+# Every element checked unless the name says elem0 (element 0 of each 16 B chunk, the TMA report_valid rule).
 CONSUMERS = {
-    "heads": dict(check_valid=True, check_mode="heads"),
-    "heads_before_b": dict(check_valid=True, check_mode="heads_before_b"),
     "rows": dict(check_valid=True, check_mode="rows"),
     "row": dict(check_valid=True, check_mode="row"),
-    "row_relaxed": dict(check_valid=True, check_mode="row", relaxed_first=True),
-    "heads_wait": dict(check_valid=True, check_mode="heads", pdl_wait_activation=True),
-    "heads_uncapped": dict(check_valid=True, check_mode="heads", min_ctas_per_sm=1),
+    "heads": dict(check_valid=True, check_mode="heads"),
+    "heads_before_b": dict(check_valid=True, check_mode="heads_before_b"),
+    "rows_wait": dict(check_valid=True, check_mode="rows", pdl_wait_activation=True),
+    "rows_uncapped": dict(check_valid=True, check_mode="rows", min_ctas_per_sm=1),
+    "rows_elem0": dict(check_valid=True, check_mode="rows", check_elements=False),
+    "heads_elem0": dict(check_valid=True, check_mode="heads", check_elements=False),
+    "row_relaxed_elem0": dict(check_valid=True, check_mode="row", relaxed_first=True, check_elements=False),
 }
 PRODUCERS = {
     "pzo": dict(DEFAULT, pzo=True),
     "pzo_early": dict(DEFAULT, pzo=True, early_trigger=True),
+    "group8": dict(DEFAULT, pzo=True, early_trigger=True, group8=True),
     "head_last": dict(DEFAULT, pzo=True, early_trigger=True, head_last=True),
-    "consumer_head_last": dict(check_valid=True, pzo=True, early_trigger=True, head_last=True),
+    "consumer_pzo": dict(check_valid=True, pzo=True, early_trigger=True),
+    "consumer_group8": dict(check_valid=True, pzo=True, early_trigger=True, group8=True),
 }
 # Reload rounds after which a wait gives up and is counted (retry_counter[1]) instead of hanging the test.
 SPIN_LIMIT = 200_000
@@ -189,6 +194,19 @@ def _st_global_v4(addr: Int64, v, *, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def _st_global_v2(addr: Int64, w0, w1, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [addr.ir_value(loc=loc, ip=ip), w0.ir_value(loc=loc, ip=ip), w1.ir_value(loc=loc, ip=ip)],
+        "st.global.v2.b32 [$0], {$1, $2};",
+        "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
 # The writer publishes anyway this long after it started if the flag never comes.
 FLAG_TIMEOUT_NS = 1_000_000_000
 
@@ -198,18 +216,21 @@ class ColumnBlockWriter:
     rows) per CTA, 16 B per store. Block p is published ``delay + ranks[p] * step`` after ``flag`` turns non-zero
     (set on the consumer's stream right before the consumer). It never writes sentinels."""
 
-    def __init__(self, block_cols: int, threads: int = 128):
+    def __init__(self, block_cols: int, threads: int = 128, split: bool = False):
+        """``split``: each chunk is published as two 8 B stores, elements 0-3 first and 4-7 ``split_ns`` later."""
         assert block_cols % 8 == 0
-        self.block_cols, self.threads = block_cols, threads
+        self.block_cols, self.threads, self.split = block_cols, threads, split
 
     @cute.jit
-    def __call__(self, src, dst, ranks, flag, delay_ns: Int64, step_ns: Int64, stream: cuda.CUstream):
-        self.kernel(src, dst, ranks, flag, delay_ns, step_ns).launch(
+    def __call__(
+        self, src, dst, ranks, flag, delay_ns: Int64, step_ns: Int64, split_ns: Int64, stream: cuda.CUstream
+    ):
+        self.kernel(src, dst, ranks, flag, delay_ns, step_ns, split_ns).launch(
             grid=(cute.size(ranks), 1, 1), block=(self.threads, 1, 1), stream=stream
         )
 
     @cute.kernel
-    def kernel(self, src, dst, ranks, flag, delay_ns: Int64, step_ns: Int64):
+    def kernel(self, src, dst, ranks, flag, delay_ns: Int64, step_ns: Int64, split_ns: Int64):
         p, _, _ = cute.arch.block_idx()
         tid, _, _ = cute.arch.thread_idx()
         give_up = cute.arch.globaltimer() + Int64(FLAG_TIMEOUT_NS)
@@ -219,12 +240,22 @@ class ColumnBlockWriter:
         while cute.arch.globaltimer() < target:
             cute.arch.nanosleep(sleep_time=200)
         chunks = self.block_cols // 8
-        for c in cutlass.range(tid, src.shape[0] * chunks, self.threads, unroll=1):
-            r = c // chunks
-            col = p * self.block_cols + (c - r * chunks) * 8
-            src_off = Int64(r) * Int64(src.stride[0]) + Int64(col)
-            dst_off = Int64(r) * Int64(dst.stride[0]) + Int64(col)
-            _st_global_v4(dst.iterator.toint() + dst_off * 2, _ld_global_v4(src.iterator.toint() + src_off * 2))
+        for half in cutlass.range_constexpr(2 if self.split else 1):
+            if cutlass.const_expr(half == 1):
+                cute.arch.fence_acq_rel_gpu()
+                target = cute.arch.globaltimer() + split_ns
+                while cute.arch.globaltimer() < target:
+                    cute.arch.nanosleep(sleep_time=200)
+            for c in cutlass.range(tid, src.shape[0] * chunks, self.threads, unroll=1):
+                r = c // chunks
+                col = p * self.block_cols + (c - r * chunks) * 8
+                src_off = Int64(r) * Int64(src.stride[0]) + Int64(col)
+                dst_off = Int64(r) * Int64(dst.stride[0]) + Int64(col)
+                v = _ld_global_v4(src.iterator.toint() + src_off * 2)
+                if cutlass.const_expr(self.split):
+                    _st_global_v2(dst.iterator.toint() + (dst_off + 4 * half) * 2, v[2 * half], v[2 * half + 1])
+                else:
+                    _st_global_v4(dst.iterator.toint() + dst_off * 2, v)
         cute.arch.fence_acq_rel_gpu()
 
 
@@ -255,19 +286,26 @@ _WRITERS = {}
 BLOCK_COLS = 128
 
 
-def late_write(src, dst, ranks, delay_us: float, step_us: float, flag=None):
+def late_write(src, dst, ranks, delay_us: float, step_us: float, flag=None, split_us: float = 0.0):
     if flag is None:
         flag = torch.ones(1, dtype=torch.int32, device="cuda")
     args = [from_dlpack(t, assumed_align=16).mark_layout_dynamic(leading_dim=1) for t in (src, dst)]
     ranks_t = from_dlpack(ranks, assumed_align=4).mark_layout_dynamic()
     flag_t = from_dlpack(flag, assumed_align=4)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    if BLOCK_COLS not in _WRITERS:
-        _WRITERS[BLOCK_COLS] = cute.compile(
-            ColumnBlockWriter(BLOCK_COLS), *args, ranks_t, flag_t, Int64(0), Int64(0), stream
+    split = split_us > 0
+    if split not in _WRITERS:
+        _WRITERS[split] = cute.compile(
+            ColumnBlockWriter(BLOCK_COLS, split=split), *args, ranks_t, flag_t, Int64(0), Int64(0), Int64(0), stream
         )
-    _WRITERS[BLOCK_COLS](
-        *args, ranks_t, flag_t, Int64(int(delay_us * 1e3)), Int64(int(step_us * 1e3)), stream
+    _WRITERS[split](
+        *args,
+        ranks_t,
+        flag_t,
+        Int64(int(delay_us * 1e3)),
+        Int64(int(step_us * 1e3)),
+        Int64(int(split_us * 1e3)),
+        stream,
     )
 
 
@@ -286,7 +324,9 @@ def ranks_for(pattern: str, n: int, seed: int = 0) -> torch.Tensor:
     return r.to(torch.int32).cuda()
 
 
-def run_hazard(name: str, pattern: str, variant: str, delay_us: float = 300.0, step_us: float = 2.0):
+def run_hazard(
+    name: str, pattern: str, variant: str, delay_us: float = 300.0, step_us: float = 2.0, split_us: float = 0.0
+):
     """Writer on its own stream first, consumer second; returns (output, FlashInfer reference, reloads, waits given
     up, published).
 
@@ -296,7 +336,7 @@ def run_hazard(name: str, pattern: str, variant: str, delay_us: float = 300.0, s
     ref = flashinfer(x, w, tactic)
     ranks = ranks_for(pattern, x.shape[1] // BLOCK_COLS)
     warm = x.clone()
-    late_write(x, warm, ranks, 0.0, 0.0)
+    late_write(x, warm, ranks, 0.0, 0.0, split_us=split_us)
     gpu_sleep(0)
     run(warm, w, tactic, dict(CONSUMERS[variant], spin_limit=SPIN_LIMIT))
     torch.cuda.synchronize()
@@ -308,7 +348,7 @@ def run_hazard(name: str, pattern: str, variant: str, delay_us: float = 300.0, s
     sp, sc = torch.cuda.Stream(), torch.cuda.Stream()
     torch.cuda.synchronize()
     with torch.cuda.stream(sp):
-        late_write(x, slot, ranks, delay_us, step_us, flag)
+        late_write(x, slot, ranks, delay_us, step_us, flag, split_us=split_us)
     with torch.cuda.stream(sc):
         gpu_sleep(HOST_SLACK_NS)
         flag.fill_(1)
@@ -331,8 +371,8 @@ def stale_blocks(name: str, got: torch.Tensor) -> str:
     return f"stale block(s) {hits}" if hits else "no single stale block reproduces it"
 
 
-def check_hazard(name: str, pattern: str, variant: str) -> None:
-    got, ref, reloads, gave_up, published = run_hazard(name, pattern, variant)
+def check_hazard(name: str, pattern: str, variant: str, split_us: float = 0.0) -> None:
+    got, ref, reloads, gave_up, published = run_hazard(name, pattern, variant, split_us=split_us)
     assert published, f"{name}/{pattern}: the writer did not publish the activation"
     assert gave_up == 0, f"{name}/{pattern}/{variant}: {gave_up} warps gave up waiting ({reloads} reloads)"
     diff = int((bits(got) != bits(ref)).sum())
@@ -353,19 +393,28 @@ def test_late_out_of_order_producer(name: str, pattern: str) -> None:
     check_hazard(name, pattern, fgs.default_check_mode(fgs.DirectTactic(*CASES[name][3]), CASES[name][2]))
 
 
-@pytest.mark.parametrize("variant", ["rows", "row", "row_relaxed", "heads_before_b", "heads_uncapped"])
+@pytest.mark.parametrize("variant", ["row", "heads", "heads_before_b", "rows_elem0", "heads_elem0"])
 @pytest.mark.parametrize("name", ["bfa1", "bfa2", "qkvg1"])
 def test_late_producer_other_check_modes(name: str, variant: str) -> None:
     for pattern in ("reverse", "random"):
         check_hazard(name, pattern, variant)
 
 
+@pytest.mark.parametrize("variant", ["rows", "row", "heads", "heads_before_b"])
+@pytest.mark.parametrize("name", ["bfa1", "bfa4", "oproj1", "qkvg1", "qkvg2"])
+def test_partially_written_chunks(name: str, variant: str) -> None:
+    """Chunks published as two 8 B halves 50 us apart (element 0 first): an element-checking consumer waits for the
+    second half."""
+    check_hazard(name, "random", variant, split_us=50.0)
+
+
+@pytest.mark.parametrize("store", ["pzo", "group8", "head_last"])
 @pytest.mark.parametrize("producer,consumer", [("oproj1", "qkvg1"), ("oproj1", "gproj1"), ("oproj1", "bfa1")])
-def test_live_pair_head_last_into_consumer(producer: str, consumer: str) -> None:
-    """o_proj-shaped producer build (head_last, .pzo, entry trigger) writes a -0.0 slot that a consumer build reads,
-    PDL-chained on one stream, three steps with new producer inputs and the slot re-armed in between (the model's
-    step reuse): every step equals FlashInfer on the canonicalized intermediate, so no L1 line of an earlier step's
-    slot contents is consumed."""
+def test_live_pair_into_consumer(producer: str, consumer: str, store: str) -> None:
+    """o_proj-shaped producer build (``store``, .pzo, entry trigger) writes a -0.0 slot that an element-checking
+    consumer build reads, PDL-chained on one stream, three steps with new producer inputs and the slot re-armed in
+    between (the model's step reuse): every step equals FlashInfer on the canonicalized intermediate, so no L1 line
+    of an earlier step's slot contents is consumed. ``pzo`` is the direct-to-direct pair (2 B stores)."""
     _, w1, t1 = inputs(producer)
     _, w2, t2 = inputs(consumer, seed=5)
     assert w1.shape[0] == w2.shape[1]
@@ -381,7 +430,9 @@ def test_live_pair_head_last_into_consumer(producer: str, consumer: str) -> None
         bits(slot).fill_(NEG0)
         counter.zero_()
         fgs.run_direct_dense_fgs(
-            x, w1.t(), slot, True, t1, retry_counter=counter, spin_limit=SPIN_LIMIT, **PRODUCERS["head_last"]
+            x, w1.t(), slot, True, t1, retry_counter=counter, spin_limit=SPIN_LIMIT, **PRODUCERS[
+                "pzo_early" if store == "pzo" else store
+            ]
         )
         fgs.run_direct_dense_fgs(
             slot, w2.t(), out, True, t2, retry_counter=counter, check_mode=mode, spin_limit=SPIN_LIMIT

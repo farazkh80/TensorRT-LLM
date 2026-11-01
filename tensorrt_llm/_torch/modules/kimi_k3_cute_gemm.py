@@ -20,7 +20,10 @@ stores whole 16 B chunks). ``rubin`` runs ``kimi_k3_fgs.dense_gemm_fgs``, split-
 ``kimi_k3_fgs.splitk_gemm_fgs``, ``fi_direct`` rows FlashInfer's default split-K tactic, or
 ``kimi_k3_fgs.direct_gemm_fgs`` at the table tactic (dense, 32 B aligned operands, N % 8 == 0 for an output slot)
 with ``TLLM_K3_FGS_DIRECT=1`` (any slot) or ``=consumer`` (input slot only); a strided input at split-K rows runs the
-``rubin`` build at ``_FGS_SMALL_TACTIC``.
+``rubin`` build at ``_FGS_SMALL_TACTIC``. The direct consumer checks every element. A direct producer stores with
+``.pzo`` only when every reader of its slot checks every element (edges in ``TLLM_K3_FGS_ELEMENT_EDGES``), else it
+stores whole 16 B chunks as ``TLLM_K3_FGS_DIRECT_PRODUCER`` says: ``group8`` (default), ``head_last``, or ``splitk``
+(the split-K fallback above).
 
 A shape without an entry runs the ``rubin`` backend under the TRT-LLM autotuner. Non-BF16 operands keep the
 cuBLAS matmul; empty problems launch nothing.
@@ -164,6 +167,17 @@ def _fgs_direct_mode() -> str:
 
 
 @functools.lru_cache(maxsize=None)
+def _direct_producer() -> str:
+    return os.environ.get("TLLM_K3_FGS_DIRECT_PRODUCER", "group8")
+
+
+@functools.lru_cache(maxsize=None)
+def _element_checked_edges() -> frozenset:
+    """Edges whose every reader checks every element (no direct GEMM consumer reads a fi_direct output today)."""
+    return frozenset(e for e in os.environ.get("TLLM_K3_FGS_ELEMENT_EDGES", "").split(",") if e)
+
+
+@functools.lru_cache(maxsize=None)
 def _x5() -> bool:
     return os.environ.get("TLLM_K3_CUTE_GEMM_X5", "1") == "1" and fgs_dsl()
 
@@ -267,7 +281,8 @@ def _fgs_rubin(x3, w3, out3, tactic, consume: bool, produce: bool) -> None:
     )
 
 
-def _fgs_direct(x, weight, out, tactic, consume: bool, produce: bool) -> None:
+def _fgs_direct(x, weight, out, tactic, consume: bool, produce: str) -> None:
+    """``produce``: "" (no output slot), "pzo" (element-checked readers), "group8" or "head_last"."""
     from .kimi_k3_fgs.direct_gemm_fgs import DirectTactic, run_direct_dense_fgs
 
     run_direct_dense_fgs(
@@ -278,13 +293,14 @@ def _fgs_direct(x, weight, out, tactic, consume: bool, produce: bool) -> None:
         DirectTactic(*tactic),
         check_valid=consume,
         pdl_wait_activation=not consume,
-        pzo=produce,
-        early_trigger=produce,
-        head_last=produce,
+        pzo=bool(produce),
+        early_trigger=bool(produce),
+        head_last=produce == "head_last",
+        group8=produce == "group8",
     )
 
 
-def _fgs_linear(x, weight, out, consume: bool, produce: bool) -> None:
+def _fgs_linear(x, weight, out, consume: bool, produce: bool, out_edge: Optional[str] = None) -> None:
     """``linear`` on edge-slot operands: the fine-grained-sync build of the table entry's kernel."""
     from .kimi_k3_fgs.splitk_gemm_fgs import SplitKTactic, default_tactic, run_splitk_dense_fgs
 
@@ -292,15 +308,18 @@ def _fgs_linear(x, weight, out, consume: bool, produce: bool) -> None:
     n = weight.shape[0]
     dense = _row_major(x) and _row_major(out)
     backend, tactic = _select(_GEMM_TABLE.get((n, k)), m)
+    direct_store = ""
+    if produce:
+        direct_store = "pzo" if out_edge in _element_checked_edges() else _direct_producer()
     if (
         backend == "fi_direct"
         and (_fgs_direct_mode() == "1" or (_fgs_direct_mode() == "consumer" and not produce))
         and dense
         and x.data_ptr() % 32 == 0
         and out.data_ptr() % 32 == 0
-        and (not produce or n % 8 == 0)
+        and (not produce or (n % 8 == 0 and direct_store != "splitk"))
     ):
-        _fgs_direct(x, weight, out, tactic, consume, produce)
+        _fgs_direct(x, weight, out, tactic, consume, direct_store)
         return
     # The decode o_proj consumer; prefill rows take the table's GEMM below.
     if consume and not produce and dense and n == 7168 and k == 12288 and m <= 2 * _FI_MAX_M:
@@ -358,7 +377,14 @@ def linear(
     if in_lease is not None or out_lease is not None:
         from .kimi_k3_fgs import edges as fgs_edges
 
-        _fgs_linear(x, weight, out, in_lease is not None, out_lease is not None)
+        _fgs_linear(
+            x,
+            weight,
+            out,
+            in_lease is not None,
+            out_lease is not None,
+            None if out_lease is None else out_lease.name,
+        )
         _debug(
             f"linear N={n} K={k}",
             m,
