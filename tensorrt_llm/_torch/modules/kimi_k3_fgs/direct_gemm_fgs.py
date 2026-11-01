@@ -13,22 +13,21 @@ with plain 16 B vector loads (no TMA), so the consumer check is done in software
 
 Compile-time consumer roles:
 
-- ``check_valid``: activation chunks are read with ``ld.relaxed.gpu`` (never served from a stale L1 line) and a
-  16 B chunk counts as written once its element 0 is not the bf16 -0.0 sentinel, the same rule as the TMA
-  ``report_valid`` check of the other FGS consumers. Waits are warp-uniform: while any lane sees an unwritten chunk,
-  the warp sleeps (exponential backoff) and reloads. There is no fallback: an input that is never published hangs
-  the kernel. ``check_mode`` places the check:
+- ``check_valid``: a 16 B activation chunk counts as written once its element 0 is not the bf16 -0.0 sentinel, the
+  same rule as the TMA ``report_valid`` check of the other FGS consumers. The first loads are the default build's
+  (L1-allocating) loads; a warp that sees an unwritten chunk sleeps (exponential backoff) and reloads with
+  ``ld.relaxed.gpu``, which an L1 line holding the sentinel cannot serve. Within the kernel's lifetime an
+  activation chunk only goes from the sentinel to its final value, so a cached line holds one or the other. Waits
+  are warp-uniform; there is no fallback (an input that is never published hangs the kernel). ``check_mode``:
 
-  - ``row``: each row's 16 B chunks are loaded, checked and reloaded until written, then used (one round trip on
-    ready input, a few registers for the loop).
-  - ``heads``: after the weight loads are issued, element 0 of every chunk of the CTA's rows is checked (4 B loads)
-    until written, then the default body runs with coherent activation loads (two round trips, default register
-    use).
+  - ``row``: each row's chunks are checked as they are loaded; reloaded chunks are used directly.
+  - ``heads``: after the weight loads are issued, element 0 of every chunk of the CTA's rows is loaded (4 B,
+    L1-allocating) until written, then the default body runs; its activation loads hit the lines the check
+    brought in. After a reload, ``fence.acq_rel.gpu`` keeps those loads from stale lines.
   - ``heads_before_b``: ``heads`` before the weight loads. With several rows, ``row`` splits the rows' FMAs into
     separate blocks, so the weight registers stay live instead of being consumed by interleaved rows (spills at
     4 outputs x 14 K tiles); this mode keeps the default body's register use there.
-- ``a_l1`` (diagnostic, ``row``): the first activation load goes through L1 as in the default build; only reloads
-  are coherent.
+- ``relaxed_first`` (diagnostic, ``row``): the first activation loads are ``ld.relaxed.gpu`` as well.
 - ``pdl_wait_activation``: ``griddepcontrol.wait`` before the weight and activation loads (the default build's
   only wait). Without it the weight rows stream from launch.
 
@@ -36,9 +35,11 @@ Compile-time producer roles (the output is a consumer's input checked per 16 B c
 
 - ``pzo``: the output is narrowed with ``cvt.rn.pzo`` (-0.0 stored as +0.0).
 - ``early_trigger``: ``griddepcontrol.launch_dependents`` at kernel entry instead of after the stores.
-- ``store16``: a 16 B output chunk spans ``8 / outputs_per_block`` CTAs, so a cluster of that many CTAs along N
-  gathers its values in the rank-0 CTA's shared memory, which writes each row's chunk with one 16 B store. Needs a
-  row-major output with N % 8 == 0.
+- ``head_last``: a 16 B output chunk spans ``G = 8 / outputs_per_block`` CTAs, each storing 2 B per element, so its
+  element 0 could land before the rest. CTAs are mapped so that the chunk head is computed by the group's highest
+  CTA index (dispatched last); that CTA stores its other elements, waits until the chunk's remaining elements are
+  no longer -0.0 (``ld.relaxed.gpu``; the output must be armed with -0.0 for the order to mean anything), then
+  stores element 0. Needs ``pzo`` (a published -0.0 would never end the wait) and N % 8 == 0.
 
 The kernel never writes sentinels; the caller owns sentinel initialization of the activation buffer.
 """
@@ -76,8 +77,8 @@ _HEADS_BEFORE_B_REGS = 128
 _CHECK_MODES = ("row", "heads", "heads_before_b")
 
 #: CTAs per SM of the default build (its register count, CuTe DSL 4.9, sm_107a) at the Kimi K3 decode tactics:
-#: (K, (block_size, outputs_per_block, rows_per_block)) -> CTAs. The check loops cost a few registers, which at
-#: these counts drops a CTA per SM; consumer builds of a multi-wave grid request the default build's occupancy.
+#: (K, (block_size, outputs_per_block, rows_per_block)) -> CTAs. The FGS roles cost a few registers, which at
+#: these counts drops a CTA per SM; FGS builds of a multi-wave grid request the default build's occupancy.
 _DEFAULT_CTAS_PER_SM = {
     (7168, (128, 1, 1)): 8,
     (7168, (128, 1, 2)): 5,
@@ -140,20 +141,14 @@ def default_tactic(m: int, n: int, k: int) -> DirectTactic:
 
 
 @dsl_user_op
-def _ld_relaxed_v4(addr, offset: int, reload, after=None, *, loc=None, ip=None):
+def _ld_relaxed_v4(addr, offset: int, reload, *, loc=None, ip=None):
     """16 B ``ld.relaxed.gpu.global`` at ``addr + offset`` bytes as four int32; a ``reload`` is never merged with or
-    hoisted above an earlier load of the address. ``after`` (unused by the load) is a value the load must not be
-    hoisted above."""
-    operands = [Int64(addr).ir_value(loc=loc, ip=ip)]
-    constraints = "=r,=r,=r,=r,l"
-    if after is not None:
-        operands.append(Int32(after).ir_value(loc=loc, ip=ip))
-        constraints += ",r"
+    hoisted above an earlier load of the address."""
     res = llvm.inline_asm(
         ir.Type.parse("!llvm.struct<(i32,i32,i32,i32)>"),
-        operands,
+        [Int64(addr).ir_value(loc=loc, ip=ip)],
         f"ld.relaxed.gpu.global.v4.b32 {{$0, $1, $2, $3}}, [$4+{offset}];",
-        constraints + (",~{memory}" if reload else ""),
+        "=r,=r,=r,=r,l,~{memory}" if reload else "=r,=r,=r,=r,l",
         has_side_effects=reload,
         asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc,
@@ -163,18 +158,36 @@ def _ld_relaxed_v4(addr, offset: int, reload, after=None, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _ld_relaxed_b32(addr, offset: int, reload, *, loc=None, ip=None):
+def _ld_head(addr, offset: int, relaxed: bool, *, loc=None, ip=None):
+    """4 B load of a chunk head, L1-allocating or ``ld.relaxed.gpu``; never reordered with other memory accesses."""
+    op = "ld.relaxed.gpu.global.b32" if relaxed else "ld.global.b32"
     return Int32(
         llvm.inline_asm(
             T.i32(),
             [Int64(addr).ir_value(loc=loc, ip=ip)],
-            f"ld.relaxed.gpu.global.b32 $0, [$1+{offset}];",
-            "=r,l,~{memory}" if reload else "=r,l",
-            has_side_effects=reload,
+            f"{op} $0, [$1+{offset}];",
+            "=r,l,~{memory}",
+            has_side_effects=True,
             asm_dialect=llvm.AsmDialect.AD_ATT,
             loc=loc,
             ip=ip,
         )
+    )
+
+
+@dsl_user_op
+def _st_release_b16(addr, bits, *, loc=None, ip=None):
+    """``st.release.gpu`` of the low 16 bits of ``bits`` (a release orders it after the chunk-tail loads without
+    the L1 invalidation of an acquire fence)."""
+    llvm.inline_asm(
+        None,
+        [Int64(addr).ir_value(loc=loc, ip=ip), Int32(bits).ir_value(loc=loc, ip=ip)],
+        "{ .reg .b16 lo, hi; mov.b32 {lo, hi}, $1; st.release.gpu.global.b16 [$0], lo; }",
+        "l,r,~{memory}",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -231,36 +244,6 @@ def _bf16_bits(x, pzo: bool, *, loc=None, ip=None):
     )
 
 
-@dsl_user_op
-def _st_cluster_b16(smem_addr, peer, bits, *, loc=None, ip=None):
-    """Store the low 16 bits of ``bits`` at this CTA's shared address ``smem_addr`` of cluster rank ``peer``."""
-    llvm.inline_asm(
-        None,
-        [Int32(v).ir_value(loc=loc, ip=ip) for v in (smem_addr, peer, bits)],
-        "{ .reg .u32 ra; .reg .b16 lo, hi; mapa.shared::cluster.u32 ra, $0, $1; mov.b32 {lo, hi}, $2; "
-        "st.shared::cluster.b16 [ra], lo; }",
-        "r,r,r",
-        has_side_effects=True,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _copy_shared_to_global_v4(gaddr, saddr, *, loc=None, ip=None):
-    llvm.inline_asm(
-        None,
-        [Int64(gaddr).ir_value(loc=loc, ip=ip), Int32(saddr).ir_value(loc=loc, ip=ip)],
-        "{ .reg .b32 r<4>; ld.shared.v4.b32 {r0, r1, r2, r3}, [$1]; st.global.v4.b32 [$0], {r0, r1, r2, r3}; }",
-        "l,r",
-        has_side_effects=True,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
 class DirectFgsGemmKernel:
     """K-specialized direct GEMM with whole-mainloop vector prefetch and optional FGS roles."""
 
@@ -273,19 +256,21 @@ class DirectFgsGemmKernel:
         tactic: DirectTactic,
         use_pdl: bool,
         check_valid: bool = False,
-        a_l1: bool = False,
+        relaxed_first: bool = False,
         check_mode: str = "row",
         pdl_wait_activation: bool = True,
         pzo: bool = False,
         early_trigger: bool = False,
-        store16: bool = False,
+        head_last: bool = False,
         min_ctas_per_sm: int = 1,
     ) -> None:
         validate_tactic(tactic, num_rows, tactic.outputs_per_block, k_extent)
         if check_mode not in _CHECK_MODES:
             raise ValueError(f"check_mode must be one of {_CHECK_MODES}, got {check_mode!r}")
-        if a_l1 and (not check_valid or check_mode != "row"):
-            raise ValueError("a_l1 applies to the row check only")
+        if relaxed_first and (not check_valid or check_mode != "row"):
+            raise ValueError("relaxed_first applies to the row check only")
+        if head_last and not pzo:
+            raise ValueError("head_last needs pzo")
         self.element_type = element_type
         self.num_rows = num_rows
         self.rows_per_block = tactic.rows_per_block
@@ -299,13 +284,13 @@ class DirectFgsGemmKernel:
         # Byte distance between a thread's consecutive activation chunks of one row (K is contiguous).
         self.k_tile_bytes = tactic.block_size * _VECTOR_WIDTH * element_type.width // 8
         self.check_valid = check_valid
-        self.a_l1 = a_l1
+        self.relaxed_first = relaxed_first
         self.check_mode = check_mode
         self.pdl_wait_activation = pdl_wait_activation
         self.pzo = pzo
         self.early_trigger = early_trigger and use_pdl
-        self.store16 = store16
-        self.cluster_n = _CHUNK // tactic.outputs_per_block if store16 else 1
+        self.head_last = head_last
+        self.group = _CHUNK // tactic.outputs_per_block
         self.min_ctas_per_sm = min_ctas_per_sm
 
     @cute.jit
@@ -330,11 +315,6 @@ class DirectFgsGemmKernel:
             num_bits_per_copy=self.vector_width * self.element_type.width,
             load_cache_mode=cute.nvgpu.LoadCacheMode.STREAMING,
         )
-        smem = self.rows_per_block * self.outputs_per_block * self.num_warps * 4
-        launch_attrs = {}
-        if const_expr(self.store16):
-            smem = (smem + 15) // 16 * 16 + self.rows_per_block * _CHUNK * 2
-            launch_attrs["cluster"] = [self.cluster_n, 1, 1]
         self.kernel(gA, gB, gC, retry_count, copy_a, copy_b).launch(
             grid=[
                 cute.ceil_div(n, self.outputs_per_block),
@@ -342,11 +322,10 @@ class DirectFgsGemmKernel:
                 1,
             ],
             block=[self.block_size, 1, 1],
-            smem=smem,
+            smem=self.rows_per_block * self.outputs_per_block * self.num_warps * 4,
             stream=stream,
             use_pdl=self.use_pdl,
             min_blocks_per_mp=self.min_ctas_per_sm,
-            **launch_attrs,
         )
 
     @cute.kernel
@@ -382,15 +361,17 @@ class DirectFgsGemmKernel:
             cute.arch.griddepcontrol_wait()
 
         n_base = block_idx * outputs_per_block
+        if const_expr(self.head_last):
+            rank = block_idx % self.group
+            n_base = (block_idx - rank + (self.group - 1 - rank)) * outputs_per_block
         m_base = block_m * num_rows
         gA_vec = cute.logical_divide(gA, (None, vector_width))
         gB_vec = cute.logical_divide(gB, (None, vector_width))
         tA_all = cute.logical_divide(gA_vec, (None, (None, block_size)))
         tB_all = cute.logical_divide(gB_vec, (None, (None, block_size)))
         tA = tA_all[None, (None, (tidx, None))]
-        rounds = Int32(0)
         if const_expr(self.check_valid and self.check_mode == "heads_before_b"):
-            rounds = self._wait_heads_written(tA, m_base, retry_count)
+            self._wait_heads_written(tA, m_base, retry_count)
 
         b_regs = cute.make_rmem_tensor(
             cute.make_layout(
@@ -404,7 +385,7 @@ class DirectFgsGemmKernel:
             for k_tile in cutlass.range_constexpr(num_k_tiles):
                 cute.copy(copy_b, tB[None, k_tile], b_regs[ni, k_tile, None])
         if const_expr(self.check_valid and self.check_mode == "heads"):
-            rounds = self._wait_heads_written(tA, m_base, retry_count)
+            self._wait_heads_written(tA, m_base, retry_count)
 
         a_regs = cute.make_rmem_tensor(
             cute.make_layout((num_k_tiles, vector_width), stride=(vector_width, 1)),
@@ -414,14 +395,6 @@ class DirectFgsGemmKernel:
         for mi in cutlass.range_constexpr(num_rows):
             if const_expr(per_row_check):
                 self._load_a_checked(copy_a, tA, m_base + mi, a_regs, retry_count)
-            elif const_expr(self.check_valid):
-                words = cute.recast_tensor(a_regs, Int32)
-                for k_tile in cutlass.range_constexpr(num_k_tiles):
-                    data = _ld_relaxed_v4(
-                        tA[m_base + mi, None, 0].iterator.toint(), k_tile * self.k_tile_bytes, False, rounds
-                    )
-                    for j in cutlass.range_constexpr(4):
-                        words[k_tile, j] = data[j]
             else:
                 for k_tile in cutlass.range_constexpr(num_k_tiles):
                     cute.copy(
@@ -455,11 +428,6 @@ class DirectFgsGemmKernel:
         )
         smem = cutlass.utils.SmemAllocator()
         partials = smem.allocate_tensor(cutlass.Float32, smem_layout, byte_alignment=16)
-        if const_expr(self.store16):
-            # Row mi of the rank-0 CTA's buffer is output chunk (m_base + mi, n_base of rank 0 .. + 8).
-            chunk_rows = smem.allocate_tensor(
-                cutlass.Int16, cute.make_layout((num_rows, _CHUNK), stride=(_CHUNK, 1)), byte_alignment=16
-            )
         with cute.arch.elect_one():
             for mi in cutlass.range_constexpr(num_rows):
                 for ni in cutlass.range_constexpr(outputs_per_block):
@@ -467,48 +435,50 @@ class DirectFgsGemmKernel:
 
         cute.arch.sync_threads()
         if tidx == 0:
+            if const_expr(self.head_last):
+                is_head = block_idx % self.group == self.group - 1
+                head_bits = cute.make_rmem_tensor((num_rows,), Int32)
             for mi in cutlass.range_constexpr(num_rows):
                 for ni in cutlass.range_constexpr(outputs_per_block):
                     total = cutlass.Float32(0.0)
                     for warp in cutlass.range_constexpr(num_warps):
                         total = total + partials[mi, ni, warp]
-                    if const_expr(self.store16):
-                        rank = block_idx % self.cluster_n
-                        _st_cluster_b16(
-                            (chunk_rows.iterator + (mi * _CHUNK + rank * outputs_per_block + ni)).toint(),
-                            0,
-                            _bf16_bits(total, self.pzo),
-                        )
-                    elif const_expr(self.pzo):
-                        cute.recast_tensor(gC, cutlass.Int16)[m_base + mi, n_base + ni] = cutlass.Int16(
-                            _bf16_bits(total, True)
-                        )
+                    if const_expr(self.pzo):
+                        out_bits = _bf16_bits(total, True)
+                        if const_expr(self.head_last and ni == 0):
+                            head_bits[mi] = out_bits
+                            if not is_head:
+                                cute.recast_tensor(gC, cutlass.Int16)[m_base + mi, n_base] = cutlass.Int16(
+                                    out_bits
+                                )
+                        else:
+                            cute.recast_tensor(gC, cutlass.Int16)[m_base + mi, n_base + ni] = cutlass.Int16(
+                                out_bits
+                            )
                     else:
                         gC[m_base + mi, n_base + ni] = total.to(self.element_type)
-
-        if const_expr(self.store16):
-            cute.arch.cluster_arrive()
-            cute.arch.cluster_wait()
-            if block_idx % self.cluster_n == 0 and tidx < num_rows:
-                _copy_shared_to_global_v4(
-                    (gC.iterator + cute.crd2idx((m_base + tidx, n_base), gC.layout)).toint(),
-                    (chunk_rows.iterator + tidx * _CHUNK).toint(),
-                )
+            if const_expr(self.head_last):
+                if is_head:
+                    self._wait_chunk_tails(gC, m_base, n_base)
+                    for mi in cutlass.range_constexpr(num_rows):
+                        _st_release_b16(
+                            (gC.iterator + cute.crd2idx((m_base + mi, n_base), gC.layout)).toint(), head_bits[mi]
+                        )
 
         if const_expr(self.use_pdl and not self.early_trigger):
             cute.arch.griddepcontrol_launch_dependents()
 
     @cute.jit
-    def _wait_heads_written(self, tA: cute.Tensor, m_base, retry_count: cute.Tensor) -> Int32:
-        """Return once element 0 of every activation chunk this warp reads in rows ``m_base ..`` is written; returns
-        the reload rounds, which are also added to ``retry_count``."""
+    def _wait_heads_written(self, tA: cute.Tensor, m_base, retry_count: cute.Tensor):
+        """Return once element 0 of every activation chunk this warp reads in rows ``m_base ..`` is written; reload
+        rounds are added to ``retry_count``."""
         num_rows: cutlass.Constexpr = self.rows_per_block
         num_k_tiles: cutlass.Constexpr = self.num_k_tiles
         k_stride: cutlass.Constexpr = self.k_tile_bytes
         bad = cutlass.Boolean(False)
         for mi in cutlass.range_constexpr(num_rows):
             for k_tile in cutlass.range_constexpr(num_k_tiles):
-                head = _ld_relaxed_b32(tA[m_base + mi, None, 0].iterator.toint(), k_tile * k_stride, False)
+                head = _ld_head(tA[m_base + mi, None, 0].iterator.toint(), k_tile * k_stride, False)
                 bad = bad | ((head & 0xFFFF) == _BF16_NEG_ZERO)
         pending = cute.arch.vote_any_sync(bad)
         rounds = Int32(0)
@@ -520,12 +490,14 @@ class DirectFgsGemmKernel:
             bad = cutlass.Boolean(False)
             for mi in cutlass.range_constexpr(num_rows):
                 for k_tile in cutlass.range_constexpr(num_k_tiles):
-                    head = _ld_relaxed_b32(tA[m_base + mi, None, 0].iterator.toint(), k_tile * k_stride, True)
+                    head = _ld_head(tA[m_base + mi, None, 0].iterator.toint(), k_tile * k_stride, True)
                     bad = bad | ((head & 0xFFFF) == _BF16_NEG_ZERO)
             pending = cute.arch.vote_any_sync(bad)
-        if cute.arch.lane_idx() == 0 and rounds > 0:
-            cute.arch.atomic_add(retry_count.iterator, rounds)
-        return rounds
+        if rounds > 0:
+            # The default body's loads must not hit the lines the first pass cached with the sentinel.
+            cute.arch.fence_acq_rel_gpu()
+            if cute.arch.lane_idx() == 0:
+                cute.arch.atomic_add(retry_count.iterator, rounds)
 
     @cute.jit
     def _load_a_checked(
@@ -537,12 +509,12 @@ class DirectFgsGemmKernel:
         words = cute.recast_tensor(a_regs, Int32)
         bad = cutlass.Boolean(False)
         for k_tile in cutlass.range_constexpr(num_k_tiles):
-            if const_expr(self.a_l1):
-                cute.copy(copy_a, tA[row, None, k_tile], a_regs[k_tile, None])
-            else:
+            if const_expr(self.relaxed_first):
                 first = _ld_relaxed_v4(tA[row, None, 0].iterator.toint(), k_tile * self.k_tile_bytes, False)
                 for j in cutlass.range_constexpr(4):
                     words[k_tile, j] = first[j]
+            else:
+                cute.copy(copy_a, tA[row, None, k_tile], a_regs[k_tile, None])
             bad = bad | ((words[k_tile, 0] & 0xFFFF) == _BF16_NEG_ZERO)
         pending = cute.arch.vote_any_sync(bad)
         rounds = Int32(0)
@@ -560,6 +532,26 @@ class DirectFgsGemmKernel:
             pending = cute.arch.vote_any_sync(bad)
         if cute.arch.lane_idx() == 0 and rounds > 0:
             cute.arch.atomic_add(retry_count.iterator, rounds)
+
+    @cute.jit
+    def _wait_chunk_tails(self, gC: cute.Tensor, m_base, n_base):
+        """Spin until elements ``outputs_per_block .. 7`` of the output chunks at (rows ``m_base ..``, ``n_base``)
+        are no longer -0.0 (stored by the group's other CTAs)."""
+        num_rows: cutlass.Constexpr = self.rows_per_block
+        first_tail: cutlass.Constexpr = self.outputs_per_block
+        bad = cutlass.Boolean(True)
+        sleep_ns = Int32(_SPIN_NS_MIN)
+        while bad:
+            bad = cutlass.Boolean(False)
+            for mi in cutlass.range_constexpr(num_rows):
+                chunk = _ld_relaxed_v4(
+                    (gC.iterator + cute.crd2idx((m_base + mi, n_base), gC.layout)).toint(), 0, True
+                )
+                for e in cutlass.range_constexpr(first_tail, _CHUNK):
+                    bad = bad | (((chunk[e // 2] >> (16 * (e % 2))) & 0xFFFF) == _BF16_NEG_ZERO)
+            if bad:
+                _nanosleep(sleep_ns)
+                sleep_ns = cute.min(sleep_ns * 2, Int32(_SPIN_NS_MAX))
 
 
 def _from_dlpack_static(tensor: _torch.Tensor):
@@ -592,12 +584,12 @@ def _get_compiled_direct_kernel(
     tactic: DirectTactic,
     use_pdl: bool,
     check_valid: bool,
-    a_l1: bool,
+    relaxed_first: bool,
     check_mode: str,
     pdl_wait_activation: bool,
     pzo: bool,
     early_trigger: bool,
-    store16: bool,
+    head_last: bool,
     min_ctas_per_sm: int,
 ):
     if dtype != _torch.bfloat16:
@@ -609,12 +601,12 @@ def _get_compiled_direct_kernel(
         tactic=tactic,
         use_pdl=use_pdl,
         check_valid=check_valid,
-        a_l1=a_l1,
+        relaxed_first=relaxed_first,
         check_mode=check_mode,
         pdl_wait_activation=pdl_wait_activation,
         pzo=pzo,
         early_trigger=early_trigger,
-        store16=store16,
+        head_last=head_last,
         min_ctas_per_sm=min_ctas_per_sm,
     )
     tensors = _make_compile_repr_tensors(dtype, m, n, k)
@@ -648,9 +640,10 @@ def _validate_runtime_tensors(a, b, out, tactic: DirectTactic):
 
 
 def default_check_mode(tactic: DirectTactic, k: int) -> str:
-    """``heads_before_b`` for multi-row tactics whose weight registers exceed ``_HEADS_BEFORE_B_REGS``, else ``row``."""
+    """``heads_before_b`` for multi-row tactics whose weight registers exceed ``_HEADS_BEFORE_B_REGS``, else
+    ``heads`` (no spill under the default build's launch bound, unlike ``row``)."""
     b_regs = tactic.outputs_per_block * k // (tactic.block_size * _VECTOR_WIDTH) * 4
-    return "heads_before_b" if tactic.rows_per_block > 1 and b_regs > _HEADS_BEFORE_B_REGS else "row"
+    return "heads_before_b" if tactic.rows_per_block > 1 and b_regs > _HEADS_BEFORE_B_REGS else "heads"
 
 
 @functools.cache
@@ -685,13 +678,13 @@ def run_direct_dense_fgs(
     tactic: DirectTactic,
     *,
     check_valid: bool = True,
-    a_l1: bool = False,
+    relaxed_first: bool = False,
     check_mode: str | None = None,
     pdl_wait_activation: bool = False,
     retry_counter: _torch.Tensor | None = None,
     pzo: bool = False,
     early_trigger: bool = False,
-    store16: bool = False,
+    head_last: bool = False,
     min_ctas_per_sm: int | None = None,
 ):
     """Run direct ``A[M,K] @ B[K,N]`` with the ``mm_bf16`` layouts; ``a`` is the FGS-checked operand.
@@ -699,7 +692,7 @@ def run_direct_dense_fgs(
     ``retry_counter`` (int32, ``RETRY_COUNTER_SLOTS`` elements) accumulates the activation reload rounds. With every
     role off (``check_valid=False``, ``pdl_wait_activation=True``) this is FlashInfer's ``run_direct_dense``.
     ``check_mode=None`` takes ``default_check_mode``; ``min_ctas_per_sm`` (launch bound) ``None`` takes
-    ``default_min_ctas_per_sm`` for a consumer and 1 (the default build's) otherwise.
+    ``default_min_ctas_per_sm`` when any role is on and 1 (the default build's) otherwise.
     """
     m, n, k = _validate_runtime_tensors(a, b, out, tactic)
     if not check_valid:
@@ -707,11 +700,10 @@ def run_direct_dense_fgs(
     elif check_mode is None:
         check_mode = default_check_mode(tactic, k)
     if min_ctas_per_sm is None:
-        min_ctas_per_sm = (
-            default_min_ctas_per_sm(tactic, m, n, k, a.get_device()) if check_valid else 1
-        )
-    if store16 and n % _CHUNK:
-        raise ValueError(f"store16 needs N % {_CHUNK} == 0, got N={n}")
+        roles = check_valid or pzo or early_trigger or head_last
+        min_ctas_per_sm = default_min_ctas_per_sm(tactic, m, n, k, a.get_device()) if roles else 1
+    if head_last and n % _CHUNK:
+        raise ValueError(f"head_last needs N % {_CHUNK} == 0, got N={n}")
     if retry_counter is None:
         retry_counter = _scratch_retry_counter(a.device)
     elif (
@@ -728,12 +720,12 @@ def run_direct_dense_fgs(
         tactic,
         pdl,
         check_valid,
-        a_l1,
+        relaxed_first,
         check_mode,
         pdl_wait_activation,
         pzo,
         early_trigger,
-        store16,
+        head_last,
         min_ctas_per_sm,
     )
     tensors = tuple(_from_dlpack_static(tensor) for tensor in (a, b.T, out))

@@ -45,18 +45,18 @@ CASES = {
 }
 DEFAULT = dict(check_valid=False, pdl_wait_activation=True)
 CONSUMERS = {
-    "row": dict(check_valid=True, check_mode="row"),
     "heads": dict(check_valid=True, check_mode="heads"),
     "heads_before_b": dict(check_valid=True, check_mode="heads_before_b"),
-    "row_wait": dict(check_valid=True, check_mode="row", pdl_wait_activation=True),
-    "row_l1": dict(check_valid=True, check_mode="row", a_l1=True),
-    "row_uncapped": dict(check_valid=True, check_mode="row", min_ctas_per_sm=1),
+    "row": dict(check_valid=True, check_mode="row"),
+    "row_relaxed": dict(check_valid=True, check_mode="row", relaxed_first=True),
+    "heads_wait": dict(check_valid=True, check_mode="heads", pdl_wait_activation=True),
+    "heads_uncapped": dict(check_valid=True, check_mode="heads", min_ctas_per_sm=1),
 }
 PRODUCERS = {
     "pzo": dict(DEFAULT, pzo=True),
     "pzo_early": dict(DEFAULT, pzo=True, early_trigger=True),
-    "store16": dict(DEFAULT, pzo=True, early_trigger=True, store16=True),
-    "consumer_store16": dict(check_valid=True, pzo=True, early_trigger=True, store16=True),
+    "head_last": dict(DEFAULT, pzo=True, early_trigger=True, head_last=True),
+    "consumer_head_last": dict(check_valid=True, pzo=True, early_trigger=True, head_last=True),
 }
 
 
@@ -81,10 +81,12 @@ def flashinfer(x, w, tactic, out=None):
     return out
 
 
-def run(x, w, tactic, flags, counter=None):
+def run(x, w, tactic, flags, counter=None, buf=None, fill=float("nan")):
     """Output buffer with one spare row past M (must stay NaN)."""
     m = x.shape[0]
-    buf = torch.full((m + 1, w.shape[0]), float("nan"), device="cuda", dtype=torch.bfloat16)
+    if buf is None:
+        buf = torch.full((m + 1, w.shape[0]), fill, device="cuda", dtype=torch.bfloat16)
+        buf[m] = float("nan")
     fgs.run_direct_dense_fgs(x, w.t(), buf[:m], True, tactic, retry_counter=counter, **flags)
     return buf
 
@@ -123,11 +125,13 @@ def _negative_zero_inputs(name: str):
     return x, w, tactic
 
 
+@pytest.mark.parametrize("armed", [False, True])
 @pytest.mark.parametrize("name,variant", [(n, v) for n in CASES for v in PRODUCERS])
-def test_producer_build_changes_only_negative_zero(name: str, variant: str) -> None:
+def test_producer_build_changes_only_negative_zero(name: str, variant: str, armed: bool) -> None:
+    """``armed``: the output starts as -0.0, so head_last chunk heads wait for the rest of their chunk."""
     x, w, tactic = _negative_zero_inputs(name)
     ref = flashinfer(x, w, tactic)
-    got = run(x, w, tactic, PRODUCERS[variant])
+    got = run(x, w, tactic, PRODUCERS[variant], fill=-0.0 if armed else float("nan"))
     torch.cuda.synchronize()
     assert bool((bits(ref) == NEG0).any()), "the inputs no longer produce -0.0 in the default build"
     canon = bits(ref).clone()
@@ -248,7 +252,10 @@ def ranks_for(pattern: str, n: int, seed: int = 0) -> torch.Tensor:
 
 
 def run_hazard(name: str, pattern: str, variant: str, delay_us: float = 300.0, step_us: float = 2.0):
-    """Writer on its own stream first, consumer second; returns (output, FlashInfer reference, reloads, published)."""
+    """Writer on its own stream first, consumer second; returns (output, FlashInfer reference, reloads, published).
+
+    The consumer's stream sleeps on the GPU before it sets the writer's flag, so the consumer is already queued
+    when the writer's clock starts, however slow the host is."""
     x, w, tactic = inputs(name, seed=3)
     ref = flashinfer(x, w, tactic)
     ranks = ranks_for(pattern, x.shape[1] // BLOCK_COLS)
@@ -260,62 +267,84 @@ def run_hazard(name: str, pattern: str, variant: str, delay_us: float = 300.0, s
     slot = torch.full_like(x, -0.0)
     counter = torch.zeros(fgs.RETRY_COUNTER_SLOTS, dtype=torch.int32, device="cuda")
     flag = torch.zeros(1, dtype=torch.int32, device="cuda")
-    torch.cuda.synchronize()
+    got = torch.full((x.shape[0] + 1, w.shape[0]), float("nan"), device="cuda", dtype=torch.bfloat16)
     sp, sc = torch.cuda.Stream(), torch.cuda.Stream()
+    torch.cuda.synchronize()
     with torch.cuda.stream(sp):
         late_write(x, slot, ranks, delay_us, step_us, flag)
     with torch.cuda.stream(sc):
+        torch.cuda._sleep(HOST_SLACK_CYCLES)
         flag.fill_(1)
-        got = run(slot, w, tactic, CONSUMERS[variant], counter)
+        run(slot, w, tactic, CONSUMERS[variant], counter, buf=got)
     torch.cuda.synchronize()
     return got[:-1], ref, int(counter.item()), bool(torch.equal(bits(slot), bits(x)))
 
 
+def stale_blocks(name: str, got: torch.Tensor) -> str:
+    """Which single writer block, read as the sentinel, reproduces ``got`` (a sentinel times w adds +-0 to the FMA
+    chain, so it equals FlashInfer with that block zeroed)."""
+    x, w, tactic = inputs(name, seed=3)
+    hits = []
+    for b in range(x.shape[1] // BLOCK_COLS):
+        xs = x.clone()
+        xs[:, b * BLOCK_COLS : (b + 1) * BLOCK_COLS] = 0.0
+        if torch.equal(bits(flashinfer(xs, w, tactic)), bits(got)):
+            hits.append(b)
+    return f"stale block(s) {hits}" if hits else "no single stale block reproduces it"
+
+
+def check_hazard(name: str, pattern: str, variant: str) -> None:
+    got, ref, reloads, published = run_hazard(name, pattern, variant)
+    assert published, f"{name}/{pattern}: the writer did not publish the activation"
+    diff = int((bits(got) != bits(ref)).sum())
+    if diff:
+        why = stale_blocks(name, got) if CASES[name][0] == 1 else "M > 1, not analysed"
+        raise AssertionError(f"{name}/{pattern}/{variant}: {diff} output elements differ ({reloads} reloads; {why})")
+    assert reloads > 0, f"{name}/{pattern}/{variant}: the writer finished before the consumer read (no reload)"
+    print(f"{name}/{pattern}/{variant}: {reloads} reload rounds")
+
+
 HAZARD_CASES = ["bfa1", "bfa4", "oproj1", "gproj1", "qkvg1", "qkvg2"]
+# About 2 ms of GPU sleep at Rubin clocks.
+HOST_SLACK_CYCLES = 4_000_000
 
 
 @pytest.mark.parametrize("pattern", ["forward", "reverse", "random", "one_late"])
 @pytest.mark.parametrize("name", HAZARD_CASES)
 def test_late_out_of_order_producer(name: str, pattern: str) -> None:
-    variant = fgs.default_check_mode(fgs.DirectTactic(*CASES[name][3]), CASES[name][2])
-    got, ref, reloads, published = run_hazard(name, pattern, variant)
-    assert published, f"{name}/{pattern}: the writer did not publish the activation"
-    diff = int((bits(got) != bits(ref)).sum())
-    assert diff == 0, f"{name}/{pattern}/{variant}: {diff} output elements differ ({reloads} reloads)"
-    assert reloads > 0, f"{name}/{pattern}: the writer finished before the consumer read (no reload)"
+    check_hazard(name, pattern, fgs.default_check_mode(fgs.DirectTactic(*CASES[name][3]), CASES[name][2]))
 
 
-@pytest.mark.parametrize("variant", ["heads", "heads_before_b", "row_l1"])
-@pytest.mark.parametrize("name", ["bfa2", "qkvg1"])
+@pytest.mark.parametrize("variant", ["row", "row_relaxed", "heads_before_b", "heads_uncapped"])
+@pytest.mark.parametrize("name", ["bfa1", "bfa2", "qkvg1"])
 def test_late_producer_other_check_modes(name: str, variant: str) -> None:
-    got, ref, reloads, published = run_hazard(name, "random", variant)
-    assert published
-    diff = int((bits(got) != bits(ref)).sum())
-    assert diff == 0, f"{name}/{variant}: {diff} output elements differ ({reloads} reloads)"
-    assert reloads > 0
+    for pattern in ("reverse", "random"):
+        check_hazard(name, pattern, variant)
 
 
 @pytest.mark.parametrize("producer,consumer", [("oproj1", "qkvg1"), ("oproj1", "gproj1"), ("oproj1", "bfa1")])
-def test_live_pair_store16_into_consumer(producer: str, consumer: str) -> None:
-    """o_proj-shaped producer build (store16, .pzo, entry trigger) writes a -0.0 slot that a consumer build reads,
-    PDL-chained on one stream: equals FlashInfer on the canonicalized intermediate."""
-    x, w1, t1 = inputs(producer, seed=4)
+def test_live_pair_head_last_into_consumer(producer: str, consumer: str) -> None:
+    """o_proj-shaped producer build (head_last, .pzo, entry trigger) writes a -0.0 slot that a consumer build reads,
+    PDL-chained on one stream, three steps with new producer inputs and the slot re-armed in between (the model's
+    step reuse): every step equals FlashInfer on the canonicalized intermediate, so no L1 line of an earlier step's
+    slot contents is consumed."""
+    _, w1, t1 = inputs(producer)
     _, w2, t2 = inputs(consumer, seed=5)
     assert w1.shape[0] == w2.shape[1]
-    mid_ref = flashinfer(x, w1, t1)
-    canon = mid_ref.clone()
-    bits(canon)[bits(canon) == NEG0] = 0
-    ref = flashinfer(canon, w2, t2)
     counter = torch.zeros(fgs.RETRY_COUNTER_SLOTS, dtype=torch.int32, device="cuda")
-    slot = torch.empty_like(mid_ref)
-    out = torch.empty_like(ref)
+    slot = torch.empty(CASES[producer][0], w1.shape[0], device="cuda", dtype=torch.bfloat16)
+    out = torch.empty(slot.shape[0], w2.shape[0], device="cuda", dtype=torch.bfloat16)
     mode = fgs.default_check_mode(t2, w2.shape[1])
-    for _ in range(2):  # the first pass compiles both builds
+    for step in range(4):  # step 0 compiles both builds
+        x = inputs(producer, seed=10 + step)[0]
+        mid_ref = flashinfer(x, w1, t1)
+        bits(mid_ref)[bits(mid_ref) == NEG0] = 0
+        ref = flashinfer(mid_ref, w2, t2)
         bits(slot).fill_(NEG0)
         counter.zero_()
-        fgs.run_direct_dense_fgs(x, w1.t(), slot, True, t1, **PRODUCERS["store16"])
+        fgs.run_direct_dense_fgs(x, w1.t(), slot, True, t1, **PRODUCERS["head_last"])
         fgs.run_direct_dense_fgs(slot, w2.t(), out, True, t2, retry_counter=counter, check_mode=mode)
         torch.cuda.synchronize()
-    assert torch.equal(bits(slot), bits(canon))
-    assert torch.equal(bits(out), bits(ref)), f"{producer}->{consumer}: {counter.item()} reloads"
-    print(f"{producer}->{consumer}: {counter.item()} reload rounds")
+        assert torch.equal(bits(slot), bits(mid_ref)), f"{producer}->{consumer} step {step}: producer output"
+        assert torch.equal(bits(out), bits(ref)), f"{producer}->{consumer} step {step}: {counter.item()} reloads"
+        print(f"{producer}->{consumer} step {step}: {counter.item()} reload rounds")
