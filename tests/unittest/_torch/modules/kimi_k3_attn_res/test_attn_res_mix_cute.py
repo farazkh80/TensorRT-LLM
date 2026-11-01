@@ -249,9 +249,7 @@ def test_fgs_consumer_ready_input_matches_default(
     ref = _default_call(x, attn, add)
     for a, b in zip(_as_tuple(got), _as_tuple(ref)):
         assert torch.equal(a, b)
-    assert workspace.tolist() == [0, 0, 0, 0], (
-        "counters must return to 0 and nothing may be re-read"
-    )
+    assert workspace.tolist() == [0] * 8, "counters must return to 0 and nothing may be re-read"
 
 
 @pytest.mark.parametrize("order", ["forward", "reverse", "random"])
@@ -289,8 +287,59 @@ def test_fgs_consumer_late_rows_match_default(add: bool, order: str) -> None:
     torch.cuda.synchronize()
     for a, b in zip(_as_tuple(got), _as_tuple(ref)):
         assert torch.equal(a, b)
-    claim, finished, _, fallbacks = workspace.tolist()
-    assert claim == 0 and finished == 0 and fallbacks == 0
+    counters = workspace.tolist()
+    assert counters[:4] == [0] * 4 and counters[5] == 0
+
+
+@pytest.mark.parametrize("mode", ["graph", "eager"])
+@torch.no_grad()
+def test_fgs_consumer_back_to_back_calls_share_workspace(mode: str) -> None:
+    """24 launches on one workspace without a reset in between, replayed 3 times when captured in a graph."""
+    num_tokens, calls, replays = 1024, 24, 3
+    inputs = [_inputs(num_tokens, 3, seed=10 + i) for i in range(2)]
+    refs = [_default_call(x, x["addend"], True) for x in inputs]
+    outs = [
+        (torch.empty_like(inputs[0]["prefix"]), torch.empty_like(inputs[0]["prefix"]))
+        for _ in range(calls)
+    ]
+    workspace = make_fgs_workspace()
+
+    def run():
+        for i, (updated, out) in enumerate(outs):
+            x = inputs[i % 2]
+            attn_res_mix(
+                x["prefix"],
+                x["bank"],
+                x["res_w"],
+                x["rms_w"],
+                EPS,
+                addend=x["addend"],
+                out_norm_weight=x["out_w"],
+                out_norm_eps=EPS,
+                out=out,
+                updated=updated,
+                fgs_consumer=True,
+                fgs_workspace=workspace,
+            )
+
+    run()
+    if mode == "graph":
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+    for _ in range(replays):
+        for pair in outs:
+            for t in pair:
+                t.fill_(float("nan"))
+        if mode == "graph":
+            graph.replay()
+        else:
+            run()
+        torch.cuda.synchronize()
+        for i, got in enumerate(outs):
+            for a, b in zip(got, refs[i % 2]):
+                assert torch.equal(a, b), f"call {i}"
+        assert workspace.tolist() == [0] * 8
 
 
 @pytest.mark.parametrize("num_tokens", [16, 300, 8192])
