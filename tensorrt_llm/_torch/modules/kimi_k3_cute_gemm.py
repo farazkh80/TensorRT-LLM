@@ -260,7 +260,8 @@ def _fgs_linear(x, weight, out, consume: bool, produce: bool) -> None:
     m, k = x.shape
     n = weight.shape[0]
     dense = _row_major(x) and _row_major(out)
-    if consume and not produce and dense and n == 7168 and k == 12288:
+    # The decode o_proj consumer; prefill rows take the table's GEMM below.
+    if consume and not produce and dense and n == 7168 and k == 12288 and m <= 2 * _FI_MAX_M:
         _fgs_consume(x, weight, out)
         return
     backend, tactic = _select(_GEMM_TABLE.get((n, k)), m)
