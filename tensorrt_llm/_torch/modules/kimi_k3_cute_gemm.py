@@ -101,7 +101,7 @@ _GEMM_TABLE: Dict[Tuple[int, int], List[Tuple[int, str, Optional[tuple]]]] = {
         (16, "rubin", ("base", False, (128, 128), (1, 1), 0, 1)),
         (32, "rubin", ("base", False, (128, 128), (1, 1), 0, 1)),
         (64, "rubin", ("base", False, (128, 128), (1, 1), 0, 1)),
-        (1 << 30, "rubin", ("base", True, (256, 256), (2, 1), 0, 1)),
+        (1 << 30, "rubin", ("base", True, (256, 256), (2, 1), 7, 1)),
     ],
 }
 # (B, N, K) -> [(max_m, backend, tactic)].
