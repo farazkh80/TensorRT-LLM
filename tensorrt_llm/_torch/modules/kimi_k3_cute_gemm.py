@@ -325,14 +325,20 @@ def linear(
         from .kimi_k3_fgs import edges as fgs_edges
 
         _fgs_linear(x, weight, out, in_lease is not None, out_lease is not None)
-        _debug(f"linear N={n} K={k}", m, f"fgs consume={in_lease is not None} produce={out_lease is not None}")
+        _debug(
+            f"linear N={n} K={k}",
+            m,
+            f"fgs consume={in_lease is not None} produce={out_lease is not None}",
+        )
         if in_lease is not None:
             fgs_edges.consumed(in_lease)
         return out
     backend, tactic = _select(_GEMM_TABLE.get((n, k)), m)
     if backend == "vsplitk" and not _x5():
         backend, tactic = "fi_splitk", tactic[1]
-    _debug(f"linear N={n} K={k}", m, f"{backend} {tactic}{'' if dense else ' strided'} pdl={_pdl()}")
+    _debug(
+        f"linear N={n} K={k}", m, f"{backend} {tactic}{'' if dense else ' strided'} pdl={_pdl()}"
+    )
     if backend == "fi_direct" and dense:
         from flashinfer.gemm.kernels.dense_bf16_gemm_direct import DirectTactic, run_direct_dense
 
@@ -417,7 +423,11 @@ def bmm(x: torch.Tensor, weight: torch.Tensor, out: Optional[torch.Tensor] = Non
         from .kimi_k3_fgs import edges as fgs_edges
 
         _fgs_rubin(x, weight, out, tactic, in_lease is not None, out_lease is not None)
-        _debug(f"bmm B={b} N={n} K={k}", m, f"fgs consume={in_lease is not None} produce={out_lease is not None}")
+        _debug(
+            f"bmm B={b} N={n} K={k}",
+            m,
+            f"fgs consume={in_lease is not None} produce={out_lease is not None}",
+        )
         if in_lease is not None:
             fgs_edges.consumed(in_lease)
         return out
