@@ -180,3 +180,109 @@ def test_retry_reissues_late_chunk() -> None:
     reissues, unchecked = counter.tolist()
     assert reissues > 0 and unchecked == 0
     assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
+
+
+# The other decode split-K uses of kimi_k3_cute_gemm at their table tactics: (N, K) -> rows -> tactic.
+DECODE_SPLITK = {
+    "bfa": (224, 7168, {8: (64, 8, 4, 12), 16: (64, 8, 4, 11), 32: (64, 8, 4, 11)}),
+    "qa_kva": (2112, 7168, {1: (64, 8, 4, 11), 16: (64, 16, 4, 10), 32: (64, 32, 4, 8)}),
+    "qb": (18432, 1536, {1: (128, 8, 1, 6), 16: (128, 16, 1, 6), 32: (128, 32, 1, 5)}),
+    "gproj": (12288, 7168, {4: (128, 8, 2, 6), 16: (64, 16, 1, 9), 32: (64, 32, 1, 9)}),
+}
+
+
+@pytest.mark.parametrize(
+    "shape,m", [(s, m) for s, (_, _, tactics) in DECODE_SPLITK.items() for m in tactics]
+)
+def test_decode_shapes_ready_and_late_chunk(shape: str, m: int) -> None:
+    """Ready input equals the plain build; one 16 B -0.0 chunk published late is retried, not consumed."""
+    import cuda.bindings.driver as cuda
+    from cutlass.cute.runtime import from_dlpack
+
+    n, k, tactics = DECODE_SPLITK[shape]
+    tactic = fgs.SplitKTactic(*tactics[m])
+    torch.manual_seed(m)
+    x = torch.randn(m, k, device="cuda").to(torch.bfloat16)
+    x[x == 0] = 1.0
+    w = (torch.randn(n, k, device="cuda") * 0.02).to(torch.bfloat16)
+
+    def run(a, variant, counter=None):
+        out = torch.full((m, n), float("nan"), device="cuda", dtype=torch.bfloat16)
+        fgs.run_splitk_dense_fgs(
+            a, w.t(), None, out, True, tactic, retry_counter=counter, **VARIANTS[variant]
+        )
+        return out
+
+    plain = run(x, "plain")
+    counter = torch.zeros(fgs.RETRY_COUNTER_SLOTS, dtype=torch.int32, device="cuda")
+    ready = run(x, "fgs", counter)
+    torch.cuda.synchronize()
+    assert torch.equal(ready.view(torch.int16), plain.view(torch.int16))
+    assert counter.tolist() == [0, 0]
+
+    slot = x.clone()
+    row, col = m // 2, k // 2 + 8
+    slot.view(torch.int16)[row, col : col + 8] = NEG0
+    args = [from_dlpack(t, assumed_align=16) for t in (slot[row, col : col + 8], x[row, col : col + 8])]
+    s_prod, s_cons = torch.cuda.Stream(), torch.cuda.Stream()
+    with torch.cuda.stream(s_prod):
+        stream = cuda.CUstream(s_prod.cuda_stream)
+        writer = cute.compile(_late_copy16, *args, cutlass.Int64(0), stream)
+        torch.cuda.synchronize()
+        counter.zero_()
+        writer(*args, cutlass.Int64(1_000_000), stream)
+    with torch.cuda.stream(s_cons):
+        out = run(slot, "fgs", counter)
+    torch.cuda.synchronize()
+    reissues, unchecked = counter.tolist()
+    assert reissues > 0 and unchecked == 0
+    assert torch.equal(out.view(torch.int16), plain.view(torch.int16))
+
+
+PRODUCER = dict(
+    report_valid=False, retry_warp=False, pdl_wait_activation=True, pzo=True, early_trigger=True
+)
+
+
+@pytest.mark.parametrize(
+    "shape,m", [("bfa", 16), ("qa_kva", 16), ("qb", 16), ("gproj", 16), ("qb", 32), ("bfa", 8)]
+)
+def test_producer_build_changes_only_negative_zero(shape: str, m: int) -> None:
+    """.pzo + early trigger + element-0-last stores equal the plain build with -0.0 read as +0.0."""
+    n, k, tactics = DECODE_SPLITK[shape]
+    tactic = fgs.SplitKTactic(*tactics[m])
+    torch.manual_seed(m)
+    x = torch.randn(m, k, device="cuda").to(torch.bfloat16)
+    x[: m // 2] = -0.0
+    w = (torch.randn(n, k, device="cuda") * 0.02).to(torch.bfloat16)
+    w[:16] = w[:16].abs()  # -0.0 rows times positive weight rows: -0.0 without .pzo
+
+    def run(**flags):
+        out = torch.full((m, n), float("nan"), device="cuda", dtype=torch.bfloat16)
+        fgs.run_splitk_dense_fgs(x, w.t(), None, out, True, tactic, **flags)
+        return out
+
+    plain = run(**VARIANTS["plain"])
+    prod = run(**PRODUCER, elem0_last=True)
+    torch.cuda.synchronize()
+    canon = plain.view(torch.int16).clone()
+    assert bool((canon == NEG0).any())
+    canon[canon == NEG0] = 0
+    assert torch.equal(prod.view(torch.int16), canon)
+
+
+@pytest.mark.parametrize("shape,m", [("bfa", 8), ("qa_kva", 16), ("qb", 32), ("gproj", 16)])
+def test_elem0_lanes_hold_chunk_heads(shape: str, m: int) -> None:
+    """Hardware check of the element-0-last lane mapping: the probe build stores only from the lanes that run the
+    second pass, and those must be exactly the first elements of the 16 B output chunks."""
+    n, k, tactics = DECODE_SPLITK[shape]
+    tactic = fgs.SplitKTactic(*tactics[m])
+    torch.manual_seed(m)
+    x = torch.randn(m, k, device="cuda").to(torch.bfloat16)
+    w = (torch.randn(n, k, device="cuda") * 0.02).to(torch.bfloat16)
+    out = torch.full((m, n), float("nan"), device="cuda", dtype=torch.bfloat16)
+    fgs.run_splitk_dense_fgs(x, w.t(), None, out, True, tactic, **PRODUCER, elem0_last="probe")
+    torch.cuda.synchronize()
+    written = ~torch.isnan(out.float())
+    heads = (torch.arange(n, device="cuda") % 8 == 0).expand(m, n)
+    assert torch.equal(written, heads)

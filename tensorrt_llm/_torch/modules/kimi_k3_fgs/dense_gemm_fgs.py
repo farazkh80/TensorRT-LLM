@@ -1,21 +1,39 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Fine-grained-sync producer build of the SM107 BF16 persistent GEMM (``kimi_k3_cute_gemm`` ``rubin`` backend).
+"""Fine-grained-sync build of the SM107 BF16 persistent GEMM / BMM (``kimi_k3_cute_gemm`` ``rubin`` backend).
 
 Same tiles, pipelines and per-tile arithmetic as ``kernels.rubin.dense_bf16_gemm_persistent`` at split-K 1 (the
-kernel body is the Blackwell one it inherits, without split-K and FP8 quantization). Compile-time producer roles:
+kernel body is the Blackwell one it inherits, without split-K and FP8 quantization), on the original persistent grid.
+Compile-time roles, all off in the stock build:
+
+Producer (the output feeds a report_valid consumer):
 
 - ``pzo``: the accumulator is narrowed with ``cvt.rn.pzo`` (-0.0 stored as +0.0, every other value bit-identical),
-  so a report_valid consumer can use bf16 -0.0 as the not-yet-written sentinel. Tiles still leave through TMA
-  stores, whose 16 B chunks land whole.
+  so a consumer can use bf16 -0.0 as the not-yet-written sentinel. Tiles leave through TMA stores, whose 16 B chunks
+  land whole.
 - ``early_trigger``: ``griddepcontrol.launch_dependents`` at kernel entry instead of after the epilogue.
 - ``raster_along="n"`` (scheduler, with ``swizzle_size``): consecutive tiles walk N first, so output row blocks
   complete in row order instead of all in the last tile round.
-- ``timeline`` (diagnostic): ``%globaltimer_lo`` when each CTA starts and when each CTA tile's last TMA store is
-  issued (see :func:`timeline_slots`).
-"""
 
-from __future__ import annotations
+Consumer (A is a sentinel-armed edge slot; B, the weights, is never checked):
+
+- ``retry_warp``: full barriers are v1 (``PipelineTmaUmmaRetry``); the MMA warp waits on the conditional phase and an
+  extra warp releases each stage once its primary phase completes with valid data. Without ``report_valid`` this is
+  the like-resource control.
+- ``report_valid``: the A TMA checks the bf16 -0.0 sentinel per 16 B. A stage whose load completes with sentinel data
+  is re-armed for the A bytes and A alone is re-loaded into it (B stays). 2-CTA tiles: the leader forwards the
+  re-issue to its peer through DSMEM. A multicast across N: the CTAs of the multicast agree on each re-issue.
+- ``wait_input=False``: no ``griddepcontrol.wait``, so A and B loads start at launch and B lands before A is valid.
+- ``store_wait``: with ``wait_input=False``, the epilogue warps wait for the PDL predecessor before their first
+  store (an output buffer the predecessor may still read).
+- ``retry_poll``: ``"try"`` suspends on each stage's primary phase (bounded by the hardware time limit), ``"test"``
+  polls it.
+
+Diagnostic: ``timeline`` stores ``%globaltimer_lo`` when each CTA starts and when each CTA tile's last TMA store is
+issued (see :func:`timeline_slots`); ``retry_count[0]`` accumulates the A re-issues of report_valid builds.
+
+The kernel never writes sentinels; the framework arms the A slot before the producer runs.
+"""
 
 import functools
 from typing import Literal, Optional, Tuple, Type, Union
@@ -33,13 +51,22 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from ...kernels.blackwell.custom_pipeline import PipelineTmaUmma, PipelineUmmaAsync
 from ...kernels.rubin.dense_bf16_gemm_persistent import PersistentDenseGemmKernel
 
-# kimi_k3_cute_gemm table entry of the prefill o_proj (7168, 12288).
+try:
+    from cutlass._mlir.dialects.nvvm import MBarrierScopeKind
+    from cutlass.experimental.primitives.nvvm_wrapper import MemOrder, fence_sync_restrict
+except ImportError:  # CuTe DSL < 4.9: the consumer roles cannot be built.
+    MBarrierScopeKind = MemOrder = fence_sync_restrict = None
+
+# kimi_k3_cute_gemm table entries.
 O_PROJ_TACTIC = ("base", True, (256, 256), (2, 1), 0, 1)
+QKVG_DECODE_TACTIC = ("base", False, (128, 128), (1, 1), 0, 1)
 # Upper bound on persistent CTAs recorded by the timeline build.
 TIMELINE_MAX_CTAS = 1024
+# int32 elements of the retry counter: A re-issues.
+RETRY_COUNTER_SLOTS = 1
 
 
-class FgsProducerDenseGemmKernel(PersistentDenseGemmKernel):
+class FgsDenseGemmKernel(PersistentDenseGemmKernel):
     def __init__(
         self,
         acc_dtype: Type[cutlass.Numeric],
@@ -53,6 +80,11 @@ class FgsProducerDenseGemmKernel(PersistentDenseGemmKernel):
         early_trigger: bool = False,
         use_pdl: bool = True,
         timeline: bool = False,
+        report_valid: bool = False,
+        retry_warp: bool = False,
+        wait_input: bool = True,
+        store_wait: bool = False,
+        retry_poll: Literal["try", "test"] = "try",
     ):
         super().__init__(
             acc_dtype=acc_dtype,
@@ -65,10 +97,54 @@ class FgsProducerDenseGemmKernel(PersistentDenseGemmKernel):
             max_num_ab_stage=max_num_ab_stage,
             split_k_slices=1,
         )
+        if report_valid and not retry_warp:
+            raise ValueError("report_valid needs retry_warp to re-issue invalid stages")
+        if retry_warp and MBarrierScopeKind is None:
+            raise ValueError("the consumer roles need CuTe DSL 4.9 (v1 mbarriers, TMA report_valid)")
+        if retry_poll not in ("try", "test"):
+            raise ValueError(f"retry_poll must be 'try' or 'test', got {retry_poll!r}")
         self.pzo = pzo
         self.early_trigger = early_trigger
         self.use_pdl = use_pdl
         self.timeline = timeline
+        self.report_valid = report_valid
+        self.retry_warp = retry_warp
+        self.wait_input = wait_input or not use_pdl
+        self.store_wait = store_wait and not self.wait_input
+        self.retry_poll = retry_poll
+        self.a_copy_kwargs = {"report_valid": True} if report_valid else {}
+        self.retry_warp_id = 6
+        if retry_warp:
+            self.threads_per_cta += 32
+
+    def _shared_storage(self):
+        stages = self.num_ab_stage
+        acc_stages = self.num_acc_stage
+        if not self.retry_warp:
+
+            @cute.struct
+            class SharedStorage:
+                ab_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, stages * 2]
+                acc_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, acc_stages * 2]
+                tmem_dealloc_mbar: cutlass.Int64
+                tmem_holding_buf: cutlass.Int32
+
+            return SharedStorage
+
+        # Peer re-issue message: stage, k tile, m tile, n tile, l.
+        coord_buf = cute.struct.MemRange[cutlass.Int32, 5]
+
+        @cute.struct
+        class RetrySharedStorage:
+            ab_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, stages * 2]
+            acc_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, acc_stages * 2]
+            retry_cluster_mbar_ptr: cute.struct.MemRange[cutlass.Int64, stages]
+            peer_retry_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+            tmem_dealloc_mbar: cutlass.Int64
+            peer_retry_coord_buf: cute.struct.Align[coord_buf, 16]
+            tmem_holding_buf: cutlass.Int32
+
+        return RetrySharedStorage, coord_buf
 
     @cute.jit
     def __call__(
@@ -77,6 +153,7 @@ class FgsProducerDenseGemmKernel(PersistentDenseGemmKernel):
         b: cute.Tensor,
         c: cute.Tensor,
         stamps: cute.Tensor,
+        retry_count: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -92,6 +169,8 @@ class FgsProducerDenseGemmKernel(PersistentDenseGemmKernel):
 
         tiled_mma = self._create_tiled_mma()
         self._setup_attributes()
+        if cutlass.const_expr(self.report_valid and self.use_2cta_instrs and self.is_a_mcast):
+            raise NotImplementedError("report_valid with 2-CTA tiles and A multicast")
 
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
 
@@ -120,6 +199,7 @@ class FgsProducerDenseGemmKernel(PersistentDenseGemmKernel):
         a_copy_size = cute.size_in_bytes(self.a_dtype, a_smem_layout)
         b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
         self.num_tma_load_bytes = (a_copy_size + b_copy_size) * atom_thr_size
+        self.num_tma_load_bytes_a = a_copy_size * atom_thr_size
 
         epi_smem_layout = cute.select(self.c_smem_layout_staged, mode=[0, 1])
         tma_atom_c, tma_tensor_c = cpasync.make_tiled_tma_atom(
@@ -144,6 +224,7 @@ class FgsProducerDenseGemmKernel(PersistentDenseGemmKernel):
             tma_atom_c,
             tma_tensor_c,
             stamps,
+            retry_count,
             self.cluster_layout_vmnk,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
@@ -170,6 +251,7 @@ class FgsProducerDenseGemmKernel(PersistentDenseGemmKernel):
         tma_atom_c: cute.CopyAtom,
         mC_mnl: cute.Tensor,
         stamps: cute.Tensor,
+        retry_count: cute.Tensor,
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
@@ -189,6 +271,8 @@ class FgsProducerDenseGemmKernel(PersistentDenseGemmKernel):
             cpasync.prefetch_descriptor(tma_atom_c)
 
         use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
+        need_peer_retry = cutlass.const_expr(self.report_valid and self.use_2cta_instrs)
+        need_retry_sync = cutlass.const_expr(self.report_valid and self.is_a_mcast)
 
         bidx, bidy, bidz = cute.arch.block_idx()
         mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
@@ -207,29 +291,55 @@ class FgsProducerDenseGemmKernel(PersistentDenseGemmKernel):
                 if cta_linear < TIMELINE_MAX_CTAS:
                     stamps[num_tile_stamps + cta_linear] = cute.arch.globaltimer_lo()
 
-        @cute.struct
-        class SharedStorage:
-            ab_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
-            acc_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
-            tmem_dealloc_mbar: cutlass.Int64
-            tmem_holding_buf: cutlass.Int32
-
+        coord_buf_type = None
+        if cutlass.const_expr(self.retry_warp):
+            SharedStorage, coord_buf_type = self._shared_storage()
+        else:
+            SharedStorage = self._shared_storage()
         smem = utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
-        ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-        num_tma_producer = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
-        ab_pipeline_consumer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, num_tma_producer
-        )
-        ab_producer, ab_consumer = PipelineTmaUmma.create(
-            barrier_storage=storage.ab_full_mbar_ptr.data_ptr(),
-            num_stages=self.num_ab_stage,
-            producer_group=ab_pipeline_producer_group,
-            consumer_group=ab_pipeline_consumer_group,
-            tx_count=self.num_tma_load_bytes,
-            cta_layout_vmnk=cluster_layout_vmnk,
-        ).make_participants()
+        ab_pipeline = None
+        full_mbar_ptr = None
+        empty_mbar_ptr = None
+        local_coord_ptr = None
+        if cutlass.const_expr(self.retry_warp):
+            # The MMA warp waits on the conditional phase; the retry warp tests the primary phase and releases.
+            ab_pipeline = pipeline.PipelineTmaUmmaRetry.create(
+                barrier_storage=storage.ab_full_mbar_ptr.data_ptr(),
+                num_stages=self.num_ab_stage,
+                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+                consumer_group_umma=pipeline.CooperativeGroup(pipeline.Agent.Warp),
+                consumer_group_retry=pipeline.CooperativeGroup(pipeline.Agent.Warp),
+                tx_count=self.num_tma_load_bytes,
+                cta_layout_vmnk=cluster_layout_vmnk,
+                enable_multicast_signaling=True,
+                defer_sync=True,
+            )
+            ab_producer, ab_consumer, _ = ab_pipeline.make_participants()
+            if cutlass.const_expr(need_peer_retry):
+                # Ping-pong pair guarding the re-issue message the leader writes into the peer's smem.
+                full_mbar_ptr = storage.peer_retry_mbar_ptr.data_ptr()
+                empty_mbar_ptr = full_mbar_ptr + 1
+                local_coord_ptr = storage.peer_retry_coord_buf.data_ptr()
+                if warp_idx == 0:
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_init(full_mbar_ptr, 1)
+                        cute.arch.mbarrier_init(empty_mbar_ptr, 32)
+        else:
+            ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+            num_tma_producer = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
+            ab_pipeline_consumer_group = pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, num_tma_producer
+            )
+            ab_producer, ab_consumer = PipelineTmaUmma.create(
+                barrier_storage=storage.ab_full_mbar_ptr.data_ptr(),
+                num_stages=self.num_ab_stage,
+                producer_group=ab_pipeline_producer_group,
+                consumer_group=ab_pipeline_consumer_group,
+                tx_count=self.num_tma_load_bytes,
+                cta_layout_vmnk=cluster_layout_vmnk,
+            ).make_participants()
 
         acc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         num_acc_consumer_threads = len(self.epilogue_warp_id) * (2 if use_2cta_instrs else 1)
@@ -255,6 +365,27 @@ class FgsProducerDenseGemmKernel(PersistentDenseGemmKernel):
             is_two_cta=use_2cta_instrs,
             two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
         )
+
+        # A multicast: every CTA of the multicast re-arms a stage before any of them re-issues its A slice into it.
+        retry_cluster_mbar = None
+        retry_dst_rank = None
+        retry_is_signalling = None
+        if cutlass.const_expr(need_retry_sync):
+            retry_cluster_mbar = pipeline.MbarrierArray(
+                barrier_storage=storage.retry_cluster_mbar_ptr.data_ptr(),
+                num_stages=self.num_ab_stage,
+                agent=(
+                    pipeline.PipelineOp.AsyncThread,
+                    pipeline.CooperativeGroup(pipeline.Agent.Thread, self.num_mcast_ctas_a - 1),
+                ),
+            )
+            # A is multicast across N: the CTAs sharing this CTA's M coordinate.
+            retry_dst_rank, retry_is_signalling = (
+                pipeline.PipelineTmaAsync.init_empty_barrier_arrive_signal(
+                    cute.make_layout(cluster_layout_vmnk.shape), tidx, (1, 0)
+                )
+            )
+            retry_is_signalling = retry_is_signalling & (retry_dst_rank != cta_rank_in_cluster)
 
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
 
@@ -328,7 +459,7 @@ class FgsProducerDenseGemmKernel(PersistentDenseGemmKernel):
         )
         work_tile = tile_sched.initial_work_tile_info()
 
-        if cutlass.const_expr(self.use_pdl):
+        if cutlass.const_expr(self.use_pdl and self.wait_input):
             cute.arch.griddepcontrol_wait()
 
         if warp_idx == self.tma_warp_id:
@@ -353,6 +484,7 @@ class FgsProducerDenseGemmKernel(PersistentDenseGemmKernel):
                         tAsA[(None, handle.index)],
                         tma_bar_ptr=handle.barrier,
                         mcast_mask=a_full_mcast_mask,
+                        **self.a_copy_kwargs,
                     )
                     cute.copy(
                         tma_atom_b,
@@ -369,6 +501,42 @@ class FgsProducerDenseGemmKernel(PersistentDenseGemmKernel):
                 work_tile = tile_sched.get_current_work()
 
             ab_producer.tail()
+
+        if cutlass.const_expr(self.retry_warp):
+            # 2-CTA loads complete only on the leader's barrier, so the leader alone validates and releases.
+            if warp_idx == self.retry_warp_id and is_leader_cta:
+                self._retry_leader(
+                    ab_pipeline,
+                    tile_sched_params,
+                    tiled_mma,
+                    tma_atom_a,
+                    tAgA,
+                    tAsA,
+                    a_full_mcast_mask,
+                    k_tile_cnt,
+                    retry_count,
+                    retry_cluster_mbar,
+                    retry_dst_rank,
+                    retry_is_signalling,
+                    full_mbar_ptr,
+                    empty_mbar_ptr,
+                    local_coord_ptr,
+                    coord_buf_type,
+                    cta_rank_in_cluster,
+                )
+            if cutlass.const_expr(need_peer_retry):
+                if warp_idx == self.retry_warp_id and not is_leader_cta:
+                    self._retry_peer(
+                        ab_pipeline,
+                        tma_atom_a,
+                        tAgA,
+                        tAsA,
+                        a_full_mcast_mask,
+                        full_mbar_ptr,
+                        empty_mbar_ptr,
+                        local_coord_ptr,
+                        cta_rank_in_cluster,
+                    )
 
         if warp_idx == self.mma_warp_id:
             tmem.wait_for_alloc()
@@ -427,6 +595,9 @@ class FgsProducerDenseGemmKernel(PersistentDenseGemmKernel):
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
+
+            if cutlass.const_expr(self.store_wait):
+                cute.arch.griddepcontrol_wait()
 
             acc_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_acc_stage
@@ -547,6 +718,217 @@ class FgsProducerDenseGemmKernel(PersistentDenseGemmKernel):
             cute.arch.griddepcontrol_launch_dependents()
 
     @cute.jit
+    def _retry_leader(
+        self,
+        ab_pipeline,
+        tile_sched_params: utils.PersistentTileSchedulerParams,
+        tiled_mma: cute.TiledMma,
+        tma_atom_a: cute.CopyAtom,
+        tAgA: cute.Tensor,
+        tAsA: cute.Tensor,
+        a_full_mcast_mask,
+        k_tile_cnt: cutlass.Int32,
+        retry_count: cute.Tensor,
+        retry_cluster_mbar,
+        retry_dst_rank,
+        retry_is_signalling,
+        full_mbar_ptr,
+        empty_mbar_ptr,
+        local_coord_ptr,
+        coord_buf_type: cutlass.Constexpr,
+        cta_rank_in_cluster,
+    ):
+        """Release each A/B stage of every work tile once its primary phase completes with valid data.
+
+        Stages are swept round-robin within the current work tile, so an invalid stage is re-issued without blocking
+        the release of later ones. ``state`` keeps a phase and a count per stage; the k tile in a stage follows from
+        its count and the stage the tile started at.
+        """
+        need_peer_retry = cutlass.const_expr(self.report_valid and self.use_2cta_instrs)
+        need_retry_sync = cutlass.const_expr(self.report_valid and self.is_a_mcast)
+        state = pipeline.PerStagePipelineState(self.num_ab_stage)
+
+        retry_cluster_phases = None
+        retry_cluster_arrived = None
+        if cutlass.const_expr(need_retry_sync):
+            retry_cluster_phases = cute.make_rmem_tensor((self.num_ab_stage), cutlass.Int32)
+            retry_cluster_phases.fill(0)
+            retry_cluster_arrived = cute.make_rmem_tensor((self.num_ab_stage), cutlass.Int32)
+            retry_cluster_arrived.fill(0)
+
+        tile_sched = utils.StaticPersistentTileScheduler.create(
+            tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+        )
+        work_tile = tile_sched.initial_work_tile_info()
+
+        peer_cta_rank = cta_rank_in_cluster ^ 1
+        reissues = cutlass.Int32(0)
+        stage_offset = cutlass.Int32(0)
+        empty_phase = cutlass.Int32(1)
+        while work_tile.is_valid_tile:
+            processed_k_tiles = cutlass.Int32(0)
+            state.reset_count()
+            cur_tile_coord = work_tile.tile_idx
+            mma_tile_coord_mnl = (
+                cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
+                cur_tile_coord[1],
+                cur_tile_coord[2],
+            )
+            tAgA_slice = tAgA[(None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])]
+            # Sweep from the tile's first k tile, so suspending waits follow the load order.
+            while state.index != stage_offset:
+                state.next()
+
+            while processed_k_tiles < k_tile_cnt:
+                for _ in range(self.num_ab_stage):
+                    stage_idx = state.index
+                    k_tile_for_stage = pipeline.PerStagePipelineState.compute_producer_count(
+                        stage_idx, state.count, stage_offset, self.num_ab_stage
+                    )
+                    if k_tile_for_stage < k_tile_cnt:
+                        if cutlass.const_expr(self.retry_poll == "test"):
+                            tma_done, data_valid = ab_pipeline.consumer_test_valid(state)
+                        else:
+                            tma_done, invalid = cute.arch.mbarrier_try_wait_primary(
+                                ab_pipeline.sync_object_full.get_barrier(stage_idx), state.phase
+                            )
+                            data_valid = tma_done & ~invalid
+
+                        if tma_done and data_valid:
+                            ab_pipeline.retry_release(state)
+                            state.mark_valid()
+                            processed_k_tiles += 1
+                        elif tma_done:
+                            do_reissue = cutlass.Boolean(True)
+                            if cutlass.const_expr(need_retry_sync):
+                                # Arrive once per round on each multicast peer's barrier for this stage.
+                                if not retry_cluster_arrived[stage_idx]:
+                                    if retry_is_signalling:
+                                        cute.arch.mbarrier_arrive(
+                                            retry_cluster_mbar.get_barrier(stage_idx), retry_dst_rank
+                                        )
+                                    retry_cluster_arrived[stage_idx] = 1
+                                do_reissue = retry_cluster_mbar.test_wait(
+                                    stage_idx, retry_cluster_phases[stage_idx]
+                                )
+
+                            if do_reissue:
+                                if cutlass.const_expr(need_retry_sync):
+                                    retry_cluster_phases[stage_idx] = retry_cluster_phases[stage_idx] ^ 1
+                                    retry_cluster_arrived[stage_idx] = 0
+
+                                if cutlass.const_expr(need_peer_retry):
+                                    cute.arch.mbarrier_wait(empty_mbar_ptr, empty_phase)
+                                    empty_phase ^= 1
+                                    with cute.arch.elect_one():
+                                        cute.arch.mbarrier_arrive_and_expect_tx(
+                                            full_mbar_ptr,
+                                            coord_buf_type.size_in_bytes,
+                                            peer_cta_rank,
+                                            relaxed=True,
+                                            scope=MBarrierScopeKind.CLUSTER,
+                                        )
+                                        cute.arch.store_async_dsmem(
+                                            local_coord_ptr,
+                                            (
+                                                stage_idx,
+                                                k_tile_for_stage,
+                                                mma_tile_coord_mnl[0],
+                                                mma_tile_coord_mnl[1],
+                                            ),
+                                            full_mbar_ptr,
+                                            peer_cta_rank,
+                                        )
+                                        cute.arch.store_async_dsmem(
+                                            local_coord_ptr + 4,
+                                            mma_tile_coord_mnl[2],
+                                            full_mbar_ptr,
+                                            peer_cta_rank,
+                                        )
+
+                                ab_pipeline.retry_expect_tx(state, self.num_tma_load_bytes_a)
+                                state.mark_invalid()
+                                cute.copy(
+                                    tma_atom_a,
+                                    tAgA_slice[(None, k_tile_for_stage)],
+                                    tAsA[(None, stage_idx)],
+                                    tma_bar_ptr=ab_pipeline.producer_get_barrier(state),
+                                    mcast_mask=a_full_mcast_mask,
+                                    report_valid=True,
+                                )
+                                reissues += 1
+                    state.next()
+
+            stage_offset = (stage_offset + k_tile_cnt) % self.num_ab_stage
+            tile_sched.advance_to_next_work()
+            work_tile = tile_sched.get_current_work()
+
+        if cutlass.const_expr(need_peer_retry):
+            # Stage -1 releases the peer from its loop; then drain its release of that last message.
+            cute.arch.mbarrier_wait(empty_mbar_ptr, empty_phase)
+            empty_phase ^= 1
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    full_mbar_ptr,
+                    cutlass.Int32.width // 8,
+                    peer_cta_rank,
+                    relaxed=True,
+                    scope=MBarrierScopeKind.CLUSTER,
+                )
+                cute.arch.store_async_dsmem(local_coord_ptr, -1, full_mbar_ptr, peer_cta_rank)
+            cute.arch.mbarrier_wait(empty_mbar_ptr, empty_phase)
+
+        if cutlass.const_expr(self.report_valid):
+            with cute.arch.elect_one():
+                if reissues > 0:
+                    cute.arch.atomic_add(retry_count.iterator, reissues)
+
+    @cute.jit
+    def _retry_peer(
+        self,
+        ab_pipeline,
+        tma_atom_a: cute.CopyAtom,
+        tAgA: cute.Tensor,
+        tAsA: cute.Tensor,
+        a_full_mcast_mask,
+        full_mbar_ptr,
+        empty_mbar_ptr,
+        local_coord_ptr,
+        cta_rank_in_cluster,
+    ):
+        """Re-issue this CTA's half of a 2-CTA A load whenever the leader forwards one (stage -1 ends the loop)."""
+        peer_cta_rank = cta_rank_in_cluster ^ 1
+        full_phase = cutlass.Int32(0)
+        retry_stage_idx = cutlass.Int32(0)
+        while retry_stage_idx != -1:
+            cute.arch.mbarrier_wait(full_mbar_ptr, full_phase)
+            full_phase ^= 1
+            retry_stage_idx = local_coord_ptr[0]
+            retry_k_tile = local_coord_ptr[1]
+            retry_coord_m = local_coord_ptr[2]
+            retry_coord_l = local_coord_ptr[4]
+
+            # Order the message reads before handing the buffer back to the leader.
+            fence_sync_restrict(MemOrder.RELEASE)
+            cute.arch.mbarrier_arrive(
+                empty_mbar_ptr,
+                peer_cta_rank,
+                scope=MBarrierScopeKind.CLUSTER,
+                relaxed=True,
+            )
+
+            if retry_stage_idx != -1:
+                retry_gA_slice = tAgA[(None, retry_coord_m, None, retry_coord_l)]
+                cute.copy(
+                    tma_atom_a,
+                    retry_gA_slice[(None, retry_k_tile)],
+                    tAsA[(None, retry_stage_idx)],
+                    tma_bar_ptr=ab_pipeline.sync_object_full.get_barrier(retry_stage_idx),
+                    mcast_mask=a_full_mcast_mask,
+                    report_valid=True,
+                )
+
+    @cute.jit
     def wrapper_fgs(
         self,
         m: cutlass.Int32,
@@ -557,6 +939,7 @@ class FgsProducerDenseGemmKernel(PersistentDenseGemmKernel):
         b_ptr: cute.Pointer,
         c_tensor: cute.Tensor,
         stamps: cute.Tensor,
+        retry_count: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -566,7 +949,35 @@ class FgsProducerDenseGemmKernel(PersistentDenseGemmKernel):
         b_tensor = cute.make_tensor(
             b_ptr, layout=cute.make_ordered_layout((n, k, batch_size), order=(1, 0, 2))
         )
-        self(a_tensor, b_tensor, c_tensor, stamps, max_active_clusters, stream)
+        self(a_tensor, b_tensor, c_tensor, stamps, retry_count, max_active_clusters, stream)
+
+    @cute.jit
+    def wrapper_strided_fgs(
+        self,
+        m: cutlass.Int32,
+        n: cutlass.Int32,
+        k: cutlass.Int32,
+        batch_size: cutlass.Int32,
+        a_ptr: cute.Pointer,
+        b_ptr: cute.Pointer,
+        c_tensor: cute.Tensor,
+        a_stride_m: cutlass.Int32,
+        a_stride_batch: cutlass.Int32,
+        b_stride_n: cutlass.Int32,
+        b_stride_batch: cutlass.Int32,
+        stamps: cute.Tensor,
+        retry_count: cute.Tensor,
+        max_active_clusters: cutlass.Constexpr,
+        stream: cuda.CUstream,
+    ):
+        """``wrapper_fgs`` with A and B (M / N, batch) strides; K is innermost."""
+        a_tensor = cute.make_tensor(
+            a_ptr, layout=cute.make_layout((m, k, batch_size), stride=(a_stride_m, 1, a_stride_batch))
+        )
+        b_tensor = cute.make_tensor(
+            b_ptr, layout=cute.make_layout((n, k, batch_size), stride=(b_stride_n, 1, b_stride_batch))
+        )
+        self(a_tensor, b_tensor, c_tensor, stamps, retry_count, max_active_clusters, stream)
 
 
 def timeline_slots(m: int, n: int, tactic: tuple = O_PROJ_TACTIC) -> int:
@@ -588,14 +999,131 @@ def _max_active_clusters(device_index: int, cluster_size: int) -> int:
 
 
 _COMPILED = {}
-_SCRATCH_STAMPS = {}
+_SCRATCH = {}
 
 
-def _scratch_stamps(device: torch.device) -> torch.Tensor:
+def _scratch(device: torch.device, name: str, numel: int) -> torch.Tensor:
     index = device.index if device.index is not None else torch.cuda.current_device()
-    if index not in _SCRATCH_STAMPS:
-        _SCRATCH_STAMPS[index] = torch.zeros(TIMELINE_MAX_CTAS, dtype=torch.int32, device=device)
-    return _SCRATCH_STAMPS[index]
+    key = (index, name)
+    if key not in _SCRATCH:
+        _SCRATCH[key] = torch.zeros(numel, dtype=torch.int32, device=device)
+    return _SCRATCH[key]
+
+
+def _parse_tactic(tactic: tuple):
+    variant, use_2cta, mma_mn, cluster_mn, max_stage = tactic[:5]
+    split_k = tactic[5] if len(tactic) > 5 else 1
+    if variant != "base" or split_k != 1:
+        raise ValueError(f"the FGS GEMM takes a base split-K 1 tactic, got {tactic}")
+    return use_2cta, tuple(mma_mn), tuple(cluster_mn), max_stage
+
+
+def run_gemm_fgs(
+    a: torch.Tensor,
+    w: torch.Tensor,
+    out: torch.Tensor,
+    tactic: tuple,
+    *,
+    report_valid: bool = True,
+    retry_warp: bool = True,
+    wait_input: bool = False,
+    store_wait: bool = False,
+    retry_poll: Literal["try", "test"] = "try",
+    pzo: bool = False,
+    early_trigger: bool = False,
+    raster_along: Literal["m", "n"] = "m",
+    swizzle_size: int = 1,
+    use_pdl: bool = True,
+    retry_counter: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """``out[L, M, N] = a[L, M, K] @ w[L, N, K]^T`` in BF16 at an in-tree ``base`` tactic.
+
+    Any operand may be a strided view with K (``a``, ``w``) / N (``out``) innermost and 16 B aligned rows, as for the
+    in-tree batched runner. Defaults are the report_valid consumer; ``retry_counter`` (int32[``RETRY_COUNTER_SLOTS``])
+    accumulates the A re-issues.
+    """
+    if a.dim() != 3 or w.dim() != 3 or out.dim() != 3:
+        raise ValueError("run_gemm_fgs takes [L, M, K], [L, N, K], [L, M, N] operands")
+    batch, m, k = a.shape
+    n = w.shape[1]
+    if tuple(w.shape) != (batch, n, k) or tuple(out.shape) != (batch, m, n):
+        raise ValueError(f"shapes a {tuple(a.shape)} w {tuple(w.shape)} out {tuple(out.shape)}")
+    if any(t.dtype != torch.bfloat16 for t in (a, w, out)):
+        raise ValueError("run_gemm_fgs takes bf16 operands")
+    if (k > 1 and (a.stride(2) != 1 or w.stride(2) != 1)) or (n > 1 and out.stride(2) != 1):
+        raise ValueError("K must be innermost in a and w, N innermost in out")
+    use_2cta, mma_mn, cluster_mn, max_stage = _parse_tactic(tactic)
+    if retry_counter is None:
+        retry_counter = _scratch(a.device, "retry", RETRY_COUNTER_SLOTS)
+    elif retry_counter.dtype != torch.int32 or retry_counter.numel() != RETRY_COUNTER_SLOTS:
+        raise ValueError(f"retry_counter must be int32[{RETRY_COUNTER_SLOTS}]")
+
+    device_index = a.get_device()
+    clusters = _max_active_clusters(device_index, cluster_mn[0] * cluster_mn[1])
+    a_ptr = make_ptr(cutlass.BFloat16, a.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+    b_ptr = make_ptr(cutlass.BFloat16, w.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+    c_mnl = out.permute(1, 2, 0)
+    c_tensor = from_dlpack(c_mnl).mark_layout_dynamic(leading_dim=1)
+    stamps_tensor = from_dlpack(_scratch(a.device, "stamps", TIMELINE_MAX_CTAS)).mark_layout_dynamic()
+    retry_tensor = from_dlpack(retry_counter, assumed_align=4)
+    stream = cuda.CUstream(torch.cuda.current_stream(a.device).cuda_stream)
+    strides = (a.stride(1), a.stride(0), w.stride(1), w.stride(0))
+    flags = dict(
+        pzo=pzo,
+        early_trigger=early_trigger,
+        use_pdl=use_pdl,
+        report_valid=report_valid,
+        retry_warp=retry_warp,
+        wait_input=wait_input,
+        store_wait=store_wait,
+        retry_poll=retry_poll,
+    )
+    key = (
+        "strided",
+        device_index,
+        use_2cta,
+        mma_mn,
+        cluster_mn,
+        max_stage,
+        raster_along,
+        swizzle_size,
+        tuple(sorted(flags.items())),
+        tuple(c_mnl.stride()),
+        clusters,
+    )
+    compiled = _COMPILED.get(key)
+    if compiled is None:
+        gemm = FgsDenseGemmKernel(
+            cutlass.Float32,
+            use_2cta,
+            mma_mn,
+            cluster_mn,
+            swizzle_size=swizzle_size,
+            raster_along=raster_along,
+            max_num_ab_stage=max_stage,
+            **flags,
+        )
+        compiled = cute.compile(
+            gemm.wrapper_strided_fgs,
+            m,
+            n,
+            k,
+            batch,
+            a_ptr,
+            b_ptr,
+            c_tensor,
+            *strides,
+            stamps_tensor,
+            retry_tensor,
+            clusters,
+            stream,
+            options="--opt-level 2",
+        )
+        _COMPILED[key] = compiled
+    compiled(
+        m, n, k, batch, a_ptr, b_ptr, c_tensor, *strides, stamps_tensor, retry_tensor, stream=stream
+    )
+    return out
 
 
 def run_dense_fgs(
@@ -611,7 +1139,7 @@ def run_dense_fgs(
     tactic: tuple = O_PROJ_TACTIC,
     stamps: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """``out[M, N] = a[M, K] @ w[N, K]^T`` in BF16; all three row-major and dense.
+    """``out[M, N] = a[M, K] @ w[N, K]^T`` in BF16 with the producer roles; all three row-major and dense.
 
     ``stamps`` (int32, :func:`timeline_slots` elements) selects the timeline build.
     """
@@ -623,14 +1151,12 @@ def run_dense_fgs(
         raise ValueError("run_dense_fgs takes dense row-major operands")
     if tuple(out.shape) != (m, n) or w.shape[1] != k:
         raise ValueError(f"shapes a {tuple(a.shape)} w {tuple(w.shape)} out {tuple(out.shape)}")
-    variant, use_2cta, mma_mn, cluster_mn, max_stage, split_k = tactic
-    if variant != "base" or split_k != 1:
-        raise ValueError(f"run_dense_fgs takes a base split-K 1 tactic, got {tactic}")
+    use_2cta, mma_mn, cluster_mn, max_stage = _parse_tactic(tactic)
     timeline = stamps is not None
     if timeline and (stamps.dtype != torch.int32 or stamps.numel() < timeline_slots(m, n, tactic)):
         raise ValueError(f"stamps must be int32 with >= {timeline_slots(m, n, tactic)} elements")
     if stamps is None:
-        stamps = _scratch_stamps(a.device)
+        stamps = _scratch(a.device, "stamps", TIMELINE_MAX_CTAS)
 
     device_index = a.get_device()
     clusters = _max_active_clusters(device_index, cluster_mn[0] * cluster_mn[1])
@@ -638,6 +1164,7 @@ def run_dense_fgs(
     b_ptr = make_ptr(cutlass.BFloat16, w.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
     c_tensor = from_dlpack(out.unsqueeze(-1)).mark_layout_dynamic(leading_dim=1)
     stamps_tensor = from_dlpack(stamps).mark_layout_dynamic()
+    retry_tensor = from_dlpack(_scratch(a.device, "retry", RETRY_COUNTER_SLOTS), assumed_align=4)
     stream = cuda.CUstream(torch.cuda.current_stream(a.device).cuda_stream)
     key = (
         device_index,
@@ -652,7 +1179,7 @@ def run_dense_fgs(
     )
     compiled = _COMPILED.get(key)
     if compiled is None:
-        gemm = FgsProducerDenseGemmKernel(
+        gemm = FgsDenseGemmKernel(
             cutlass.Float32,
             use_2cta,
             mma_mn,
@@ -675,10 +1202,11 @@ def run_dense_fgs(
             b_ptr,
             c_tensor,
             stamps_tensor,
+            retry_tensor,
             clusters,
             stream,
             options="--opt-level 2",
         )
         _COMPILED[key] = compiled
-    compiled(m, n, k, 1, a_ptr, b_ptr, c_tensor, stamps_tensor, stream=stream)
+    compiled(m, n, k, 1, a_ptr, b_ptr, c_tensor, stamps_tensor, retry_tensor, stream=stream)
     return out

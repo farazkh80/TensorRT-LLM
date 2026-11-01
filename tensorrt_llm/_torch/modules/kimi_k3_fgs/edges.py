@@ -11,6 +11,11 @@ decode batch is in ``[MIN_ROWS, MAX_ROWS]``; ``kimi_k3_cute_gemm.linear`` recogn
 the slot, runs the report_valid consumer on it and releases it, which re-arms the
 slot on the workspaces' reset stream.
 
+``kimi_k3_cute_gemm.linear`` / ``bmm`` treat any operand view of a live slot the
+same way: an input slot selects the report_valid consumer build of the GEMM, an
+output slot its producer build (.pzo, trigger at entry). A slot acquired with
+``readers=n`` is released by the n-th consuming launch.
+
 Modules ``declare`` their edges at construction, once per layer. The model
 forward runs under ``model_scope``, which registers the declared edges on first
 use (outside a CUDA graph capture) and brackets the whole forward with one
@@ -70,6 +75,7 @@ def _state():
 
         _local.workspaces = EdgeWorkspaces.from_env()
         _local.live = {}
+        _local.readers = {}
     return _local.workspaces, _local.live
 
 
@@ -105,12 +111,14 @@ def model_scope() -> Iterator[None]:
             yield
     finally:
         _local.live.clear()
+        _local.readers.clear()
 
 
-def acquire(name: str, rows: int):
+def acquire(name: str, rows: int, readers: int = 1):
     """The next armed slot of ``name`` truncated to ``rows``, or None to keep the producer's own buffer.
 
-    Only ``kimi_k3_cute_gemm.linear`` consumes and releases a slot, so none is handed out while it is off.
+    The slot is released after ``readers`` launches of ``kimi_k3_cute_gemm`` consumed it. Only that module consumes
+    and releases slots, so none is handed out while it is off.
     """
     if mode() != "lamport" or not MIN_ROWS <= rows <= MAX_ROWS or not hasattr(_local, "workspaces"):
         return None
@@ -123,25 +131,38 @@ def acquire(name: str, rows: int):
         return None
     lease = workspaces.acquire(name, rows=rows)
     live[lease.tensor.data_ptr()] = lease
+    _local.readers[lease.tensor.data_ptr()] = readers
     return lease
 
 
-def lease_for(x: torch.Tensor):
-    """The live lease whose slot ``x`` is (same base and rows), else None."""
+def lease_containing(t: torch.Tensor):
+    """The live lease whose slot holds ``t``'s first element (``t`` may be any view of it), else None."""
     live = getattr(_local, "live", None)
     if not live:
         return None
-    lease = live.get(x.data_ptr())
-    if lease is None or lease.tensor.shape[0] != x.shape[0]:
-        return None
-    return lease
+    ptr = t.data_ptr()
+    for base, lease in live.items():
+        if base <= ptr < base + lease.tensor.numel() * lease.tensor.element_size():
+            return lease
+    return None
 
 
 def release(lease) -> None:
-    """Release the slot after its only reader (o_proj) was launched on the current stream."""
+    """Release the slot after its last reader was launched on the current stream."""
     workspaces, live = _state()
     live.pop(lease.tensor.data_ptr(), None)
+    _local.readers.pop(lease.tensor.data_ptr(), None)
     workspaces.release(lease)
+
+
+def consumed(lease) -> None:
+    """One reader of ``lease`` was launched on the current stream; the last one releases the slot."""
+    ptr = lease.tensor.data_ptr()
+    left = _local.readers.get(ptr, 1) - 1
+    if left > 0:
+        _local.readers[ptr] = left
+    else:
+        release(lease)
 
 
 def ledger() -> Optional[list]:
