@@ -56,6 +56,9 @@ _declared: Dict[str, Tuple[int, Set[int]]] = {}
 # Edge name -> slot rows, when a declaring module's row window ends above MAX_ROWS.
 _rows: Dict[str, int] = {}
 _local = threading.local()
+# TLLM_K3_FGS_DEBUG=1: ``debug`` logs which path each kernel took, once per (site, rows, path).
+DEBUG = os.environ.get("TLLM_K3_FGS_DEBUG", "0") == "1"
+_debug_seen: Set[Tuple[str, int, str]] = set()
 # Why the last acquire returned None (process-wide, so a missing scope in another thread shows too).
 _refusal = [""]
 
@@ -65,6 +68,13 @@ def mode() -> str:
     if value not in MODES:
         raise ValueError(f"{ENV}={value!r}; valid: {', '.join(MODES)}")
     return value
+
+
+def debug(site: str, rows: int, path: str) -> None:
+    """Log the path ``site`` took for ``rows`` rows (once each) when TLLM_K3_FGS_DEBUG=1, in every mode."""
+    if DEBUG and (site, rows, path) not in _debug_seen:
+        _debug_seen.add((site, rows, path))
+        logger.info(f"TLLM_K3_FGS_DEBUG {ENV}={mode()} {site} rows={rows}: {path}")
 
 
 def slots() -> bool:
@@ -153,6 +163,7 @@ def model_scope(layers: Optional[Iterable[int]] = None) -> Iterator[None]:
             " eager forward first)",
             key="k3_fgs_unregistered",
         )
+    debug("model_scope", 0, f"reset-stream fork / join around the forward, {len(workspaces.ledger())} edges")
     try:
         with workspaces.scope():
             yield
