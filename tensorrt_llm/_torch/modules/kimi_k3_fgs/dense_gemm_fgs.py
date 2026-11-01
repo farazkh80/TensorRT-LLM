@@ -66,6 +66,13 @@ TIMELINE_MAX_CTAS = 1024
 RETRY_COUNTER_SLOTS = 1
 
 
+class _Stage:
+    """The ``state.index`` view pipeline calls take, for a stage tracked outside a pipeline state."""
+
+    def __init__(self, index):
+        self.index = index
+
+
 class FgsDenseGemmKernel(PersistentDenseGemmKernel):
     def __init__(
         self,
@@ -171,6 +178,8 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
         self._setup_attributes()
         if cutlass.const_expr(self.report_valid and self.use_2cta_instrs and self.is_a_mcast):
             raise NotImplementedError("report_valid with 2-CTA tiles and A multicast")
+        if cutlass.const_expr(self.retry_warp and self.num_ab_stage > 30):
+            raise NotImplementedError(f"the retry warp tracks <= 30 stages in bitmasks, got {self.num_ab_stage}")
 
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
 
@@ -740,21 +749,14 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
     ):
         """Release each A/B stage of every work tile once its primary phase completes with valid data.
 
-        Stages are swept round-robin within the current work tile, so an invalid stage is re-issued without blocking
-        the release of later ones. ``state`` keeps a phase and a count per stage; the k tile in a stage follows from
-        its count and the stage the tile started at.
+        The k tiles of the current work tile in flight lie in [base, base + stages): the producer refills a stage only
+        after it is released, and the tile's k tile t lives in stage (first stage + t) % stages. Bit s of ``done`` marks
+        stage s's tile in that window as released, bit s of ``parity`` is the primary-phase parity stage s completes
+        next. Invalid stages are re-armed, re-loaded and revisited on the next sweep, so several can retry at once.
         """
         need_peer_retry = cutlass.const_expr(self.report_valid and self.use_2cta_instrs)
         need_retry_sync = cutlass.const_expr(self.report_valid and self.is_a_mcast)
-        state = pipeline.PerStagePipelineState(self.num_ab_stage)
-
-        retry_cluster_phases = None
-        retry_cluster_arrived = None
-        if cutlass.const_expr(need_retry_sync):
-            retry_cluster_phases = cute.make_rmem_tensor((self.num_ab_stage), cutlass.Int32)
-            retry_cluster_phases.fill(0)
-            retry_cluster_arrived = cute.make_rmem_tensor((self.num_ab_stage), cutlass.Int32)
-            retry_cluster_arrived.fill(0)
+        stages = self.num_ab_stage
 
         tile_sched = utils.StaticPersistentTileScheduler.create(
             tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
@@ -763,11 +765,13 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
 
         peer_cta_rank = cta_rank_in_cluster ^ 1
         reissues = cutlass.Int32(0)
-        stage_offset = cutlass.Int32(0)
+        base_stage = cutlass.Int32(0)
+        parity = cutlass.Int32(0)
+        # A multicast: per stage, arrived on the peers' retry barriers this round / their phase parity.
+        mc_arrived = cutlass.Int32(0)
+        mc_parity = cutlass.Int32(0)
         empty_phase = cutlass.Int32(1)
         while work_tile.is_valid_tile:
-            processed_k_tiles = cutlass.Int32(0)
-            state.reset_count()
             cur_tile_coord = work_tile.tile_idx
             mma_tile_coord_mnl = (
                 cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
@@ -775,91 +779,89 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
                 cur_tile_coord[2],
             )
             tAgA_slice = tAgA[(None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])]
-            # Sweep from the tile's first k tile, so suspending waits follow the load order.
-            while state.index != stage_offset:
-                state.next()
 
-            while processed_k_tiles < k_tile_cnt:
-                for _ in range(self.num_ab_stage):
-                    stage_idx = state.index
-                    k_tile_for_stage = pipeline.PerStagePipelineState.compute_producer_count(
-                        stage_idx, state.count, stage_offset, self.num_ab_stage
-                    )
-                    if k_tile_for_stage < k_tile_cnt:
+            base = cutlass.Int32(0)
+            done = cutlass.Int32(0)
+            while base < k_tile_cnt:
+                window = k_tile_cnt - base
+                if window > stages:
+                    window = cutlass.Int32(stages)
+                stage = base_stage
+                for i in cutlass.range(window, unroll=1):
+                    bit = cutlass.Int32(1) << stage
+                    if (done & bit) == 0:
+                        barrier = ab_pipeline.sync_object_full.get_barrier(stage)
                         if cutlass.const_expr(self.retry_poll == "test"):
-                            tma_done, data_valid = ab_pipeline.consumer_test_valid(state)
-                        else:
-                            tma_done, invalid = cute.arch.mbarrier_try_wait_primary(
-                                ab_pipeline.sync_object_full.get_barrier(stage_idx), state.phase
+                            complete, invalid = cute.arch.mbarrier_test_wait_primary(
+                                barrier, (parity >> stage) & 1
                             )
-                            data_valid = tma_done & ~invalid
-
-                        if tma_done and data_valid:
-                            ab_pipeline.retry_release(state)
-                            state.mark_valid()
-                            processed_k_tiles += 1
-                        elif tma_done:
-                            do_reissue = cutlass.Boolean(True)
-                            if cutlass.const_expr(need_retry_sync):
-                                # Arrive once per round on each multicast peer's barrier for this stage.
-                                if not retry_cluster_arrived[stage_idx]:
-                                    if retry_is_signalling:
-                                        cute.arch.mbarrier_arrive(
-                                            retry_cluster_mbar.get_barrier(stage_idx), retry_dst_rank
-                                        )
-                                    retry_cluster_arrived[stage_idx] = 1
-                                do_reissue = retry_cluster_mbar.test_wait(
-                                    stage_idx, retry_cluster_phases[stage_idx]
-                                )
-
-                            if do_reissue:
+                        else:
+                            complete, invalid = cute.arch.mbarrier_try_wait_primary(
+                                barrier, (parity >> stage) & 1
+                            )
+                        if complete:
+                            if invalid:
+                                do_reissue = cutlass.Boolean(True)
                                 if cutlass.const_expr(need_retry_sync):
-                                    retry_cluster_phases[stage_idx] = retry_cluster_phases[stage_idx] ^ 1
-                                    retry_cluster_arrived[stage_idx] = 0
+                                    if (mc_arrived & bit) == 0:
+                                        if retry_is_signalling:
+                                            cute.arch.mbarrier_arrive(
+                                                retry_cluster_mbar.get_barrier(stage), retry_dst_rank
+                                            )
+                                        mc_arrived = mc_arrived | bit
+                                    do_reissue = retry_cluster_mbar.test_wait(stage, (mc_parity >> stage) & 1)
+                                if do_reissue:
+                                    parity = parity ^ bit
+                                    if cutlass.const_expr(need_retry_sync):
+                                        mc_parity = mc_parity ^ bit
+                                        mc_arrived = mc_arrived ^ bit
+                                    if cutlass.const_expr(need_peer_retry):
+                                        cute.arch.mbarrier_wait(empty_mbar_ptr, empty_phase)
+                                        empty_phase ^= 1
+                                        with cute.arch.elect_one():
+                                            cute.arch.mbarrier_arrive_and_expect_tx(
+                                                full_mbar_ptr,
+                                                coord_buf_type.size_in_bytes,
+                                                peer_cta_rank,
+                                                relaxed=True,
+                                                scope=MBarrierScopeKind.CLUSTER,
+                                            )
+                                            cute.arch.store_async_dsmem(
+                                                local_coord_ptr,
+                                                (stage, base + i, mma_tile_coord_mnl[0], mma_tile_coord_mnl[1]),
+                                                full_mbar_ptr,
+                                                peer_cta_rank,
+                                            )
+                                            cute.arch.store_async_dsmem(
+                                                local_coord_ptr + 4,
+                                                mma_tile_coord_mnl[2],
+                                                full_mbar_ptr,
+                                                peer_cta_rank,
+                                            )
+                                    ab_pipeline.retry_expect_tx(_Stage(stage), self.num_tma_load_bytes_a)
+                                    cute.copy(
+                                        tma_atom_a,
+                                        tAgA_slice[(None, base + i)],
+                                        tAsA[(None, stage)],
+                                        tma_bar_ptr=barrier,
+                                        mcast_mask=a_full_mcast_mask,
+                                        report_valid=True,
+                                    )
+                                    reissues += 1
+                            else:
+                                parity = parity ^ bit
+                                done = done | bit
+                                ab_pipeline.retry_release(_Stage(stage))
+                    stage = stage + 1
+                    if stage == stages:
+                        stage = cutlass.Int32(0)
+                while ((done >> base_stage) & 1) == 1:
+                    done = done ^ (cutlass.Int32(1) << base_stage)
+                    base = base + 1
+                    base_stage = base_stage + 1
+                    if base_stage == stages:
+                        base_stage = cutlass.Int32(0)
 
-                                if cutlass.const_expr(need_peer_retry):
-                                    cute.arch.mbarrier_wait(empty_mbar_ptr, empty_phase)
-                                    empty_phase ^= 1
-                                    with cute.arch.elect_one():
-                                        cute.arch.mbarrier_arrive_and_expect_tx(
-                                            full_mbar_ptr,
-                                            coord_buf_type.size_in_bytes,
-                                            peer_cta_rank,
-                                            relaxed=True,
-                                            scope=MBarrierScopeKind.CLUSTER,
-                                        )
-                                        cute.arch.store_async_dsmem(
-                                            local_coord_ptr,
-                                            (
-                                                stage_idx,
-                                                k_tile_for_stage,
-                                                mma_tile_coord_mnl[0],
-                                                mma_tile_coord_mnl[1],
-                                            ),
-                                            full_mbar_ptr,
-                                            peer_cta_rank,
-                                        )
-                                        cute.arch.store_async_dsmem(
-                                            local_coord_ptr + 4,
-                                            mma_tile_coord_mnl[2],
-                                            full_mbar_ptr,
-                                            peer_cta_rank,
-                                        )
-
-                                ab_pipeline.retry_expect_tx(state, self.num_tma_load_bytes_a)
-                                state.mark_invalid()
-                                cute.copy(
-                                    tma_atom_a,
-                                    tAgA_slice[(None, k_tile_for_stage)],
-                                    tAsA[(None, stage_idx)],
-                                    tma_bar_ptr=ab_pipeline.producer_get_barrier(state),
-                                    mcast_mask=a_full_mcast_mask,
-                                    report_valid=True,
-                                )
-                                reissues += 1
-                    state.next()
-
-            stage_offset = (stage_offset + k_tile_cnt) % self.num_ab_stage
             tile_sched.advance_to_next_work()
             work_tile = tile_sched.get_current_work()
 

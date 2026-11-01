@@ -16,7 +16,7 @@ points; the first entry whose max_m covers the runtime M is used. Backends:
 An operand that is a view of a live ``TLLM_K3_FGS=lamport`` edge slot (``kimi_k3_fgs.edges``) selects the
 fine-grained-sync build of the table entry's kernel at its tactic: an input slot the report_valid consumer (no
 ``griddepcontrol.wait``; the slot is consumed), an output slot the producer roles (.pzo, trigger at entry; split-K
-stores element 0 of each 16 B chunk last). ``rubin`` runs ``kimi_k3_fgs.dense_gemm_fgs``, split-K entries
+stores whole 16 B chunks). ``rubin`` runs ``kimi_k3_fgs.dense_gemm_fgs``, split-K entries
 ``kimi_k3_fgs.splitk_gemm_fgs``, ``fi_direct`` rows FlashInfer's default split-K tactic; a strided input at split-K
 rows runs the ``rubin`` build at ``_FGS_SMALL_TACTIC``.
 
@@ -290,7 +290,7 @@ def _fgs_linear(x, weight, out, consume: bool, produce: bool) -> None:
             smem_carveout=_VSPLITK_CARVEOUT if exact else None,
             pzo=produce,
             early_trigger=produce,
-            elem0_last=produce,
+            store16=produce,
         )
 
 

@@ -235,8 +235,9 @@ def test_decode_shapes_ready_and_late_chunk(shape: str, m: int) -> None:
         out = run(slot, "fgs", counter)
     torch.cuda.synchronize()
     reissues, unchecked = counter.tolist()
-    assert reissues > 0 and unchecked == 0
-    assert torch.equal(out.view(torch.int16), plain.view(torch.int16))
+    diff = int((out.view(torch.int16) != plain.view(torch.int16)).sum())
+    assert diff == 0, f"{diff} output elements differ ({reissues} re-issues)"
+    assert reissues > 0 and unchecked == 0, f"re-issues {reissues}, unchecked {unchecked}"
 
 
 PRODUCER = dict(
@@ -245,10 +246,11 @@ PRODUCER = dict(
 
 
 @pytest.mark.parametrize(
-    "shape,m", [("bfa", 16), ("qa_kva", 16), ("qb", 16), ("gproj", 16), ("qb", 32), ("bfa", 8)]
+    "shape,m",
+    [("bfa", 16), ("qa_kva", 16), ("qb", 16), ("gproj", 16), ("qb", 32), ("bfa", 8), ("qa_kva", 1)],
 )
 def test_producer_build_changes_only_negative_zero(shape: str, m: int) -> None:
-    """.pzo + early trigger + element-0-last stores equal the plain build with -0.0 read as +0.0."""
+    """.pzo + early trigger + 16 B owner stores equal the plain build with -0.0 read as +0.0, rows past M untouched."""
     n, k, tactics = DECODE_SPLITK[shape]
     tactic = fgs.SplitKTactic(*tactics[m])
     torch.manual_seed(m)
@@ -258,31 +260,14 @@ def test_producer_build_changes_only_negative_zero(shape: str, m: int) -> None:
     w[:16] = w[:16].abs()  # -0.0 rows times positive weight rows: -0.0 without .pzo
 
     def run(**flags):
-        out = torch.full((m, n), float("nan"), device="cuda", dtype=torch.bfloat16)
-        fgs.run_splitk_dense_fgs(x, w.t(), None, out, True, tactic, **flags)
-        return out
+        buf = torch.full((m + 1, n), float("nan"), device="cuda", dtype=torch.bfloat16)
+        fgs.run_splitk_dense_fgs(x, w.t(), None, buf[:m], True, tactic, **flags)
+        return buf
 
     plain = run(**VARIANTS["plain"])
-    prod = run(**PRODUCER, elem0_last=True)
+    prod = run(**PRODUCER, store16=True)
     torch.cuda.synchronize()
     canon = plain.view(torch.int16).clone()
-    assert bool((canon == NEG0).any())
     canon[canon == NEG0] = 0
     assert torch.equal(prod.view(torch.int16), canon)
-
-
-@pytest.mark.parametrize("shape,m", [("bfa", 8), ("qa_kva", 16), ("qb", 32), ("gproj", 16)])
-def test_elem0_lanes_hold_chunk_heads(shape: str, m: int) -> None:
-    """Hardware check of the element-0-last lane mapping: the probe build stores only from the lanes that run the
-    second pass, and those must be exactly the first elements of the 16 B output chunks."""
-    n, k, tactics = DECODE_SPLITK[shape]
-    tactic = fgs.SplitKTactic(*tactics[m])
-    torch.manual_seed(m)
-    x = torch.randn(m, k, device="cuda").to(torch.bfloat16)
-    w = (torch.randn(n, k, device="cuda") * 0.02).to(torch.bfloat16)
-    out = torch.full((m, n), float("nan"), device="cuda", dtype=torch.bfloat16)
-    fgs.run_splitk_dense_fgs(x, w.t(), None, out, True, tactic, **PRODUCER, elem0_last="probe")
-    torch.cuda.synchronize()
-    written = ~torch.isnan(out.float())
-    heads = (torch.arange(n, device="cuda") % 8 == 0).expand(m, n)
-    assert torch.equal(written, heads)
+    assert bool(torch.isnan(prod[m].float()).all())

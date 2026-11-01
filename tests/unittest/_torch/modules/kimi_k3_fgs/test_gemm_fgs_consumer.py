@@ -113,6 +113,10 @@ class Case:
             return buf, buf[:, :, : self.N].transpose(0, 1)
         return buf, buf.transpose(0, 1)
 
+    def written(self, buf: torch.Tensor) -> torch.Tensor:
+        """The part of an output buffer the GEMM writes (W_UK fills only the first N of 576 columns)."""
+        return buf[:, :, : self.N] if self.kind == "wuk" else buf
+
     def with_a(self, base: torch.Tensor) -> torch.Tensor:
         """``self.a``'s view of another buffer shaped like ``self.base``."""
         return base.as_strided(self.a.shape, self.a.stride(), self.a.storage_offset())
@@ -247,10 +251,11 @@ def late_write(src, dst, ranks, delay_us: float, step_us: float, block_rows: int
 
 
 def block_shape(case: Case):
-    """Publication granularity: K slices of all rows for decode (head-by-head producers), row blocks for prefill."""
+    """Publication granularity: K slices of all rows for decode (head-by-head producers, at least 8 slices), row
+    blocks for prefill."""
     if case.M >= 256:
         return 128, case.K
-    return case.M, min(case.K, 128)
+    return case.M, min(128, max(32, case.K // 8))
 
 
 def ranks_for(pattern: str, n: int, seed: int = 0) -> torch.Tensor:
@@ -268,8 +273,10 @@ def ranks_for(pattern: str, n: int, seed: int = 0) -> torch.Tensor:
     return r.to(torch.int32).cuda()
 
 
-def run_hazard(case: Case, pattern: str, variant: str = "c", delay_us: float = 30.0, step_us: float = 2.0):
-    """Writer on its own stream first, consumer second; returns (output buffer, re-issues, published A)."""
+def run_hazard(case: Case, pattern: str, variant: str = "c", delay_us: float = 300.0, step_us: float = 2.0):
+    """Writer on its own stream first, consumer second; returns (output buffer, re-issues, published A).
+
+    The first block lands ``delay_us`` after the writer starts, well after the consumer's host launch path."""
     ref_a = case.a
     slot_base = torch.full_like(case.base, -0.0)
     slot_a = case.with_a(slot_base)
@@ -301,7 +308,7 @@ READY = [(n, v) for n in CASES for v in ("v", "b", "c")] + [
 def test_ready_input_matches_in_tree_runner(name: str, variant: str) -> None:
     case = Case(name)
     ref = reference(case)
-    f = ref.float()
+    f = case.written(ref).float()
     assert bool(torch.isfinite(f).all()) and bool(f.abs().max() > 0)
     counter = torch.zeros(1, dtype=torch.int32, device="cuda")
     buf, out = case.new_out()
@@ -346,8 +353,9 @@ def test_late_out_of_order_producer(name: str, pattern: str) -> None:
     case = Case(name, seed=1)
     ref = reference(case)
     buf, reissues, published = run_hazard(case, pattern)
-    assert published
-    assert torch.equal(bits(buf), bits(ref)), f"{name}/{pattern}: output differs after re-issues"
+    assert published, f"{name}/{pattern}: the writer did not publish A"
+    diff = int((bits(buf) != bits(ref)).sum())
+    assert diff == 0, f"{name}/{pattern}: {diff} output elements differ ({reissues} re-issues)"
     assert reissues > 0, f"{name}/{pattern}: the writer finished before the consumer read (no re-issue)"
 
 
@@ -374,5 +382,6 @@ def test_one_late_chunk(name: str) -> None:
     with torch.cuda.stream(sc):
         run_variant(case, slot_a, out, "c", counter=counter)
     torch.cuda.synchronize()
-    assert torch.equal(bits(buf), bits(ref))
+    diff = int((bits(buf) != bits(ref)).sum())
+    assert diff == 0, f"{name}: {diff} output elements differ ({counter.item()} re-issues)"
     assert counter.item() > 0
