@@ -332,6 +332,21 @@ def test_fgs_consumer_ready_input_matches_default(num_tokens, num_candidates, ad
     assert counters.tolist() == [0] * 4, "ready input must never be re-read"
 
 
+@pytest.mark.parametrize("fgs_check", ["consumer", "producer"])
+@pytest.mark.parametrize("add", [True, False], ids=["add_norm", "snapshot_norm"])
+@pytest.mark.parametrize("num_tokens,num_candidates", [(300, 2), (8192, 9)])
+@torch.no_grad()
+def test_fgs_check_placements_match_default(num_tokens, num_candidates, add, fgs_check) -> None:
+    x = _inputs(num_tokens, num_candidates, seed=12)
+    attn = x["addend"] if add else x["prefix"]
+    counters = make_fgs_counters()
+    got = _fgs_call(x, attn, add, counters, fgs_check=fgs_check)
+    ref = _default_call(x, attn, add)
+    for a, b in zip(_as_tuple(got), _as_tuple(ref)):
+        assert torch.equal(a, b)
+    assert counters.tolist() == [0] * 4
+
+
 @pytest.mark.parametrize("order", ["forward", "reverse", "random"])
 @pytest.mark.parametrize("add", [True, False], ids=["add_norm", "snapshot_norm"])
 @pytest.mark.parametrize("num_tokens,block", [(64, 8), (1024, 128)], ids=["reg", "pipe"])

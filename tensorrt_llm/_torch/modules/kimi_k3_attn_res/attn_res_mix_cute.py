@@ -484,7 +484,7 @@ if _CUTE_AVAILABLE:
                 addr = (src.iterator + (cutlass.Int64(tok) * self.H + col * _VEC)).toint()
                 chunk = cute.make_rmem_tensor(src[(None, (tok, col))].shape, BFloat16)
                 w = cute.recast_tensor(chunk, Int32)
-                vals = _ld_relaxed_v4(addr)
+                vals = _ld_weak_v4(addr)
                 for k in cutlass.range_constexpr(4):
                     w[k] = vals[k]
                 chunks.append(chunk)
@@ -571,6 +571,69 @@ if _CUTE_AVAILABLE:
                 pure=True,
             )
         )
+
+    @dsl_user_op
+    def _ld_weak_v4(addr: cutlass.Int64, *, loc=None, ip=None):
+        """Plain 16-B load for the first read of a published-or-sentinel chunk; re-reads use ``_ld_relaxed_v4``."""
+        res = _asm(
+            llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+            [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)],
+            "ld.global.v4.b32 {$0, $1, $2, $3}, [$4];",
+            "=r,=r,=r,=r,l",
+            loc,
+            ip,
+        )
+        return tuple(Int32(llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(4))
+
+    @dsl_user_op
+    def _ld_shared_b32(addr: Int32, *, loc=None, ip=None) -> Int32:
+        return Int32(
+            _asm(
+                T.i32(),
+                [Int32(addr).ir_value(loc=loc, ip=ip)],
+                "ld.shared.b32 $0, [$1];",
+                "=r,r",
+                loc,
+                ip,
+            )
+        )
+
+    @dsl_user_op
+    def _st_shared_v4(addr: Int32, words, *, loc=None, ip=None) -> None:
+        _asm(
+            None,
+            [Int32(addr).ir_value(loc=loc, ip=ip)]
+            + [Int32(w).ir_value(loc=loc, ip=ip) for w in words],
+            "st.shared.v4.b32 [$0], {$1, $2, $3, $4};",
+            "r,r,r,r,r",
+            loc,
+            ip,
+        )
+
+    @dsl_user_op
+    def _mbarrier_test(mbar: cute.Pointer, parity: Int32, *, loc=None, ip=None) -> Int32:
+        """1 if the phase with ``parity`` has completed (non-blocking ``mbarrier.test_wait``), else 0."""
+        return Int32(
+            _asm(
+                T.i32(),
+                [
+                    Int32(mbar.toint(loc=loc, ip=ip)).ir_value(),
+                    Int32(parity).ir_value(loc=loc, ip=ip),
+                ],
+                "{\n"
+                ".reg .pred p;\n"
+                "mbarrier.test_wait.parity.shared::cta.b64 p, [$1], $2;\n"
+                "selp.u32 $0, 1, 0, p;\n"
+                "}",
+                "=r,r,r",
+                loc,
+                ip,
+            )
+        )
+
+    @dsl_user_op
+    def _fence_proxy_async_smem(*, loc=None, ip=None) -> None:
+        _asm(None, [], "fence.proxy.async.shared::cta;", "", loc, ip)
 
     @dsl_user_op
     def _pzo_b32(w: Int32, *, loc=None, ip=None) -> Int32:
@@ -705,7 +768,9 @@ if _CUTE_AVAILABLE:
         running, on the same grid, token order and producer loop. Each consumer warp tests the attention-row
         chunks it took from the ring; a warp with a chunk that still starts with the bf16 -0.0 sentinel re-reads
         them from global memory together (warp-uniform backoff; after ``fgs_max_spins`` rounds it waits for the
-        producer grid).
+        producer grid). With ``fgs_producer_check`` the producer warp does it instead: the attention row lands on a
+        separate mbarrier and the warp, polling between issuing rows, checks the oldest landed row in shared memory
+        (word 0 of each 16-B chunk), patches stale chunks and only then releases the row to the consumer warps.
         """
 
         RED_SLOTS = 4
@@ -724,6 +789,7 @@ if _CUTE_AVAILABLE:
             overlap: bool = False,
             fgs_consumer: bool = False,
             fgs_max_spins: int = 1 << 16,
+            fgs_producer_check: bool = False,
         ):
             assert 2 <= num_candidates <= _MAX_CANDIDATES
             assert norm_mode in ("flashinfer", "kimi")
@@ -751,10 +817,16 @@ if _CUTE_AVAILABLE:
             assert not fgs_consumer or hidden_size // (_VEC * 32) <= 31
             self.fgs_consumer = fgs_consumer
             self.fgs_max_spins = fgs_max_spins
+            self.fgs_producer_check = fgs_consumer and fgs_producer_check
+            # A token's attention row is issued once its slot is free, i.e. at most S // R + 1 tokens after the
+            # oldest one still unchecked, so this many landing barriers are never reused while armed.
+            self.fgs_chk = stages // self.rows_per_token + 2
 
         def smem_bytes(self) -> int:
             red = self.RED_SLOTS * self.cwarps * self.slot_stride * 4
             nbytes = self.stages * self.H * 2 + red + (2 * self.stages + self.RED_SLOTS) * 8 + 256
+            if self.fgs_producer_check:
+                nbytes += self.fgs_chk * 8
             return nbytes
 
         @cute.jit
@@ -868,6 +940,137 @@ if _CUTE_AVAILABLE:
                 vals[k] = cute.arch.shuffle_sync(total, offset=k)
 
         @cute.jit
+        def _fgs_produce(
+            self,
+            mB: cute.Tensor,
+            mP: cute.Tensor,
+            mA: cute.Tensor,
+            M: Int32,
+            ring: cute.Tensor,
+            full: cute.Pointer,
+            empty: cute.Pointer,
+            chk: cute.Pointer,
+            cnt: cute.Tensor,
+        ):
+            """Producer warp of the ``fgs_consumer`` build: issues rows like the default loop (each attention row
+            onto its own ``chk`` barrier) and, whenever the oldest unchecked attention row has landed, checks and
+            releases it. Neither waits for the other, so the ring stays as full as in the default build."""
+            K = self.N - 1
+            H = self.H
+            S = self.stages
+            R = self.rows_per_token
+            C = self.fgs_chk
+            row_bytes = H * 2
+            lane = cute.arch.lane_idx()
+            bidx, _, _ = cute.arch.block_idx()
+            gdim, _, _ = cute.arch.grid_dim()
+            attn = mA if self.fuse_add else mP
+            rows = (M - bidx + gdim - 1) // gdim * R
+            r = Int32(0)
+            j = Int32(0)
+            while j * R < rows:
+                idle = Int32(1)
+                if r < rows:
+                    slot = r % S
+                    parity = ((r // S) & 1) ^ 1
+                    if cute.arch.vote_any_sync(_mbarrier_test(empty + slot, parity) != 0):
+                        idle = Int32(0)
+                        if lane == 0:
+                            cute.arch.mbarrier_wait(empty + slot, parity)
+                            i = r % R
+                            tok = bidx + r // R * gdim
+                            if i == R - 1:
+                                landed = chk + (r // R) % C
+                                cute.arch.mbarrier_arrive_and_expect_tx(landed, row_bytes)
+                                _bulk_g2s(
+                                    ring.iterator + slot * H,
+                                    attn.iterator + cutlass.Int64(tok) * H,
+                                    landed,
+                                    row_bytes,
+                                )
+                            else:
+                                cute.arch.mbarrier_arrive_and_expect_tx(full + slot, row_bytes)
+                                src = mP.iterator + cutlass.Int64(tok) * H
+                                if i < K:
+                                    src = (
+                                        mB.iterator
+                                        + (cutlass.Int64(i) * cutlass.Int64(M) + cutlass.Int64(tok))
+                                        * H
+                                    )
+                                _bulk_g2s(ring.iterator + slot * H, src, full + slot, row_bytes)
+                        r = r + 1
+                if j * R + R - 1 < r:
+                    if cute.arch.vote_any_sync(_mbarrier_test(chk + j % C, (j // C) & 1) != 0):
+                        idle = Int32(0)
+                        self._fgs_release(ring, full, chk, attn, j, bidx + j * gdim, cnt)
+                        j = j + 1
+                if idle != 0:
+                    _nanosleep(Int32(32))
+
+        @cute.jit
+        def _fgs_release(
+            self,
+            ring: cute.Tensor,
+            full: cute.Pointer,
+            chk: cute.Pointer,
+            attn: cute.Tensor,
+            j: Int32,
+            tok: Int32,
+            cnt: cute.Tensor,
+        ):
+            """Check the landed attention row of the ``j``-th token (``tok``), patch it, hand it to the consumers."""
+            H = self.H
+            R = self.rows_per_token
+            NK = H // (_VEC * 32)
+            lane = cute.arch.lane_idx()
+            slot = (j * R + R - 1) % self.stages
+            cute.arch.mbarrier_wait(chk + j % self.fgs_chk, (j // self.fgs_chk) & 1)
+            dst = Int32((ring.iterator + slot * H).toint()) + lane * 16
+            src = (attn.iterator + cutlass.Int64(tok) * H).toint() + lane * 16
+            stale = Int32(0)
+            for k0 in cutlass.range_constexpr(0, NK, 7):
+                group = [_ld_shared_b32(dst + k * 512) for k in range(k0, min(k0 + 7, NK))]
+                for k, w in enumerate(group, k0):
+                    if _unpublished([w]) != 0:
+                        stale = stale | (1 << k)
+            if cute.arch.vote_any_sync(stale != 0):
+                if lane == 0:
+                    _red_add(cnt.iterator.toint(), Int32(1))
+                spins = Int32(0)
+                delay = Int32(32)
+                go = Int32(1)
+                while go != 0:
+                    done = Int32(0)
+                    if spins == self.fgs_max_spins:
+                        if lane == 0:
+                            _red_add((cnt.iterator + 2).toint(), Int32(1))
+                        cute.arch.griddepcontrol_wait()
+                        done = Int32(1)
+                    else:
+                        _nanosleep(delay)
+                        delay = cutlass.min(delay * 2, Int32(1024))
+                    for k in cutlass.range_constexpr(NK):
+                        if ((stale >> k) & 1) != 0:
+                            w = _ld_relaxed_v4(src + k * 512)
+                            fresh = done
+                            if _unpublished(w) == 0:
+                                fresh = Int32(1)
+                            if fresh != 0:
+                                _st_shared_v4(dst + k * 512, w)
+                                stale = stale & ~(1 << k)
+                    if lane == 0:
+                        _red_add((cnt.iterator + 1).toint(), Int32(1))
+                    spins = spins + 1
+                    go = Int32(0)
+                    if cute.arch.vote_any_sync(stale != 0):
+                        go = Int32(1)
+                # Order these generic-proxy stores before the bulk copy that refills the slot.
+                _fence_proxy_async_smem()
+            cute.arch.sync_warp()
+            if lane == 0:
+                cute.arch.mbarrier_arrive(full + slot)
+
+        @cute.jit
         def _fgs_patch(self, vals: list, attn: cute.Tensor, tok: Int32, cnt: cute.Tensor):
             """This thread's chunks of attention row ``tok``, re-read from global memory while unpublished."""
             tidx, _, _ = cute.arch.thread_idx()
@@ -939,7 +1142,9 @@ if _CUTE_AVAILABLE:
                             cute.arch.sync_warp()
                             if lane == 0:
                                 cute.arch.mbarrier_arrive(empty + slot_a)
-                            if cutlass.const_expr(self.fgs_consumer):
+                            if cutlass.const_expr(
+                                self.fgs_consumer and not self.fgs_producer_check
+                            ):
                                 adds = self._fgs_patch(adds, attn, tok, cnt)
                             for v in cutlass.range_constexpr(V):
                                 vals[v] = (vals[v].to(Float32) + adds[v].to(Float32)).to(BFloat16)
@@ -947,7 +1152,12 @@ if _CUTE_AVAILABLE:
                         cute.arch.sync_warp()
                         if lane == 0:
                             cute.arch.mbarrier_arrive(empty + slot)
-                        if cutlass.const_expr(self.fgs_consumer and not self.fuse_add and n == K):
+                        if cutlass.const_expr(
+                            self.fgs_consumer
+                            and not self.fgs_producer_check
+                            and not self.fuse_add
+                            and n == K
+                        ):
                             vals = self._fgs_patch(vals, attn, tok, cnt)
                         xs.append(vals)
                     for jj in cutlass.range_constexpr(nc):
@@ -1085,12 +1295,18 @@ if _CUTE_AVAILABLE:
             full = smem.allocate_array(cutlass.Int64, num_elems=S)
             empty = smem.allocate_array(cutlass.Int64, num_elems=S)
             red_bar = smem.allocate_array(cutlass.Int64, num_elems=self.RED_SLOTS)
+            chk = None
+            if cutlass.const_expr(self.fgs_producer_check):
+                chk = smem.allocate_array(cutlass.Int64, num_elems=self.fgs_chk)
             if tidx == 0:
                 for s in cutlass.range_constexpr(S):
                     cute.arch.mbarrier_init(full + s, 1)
                     cute.arch.mbarrier_init(empty + s, self.cwarps)
                 for s in cutlass.range_constexpr(self.RED_SLOTS):
                     cute.arch.mbarrier_init(red_bar + s, self.cwarps)
+                if cutlass.const_expr(self.fgs_producer_check):
+                    for s in cutlass.range_constexpr(self.fgs_chk):
+                        cute.arch.mbarrier_init(chk + s, 1)
             cute.arch.mbarrier_init_fence()
             cute.arch.barrier()
 
@@ -1098,7 +1314,9 @@ if _CUTE_AVAILABLE:
                 cute.arch.griddepcontrol_wait()
 
             if warp == self.cwarps:
-                if lane == 0:
+                if cutlass.const_expr(self.fgs_producer_check):
+                    self._fgs_produce(mB, mP, mA, M, ring, full, empty, chk, mCnt)
+                elif lane == 0:
                     it = Int32(0)
                     for tok in cutlass.range(bidx, M, gdim, unroll=1):
                         for i in cutlass.range_constexpr(R):
@@ -1119,7 +1337,7 @@ if _CUTE_AVAILABLE:
                         it = it + 1
             else:
                 args = (ring, full, empty, red_buf, red_bar, gR, gG, gW, gO, gU)
-                if cutlass.const_expr(self.fgs_consumer):
+                if cutlass.const_expr(self.fgs_consumer and not self.fgs_producer_check):
                     self._consumers(*args, M, eps, eps_out, mA if self.fuse_add else mP, mCnt)
                 else:
                     self._consumers(*args, M, eps, eps_out)
@@ -1214,6 +1432,7 @@ def _compiled(
     fgs_consumer: bool = False,
     fgs_producer: bool = False,
     fgs_max_spins: int = 1 << 16,
+    fgs_producer_check: bool = False,
 ):
     if config[0] == "pipe":
         _, vecs, stages, max_chunk, overlap = config
@@ -1230,6 +1449,7 @@ def _compiled(
             overlap,
             fgs_consumer=fgs_consumer,
             fgs_max_spins=fgs_max_spins,
+            fgs_producer_check=fgs_producer_check,
         )
     else:
         _, cluster_n, vecs = config
@@ -1286,6 +1506,14 @@ def _num_sms(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
+def _producer_check(fgs_check: str, fuse_add: bool, num_candidates: int) -> bool:
+    if fgs_check not in ("auto", "consumer", "producer"):
+        raise ValueError(f"attn_res_mix: unknown fgs_check {fgs_check!r}")
+    if fgs_check == "auto":
+        return not fuse_add and num_candidates <= 4
+    return fgs_check == "producer"
+
+
 def make_fgs_counters(device=None) -> torch.Tensor:
     """Counters of ``fgs_consumer`` calls, never reset by the kernels.
 
@@ -1314,6 +1542,7 @@ def attn_res_mix(
     fgs_producer: bool = False,
     fgs_counters: Optional[torch.Tensor] = None,
     fgs_max_spins: int = 1 << 16,
+    fgs_check: str = "auto",
 ):
     """Attention-residual mix (+ optional fused add / output RMSNorm).
 
@@ -1329,7 +1558,8 @@ def attn_res_mix(
     be complete. Counters go to ``fgs_counters`` (:func:`make_fgs_counters`). ``out`` and
     ``updated`` must be given: the kernel may start before the producer ends, so its outputs must not share memory
     the producer still uses. ``fgs_producer`` ("reg" kernel) triggers its dependents at entry and never stores
-    -0.0. Both launch with PDL.
+    -0.0. Both launch with PDL. ``fgs_check`` ("pipe" kernel): "consumer" warps or the "producer" warp test the
+    attention row; "auto" takes the producer warp for snapshot sites with N <= 4, where it measured faster.
     """
     M, H = prefix.shape
     K = bank.numel() // (M * H)
@@ -1371,6 +1601,7 @@ def attn_res_mix(
         fgs_consumer,
         fgs_producer,
         fgs_max_spins if fgs_consumer else 1 << 16,
+        fgs_consumer and config[0] == "pipe" and _producer_check(fgs_check, fuse_add, N),
     )
     if grid_x <= 0:
         grid_x = min(M, _num_sms(prefix.device.index)) if config[0] == "pipe" else M
