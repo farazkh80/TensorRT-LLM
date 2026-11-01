@@ -71,6 +71,22 @@ def ld_cg_v4(addr, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def ld_cg_v8(addr, *, loc=None, ip=None):
+    """32-byte ``ld.global.cg`` as eight int32 (first load of two adjacent FGS chunks)."""
+    res = llvm.inline_asm(
+        ir.Type.parse("!llvm.struct<(i32,i32,i32,i32,i32,i32,i32,i32)>"),
+        [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)],
+        "ld.global.cg.v8.b32 {$0, $1, $2, $3, $4, $5, $6, $7}, [$8];",
+        "=r,=r,=r,=r,=r,=r,=r,=r,l",
+        has_side_effects=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return [cutlass.Int32(llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(8)]
+
+
+@dsl_user_op
 def ld_relaxed_v4(addr, *, loc=None, ip=None):
     """16-byte ``ld.relaxed.gpu.global`` as four int32 (reload of an FGS chunk)."""
     return _v4(
@@ -127,23 +143,70 @@ def bf16x2_pzo(lo, hi, hw, *, loc=None, ip=None):
     )
 
 
+def _zero_halves(t):
+    """Mask with bit 15 / bit 31 set exactly for the 16-bit halves of ``t`` that are zero; plain integer ops the
+    compiler folds into a few LOP3 / IADD."""
+    low15 = (t & cutlass.Int32(0x7FFF7FFF)) + cutlass.Int32(0x7FFF7FFF)
+    return ((low15 | t) ^ cutlass.Int32(-1)) & cutlass.Int32(-0x7FFF8000)
+
+
+def _neg_zero_halves(w):
+    """Mask with bit 15 / bit 31 set exactly for the halves of ``w`` equal to 0x8000 (bf16 -0.0)."""
+    return _zero_halves(cutlass.Int32(w) ^ cutlass.Int32(-0x7FFF8000))
+
+
 @dsl_user_op
-def canon_bf16x2(w, *, loc=None, ip=None):
-    """A packed bf16x2 word with each -0.0 half replaced by +0.0; every other bit pattern is kept."""
+def _min_u16x2(a, b, *, loc=None, ip=None):
     return cutlass.Int32(
         llvm.inline_asm(
             T.i32(),
-            [cutlass.Int32(w).ir_value(loc=loc, ip=ip)],
-            "{ .reg .b16 l, h; .reg .pred p; mov.b32 {l, h}, $1; "
-            "setp.eq.b16 p, l, 0x8000; selp.b16 l, 0, l, p; "
-            "setp.eq.b16 p, h, 0x8000; selp.b16 h, 0, h, p; mov.b32 $0, {l, h}; }",
-            "=r,r",
+            [cutlass.Int32(a).ir_value(loc=loc, ip=ip), cutlass.Int32(b).ir_value(loc=loc, ip=ip)],
+            "min.u16x2 $0, $1, $2;",
+            "=r,r,r",
             has_side_effects=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
             loc=loc,
             ip=ip,
         )
     )
+
+
+@dsl_user_op
+def _min_u32(a, b, *, loc=None, ip=None):
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [cutlass.Int32(a).ir_value(loc=loc, ip=ip), cutlass.Int32(b).ir_value(loc=loc, ip=ip)],
+            "min.u32 $0, $1, $2;",
+            "=r,r,r",
+            has_side_effects=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+def any_pending(words, count: int, f32: bool):
+    """Int32 non-zero when any element of the int32 words ``words[0:count]`` is the sentinel: XOR with the
+    sentinel and take the unsigned (per-half for bf16) minimum, so a sentinel element shows up as a zero lane."""
+    m = None
+    for i in range(count):
+        t = cutlass.Int32(words[i]) ^ cutlass.Int32(F32_SENTINEL if f32 else -0x7FFF8000)
+        if m is None:
+            m = t
+        elif f32:
+            m = _min_u32(m, t)
+        else:
+            m = _min_u16x2(m, t)
+    if f32:
+        return cutlass.Int32(m == cutlass.Int32(0))
+    return _zero_halves(m)
+
+
+def canon_bf16x2(w):
+    """A packed bf16x2 word with each -0.0 half replaced by +0.0; every other bit pattern is kept."""
+    return cutlass.Int32(w) ^ _neg_zero_halves(w)
 
 
 @dsl_user_op
@@ -164,22 +227,9 @@ def canon_f32(x, *, loc=None, ip=None):
     )
 
 
-@dsl_user_op
-def bf16x2_has_sentinel(w, *, loc=None, ip=None):
-    """1 when either bf16 half of ``w`` is -0.0, else 0 (int32)."""
-    return cutlass.Int32(
-        llvm.inline_asm(
-            T.i32(),
-            [cutlass.Int32(w).ir_value(loc=loc, ip=ip)],
-            "{ .reg .b16 l, h; .reg .pred p, q; mov.b32 {l, h}, $1; "
-            "setp.eq.b16 p, l, 0x8000; setp.eq.or.b16 q, h, 0x8000, p; selp.b32 $0, 1, 0, q; }",
-            "=r,r",
-            has_side_effects=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
-    )
+def bf16x2_has_sentinel(w):
+    """Non-zero when either bf16 half of ``w`` is -0.0 (int32)."""
+    return _neg_zero_halves(w)
 
 
 @dsl_user_op
@@ -242,9 +292,7 @@ def poll_chunks(
 
     ``words`` int32 rmem [4 * n] (already loaded), ``addrs`` int64 rmem [n]. Returns the number of sweeps.
     """
-    pending = cutlass.Int32(0)
-    for c in cutlass.range_constexpr(n):
-        pending = pending | words_pending(words, 4 * c, f32)
+    pending = any_pending(words, 4 * n, f32)
     sweeps = cutlass.Int32(0)
     reloads = cutlass.Int32(0)
     if cute.arch.vote_any_sync(pending != cutlass.Int32(0)):

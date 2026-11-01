@@ -73,9 +73,9 @@ def _sigmoid_bf16_as_f32(g: cutlass.Float32, fast: cutlass.Constexpr) -> cutlass
 
 
 try:
-    from .mla_fgs import STATS_LEN, bf16x2_pzo, load_chunks, poll_chunks, st_global_v4
+    from .mla_fgs import STATS_LEN, bf16x2_pzo, ld_cg_v8, load_chunks, poll_chunks, st_global_v4
 except ImportError:
-    from mla_fgs import STATS_LEN, bf16x2_pzo, load_chunks, poll_chunks, st_global_v4
+    from mla_fgs import STATS_LEN, bf16x2_pzo, ld_cg_v8, load_chunks, poll_chunks, st_global_v4
 
 
 def _store_out(out_arr, out_base, idx, res, vec, producer, hw_pzo):
@@ -136,7 +136,14 @@ def _gate_consumer(
             off = (v * cutlass.Int64(vec) + cutlass.Int64(8 * c)) * cutlass.Int64(2)
             addrs[(2 * u) * cpv + c] = o_base + off
             addrs[(2 * u + 1) * cpv + c] = g_base + off
-    load_chunks(words, addrs, n, cutlass.Boolean(True))
+    if cutlass.const_expr(cpv == 2):
+        # 32-byte accesses load both chunks of a vector at once, as the default build does.
+        for k in cutlass.range_constexpr(n // 2):
+            w = ld_cg_v8(addrs[2 * k])
+            for i in cutlass.range_constexpr(8):
+                words[8 * k + i] = w[i]
+    else:
+        load_chunks(words, addrs, n, cutlass.Boolean(True))
     poll_chunks(words, addrs, n, False, spin_limit, mStats, with_stats)
     for u in cutlass.range_constexpr(unroll):
         v = first + cutlass.Int64(u * THREADS)
@@ -271,8 +278,8 @@ def _output_gate_host(
 DECODE_CONFIG = (8, 1, False)
 PREFILL_CONFIG = (16, 2, True)
 DECODE_MAX_NUMEL = 64 * 96 * 128
-# fgs_producer stores 16-B chunks, so it keeps 8 elements per access.
-PRODUCER_PREFILL_CONFIG = (8, 4, True)
+# fgs_producer stores each 16-B chunk of an access separately.
+PRODUCER_PREFILL_CONFIG = PREFILL_CONFIG
 _COMPILED: dict[tuple, Callable] = {}
 
 
@@ -311,7 +318,7 @@ def mla_output_gate(
     """out = o * sigmoid(g), bf16, bit-matching ``o * g.sigmoid()``. ``out`` may alias ``o``.
 
     With ``fgs_producer`` the result is ``o * g.sigmoid()`` with -0.0 stored as +0.0, ``out`` is required (the
-    consumer's slot) and must not overlap ``o`` or ``g``, and ``config`` must use 8 elements per access.
+    consumer's slot) and must not overlap ``o`` or ``g``.
     With ``fgs_consumer`` o and g are fine-grained-sync slots (``out`` must not overlap them); ``fgs_stats``
     (int32 [4]) accumulates the wait statistics of ``mla_fgs.poll_chunks`` and ``fgs_spin_limit`` > 0 traps after
     that many reload sweeps (diagnostic).
@@ -341,8 +348,6 @@ def mla_output_gate(
         prefill = PRODUCER_PREFILL_CONFIG if fgs_producer else PREFILL_CONFIG
         config = DECODE_CONFIG if o.numel() <= DECODE_MAX_NUMEL else prefill
     vec, unroll, fast = config
-    if fgs_producer and vec != 8:
-        raise ValueError("mla_output_gate: fgs_producer stores 16-B chunks (8 elements per access)")
     with_stats = fgs_consumer and fgs_stats is not None
     if with_stats and (fgs_stats.dtype != torch.int32 or fgs_stats.numel() < STATS_LEN):
         raise ValueError("fgs_stats must be an int32 tensor with at least 4 entries")

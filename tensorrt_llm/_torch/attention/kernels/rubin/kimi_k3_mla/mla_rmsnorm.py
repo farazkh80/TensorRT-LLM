@@ -42,9 +42,9 @@ import torch
 from cutlass import Float32, Int32, Int64
 
 try:
-    from .mla_fgs import SPIN_NS_MAX, SPIN_NS_MIN, STATS_LEN, bf16x2_has_sentinel, bf16x2_pzo, nanosleep, trap
+    from .mla_fgs import SPIN_NS_MAX, SPIN_NS_MIN, STATS_LEN, any_pending, bf16x2_pzo, nanosleep, trap
 except ImportError:
-    from mla_fgs import SPIN_NS_MAX, SPIN_NS_MIN, STATS_LEN, bf16x2_has_sentinel, bf16x2_pzo, nanosleep, trap
+    from mla_fgs import SPIN_NS_MAX, SPIN_NS_MIN, STATS_LEN, any_pending, bf16x2_pzo, nanosleep, trap
 
 COPY_BITS = 128
 
@@ -107,10 +107,7 @@ def _predicate_k(tXcX: cute.Tensor, limit: int) -> cute.Tensor:
 @cute.jit
 def _fragment_pending(frag: cute.Tensor) -> Int32:
     words = cute.recast_tensor(frag, Int32)
-    acc = Int32(0)
-    for i in cutlass.range_constexpr(cute.size(words)):
-        acc = acc | bf16x2_has_sentinel(words[i])
-    return acc
+    return any_pending(words, cute.size(words), False)
 
 
 class MlaRMSNormKernel:
