@@ -51,6 +51,20 @@ MAX_ROWS = int(os.environ.get("TLLM_K3_FGS_MAX_ROWS", "16"))
 # table's GEMM at 64 rows.
 LAMPORT_MAX_ROWS = int(os.environ.get("TLLM_K3_FGS_LAMPORT_MAX_ROWS", "16"))
 
+
+def _parse_drops(value: str) -> Dict[str, Tuple[int, int]]:
+    drops = {}
+    for item in filter(None, (v.strip() for v in value.split(","))):
+        name, _, span = item.partition(":")
+        low, _, high = span.partition("-")
+        drops[name] = (int(low or 0), int(high or low or 1 << 30))
+    return drops
+
+
+# Pruned edges (``name`` or ``name:low-high`` rows, comma separated): acquire refuses them, so the producer writes its
+# own buffer and the consumer runs its default build.
+DROPPED = _parse_drops(os.environ.get("TLLM_K3_FGS_DROP_EDGES", ""))
+
 # Edge name -> (row width, layers that declared it).
 _declared: Dict[str, Tuple[int, Set[int]]] = {}
 # Edge name -> slot rows, when a declaring module's row window ends above MAX_ROWS.
@@ -217,6 +231,8 @@ def acquire(name: str, rows: int, readers: int = 1, window: Optional[Tuple[int, 
         return _refuse(f"{ENV}={mode()} has no slots")
     if not low <= rows <= high:
         return _refuse(f"{rows} rows outside [{low}, {high}]")
+    if name in DROPPED and DROPPED[name][0] <= rows <= DROPPED[name][1]:
+        return _refuse(f"edge {name} pruned at {rows} rows (TLLM_K3_FGS_DROP_EDGES)")
     if not hasattr(_local, "workspaces"):
         return _refuse(f"no model_scope opened in thread {threading.current_thread().name}")
     from .. import kimi_k3_cute_gemm
