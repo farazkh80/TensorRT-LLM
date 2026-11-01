@@ -47,6 +47,11 @@ from ..mamba.recurrent_state_cache import reset_recurrent_state_rows
 from ..multi_stream_utils import maybe_execute_in_parallel
 from ._kda_kernels import KDAKernelDispatch, fused_kda_post_conv
 
+try:
+    from ..kimi_k3_fgs import edges as k3_fgs_edges
+except ImportError:
+    k3_fgs_edges = None
+
 if TYPE_CHECKING:
     from ..mamba.mamba2_metadata import Mamba2Metadata
 
@@ -414,6 +419,9 @@ class KimiKDALinearAttention(nn.Module):
         self._projection_join_event = torch.cuda.Event()
         # Output buffer for the inplace-only ``trtllm::kda_decode`` op.
         self._o_dense: Optional[torch.Tensor] = None
+        # TLLM_K3_FGS=lamport: decode writes the core into a slot of this edge, read only by o_proj.
+        if k3_fgs_edges is not None:
+            k3_fgs_edges.declare("kda.core_o", self.proj_size, self.layer_idx)
         self._projection_bufs: Optional[Tuple[torch.Tensor, ...]] = None
         self._packed_conv_weight: Optional[torch.Tensor] = None
         self._mtp_conv_weights: Optional[Tuple[torch.Tensor, ...]] = None
@@ -659,6 +667,8 @@ class KimiKDALinearAttention(nn.Module):
                         generation_state_indices if self._use_indexed_ssm_pool else None
                     ),
                     output=output[num_ctx_tokens:num_tokens] if output is not None else None,
+                    # The slot must reach o_proj as is, which a mixed batch's concatenation breaks.
+                    fgs_slot=output is None and num_prefills == 0,
                 )
                 if output is None:
                     cores.append(decode_core)
@@ -1103,6 +1113,7 @@ class KimiKDALinearAttention(nn.Module):
         layer_cache=None,
         ssm_state_indices=None,
         output: Optional[torch.Tensor] = None,
+        fgs_slot: bool = False,
     ) -> torch.Tensor:
         """Plain T=1 decode, fast path.
 
@@ -1248,6 +1259,7 @@ class KimiKDALinearAttention(nn.Module):
                 onorm_g,
                 kda_out,
                 mamba_metadata,
+                fgs_slot,
             )
             if o is None:
                 o = self._dispatch.decode_kda(
@@ -1303,6 +1315,7 @@ class KimiKDALinearAttention(nn.Module):
         onorm_g,
         kda_out,
         mamba_metadata,
+        fgs_slot: bool = False,
     ) -> Optional[torch.Tensor]:
         """CuTe DSL T=1 decode (TLLM_K3_CUTE_KDA=decode), or None to keep the stock kernel."""
         if "decode" not in _CUTE_KDA:
@@ -1342,8 +1355,18 @@ class KimiKDALinearAttention(nn.Module):
         _count_path("decode", args is not None)
         if args is None:
             return None
+        fgs_kwargs = {}
+        if k3_fgs_edges is not None and k3_fgs_edges.producer_early():
+            fgs_kwargs = dict(fgs_producer=True)
+            lease = k3_fgs_edges.acquire("kda.core_o", B) if fgs_slot else None
+            if lease is not None:
+                args = args[:-1] + (lease.tensor.view(B, H, hd),)
         return fused_decode.kda_decode_t1(
-            *args, lower_bound=self.gate_lower_bound, norm_eps=self.o_norm.eps, scale=hd**-0.5
+            *args,
+            lower_bound=self.gate_lower_bound,
+            norm_eps=self.o_norm.eps,
+            scale=hd**-0.5,
+            **fgs_kwargs,
         )
 
     def _decode_fallback_cute(
