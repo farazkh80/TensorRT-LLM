@@ -49,9 +49,9 @@ from cutlass.cutlass_dsl import BaseDSL
 from .helpers import fmha_helpers as fmha_utils
 
 try:
-    from ..mla_fgs import bf16x2_pzo, st_global_v4, trap
+    from ..mla_fgs import bf16x2_pzo, trap
 except ImportError:
-    from mla_fgs import bf16x2_pzo, st_global_v4, trap
+    from mla_fgs import bf16x2_pzo, trap
 
 # fgs_stats slots: re-issued loads, CTAs that re-issued, of which Q loads, of which K loads.
 FGS_STATS_LEN = 4
@@ -210,7 +210,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.tuning = dict(tuning or {})
         # Fine-grained sync (Lamport) roles, see fgs_retry. fgs_consumer: no griddepcontrol.wait; Q/K/V loads use
         # TMA report_valid against the bf16 -0.0 sentinel and the empty warp re-issues invalid stages.
-        # fgs_producer: launch_dependents at entry, O stored as 16-B chunks without -0.0 (st.global epilogue).
+        # fgs_producer: launch_dependents at entry, O converted with cvt.rn.pzo (no -0.0; st.global epilogue).
         # fgs_retry_limit (diagnostic): trap after that many re-issues or empty sweeps in one CTA.
         if fgs_producer and use_tma_store:
             raise ValueError("fgs_producer needs the st.global epilogue (use_tma_store=False)")
@@ -3408,29 +3408,24 @@ class BlackwellFusedMultiHeadAttentionForward:
                     (tTMrO[j], tTMrO[j + 1]),
                     (scale, scale),
                 )
+            tDMrO = cute.make_rmem_tensor(tTMrO.shape, self.o_dtype)
             if cutlass.const_expr(self.fgs_producer):
-                # A thread's sub-tile is one contiguous row segment; each 16-B chunk is a single store, so a
-                # consumer never sees a chunk half written, and cvt.rn.pzo never emits the -0.0 sentinel.
+                # cvt.rn.pzo: same rounding as the default convert except that -0.0 (the sentinel) becomes +0.0.
+                # The store stays the default one: the consumer (output gate) checks every element of a chunk.
                 assert cutlass.const_expr(self.o_dtype == cutlass.BFloat16)
-                if row_idx < seqlen_q:
-                    o_addr = tTMEM_LOADdO_i.iterator.toint()
-                    for c in cutlass.range_constexpr(corr_tile_size // 8):
-                        w = [
-                            bf16x2_pzo(tTMrO[8 * c + 2 * e], tTMrO[8 * c + 2 * e + 1], True)
-                            for e in range(4)
-                        ]
-                        st_global_v4(o_addr + 16 * c, w[0], w[1], w[2], w[3])
+                o_words = cute.recast_tensor(tDMrO, Int32)
+                for e in cutlass.range_constexpr(cute.size(tTMrO) // 2):
+                    o_words[e] = bf16x2_pzo(tTMrO[2 * e], tTMrO[2 * e + 1], True)
             else:
-                tDMrO = cute.make_rmem_tensor(tTMrO.shape, self.o_dtype)
                 o_vec = tTMrO.load()
                 tDMrO.store(o_vec.to(self.o_dtype))
-                if cutlass.const_expr(self.use_tma_store):
-                    # TMA store path: write to shared memory
-                    cute.copy(tiled_smem_store, tDMrO, tTMEM_LOADdO_i)
-                else:
-                    # st.global path: write directly to global memory with bounds check
-                    if row_idx < seqlen_q:
-                        cute.autovec_copy(tDMrO, tTMEM_LOADdO_i)
+            if cutlass.const_expr(self.use_tma_store):
+                # TMA store path: write to shared memory
+                cute.copy(tiled_smem_store, tDMrO, tTMEM_LOADdO_i)
+            else:
+                # st.global path: write directly to global memory with bounds check
+                if row_idx < seqlen_q:
+                    cute.autovec_copy(tDMrO, tTMEM_LOADdO_i)
 
         if cutlass.const_expr(mLSE is not None):
             scaled_tmp = scale_softmax * tTMEM_LOAD_VECrS[1]

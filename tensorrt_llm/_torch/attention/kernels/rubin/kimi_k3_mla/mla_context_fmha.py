@@ -24,7 +24,7 @@ Fine-grained-sync (Lamport) builds, launched with PDL (see ``mla_fgs``):
   sentinel and re-loaded until valid (CuTe DSL >= 4.9). Producers of q / k / v must never write -0.0 as data and
   must publish each 16-B chunk with one store whose first element lands last or together. ``cu_seqlens`` is read
   without a wait, so it must be ready before the chain.
-* ``fgs_producer``: triggers its dependents at entry and stores O as 16-B chunks with -0.0 mapped to +0.0.
+* ``fgs_producer``: triggers its dependents at entry and stores O with -0.0 mapped to +0.0 (cvt.rn.pzo).
 * ``fgs_stats`` (int32 [4], zeroed by the caller): re-issued loads, CTAs that re-issued, of which Q, of which K.
 * ``fgs_retry_limit`` (diagnostic): a CTA traps after that many re-issues or sweeps without progress.
 """

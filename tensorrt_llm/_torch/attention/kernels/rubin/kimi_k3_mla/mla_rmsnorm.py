@@ -27,7 +27,8 @@ Fine-grained sync (Lamport) modes, opt-in and combinable:
                 sentinel the warp waits (warp-uniform, nanosleep backoff) and reloads that fragment with
                 ``ld.relaxed.gpu``. The reduction and the output are those of the default build.
   fgs_producer  y is published to FGS consumers (the q_b GEMM, the latent / context append): dependents are
-                triggered on entry and -0.0 is stored as +0.0 (each 16-B chunk is one vector store).
+                triggered on entry and y is converted with cvt.rn.pzo (-0.0 stored as +0.0; each 16-B chunk is one
+                vector store).
 """
 
 import functools
@@ -41,9 +42,9 @@ import torch
 from cutlass import Float32, Int32, Int64
 
 try:
-    from .mla_fgs import SPIN_NS_MAX, SPIN_NS_MIN, STATS_LEN, bf16x2_has_sentinel, canon_bf16x2, nanosleep, trap
+    from .mla_fgs import SPIN_NS_MAX, SPIN_NS_MIN, STATS_LEN, bf16x2_has_sentinel, bf16x2_pzo, nanosleep, trap
 except ImportError:
-    from mla_fgs import SPIN_NS_MAX, SPIN_NS_MIN, STATS_LEN, bf16x2_has_sentinel, canon_bf16x2, nanosleep, trap
+    from mla_fgs import SPIN_NS_MAX, SPIN_NS_MIN, STATS_LEN, bf16x2_has_sentinel, bf16x2_pzo, nanosleep, trap
 
 COPY_BITS = 128
 
@@ -122,6 +123,7 @@ class MlaRMSNormKernel:
         fgs_producer: bool = False,
         spin_limit: int = 0,
         with_stats: bool = False,
+        hw_pzo: bool = True,
     ):
         self.dtype = cutlass.BFloat16
         self.H = H
@@ -141,6 +143,7 @@ class MlaRMSNormKernel:
         self.fgs_producer = fgs_producer
         self.spin_limit = spin_limit
         self.with_stats = with_stats
+        self.hw_pzo = hw_pzo
         # FlashInfer stages x through shared memory with cp.async whenever the tile fits (always for H <= 16384);
         # the FGS consumer loads x into registers so that it can check and reload it.
         self.use_async_copy = self.copy_bits >= 32 and not fgs_consumer
@@ -313,11 +316,15 @@ class MlaRMSNormKernel:
         w = tXrW.load().to(Float32)
         y = x * rstd * (w + Float32(0.0))
 
-        tXrO.store(y.to(mY.element_type))
         if cutlass.const_expr(self.fgs_producer):
+            # Same rounding as the default convert, with -0.0 stored as +0.0 (cvt.rn.pzo on sm_107).
+            y_f32 = cute.make_fragment_like(tXrO, Float32)
+            y_f32.store(y)
             words = cute.recast_tensor(tXrO, Int32)
             for i in cutlass.range_constexpr(cute.size(words)):
-                words[i] = canon_bf16x2(words[i])
+                words[i] = bf16x2_pzo(y_f32[2 * i], y_f32[2 * i + 1], self.hw_pzo)
+        else:
+            tXrO.store(y.to(mY.element_type))
 
         if row_in_bounds:
             cute.copy(copy_atom_store, tXrO, tXgO, pred=tXpX)
@@ -380,8 +387,16 @@ class MlaRMSNormKernel:
 
 
 @functools.cache
-def _compiled(H: int, enable_pdl: bool, consumer: bool, producer: bool, spin_limit: int, with_stats: bool):
-    kernel = MlaRMSNormKernel(H, consumer, producer, spin_limit, with_stats)
+def _compiled(
+    H: int,
+    enable_pdl: bool,
+    consumer: bool,
+    producer: bool,
+    spin_limit: int,
+    with_stats: bool,
+    hw_pzo: bool = True,
+):
+    kernel = MlaRMSNormKernel(H, consumer, producer, spin_limit, with_stats, hw_pzo)
     sym_m = cute.sym_int(64)
     bf16 = cutlass.BFloat16
     x = cute.runtime.make_fake_tensor(
@@ -433,6 +448,7 @@ def mla_rmsnorm(
         return out
     stats = fgs_stats if with_stats else _dummy_stats(x.device)
     spin_limit = fgs_spin_limit if fgs_consumer else 0
-    fn = _compiled(H, enable_pdl, fgs_consumer, fgs_producer, spin_limit, with_stats)
+    hw_pzo = fgs_producer and torch.cuda.get_device_capability(x.device) == (10, 7)
+    fn = _compiled(H, enable_pdl, fgs_consumer, fgs_producer, spin_limit, with_stats, hw_pzo)
     fn(x, weight, out, stats, M, eps)
     return out
