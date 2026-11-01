@@ -17,8 +17,9 @@ An operand that is a view of a live ``TLLM_K3_FGS=lamport`` edge slot (``kimi_k3
 fine-grained-sync build of the table entry's kernel at its tactic: an input slot the report_valid consumer (no
 ``griddepcontrol.wait``; the slot is consumed), an output slot the producer roles (.pzo, trigger at entry; split-K
 stores whole 16 B chunks). ``rubin`` runs ``kimi_k3_fgs.dense_gemm_fgs``, split-K entries
-``kimi_k3_fgs.splitk_gemm_fgs``, ``fi_direct`` rows FlashInfer's default split-K tactic; a strided input at split-K
-rows runs the ``rubin`` build at ``_FGS_SMALL_TACTIC``.
+``kimi_k3_fgs.splitk_gemm_fgs``, ``fi_direct`` rows ``kimi_k3_fgs.direct_gemm_fgs`` (FlashInfer's default split-K
+tactic when an operand is not 32 B aligned or, for an output slot, N % 8 != 0); a strided input at split-K rows
+runs the ``rubin`` build at ``_FGS_SMALL_TACTIC``.
 
 A shape without an entry runs the ``rubin`` backend under the TRT-LLM autotuner. Non-BF16 operands keep the
 cuBLAS matmul; empty problems launch nothing.
@@ -260,6 +261,23 @@ def _fgs_rubin(x3, w3, out3, tactic, consume: bool, produce: bool) -> None:
     )
 
 
+def _fgs_direct(x, weight, out, tactic, consume: bool, produce: bool) -> None:
+    from .kimi_k3_fgs.direct_gemm_fgs import DirectTactic, run_direct_dense_fgs
+
+    run_direct_dense_fgs(
+        x,
+        weight.t(),
+        out,
+        _pdl(),
+        DirectTactic(*tactic),
+        check_valid=consume,
+        pdl_wait_activation=not consume,
+        pzo=produce,
+        early_trigger=produce,
+        store16=produce,
+    )
+
+
 def _fgs_linear(x, weight, out, consume: bool, produce: bool) -> None:
     """``linear`` on edge-slot operands: the fine-grained-sync build of the table entry's kernel."""
     from .kimi_k3_fgs.splitk_gemm_fgs import SplitKTactic, default_tactic, run_splitk_dense_fgs
@@ -267,11 +285,20 @@ def _fgs_linear(x, weight, out, consume: bool, produce: bool) -> None:
     m, k = x.shape
     n = weight.shape[0]
     dense = _row_major(x) and _row_major(out)
+    backend, tactic = _select(_GEMM_TABLE.get((n, k)), m)
+    if (
+        backend == "fi_direct"
+        and dense
+        and x.data_ptr() % 32 == 0
+        and out.data_ptr() % 32 == 0
+        and (not produce or n % 8 == 0)
+    ):
+        _fgs_direct(x, weight, out, tactic, consume, produce)
+        return
     # The decode o_proj consumer; prefill rows take the table's GEMM below.
     if consume and not produce and dense and n == 7168 and k == 12288 and m <= 2 * _FI_MAX_M:
         _fgs_consume(x, weight, out)
         return
-    backend, tactic = _select(_GEMM_TABLE.get((n, k)), m)
     if backend == "rubin" or not dense:
         if backend != "rubin":
             tactic = _FGS_SMALL_TACTIC
