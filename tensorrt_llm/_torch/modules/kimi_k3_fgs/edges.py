@@ -110,8 +110,8 @@ def model_scope() -> Iterator[None]:
         per_step = workspaces.reset_policy is ResetPolicy.STEP
         for name in missing:
             width, layers = _declared[name]
-            slots = len(layers) if per_step else 2
-            workspaces.workspace(name, (MAX_ROWS, width), torch.bfloat16, slots=slots)
+            num_slots = len(layers) if per_step else 2
+            workspaces.workspace(name, (MAX_ROWS, width), torch.bfloat16, slots=num_slots)
         logger.info(f"{ENV}=lamport: edge slots {workspaces.ledger()}")
     elif missing:
         logger.warning_once(
