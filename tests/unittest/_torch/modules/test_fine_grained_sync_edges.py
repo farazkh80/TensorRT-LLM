@@ -514,6 +514,38 @@ def test_spans_fill_standalone():
             ), "spans fill wrote outside its tensors"
 
 
+def test_fill_pieces():
+    fill = importlib.import_module(fgs().__name__.rsplit(".", 1)[0] + ".fine_grained_sync_fill")
+    piece = fill._MAX_FILL_BYTES // 16
+    for num_vecs in (0, 1, piece - 1, piece, piece + 1, 3 * piece + 5):
+        pieces = fill._vector_pieces(num_vecs)
+        assert sum(n for _, n in pieces) == num_vecs, num_vecs
+        assert all(0 < n <= piece for _, n in pieces), num_vecs
+        assert [first for first, _ in pieces] == list(range(0, num_vecs, piece)), num_vecs
+
+
+def test_fill_split_into_pieces():
+    """Fills above one piece (shrunk to 4 KiB) go out piece by piece, plain and as spans."""
+    fill = importlib.import_module(fgs().__name__.rsplit(".", 1)[0] + ".fine_grained_sync_fill")
+    saved = fill._MAX_FILL_BYTES
+    fill._MAX_FILL_BYTES = 4096
+    try:
+        guard = 4096
+        vecs = 3 * 256 + 7
+        buf = torch.full((2 * guard + vecs * 8 + 3,), 0x1234, dtype=torch.int16, device="cuda")
+        target = buf[guard : guard + vecs * 8 + 3].view(torch.bfloat16)
+        fill.sentinel_fill_(target, -0x7FFF8000, max_ctas=4)
+        spans_buf = torch.full((2 * guard + vecs * 4,), 0x1234, dtype=torch.int32, device="cuda")
+        span = spans_buf[guard : guard + vecs * 4].view(torch.float32)
+        fill.sentinel_fill_spans_([(span, -0x80000000)], max_ctas=4)
+        torch.cuda.synchronize()
+        assert count_non_sentinel(target) == 0 and count_non_sentinel(span) == 0
+        for whole, end in ((buf, guard + vecs * 8 + 3), (spans_buf, guard + vecs * 4)):
+            assert bool((whole[:guard] == 0x1234).all()) and bool((whole[end:] == 0x1234).all())
+    finally:
+        fill._MAX_FILL_BYTES = saved
+
+
 def test_memory_ledger():
     edges = _edges("template")
     specs = {
@@ -636,6 +668,8 @@ TESTS = [
         for p in ("release", "step")
     ],
     ("spans_fill_standalone", test_spans_fill_standalone, ()),
+    ("fill_pieces", test_fill_pieces, ()),
+    ("fill_split_into_pieces", test_fill_split_into_pieces, ()),
     *[(f"step_batched_reset[{b}]", test_step_batched_reset, (b,)) for b in _backends()],
     ("step_reuse_rules", test_step_reuse_rules, ()),
     ("memory_ledger", test_memory_ledger, ()),
