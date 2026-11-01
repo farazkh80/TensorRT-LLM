@@ -20,6 +20,8 @@ Compile-time consumer roles:
   activation chunk only goes from the sentinel to its final value, so a cached line holds one or the other. Waits
   are warp-uniform; there is no fallback (an input that is never published hangs the kernel). ``check_mode``:
 
+  - ``rows``: every row's chunks are loaded (the default build's loads) and checked before the FMAs; reloaded
+    chunks are used directly. One round trip; holds all rows' activations in registers.
   - ``row``: each row's chunks are checked as they are loaded; reloaded chunks are used directly.
   - ``heads``: after the weight loads are issued, element 0 of every chunk of the CTA's rows is loaded (4 B,
     L1-allocating) until written, then the default body runs; its activation loads hit the lines the check
@@ -28,6 +30,8 @@ Compile-time consumer roles:
     separate blocks, so the weight registers stay live instead of being consumed by interleaved rows (spills at
     4 outputs x 14 K tiles); this mode keeps the default body's register use there.
 - ``relaxed_first`` (diagnostic, ``row``): the first activation loads are ``ld.relaxed.gpu`` as well.
+- ``spin_limit`` (diagnostic): after that many reload rounds a warp (or a chunk-head CTA) stops waiting, uses what it
+  holds and counts a give-up, so a test reports a stuck wait instead of hanging.
 - ``pdl_wait_activation``: ``griddepcontrol.wait`` before the weight and activation loads (the default build's
   only wait). Without it the weight rows stream from launch.
 
@@ -39,7 +43,8 @@ Compile-time producer roles (the output is a consumer's input checked per 16 B c
   element 0 could land before the rest. CTAs are mapped so that the chunk head is computed by the group's highest
   CTA index (dispatched last); that CTA stores its other elements, waits until the chunk's remaining elements are
   no longer -0.0 (``ld.relaxed.gpu``; the output must be armed with -0.0 for the order to mean anything), then
-  stores element 0. Needs ``pzo`` (a published -0.0 would never end the wait) and N % 8 == 0.
+  stores element 0; the store depends on the loop exit, so it is performed after the rest of the chunk was read
+  back from L2. Needs ``pzo`` (a published -0.0 would never end the wait) and N % 8 == 0.
 
 The kernel never writes sentinels; the caller owns sentinel initialization of the activation buffer.
 """
@@ -74,7 +79,7 @@ _SPIN_NS_MAX = 2048
 
 #: 32-bit weight registers per thread above which a multi-row consumer validates before loading weights.
 _HEADS_BEFORE_B_REGS = 128
-_CHECK_MODES = ("row", "heads", "heads_before_b")
+_CHECK_MODES = ("rows", "row", "heads", "heads_before_b")
 
 #: CTAs per SM of the default build (its register count, CuTe DSL 4.9, sm_107a) at the Kimi K3 decode tactics:
 #: (K, (block_size, outputs_per_block, rows_per_block)) -> CTAs. The FGS roles cost a few registers, which at
@@ -88,8 +93,8 @@ _DEFAULT_CTAS_PER_SM = {
     (12288, (256, 2, 1)): 3,
 }
 
-#: Slots of the retry counter: activation reload rounds, summed over warps.
-RETRY_COUNTER_SLOTS = 1
+#: Slots of the retry counter: activation reload rounds summed over warps, waits given up (``spin_limit``).
+RETRY_COUNTER_SLOTS = 2
 
 
 @dataclasses.dataclass(frozen=True)
@@ -176,22 +181,6 @@ def _ld_head(addr, offset: int, relaxed: bool, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _st_release_b16(addr, bits, *, loc=None, ip=None):
-    """``st.release.gpu`` of the low 16 bits of ``bits`` (a release orders it after the chunk-tail loads without
-    the L1 invalidation of an acquire fence)."""
-    llvm.inline_asm(
-        None,
-        [Int64(addr).ir_value(loc=loc, ip=ip), Int32(bits).ir_value(loc=loc, ip=ip)],
-        "{ .reg .b16 lo, hi; mov.b32 {lo, hi}, $1; st.release.gpu.global.b16 [$0], lo; }",
-        "l,r,~{memory}",
-        has_side_effects=True,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
 def _nanosleep(ns, *, loc=None, ip=None):
     llvm.inline_asm(
         None,
@@ -263,6 +252,7 @@ class DirectFgsGemmKernel:
         early_trigger: bool = False,
         head_last: bool = False,
         min_ctas_per_sm: int = 1,
+        spin_limit: int = 0,
     ) -> None:
         validate_tactic(tactic, num_rows, tactic.outputs_per_block, k_extent)
         if check_mode not in _CHECK_MODES:
@@ -292,6 +282,7 @@ class DirectFgsGemmKernel:
         self.head_last = head_last
         self.group = _CHUNK // tactic.outputs_per_block
         self.min_ctas_per_sm = min_ctas_per_sm
+        self.spin_limit = spin_limit
 
     @cute.jit
     def __call__(
@@ -387,6 +378,16 @@ class DirectFgsGemmKernel:
         if const_expr(self.check_valid and self.check_mode == "heads"):
             self._wait_heads_written(tA, m_base, retry_count)
 
+        rows_check = self.check_valid and self.check_mode == "rows"
+        if const_expr(rows_check):
+            a_rows = cute.make_rmem_tensor(
+                cute.make_layout(
+                    (num_rows, num_k_tiles, vector_width),
+                    stride=(num_k_tiles * vector_width, vector_width, 1),
+                ),
+                self.element_type,
+            )
+            self._load_rows_checked(copy_a, tA, m_base, a_rows, retry_count)
         a_regs = cute.make_rmem_tensor(
             cute.make_layout((num_k_tiles, vector_width), stride=(vector_width, 1)),
             self.element_type,
@@ -395,6 +396,8 @@ class DirectFgsGemmKernel:
         for mi in cutlass.range_constexpr(num_rows):
             if const_expr(per_row_check):
                 self._load_a_checked(copy_a, tA, m_base + mi, a_regs, retry_count)
+            elif const_expr(rows_check):
+                pass
             else:
                 for k_tile in cutlass.range_constexpr(num_k_tiles):
                     cute.copy(
@@ -412,7 +415,10 @@ class DirectFgsGemmKernel:
                                 a_regs[k_tile, vi], b_regs[ni, k_tile, vi], acc[mi, ni]
                             )
                     else:
-                        a_value = a_regs[k_tile, vi].to(cutlass.Float32)
+                        if const_expr(rows_check):
+                            a_value = a_rows[mi, k_tile, vi].to(cutlass.Float32)
+                        else:
+                            a_value = a_regs[k_tile, vi].to(cutlass.Float32)
                         for ni in cutlass.range_constexpr(outputs_per_block):
                             acc[mi, ni] = acc[mi, ni] + a_value * b_regs[ni, k_tile, vi].to(
                                 cutlass.Float32
@@ -459,19 +465,32 @@ class DirectFgsGemmKernel:
                         gC[m_base + mi, n_base + ni] = total.to(self.element_type)
             if const_expr(self.head_last):
                 if is_head:
-                    self._wait_chunk_tails(gC, m_base, n_base)
+                    self._wait_chunk_tails(gC, m_base, n_base, retry_count)
                     for mi in cutlass.range_constexpr(num_rows):
-                        _st_release_b16(
-                            (gC.iterator + cute.crd2idx((m_base + mi, n_base), gC.layout)).toint(), head_bits[mi]
-                        )
+                        cute.recast_tensor(gC, cutlass.Int16)[m_base + mi, n_base] = cutlass.Int16(head_bits[mi])
 
         if const_expr(self.use_pdl and not self.early_trigger):
             cute.arch.griddepcontrol_launch_dependents()
 
     @cute.jit
+    def _keep_waiting(self, pending, rounds):
+        if const_expr(self.spin_limit):
+            pending = pending & (rounds < self.spin_limit)
+        return pending
+
+    @cute.jit
+    def _count(self, retry_count: cute.Tensor, rounds, bad):
+        """Lane 0 adds the warp's reload rounds and, if a ``spin_limit`` wait ended unwritten, one give-up."""
+        stuck = cute.arch.vote_any_sync(bad)
+        if cute.arch.lane_idx() == 0:
+            if rounds > 0:
+                cute.arch.atomic_add(retry_count.iterator, rounds)
+            if stuck:
+                cute.arch.atomic_add(retry_count.iterator + 1, Int32(1))
+
+    @cute.jit
     def _wait_heads_written(self, tA: cute.Tensor, m_base, retry_count: cute.Tensor):
-        """Return once element 0 of every activation chunk this warp reads in rows ``m_base ..`` is written; reload
-        rounds are added to ``retry_count``."""
+        """Return once element 0 of every activation chunk this warp reads in rows ``m_base ..`` is written."""
         num_rows: cutlass.Constexpr = self.rows_per_block
         num_k_tiles: cutlass.Constexpr = self.num_k_tiles
         k_stride: cutlass.Constexpr = self.k_tile_bytes
@@ -492,19 +511,18 @@ class DirectFgsGemmKernel:
                 for k_tile in cutlass.range_constexpr(num_k_tiles):
                     head = _ld_head(tA[m_base + mi, None, 0].iterator.toint(), k_tile * k_stride, True)
                     bad = bad | ((head & 0xFFFF) == _BF16_NEG_ZERO)
-            pending = cute.arch.vote_any_sync(bad)
+            pending = self._keep_waiting(cute.arch.vote_any_sync(bad), rounds)
         if rounds > 0:
             # The default body's loads must not hit the lines the first pass cached with the sentinel.
             cute.arch.fence_acq_rel_gpu()
-            if cute.arch.lane_idx() == 0:
-                cute.arch.atomic_add(retry_count.iterator, rounds)
+            self._count(retry_count, rounds, bad)
 
     @cute.jit
     def _load_a_checked(
         self, copy_a: cute.CopyAtom, tA: cute.Tensor, row, a_regs: cute.Tensor, retry_count: cute.Tensor
     ):
         """Load this thread's chunks of activation ``row`` into ``a_regs`` and return once every lane of the warp
-        holds written ones; reload rounds are added to ``retry_count``."""
+        holds written ones."""
         num_k_tiles: cutlass.Constexpr = self.num_k_tiles
         words = cute.recast_tensor(a_regs, Int32)
         bad = cutlass.Boolean(False)
@@ -529,19 +547,52 @@ class DirectFgsGemmKernel:
                 for j in cutlass.range_constexpr(4):
                     words[k_tile, j] = reloaded[j]
                 bad = bad | ((reloaded[0] & 0xFFFF) == _BF16_NEG_ZERO)
-            pending = cute.arch.vote_any_sync(bad)
-        if cute.arch.lane_idx() == 0 and rounds > 0:
-            cute.arch.atomic_add(retry_count.iterator, rounds)
+            pending = self._keep_waiting(cute.arch.vote_any_sync(bad), rounds)
+        self._count(retry_count, rounds, bad)
 
     @cute.jit
-    def _wait_chunk_tails(self, gC: cute.Tensor, m_base, n_base):
+    def _load_rows_checked(
+        self, copy_a: cute.CopyAtom, tA: cute.Tensor, m_base, a_rows: cute.Tensor, retry_count: cute.Tensor
+    ):
+        """``_load_a_checked`` for all of the CTA's rows at once, before any FMA."""
+        num_rows: cutlass.Constexpr = self.rows_per_block
+        num_k_tiles: cutlass.Constexpr = self.num_k_tiles
+        words = cute.recast_tensor(a_rows, Int32)
+        bad = cutlass.Boolean(False)
+        for mi in cutlass.range_constexpr(num_rows):
+            for k_tile in cutlass.range_constexpr(num_k_tiles):
+                cute.copy(copy_a, tA[m_base + mi, None, k_tile], a_rows[mi, k_tile, None])
+                bad = bad | ((words[mi, k_tile, 0] & 0xFFFF) == _BF16_NEG_ZERO)
+        pending = cute.arch.vote_any_sync(bad)
+        rounds = Int32(0)
+        sleep_ns = Int32(_SPIN_NS_MIN)
+        while pending:
+            _nanosleep(sleep_ns)
+            sleep_ns = cute.min(sleep_ns * 2, Int32(_SPIN_NS_MAX))
+            rounds = rounds + 1
+            bad = cutlass.Boolean(False)
+            for mi in cutlass.range_constexpr(num_rows):
+                for k_tile in cutlass.range_constexpr(num_k_tiles):
+                    reloaded = _ld_relaxed_v4(
+                        tA[m_base + mi, None, 0].iterator.toint(), k_tile * self.k_tile_bytes, True
+                    )
+                    for j in cutlass.range_constexpr(4):
+                        words[mi, k_tile, j] = reloaded[j]
+                    bad = bad | ((reloaded[0] & 0xFFFF) == _BF16_NEG_ZERO)
+            pending = self._keep_waiting(cute.arch.vote_any_sync(bad), rounds)
+        self._count(retry_count, rounds, bad)
+
+    @cute.jit
+    def _wait_chunk_tails(self, gC: cute.Tensor, m_base, n_base, retry_count: cute.Tensor):
         """Spin until elements ``outputs_per_block .. 7`` of the output chunks at (rows ``m_base ..``, ``n_base``)
-        are no longer -0.0 (stored by the group's other CTAs)."""
+        are no longer -0.0 (stored by the group's other CTAs). One thread."""
         num_rows: cutlass.Constexpr = self.rows_per_block
         first_tail: cutlass.Constexpr = self.outputs_per_block
         bad = cutlass.Boolean(True)
+        pending = cutlass.Boolean(True)
+        rounds = Int32(0)
         sleep_ns = Int32(_SPIN_NS_MIN)
-        while bad:
+        while pending:
             bad = cutlass.Boolean(False)
             for mi in cutlass.range_constexpr(num_rows):
                 chunk = _ld_relaxed_v4(
@@ -549,9 +600,14 @@ class DirectFgsGemmKernel:
                 )
                 for e in cutlass.range_constexpr(first_tail, _CHUNK):
                     bad = bad | (((chunk[e // 2] >> (16 * (e % 2))) & 0xFFFF) == _BF16_NEG_ZERO)
-            if bad:
+            pending = self._keep_waiting(bad, rounds)
+            if pending:
                 _nanosleep(sleep_ns)
                 sleep_ns = cute.min(sleep_ns * 2, Int32(_SPIN_NS_MAX))
+                rounds = rounds + 1
+        if const_expr(self.spin_limit):
+            if bad:
+                cute.arch.atomic_add(retry_count.iterator + 1, Int32(1))
 
 
 def _from_dlpack_static(tensor: _torch.Tensor):
@@ -591,6 +647,7 @@ def _get_compiled_direct_kernel(
     early_trigger: bool,
     head_last: bool,
     min_ctas_per_sm: int,
+    spin_limit: int,
 ):
     if dtype != _torch.bfloat16:
         raise ValueError(f"direct GEMM supports BF16; got {dtype}")
@@ -608,6 +665,7 @@ def _get_compiled_direct_kernel(
         early_trigger=early_trigger,
         head_last=head_last,
         min_ctas_per_sm=min_ctas_per_sm,
+        spin_limit=spin_limit,
     )
     tensors = _make_compile_repr_tensors(dtype, m, n, k)
     retry = _retry_tensor(_torch.zeros(RETRY_COUNTER_SLOTS, dtype=_torch.int32, device="cuda"))
@@ -640,10 +698,12 @@ def _validate_runtime_tensors(a, b, out, tactic: DirectTactic):
 
 
 def default_check_mode(tactic: DirectTactic, k: int) -> str:
-    """``heads_before_b`` for multi-row tactics whose weight registers exceed ``_HEADS_BEFORE_B_REGS``, else
-    ``heads`` (no spill under the default build's launch bound, unlike ``row``)."""
+    """One row: ``heads`` (no spill under the default build's launch bound, unlike ``row``). Several rows: ``rows``
+    (one round trip), or ``heads_before_b`` when the weight registers exceed ``_HEADS_BEFORE_B_REGS``."""
+    if tactic.rows_per_block == 1:
+        return "heads"
     b_regs = tactic.outputs_per_block * k // (tactic.block_size * _VECTOR_WIDTH) * 4
-    return "heads_before_b" if tactic.rows_per_block > 1 and b_regs > _HEADS_BEFORE_B_REGS else "heads"
+    return "heads_before_b" if b_regs > _HEADS_BEFORE_B_REGS else "rows"
 
 
 @functools.cache
@@ -686,10 +746,12 @@ def run_direct_dense_fgs(
     early_trigger: bool = False,
     head_last: bool = False,
     min_ctas_per_sm: int | None = None,
+    spin_limit: int = 0,
 ):
     """Run direct ``A[M,K] @ B[K,N]`` with the ``mm_bf16`` layouts; ``a`` is the FGS-checked operand.
 
-    ``retry_counter`` (int32, ``RETRY_COUNTER_SLOTS`` elements) accumulates the activation reload rounds. With every
+    ``retry_counter`` (int32, ``RETRY_COUNTER_SLOTS`` elements) accumulates the activation reload rounds and the
+    waits ``spin_limit`` (diagnostic) gave up. With every
     role off (``check_valid=False``, ``pdl_wait_activation=True``) this is FlashInfer's ``run_direct_dense``.
     ``check_mode=None`` takes ``default_check_mode``; ``min_ctas_per_sm`` (launch bound) ``None`` takes
     ``default_min_ctas_per_sm`` when any role is on and 1 (the default build's) otherwise.
@@ -727,6 +789,7 @@ def run_direct_dense_fgs(
         early_trigger,
         head_last,
         min_ctas_per_sm,
+        spin_limit,
     )
     tensors = tuple(_from_dlpack_static(tensor) for tensor in (a, b.T, out))
     stream = _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream)

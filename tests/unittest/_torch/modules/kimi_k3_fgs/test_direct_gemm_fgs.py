@@ -47,6 +47,7 @@ DEFAULT = dict(check_valid=False, pdl_wait_activation=True)
 CONSUMERS = {
     "heads": dict(check_valid=True, check_mode="heads"),
     "heads_before_b": dict(check_valid=True, check_mode="heads_before_b"),
+    "rows": dict(check_valid=True, check_mode="rows"),
     "row": dict(check_valid=True, check_mode="row"),
     "row_relaxed": dict(check_valid=True, check_mode="row", relaxed_first=True),
     "heads_wait": dict(check_valid=True, check_mode="heads", pdl_wait_activation=True),
@@ -58,6 +59,8 @@ PRODUCERS = {
     "head_last": dict(DEFAULT, pzo=True, early_trigger=True, head_last=True),
     "consumer_head_last": dict(check_valid=True, pzo=True, early_trigger=True, head_last=True),
 }
+# Reload rounds after which a wait gives up and is counted (retry_counter[1]) instead of hanging the test.
+SPIN_LIMIT = 200_000
 
 
 def bits(t: torch.Tensor) -> torch.Tensor:
@@ -111,7 +114,7 @@ def test_ready_consumer_matches_flashinfer(name: str, variant: str) -> None:
     got = run(x, w, tactic, CONSUMERS[variant], counter)
     torch.cuda.synchronize()
     assert torch.equal(bits(got[:-1]), bits(ref)), f"{name}/{variant} differs from FlashInfer"
-    assert counter.item() == 0
+    assert counter.tolist() == [0, 0]
 
 
 def _negative_zero_inputs(name: str):
@@ -131,8 +134,12 @@ def test_producer_build_changes_only_negative_zero(name: str, variant: str, arme
     """``armed``: the output starts as -0.0, so head_last chunk heads wait for the rest of their chunk."""
     x, w, tactic = _negative_zero_inputs(name)
     ref = flashinfer(x, w, tactic)
-    got = run(x, w, tactic, PRODUCERS[variant], fill=-0.0 if armed else float("nan"))
+    counter = torch.zeros(fgs.RETRY_COUNTER_SLOTS, dtype=torch.int32, device="cuda")
+    got = run(
+        x, w, tactic, dict(PRODUCERS[variant], spin_limit=SPIN_LIMIT), counter, fill=-0.0 if armed else float("nan")
+    )
     torch.cuda.synchronize()
+    assert counter[1].item() == 0, f"{counter[1].item()} chunk-head waits gave up"
     assert bool((bits(ref) == NEG0).any()), "the inputs no longer produce -0.0 in the default build"
     canon = bits(ref).clone()
     canon[canon == NEG0] = 0
@@ -182,6 +189,10 @@ def _st_global_v4(addr: Int64, v, *, loc=None, ip=None):
     )
 
 
+# The writer publishes anyway this long after it started if the flag never comes.
+FLAG_TIMEOUT_NS = 1_000_000_000
+
+
 class ColumnBlockWriter:
     """Test producer: copies ``src`` -> ``dst`` ([M, K], K contiguous) one block of ``block_cols`` columns (all
     rows) per CTA, 16 B per store. Block p is published ``delay + ranks[p] * step`` after ``flag`` turns non-zero
@@ -201,7 +212,8 @@ class ColumnBlockWriter:
     def kernel(self, src, dst, ranks, flag, delay_ns: Int64, step_ns: Int64):
         p, _, _ = cute.arch.block_idx()
         tid, _, _ = cute.arch.thread_idx()
-        while _ld_relaxed_u32(flag.iterator.toint()) == 0:
+        give_up = cute.arch.globaltimer() + Int64(FLAG_TIMEOUT_NS)
+        while (_ld_relaxed_u32(flag.iterator.toint()) == 0) & (cute.arch.globaltimer() < give_up):
             cute.arch.nanosleep(sleep_time=200)
         target = cute.arch.globaltimer() + delay_ns + Int64(ranks[p]) * step_ns
         while cute.arch.globaltimer() < target:
@@ -214,6 +226,29 @@ class ColumnBlockWriter:
             dst_off = Int64(r) * Int64(dst.stride[0]) + Int64(col)
             _st_global_v4(dst.iterator.toint() + dst_off * 2, _ld_global_v4(src.iterator.toint() + src_off * 2))
         cute.arch.fence_acq_rel_gpu()
+
+
+@cute.kernel
+def _gpu_sleep_kernel(ns: Int64):
+    end = cute.arch.globaltimer() + ns
+    while cute.arch.globaltimer() < end:
+        cute.arch.nanosleep(sleep_time=1000)
+
+
+@cute.jit
+def _gpu_sleep_launch(ns: Int64, stream: cuda.CUstream):
+    _gpu_sleep_kernel(ns).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+
+
+_SLEEP = []
+
+
+def gpu_sleep(ns: int) -> None:
+    """Hold the current stream for ``ns`` on the GPU."""
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if not _SLEEP:
+        _SLEEP.append(cute.compile(_gpu_sleep_launch, Int64(0), stream))
+    _SLEEP[0](Int64(ns), stream)
 
 
 _WRITERS = {}
@@ -252,7 +287,8 @@ def ranks_for(pattern: str, n: int, seed: int = 0) -> torch.Tensor:
 
 
 def run_hazard(name: str, pattern: str, variant: str, delay_us: float = 300.0, step_us: float = 2.0):
-    """Writer on its own stream first, consumer second; returns (output, FlashInfer reference, reloads, published).
+    """Writer on its own stream first, consumer second; returns (output, FlashInfer reference, reloads, waits given
+    up, published).
 
     The consumer's stream sleeps on the GPU before it sets the writer's flag, so the consumer is already queued
     when the writer's clock starts, however slow the host is."""
@@ -261,7 +297,8 @@ def run_hazard(name: str, pattern: str, variant: str, delay_us: float = 300.0, s
     ranks = ranks_for(pattern, x.shape[1] // BLOCK_COLS)
     warm = x.clone()
     late_write(x, warm, ranks, 0.0, 0.0)
-    run(warm, w, tactic, CONSUMERS[variant])
+    gpu_sleep(0)
+    run(warm, w, tactic, dict(CONSUMERS[variant], spin_limit=SPIN_LIMIT))
     torch.cuda.synchronize()
 
     slot = torch.full_like(x, -0.0)
@@ -273,11 +310,12 @@ def run_hazard(name: str, pattern: str, variant: str, delay_us: float = 300.0, s
     with torch.cuda.stream(sp):
         late_write(x, slot, ranks, delay_us, step_us, flag)
     with torch.cuda.stream(sc):
-        torch.cuda._sleep(HOST_SLACK_CYCLES)
+        gpu_sleep(HOST_SLACK_NS)
         flag.fill_(1)
-        run(slot, w, tactic, CONSUMERS[variant], counter, buf=got)
+        run(slot, w, tactic, dict(CONSUMERS[variant], spin_limit=SPIN_LIMIT), counter, buf=got)
     torch.cuda.synchronize()
-    return got[:-1], ref, int(counter.item()), bool(torch.equal(bits(slot), bits(x)))
+    reloads, gave_up = counter.tolist()
+    return got[:-1], ref, reloads, gave_up, bool(torch.equal(bits(slot), bits(x)))
 
 
 def stale_blocks(name: str, got: torch.Tensor) -> str:
@@ -294,8 +332,9 @@ def stale_blocks(name: str, got: torch.Tensor) -> str:
 
 
 def check_hazard(name: str, pattern: str, variant: str) -> None:
-    got, ref, reloads, published = run_hazard(name, pattern, variant)
+    got, ref, reloads, gave_up, published = run_hazard(name, pattern, variant)
     assert published, f"{name}/{pattern}: the writer did not publish the activation"
+    assert gave_up == 0, f"{name}/{pattern}/{variant}: {gave_up} warps gave up waiting ({reloads} reloads)"
     diff = int((bits(got) != bits(ref)).sum())
     if diff:
         why = stale_blocks(name, got) if CASES[name][0] == 1 else "M > 1, not analysed"
@@ -305,8 +344,7 @@ def check_hazard(name: str, pattern: str, variant: str) -> None:
 
 
 HAZARD_CASES = ["bfa1", "bfa4", "oproj1", "gproj1", "qkvg1", "qkvg2"]
-# About 2 ms of GPU sleep at Rubin clocks.
-HOST_SLACK_CYCLES = 4_000_000
+HOST_SLACK_NS = 2_000_000
 
 
 @pytest.mark.parametrize("pattern", ["forward", "reverse", "random", "one_late"])
@@ -315,7 +353,7 @@ def test_late_out_of_order_producer(name: str, pattern: str) -> None:
     check_hazard(name, pattern, fgs.default_check_mode(fgs.DirectTactic(*CASES[name][3]), CASES[name][2]))
 
 
-@pytest.mark.parametrize("variant", ["row", "row_relaxed", "heads_before_b", "heads_uncapped"])
+@pytest.mark.parametrize("variant", ["rows", "row", "row_relaxed", "heads_before_b", "heads_uncapped"])
 @pytest.mark.parametrize("name", ["bfa1", "bfa2", "qkvg1"])
 def test_late_producer_other_check_modes(name: str, variant: str) -> None:
     for pattern in ("reverse", "random"):
@@ -342,9 +380,14 @@ def test_live_pair_head_last_into_consumer(producer: str, consumer: str) -> None
         ref = flashinfer(mid_ref, w2, t2)
         bits(slot).fill_(NEG0)
         counter.zero_()
-        fgs.run_direct_dense_fgs(x, w1.t(), slot, True, t1, **PRODUCERS["head_last"])
-        fgs.run_direct_dense_fgs(slot, w2.t(), out, True, t2, retry_counter=counter, check_mode=mode)
+        fgs.run_direct_dense_fgs(
+            x, w1.t(), slot, True, t1, retry_counter=counter, spin_limit=SPIN_LIMIT, **PRODUCERS["head_last"]
+        )
+        fgs.run_direct_dense_fgs(
+            slot, w2.t(), out, True, t2, retry_counter=counter, check_mode=mode, spin_limit=SPIN_LIMIT
+        )
         torch.cuda.synchronize()
+        assert counter[1].item() == 0, f"{producer}->{consumer} step {step}: {counter[1].item()} waits gave up"
         assert torch.equal(bits(slot), bits(mid_ref)), f"{producer}->{consumer} step {step}: producer output"
-        assert torch.equal(bits(out), bits(ref)), f"{producer}->{consumer} step {step}: {counter.item()} reloads"
-        print(f"{producer}->{consumer} step {step}: {counter.item()} reload rounds")
+        assert torch.equal(bits(out), bits(ref)), f"{producer}->{consumer} step {step}: {counter[0].item()} reloads"
+        print(f"{producer}->{consumer} step {step}: {counter[0].item()} reload rounds")

@@ -17,9 +17,10 @@ An operand that is a view of a live ``TLLM_K3_FGS=lamport`` edge slot (``kimi_k3
 fine-grained-sync build of the table entry's kernel at its tactic: an input slot the report_valid consumer (no
 ``griddepcontrol.wait``; the slot is consumed), an output slot the producer roles (.pzo, trigger at entry; split-K
 stores whole 16 B chunks). ``rubin`` runs ``kimi_k3_fgs.dense_gemm_fgs``, split-K entries
-``kimi_k3_fgs.splitk_gemm_fgs``, ``fi_direct`` rows FlashInfer's default split-K tactic, or with
-``TLLM_K3_FGS_DIRECT=1`` ``kimi_k3_fgs.direct_gemm_fgs`` at the table tactic (dense, 32 B aligned operands, N % 8 == 0
-for an output slot); a strided input at split-K rows runs the ``rubin`` build at ``_FGS_SMALL_TACTIC``.
+``kimi_k3_fgs.splitk_gemm_fgs``, ``fi_direct`` rows FlashInfer's default split-K tactic, or
+``kimi_k3_fgs.direct_gemm_fgs`` at the table tactic (dense, 32 B aligned operands, N % 8 == 0 for an output slot)
+with ``TLLM_K3_FGS_DIRECT=1`` (any slot) or ``=consumer`` (input slot only); a strided input at split-K rows runs the
+``rubin`` build at ``_FGS_SMALL_TACTIC``.
 
 A shape without an entry runs the ``rubin`` backend under the TRT-LLM autotuner. Non-BF16 operands keep the
 cuBLAS matmul; empty problems launch nothing.
@@ -158,8 +159,8 @@ def fgs_dsl() -> bool:
 
 
 @functools.lru_cache(maxsize=None)
-def _fgs_direct_enabled() -> bool:
-    return os.environ.get("TLLM_K3_FGS_DIRECT", "0") == "1"
+def _fgs_direct_mode() -> str:
+    return os.environ.get("TLLM_K3_FGS_DIRECT", "0")
 
 
 @functools.lru_cache(maxsize=None)
@@ -293,7 +294,7 @@ def _fgs_linear(x, weight, out, consume: bool, produce: bool) -> None:
     backend, tactic = _select(_GEMM_TABLE.get((n, k)), m)
     if (
         backend == "fi_direct"
-        and _fgs_direct_enabled()
+        and (_fgs_direct_mode() == "1" or (_fgs_direct_mode() == "consumer" and not produce))
         and dense
         and x.data_ptr() % 32 == 0
         and out.data_ptr() % 32 == 0
