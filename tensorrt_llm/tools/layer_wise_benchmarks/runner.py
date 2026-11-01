@@ -513,7 +513,7 @@ class Runner:
                 False,
             )
             residual_addend = None
-            with k3_fgs_edges.model_scope():
+            with k3_fgs_edges.model_scope(layer_indices):
                 for layer_idx in layer_indices:
                     layer = model.model.layers[layer_idx]
                     if fold:

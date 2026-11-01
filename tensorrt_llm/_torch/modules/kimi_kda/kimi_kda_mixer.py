@@ -1356,9 +1356,13 @@ class KimiKDALinearAttention(nn.Module):
         if args is None:
             return None
         fgs_kwargs = {}
-        if k3_fgs_edges is not None and k3_fgs_edges.producer_early():
+        if k3_fgs_edges is not None and k3_fgs_edges.producer_early(B):
             fgs_kwargs = dict(fgs_producer=True)
-            lease = k3_fgs_edges.acquire("kda.core_o", B) if fgs_slot else None
+            lease = (
+                k3_fgs_edges.acquire("kda.core_o", B, window=k3_fgs_edges.lamport_window())
+                if fgs_slot
+                else None
+            )
             if lease is not None:
                 args = args[:-1] + (lease.tensor.view(B, H, hd),)
         return fused_decode.kda_decode_t1(

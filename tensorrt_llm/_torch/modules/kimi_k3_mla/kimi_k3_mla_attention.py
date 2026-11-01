@@ -265,8 +265,11 @@ class KimiK3MLAAttention(MLA):
                 )
 
                 if supported(attn_output, gate):
-                    if k3_fgs_edges is not None and k3_fgs_edges.producer_early():
-                        lease = k3_fgs_edges.acquire("mla.gated", attn_output.shape[0])
+                    rows = attn_output.shape[0]
+                    if k3_fgs_edges is not None and k3_fgs_edges.producer_early(rows):
+                        lease = k3_fgs_edges.acquire(
+                            "mla.gated", rows, window=k3_fgs_edges.lamport_window()
+                        )
                         # The producer build stores into a separate buffer, never in place.
                         out = (
                             torch.empty_like(attn_output)
