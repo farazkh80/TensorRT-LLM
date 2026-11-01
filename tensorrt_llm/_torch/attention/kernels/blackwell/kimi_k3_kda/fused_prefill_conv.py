@@ -46,6 +46,20 @@ aligned base and slot stride % 8 == 0, each lane moves its 8 channels x 3 taps a
 Slots: -1 skips the state pool (raw copy); -pool <= slot < -1 index the pool from the
 end, as in the reference's Python indexing.
 
+Fine-grained sync (opt-in, aligned vector paths only). ``fgs_consumer`` reads the packed
+QKV source as a fine-grained-sync slot instead of waiting for the producer grid: a
+16-byte chunk counts as written once its element 0 is not the BF16 -0.0 sentinel. Each
+pack of ring tokens is checked after its cp.async group retires; the halo rows and the
+final-state rows of run 0 (gathered after the loop) are loaded with ``ld.relaxed.gpu``
+and checked the same way. The wait is warp-uniform: while any lane holds an unwritten
+chunk the whole warp sleeps and reloads its chunks with ``ld.relaxed.gpu`` (ring tokens
+are written back into their slot), and leaves the loop together; after ``max_spins``
+rounds it falls back to ``griddepcontrol.wait`` and takes the values it then reads.
+``fgs_producer`` publishes q/k/v for a consumer with the same check: PDL dependents are
+released at entry, -0.0 is never stored (cvt.rn.pzo; raw copies map 0x8000 to 0), and
+each 16-byte chunk is stored once: a token group is staged in shared memory and stored
+after its SiLU vote, so groups that take the exact recompute are only stored by it.
+
 Caller contract (stated by the problem: "Slot -1 bypasses ... Other slots are unique and
 valid"; not checked on device): slots other than -1 are unique after wrapping and lie in
 [-pool, pool). Duplicate slots are outside that contract: the reference's sequential
@@ -75,6 +89,9 @@ SLOT = 32 * 16  # bytes per ring slot: one 16-byte granule per lane
 FAST_MIN_H = -2.0
 H_INIT = 3.0e38  # running-min start value
 NEG_2LOG2E = -2.8853900817779268  # -2*log2(e)
+BF16_NEG_ZERO = 0x8000
+SPIN_NS_MIN = 32
+SPIN_NS_MAX = 2048
 
 
 def _asm(res, args, text, cons, side=False, loc=None, ip=None):
@@ -155,6 +172,54 @@ def ld_v4_rw(addr, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def ld_v4_relaxed(addr, reload=False, *, loc=None, ip=None):
+    """16-byte ``ld.relaxed.gpu`` (coherent, never a stale L1 line); a ``reload`` stays in
+    program order and is never merged with an earlier load of the address."""
+    out = _asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)],
+        "ld.relaxed.gpu.global.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l,~{memory}" if reload else "=r,=r,=r,=r,l",
+        side=reload,
+        loc=loc,
+        ip=ip,
+    )
+    return [cutlass.Int32(llvm.extractvalue(T.i32(), out, [i], loc=loc, ip=ip)) for i in range(4)]
+
+
+@dsl_user_op
+def sts_v4(saddr, a, b, c, d, *, loc=None, ip=None):
+    _asm(
+        T.i32(),
+        [cutlass.Int32(saddr).ir_value(loc=loc, ip=ip)]
+        + [cutlass.Int32(w).ir_value(loc=loc, ip=ip) for w in (a, b, c, d)],
+        "st.shared.v4.b32 [$1], {$2, $3, $4, $5};\n\tmov.b32 $0, 0;",
+        "=r,r,r,r,r,r",
+        side=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def nanosleep(ns, *, loc=None, ip=None):
+    _asm(
+        T.i32(),
+        [cutlass.Int32(ns).ir_value(loc=loc, ip=ip)],
+        "nanosleep.u32 $1;\n\tmov.b32 $0, 0;",
+        "=r,r",
+        side=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+def unwritten(w):
+    """Whether a chunk whose first word is ``w`` still holds the -0.0 sentinel in element 0."""
+    return (cutlass.Int32(w) & 0xFFFF) == BF16_NEG_ZERO
+
+
+@dsl_user_op
 def prmt(a, b, sel: int, *, loc=None, ip=None):
     """Byte permute of the pair (a: bytes 0-3, b: bytes 4-7) with an immediate selector."""
     return cutlass.Int32(
@@ -197,6 +262,41 @@ def pack_bf16x2(lo, hi, *, loc=None, ip=None):
             ],
             "cvt.rn.bf16x2.f32 $0, $2, $1;",
             "=r,f,f",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def pack_bf16x2_pzo(lo, hi, *, loc=None, ip=None):
+    """``pack_bf16x2`` with -0.0 rounded to +0.0 (sm_107 ``cvt.rn.pzo``)."""
+    return cutlass.Int32(
+        _asm(
+            T.i32(),
+            [
+                cutlass.Float32(lo).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(hi).ir_value(loc=loc, ip=ip),
+            ],
+            "cvt.rn.pzo.bf16x2.f32 $0, $2, $1;",
+            "=r,f,f",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def canon_bf16x2(w, *, loc=None, ip=None):
+    """Packed BF16x2 with each -0.0 half (0x8000) replaced by +0.0."""
+    return cutlass.Int32(
+        _asm(
+            T.i32(),
+            [cutlass.Int32(w).ir_value(loc=loc, ip=ip)],
+            "{ .reg .b16 l, h; .reg .pred p; mov.b32 {l, h}, $1; "
+            "setp.eq.b16 p, l, 0x8000; selp.b16 l, 0, l, p; "
+            "setp.eq.b16 p, h, 0x8000; selp.b16 h, 0, h, p; mov.b32 $0, {l, h}; }",
+            "=r,r",
             loc=loc,
             ip=ip,
         )
@@ -400,6 +500,10 @@ class KdaConv:
         depth=8,
         warps=4,
         st_vec=False,
+        fgs_consumer=False,
+        fgs_producer=False,
+        max_spins=0,
+        with_stats=False,
     ):
         self.W = warps
         self.MB = FORCE_MB
@@ -421,12 +525,24 @@ class KdaConv:
         self.RUN_LOG2 = self.RUN.bit_length() - 1
         assert self.RUN == 1 << self.RUN_LOG2
         assert self.D % ASYNC_GROUP == 0 and self.U % ASYNC_GROUP == 0
+        assert not (fgs_consumer or fgs_producer) or (src_vec and out_vec)
+        assert fgs_consumer or not with_stats
+        self.fgs_consumer = fgs_consumer
+        self.fgs_producer = fgs_producer
+        self.max_spins = max_spins
+        self.with_stats = with_stats
+        # Per warp: D ring slots, then (producer) U staging slots for one token group.
+        self.STAGE = self.U if fgs_producer else 0
 
     @cute.jit
     def loadw(self, src, src_base, row, cc, xw: cute.Tensor, off: cutlass.Constexpr):
         """Load source channels [cc, cc+8) of `row` as 4 packed BF16x2 words into xw[off:off+4]."""
         if cutlass.const_expr(self.src_vec):
-            w = ld_v4(src_base + (cutlass.Int64(row) * self.SR + cc) * 2)
+            addr = src_base + (cutlass.Int64(row) * self.SR + cc) * 2
+            if cutlass.const_expr(self.fgs_consumer):
+                w = ld_v4_relaxed(addr)
+            else:
+                w = ld_v4(addr)
             for j in cutlass.range_constexpr(4):
                 xw[off + j] = w[j]
         else:
@@ -471,13 +587,23 @@ class KdaConv:
                     v[0, row64, h, d + 2 * j + e] = val
 
     @cute.kernel
-    def kernel(self, src, weight, state, starts, slots, has_init, q, k, v):
+    def kernel(self, src, weight, state, starts, slots, has_init, q, k, v, stats):
         tid, _, _ = cute.arch.thread_idx()
+        if cutlass.const_expr(self.fgs_producer):
+            # The q/k/v consumer validates its input per 16 B instead of waiting for this grid.
+            cute.arch.griddepcontrol_launch_dependents()
         b0, b1, b2 = cute.arch.block_idx()
         _, gdy, gdz = cute.arch.grid_dim()
         smem = cutlass.utils.SmemAllocator()
-        ring = smem.allocate_tensor(cutlass.Int8, cute.make_layout(self.W * self.D * SLOT), 16)
-        ring_warp = cutlass.Int32(ring.iterator.toint()) + (tid // 32) * (self.D * SLOT)
+        warp_bytes = (self.D + self.STAGE) * SLOT
+        ring = smem.allocate_tensor(cutlass.Int8, cute.make_layout(self.W * warp_bytes), 16)
+        ring_warp = cutlass.Int32(ring.iterator.toint()) + (tid // 32) * warp_bytes
+        # Reload rounds and fallbacks of this thread (warp-uniform).
+        cnt = None
+        if cutlass.const_expr(self.fgs_consumer):
+            cnt = cute.make_rmem_tensor(cute.make_layout(2), cutlass.Int32)
+            cnt[0] = cutlass.Int32(0)
+            cnt[1] = cutlass.Int32(0)
         if cutlass.const_expr(self.seq_loop):
             # B > 65535 (grid.z limit): grid-stride over sequences too.
             for seq in cutlass.range(b2, slots.shape[0], gdz, unroll=1):
@@ -497,6 +623,7 @@ class KdaConv:
                     q,
                     k,
                     v,
+                    cnt,
                 )
         else:
             self.runs(
@@ -515,11 +642,34 @@ class KdaConv:
                 q,
                 k,
                 v,
+                cnt,
             )
+        if cutlass.const_expr(self.with_stats):
+            if tid % 32 == 0:
+                if cnt[0] > 0:
+                    cute.arch.atomic_add(stats.iterator, cnt[0])
+                if cnt[1] > 0:
+                    cute.arch.atomic_add(stats.iterator + 1, cnt[1])
 
     @cute.jit
     def runs(
-        self, seq, b0, b1, gdy, tid, ring_warp, src, weight, state, starts, slots, has_init, q, k, v
+        self,
+        seq,
+        b0,
+        b1,
+        gdy,
+        tid,
+        ring_warp,
+        src,
+        weight,
+        state,
+        starts,
+        slots,
+        has_init,
+        q,
+        k,
+        v,
+        cnt,
     ):
         """All runs b1, b1 + gdy, ... of sequence `seq` for channel block b0.
 
@@ -533,13 +683,29 @@ class KdaConv:
         begin, length, slot, init = self.meta(seq, state, starts, slots, has_init)
         # Only this bit stays live across the hot tile; the cold path reloads the metadata.
         more = b1 + gdy < ((length + (self.RUN - 1)) >> self.RUN_LOG2)
-        self.tile(b1, b0, tid, ring_warp, begin, length, slot, init, src, weight, state, q, k, v)
+        self.tile(
+            b1, b0, tid, ring_warp, begin, length, slot, init, src, weight, state, q, k, v, cnt
+        )
         if more:
             begin, length, slot, init = self.meta(seq, state, starts, slots, has_init)
             nrun = (length + (self.RUN - 1)) >> self.RUN_LOG2
             for bx in cutlass.range(b1 + gdy, nrun, gdy, unroll=1):
                 self.tile(
-                    bx, b0, tid, ring_warp, begin, length, slot, init, src, weight, state, q, k, v
+                    bx,
+                    b0,
+                    tid,
+                    ring_warp,
+                    begin,
+                    length,
+                    slot,
+                    init,
+                    src,
+                    weight,
+                    state,
+                    q,
+                    k,
+                    v,
+                    cnt,
                 )
 
     @cute.jit
@@ -555,7 +721,9 @@ class KdaConv:
         return begin, length, slot, init
 
     @cute.jit
-    def tile(self, bx, by, tid, ring_warp, begin, length, slot, init, src, weight, state, q, k, v):
+    def tile(
+        self, bx, by, tid, ring_warp, begin, length, slot, init, src, weight, state, q, k, v, cnt
+    ):
         """One warp: run t0 = (bx * W + warp) * L of one sequence, channel block `by`."""
         C, P, L, U = self.C, self.P, self.L, self.U
         lane = tid % 32
@@ -592,9 +760,11 @@ class KdaConv:
             if cutlass.const_expr(self.src_vec):
                 if t0 != 0:
                     for j in cutlass.range_constexpr(WIDTH - 1):
-                        w = ld_v4_first(
-                            src_base + (cutlass.Int64(row0 - (WIDTH - 1) + j) * self.SR + cc) * 2
-                        )
+                        addr = src_base + (cutlass.Int64(row0 - (WIDTH - 1) + j) * self.SR + cc) * 2
+                        if cutlass.const_expr(self.fgs_consumer):
+                            w = ld_v4_relaxed(addr, True)
+                        else:
+                            w = ld_v4_first(addr)
                         for e in cutlass.range_constexpr(4):
                             hw[4 * j + e] = w[e]
             if cutlass.const_expr(self.src_vec):
@@ -653,7 +823,9 @@ class KdaConv:
                     for j in cutlass.range_constexpr(WIDTH - 1):
                         rel = length - (WIDTH - 1) + j
                         if rel >= 0:
-                            self.loadw(src, src_base, begin + rel, cc, fin, 4 * j)
+                            # The FGS consumer gathers these rows after the loop, behind the check.
+                            if cutlass.const_expr(not self.fgs_consumer):
+                                self.loadw(src, src_base, begin + rel, cc, fin, 4 * j)
                         else:
                             hidx = rel + (WIDTH - 1)
                             for i in cutlass.range_constexpr(VEC):
@@ -667,6 +839,11 @@ class KdaConv:
                                 fin[4 * j + w] = pack_bf16x2(xs[2 * w], xs[2 * w + 1])
             else:
                 if cutlass.const_expr(self.src_vec):
+                    if cutlass.const_expr(self.fgs_consumer):
+                        h0 = src_base + (cutlass.Int64(row0 - (WIDTH - 1)) * self.SR + cc) * 2
+                        self.wait_rows(
+                            hw, h0, h0 + self.SR * 2, h0 + self.SR * 4, True, True, True, cnt
+                        )
                     for j in cutlass.range_constexpr(WIDTH - 1):
                         for e in cutlass.range_constexpr(4):
                             xlo, xhi = unpack_bf16x2(hw[4 * j + e])
@@ -695,6 +872,8 @@ class KdaConv:
                     for p in cutlass.range_constexpr(U // ASYNC_GROUP):
                         if cutlass.const_expr(self.src_vec):
                             cute.arch.cp_async_wait_group(D // ASYNC_GROUP - 1)
+                        if cutlass.const_expr(self.fgs_consumer):
+                            self.check_pack(g * U + ASYNC_GROUP * p, count, ring_lane, gbase, cnt)
                         for pe in cutlass.range_constexpr(ASYNC_GROUP):
                             u = ASYNC_GROUP * p + pe
                             self.step(
@@ -724,6 +903,10 @@ class KdaConv:
                             cute.arch.cp_async_commit_group()
                     deep = cute.arch.vote_any_sync(hm[0] < FAST_MIN_H)
                     flag[0] = flag[0] | (cutlass.Int32(deep) << g)
+                    if cutlass.const_expr(self.fgs_producer):
+                        # A flagged group is stored only by the exact recompute after the loop.
+                        if cutlass.Int32(deep) == 0:
+                            self.flush(g * U, U, ring_lane, cvalid, sbase)
                 hm[0] = cutlass.Float32(H_INIT)
                 first = ngroup * U
                 npack = (count - first + (ASYNC_GROUP - 1)) // ASYNC_GROUP
@@ -731,6 +914,8 @@ class KdaConv:
                     i = first + ASYNC_GROUP * p
                     if cutlass.const_expr(self.src_vec):
                         cute.arch.cp_async_wait_group(D // ASYNC_GROUP - 1)
+                    if cutlass.const_expr(self.fgs_consumer):
+                        self.check_pack(i, count, ring_lane, gbase, cnt)
                     gg = gbase + cutlass.Int64(i) * (self.SR * 2)
                     sg = sbase + cutlass.Int64(i) * (P * 2)
                     self.step(
@@ -785,6 +970,9 @@ class KdaConv:
                         cute.arch.cp_async_commit_group()
                 deep = cute.arch.vote_any_sync(hm[0] < FAST_MIN_H)
                 flag[0] = flag[0] | (cutlass.Int32(deep) << ngroup)
+                if cutlass.const_expr(self.fgs_producer):
+                    if cutlass.Int32(deep) == 0:
+                        self.flush(ngroup * U, count - ngroup * U, ring_lane, cvalid, sbase)
                 # Rare, warp-uniform: exact SiLU for flagged groups. hist is dead here.
                 if flag[0] != 0:
                     for g in cutlass.range(ngroup + 1, unroll=1):
@@ -818,6 +1006,8 @@ class KdaConv:
                     i = ASYNC_GROUP * p
                     if cutlass.const_expr(self.src_vec):
                         cute.arch.cp_async_wait_group(D // ASYNC_GROUP - 1)
+                    if cutlass.const_expr(self.fgs_consumer):
+                        self.check_pack(i, count, ring_lane, gbase, cnt)
                     gg = gbase + cutlass.Int64(i) * (self.SR * 2)
                     sg = sbase + cutlass.Int64(i) * (P * 2)
                     self.step(
@@ -874,6 +1064,9 @@ class KdaConv:
                 cute.arch.cp_async_wait_group(0)
             if t0 == 0:
                 if slot >= 0:
+                    if cutlass.const_expr(self.fgs_consumer):
+                        if length > 0:
+                            self.gather_fin(src_base, begin, length, cc, fin, cnt)
                     if cvalid:
                         if cutlass.const_expr(self.st_vec):
                             # Element e = 3 * i + j (channel i, tap j) is half i % 2 of
@@ -979,7 +1172,7 @@ class KdaConv:
             for j in cutlass.range_constexpr(4):
                 h0, h1 = hs[2 * j], hs[2 * j + 1]
                 y0, y1 = fma2(h0, h1, tanh_approx(h0), tanh_approx(h1), h0, h1)
-                yw[j] = pack_bf16x2(y0, y1)
+                yw[j] = self.pack(y0, y1)
             # That form cancels for strongly negative h: track the group minimum
             # (the caller recomputes the group exactly if it is below the bound).
             hm[0] = fmin3(
@@ -987,17 +1180,118 @@ class KdaConv:
             )
         else:
             for j in cutlass.range_constexpr(4):
-                yw[j] = xt[j]
+                if cutlass.const_expr(self.fgs_producer):
+                    yw[j] = canon_bf16x2(xt[j])
+                else:
+                    yw[j] = xt[j]
         # Refill this slot in program order after its same-thread lds_v4. The
         # caller commits one adjacent-token pack of refills as one cp.async group.
         if cutlass.const_expr(self.src_vec):
             if i + D < count:
                 cp_async16(sl, gb + (u + D) * (self.SR * 2))
         if cvalid:
-            if cutlass.const_expr(self.out_vec):
+            if cutlass.const_expr(self.fgs_producer and conv):
+                # Staged until the group's SiLU vote (see flush).
+                sts_v4(ring_lane + (D + i % self.U) * SLOT, yw[0], yw[1], yw[2], yw[3])
+            elif cutlass.const_expr(self.out_vec):
                 st_v4(sb + u * (self.P * 2), yw[0], yw[1], yw[2], yw[3])
             else:
                 self.storew(q, k, v, sec, row0 + i, inner, yw)
+
+    @cute.jit
+    def pack(self, lo, hi):
+        if cutlass.const_expr(self.fgs_producer):
+            return pack_bf16x2_pzo(lo, hi)
+        return pack_bf16x2(lo, hi)
+
+    @cute.jit
+    def flush(self, first, n, ring_lane, cvalid, sbase):
+        """Store staged tokens [first, first + n) of a token group (fgs_producer)."""
+        if cvalid:
+            for u in cutlass.range(n, unroll=1):
+                i = first + u
+                w = lds_v4(ring_lane + (self.D + i % self.U) * SLOT)
+                st_v4(sbase + cutlass.Int64(i) * (self.P * 2), w[0], w[1], w[2], w[3])
+
+    @cute.jit
+    def wait_chunks(self, words: cute.Tensor, addrs, valid, ring_slots, cnt):
+        """Return once no lane of the warp holds an unwritten chunk among the valid entries of
+        ``words`` (4 words per chunk). Pending rounds sleep with exponential backoff and reload
+        every chunk from ``addrs`` (also into ``ring_slots``, if given); past ``max_spins``
+        rounds, or after an earlier fallback, the warp waits for the primary grid and takes
+        the values it then reads."""
+        n = len(addrs)
+        bad = cutlass.Boolean(False)
+        for c in cutlass.range_constexpr(n):
+            bad = bad | (valid[c] & unwritten(words[4 * c]))
+        pending = cute.arch.vote_any_sync(bad)
+        sleep_ns = cutlass.Int32(SPIN_NS_MIN)
+        rounds = cutlass.Int32(0)
+        while pending:
+            if cnt[1] > 0 or rounds >= self.max_spins:
+                cute.arch.griddepcontrol_wait()
+                cnt[1] = cutlass.Int32(1)
+            else:
+                nanosleep(sleep_ns)
+                sleep_ns = cutlass.min(sleep_ns * 2, cutlass.Int32(SPIN_NS_MAX))
+            rounds = rounds + 1
+            bad = cutlass.Boolean(False)
+            for c in cutlass.range_constexpr(n):
+                w = ld_v4_relaxed(addrs[c], True)
+                for j in cutlass.range_constexpr(4):
+                    words[4 * c + j] = w[j]
+                if cutlass.const_expr(ring_slots is not None):
+                    sts_v4(ring_slots[c], w[0], w[1], w[2], w[3])
+                bad = bad | (valid[c] & unwritten(words[4 * c]))
+            pending = cute.arch.vote_any_sync(bad) & (cnt[1] == 0)
+        cnt[0] = cnt[0] + rounds
+
+    @cute.jit
+    def check_pack(self, i, count, ring_lane, gbase, cnt):
+        """Validate the ring slots of tokens [i, i + ASYNC_GROUP) below ``count`` (fgs_consumer).
+
+        Runs after the pack's cp.async group retired, before any of its tokens is consumed;
+        tokens past ``count`` reload the last token and are ignored."""
+        words = cute.make_rmem_tensor(cute.make_layout(4 * ASYNC_GROUP), cutlass.Int32)
+        addrs = []
+        valid = []
+        slots = []
+        for pe in cutlass.range_constexpr(ASYNC_GROUP):
+            t = i + pe
+            sl = ring_lane + (t % self.D) * SLOT
+            w = lds_v4(sl)
+            for j in cutlass.range_constexpr(4):
+                words[4 * pe + j] = w[j]
+            addrs.append(gbase + cutlass.Int64(cutlass.min(t, count - 1)) * (self.SR * 2))
+            valid.append(t < count)
+            slots.append(sl)
+        self.wait_chunks(words, addrs, valid, slots, cnt)
+
+    @cute.jit
+    def wait_rows(self, words: cute.Tensor, a0, a1, a2, v0, v1, v2, cnt):
+        """Validate three already loaded source chunks (fgs_consumer)."""
+        self.wait_chunks(words, [a0, a1, a2], [v0, v1, v2], None, cnt)
+
+    @cute.jit
+    def gather_fin(self, src_base, begin, length, cc, fin: cute.Tensor, cnt):
+        """Run 0's final-state rows (the last WIDTH - 1 raw inputs) into ``fin``, behind the
+        check; entries before the sequence start keep the initial history packed earlier."""
+        fw = cute.make_rmem_tensor(cute.make_layout(4 * (WIDTH - 1)), cutlass.Int32)
+        addrs = []
+        valid = []
+        for j in cutlass.range_constexpr(WIDTH - 1):
+            rel = length - (WIDTH - 1) + j
+            addr = src_base + (cutlass.Int64(begin + cutlass.max(rel, 0)) * self.SR + cc) * 2
+            w = ld_v4_relaxed(addr)
+            for e in cutlass.range_constexpr(4):
+                fw[4 * j + e] = w[e]
+            addrs.append(addr)
+            valid.append(rel >= 0)
+        self.wait_chunks(fw, addrs, valid, None, cnt)
+        for j in cutlass.range_constexpr(WIDTH - 1):
+            if length - (WIDTH - 1) + j >= 0:
+                for e in cutlass.range_constexpr(4):
+                    fin[4 * j + e] = fw[4 * j + e]
 
     @cute.jit
     def redo(
@@ -1053,7 +1347,7 @@ class KdaConv:
                 )
                 acc0, acc1 = fma2(wt[3 * VEC + a], wt[3 * VEC + b], xr[a], xr[b], acc0, acc1)
                 y0, y1 = silu2_exact(acc0, acc1)
-                yr[j] = pack_bf16x2(y0, y1)
+                yr[j] = self.pack(y0, y1)
                 for e3 in cutlass.range_constexpr(2):
                     ch = a + e3
                     hx[ch] = hx[VEC + ch]
@@ -1082,12 +1376,17 @@ class KdaConv:
         k,
         v,
         grid_y: cutlass.Int32,
+        stats: cute.Tensor | None,
         stream: cuda.CUstream,
     ):
         channel_blocks = (self.C + WARP_CH - 1) // WARP_CH
         grid = (channel_blocks, grid_y, min(slots.shape[0], MAX_GRID_YZ))
-        self.kernel(src, weight, state, starts, slots, has_init, q, k, v).launch(
-            grid=grid, block=(self.W * 32, 1, 1), min_blocks_per_mp=self.MB, stream=stream
+        self.kernel(src, weight, state, starts, slots, has_init, q, k, v, stats).launch(
+            grid=grid,
+            block=(self.W * 32, 1, 1),
+            min_blocks_per_mp=self.MB,
+            stream=stream,
+            use_pdl=self.fgs_consumer,
         )
 
 
@@ -1133,6 +1432,10 @@ def compile_prefill_conv(
     out_vec: bool,
     st_vec: bool,
     seq_loop: bool,
+    fgs_consumer: bool = False,
+    fgs_producer: bool = False,
+    max_spins: int = 0,
+    with_stats: bool = False,
 ) -> Callable:
     """Compile and cache a convolution layout without retaining caller-owned tensors."""
     with torch.cuda.device(device):
@@ -1168,19 +1471,50 @@ def compile_prefill_conv(
             depth,
             warps,
             st_vec,
+            fgs_consumer,
+            fgs_producer,
+            max_spins,
+            with_stats,
         )
         op.MB = min_blocks_per_mp
+        stats = None
+        if with_stats:
+            stats = make_fake_tensor(cutlass.Int32, (2,), stride=(1,), assumed_align=8)
         stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
         # Grid size and stream remain runtime arguments, not cache-key inputs.
-        return cute.compile(op, *args, cutlass.Int32(1), stream, options="--enable-tvm-ffi")
+        return cute.compile(op, *args, cutlass.Int32(1), stats, stream, options="--enable-tvm-ffi")
 
 
-def fused_prefill_conv(src, weight, conv_state, starts, slots, has_init, max_seqlen, q, k, v):
+def fused_prefill_conv(
+    src,
+    weight,
+    conv_state,
+    starts,
+    slots,
+    has_init,
+    max_seqlen,
+    q,
+    k,
+    v,
+    *,
+    fgs_consumer=False,
+    fgs_producer=False,
+    fgs_max_spins=1 << 16,
+    fgs_stats=None,
+):
     """Convolve raw packed QKV into contiguous, unnormalized BF16 Q/K/V.
 
     Starts must be monotone, with unique nonnegative slots in the pool. The
     scheduler prepares both arrays once per batch, before layer execution.
     Outputs and the state pool must not alias the immutable inputs.
+
+    ``fgs_consumer`` reads ``src`` as a fine-grained-sync slot (module docstring): the
+    kernel launches with PDL and does not wait for the primary grid; ``src`` must be armed
+    with -0.0 before its producer runs and published by one 16-byte store per chunk, never
+    as -0.0. The state pool and the metadata are read before any input is validated, so
+    they must be complete at launch. ``fgs_producer`` publishes q/k/v for such a consumer
+    (the caller arms them with -0.0). ``fgs_stats`` (int32 [2], zeroed by the caller)
+    accumulates reload rounds and fallbacks per warp.
     """
     tensors = (src, weight, conv_state, starts, slots, has_init, q, k, v)
     if any(t.device != src.device for t in tensors) or src.device.type != "cuda":
@@ -1244,6 +1578,11 @@ def fused_prefill_conv(src, weight, conv_state, starts, slots, has_init, max_seq
     # a 16-byte-aligned base and a slot stride divisible by 8 elements.
     ss = conv_state.stride()
     st_vec = ss[1] == 3 and ss[2] == 1 and ss[0] % 8 == 0 and _align(conv_state) == 0
+    if (fgs_consumer or fgs_producer) and not (src_vec and out_vec):
+        raise ValueError("KDA convolution FGS modes need 16-byte aligned source rows and outputs")
+    with_stats = fgs_consumer and fgs_stats is not None
+    if with_stats and (fgs_stats.dtype != torch.int32 or fgs_stats.numel() < 2):
+        raise ValueError("fgs_stats must be an int32 tensor of 2 elements")
     stream = cuda.CUstream(torch.cuda.current_stream(src.device).cuda_stream)
     # grid.y only sets parallelism (CTAs loop over the device-side run count): no
     # sequence is longer than T, so a looser bound only adds idle CTAs and an
@@ -1276,5 +1615,10 @@ def fused_prefill_conv(src, weight, conv_state, starts, slots, has_init, max_seq
         out_vec,
         st_vec,
         seq_loop,
+        fgs_consumer,
+        fgs_producer,
+        fgs_max_spins if fgs_consumer else 0,
+        with_stats,
     )
-    fn(src, weight, conv_state, starts, slots, has_init, q, k, v, grid_y, stream)
+    stats = fgs_stats if with_stats else None
+    fn(src, weight, conv_state, starts, slots, has_init, q, k, v, grid_y, stats, stream)
