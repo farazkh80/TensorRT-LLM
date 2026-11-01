@@ -163,7 +163,11 @@ def model_scope(layers: Optional[Iterable[int]] = None) -> Iterator[None]:
             " eager forward first)",
             key="k3_fgs_unregistered",
         )
-    debug("model_scope", 0, f"reset-stream fork / join around the forward, {len(workspaces.ledger())} edges")
+    debug(
+        "model_scope",
+        0,
+        f"reset-stream fork / join around the forward, {len(workspaces.ledger())} edges",
+    )
     try:
         with workspaces.scope():
             yield
