@@ -345,12 +345,14 @@ if _CUTE_AVAILABLE:
                 phase = (it >> 1) & 1
 
                 xs = []
-                for n in cutlass.range_constexpr(K):
-                    row = n * M + tok
-                    xs.append([gB[(None, (row, col0 + v * self.threads))].load() for v in range(V)])
                 if cutlass.const_expr(self.fgs_consumer):
-                    self._fgs_token(xs, gP, gA, gU, q, stats, tok, col0, mCnt)
+                    self._fgs_token(xs, gB, gP, gA, gU, q, stats, tok, M, col0, mCnt)
                 else:
+                    for n in cutlass.range_constexpr(K):
+                        row = n * M + tok
+                        xs.append(
+                            [gB[(None, (row, col0 + v * self.threads))].load() for v in range(V)]
+                        )
                     last = [gP[(None, (tok, col0 + v * self.threads))].load() for v in range(V)]
                     if cutlass.const_expr(self.fuse_add):
                         for v in cutlass.range_constexpr(V):
@@ -459,16 +461,19 @@ if _CUTE_AVAILABLE:
         def _fgs_token(
             self,
             xs: list,
+            gB: cute.Tensor,
             gP: cute.Tensor,
             gA: cute.Tensor,
             gU: cute.Tensor,
             q: list,
             stats: cute.Tensor,
             tok: Int32,
+            M: Int32,
             col0: Int32,
             cnt: cute.Tensor,
         ):
-            """Consumer token body: the bank rows' sums are computed while the attention row is in flight."""
+            """Consumer token body: the attention row is loaded first and the bank rows' sums are computed while
+            it is in flight."""
             K = self.N - 1
             V = self.V
             src = gA if self.fuse_add else gP
@@ -476,8 +481,6 @@ if _CUTE_AVAILABLE:
             last = []
             for v in cutlass.range_constexpr(V):
                 col = col0 + v * self.threads
-                if cutlass.const_expr(self.fuse_add):
-                    last.append(gP[(None, (tok, col))].load())
                 addr = (src.iterator + (cutlass.Int64(tok) * self.H + col * _VEC)).toint()
                 chunk = cute.make_rmem_tensor(src[(None, (tok, col))].shape, BFloat16)
                 w = cute.recast_tensor(chunk, Int32)
@@ -487,6 +490,11 @@ if _CUTE_AVAILABLE:
                 chunks.append(chunk)
                 words.append(w)
                 addrs.append(addr)
+            for n in cutlass.range_constexpr(K):
+                row = n * M + tok
+                xs.append([gB[(None, (row, col0 + v * self.threads))].load() for v in range(V)])
+            if cutlass.const_expr(self.fuse_add):
+                last = [gP[(None, (tok, col0 + v * self.threads))].load() for v in range(V)]
             for n in cutlass.range_constexpr(K):
                 self._row_stats(xs[n], q, stats, n)
             _lamport_wait(words, addrs, cnt, self.fgs_max_spins)
@@ -550,80 +558,19 @@ if _CUTE_AVAILABLE:
         return tuple(Int32(llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(4))
 
     @dsl_user_op
-    def _ld_shared_v4(addr: Int32, *, loc=None, ip=None):
-        res = _asm(
-            llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
-            [Int32(addr).ir_value(loc=loc, ip=ip)],
-            "ld.shared.v4.b32 {$0, $1, $2, $3}, [$4];",
-            "=r,=r,=r,=r,r",
-            loc,
-            ip,
-        )
-        return tuple(Int32(llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(4))
-
-    @dsl_user_op
     def _unpublished(words, *, loc=None, ip=None) -> Int32:
-        """Nonzero iff a bf16 of the 16-B chunk ``words`` is -0.0 (``(x - 0x10001) & ~x`` finds a zero half)."""
+        """Nonzero iff the 16-B chunk ``words`` still starts with the bf16 -0.0 sentinel."""
         return Int32(
             _asm(
                 T.i32(),
-                [Int32(w).ir_value(loc=loc, ip=ip) for w in words],
-                "{\n"
-                ".reg .b32 x, y, acc;\n"
-                "mov.b32 acc, 0;\n"
-                + "".join(
-                    f"xor.b32 x, ${i + 1}, 0x80008000;\n"
-                    "sub.u32 y, x, 0x00010001;\n"
-                    "not.b32 x, x;\n"
-                    "and.b32 y, y, x;\n"
-                    "or.b32 acc, acc, y;\n"
-                    for i in range(4)
-                )
-                + "and.b32 $0, acc, 0x80008000;\n"
-                "}",
-                "=r,r,r,r,r",
+                [Int32(words[0]).ir_value(loc=loc, ip=ip)],
+                "{\n.reg .b32 t;\nand.b32 t, $1, 0xFFFF;\nset.eq.u32.u32 $0, t, 0x8000;\n}",
+                "=r,r",
                 loc,
                 ip,
                 pure=True,
             )
         )
-
-    @dsl_user_op
-    def _st_shared_v4(addr: Int32, words, *, loc=None, ip=None) -> None:
-        _asm(
-            None,
-            [Int32(addr).ir_value(loc=loc, ip=ip)]
-            + [Int32(w).ir_value(loc=loc, ip=ip) for w in words],
-            "st.shared.v4.b32 [$0], {$1, $2, $3, $4};",
-            "r,r,r,r,r",
-            loc,
-            ip,
-        )
-
-    @dsl_user_op
-    def _mbarrier_test(mbar: cute.Pointer, parity: Int32, *, loc=None, ip=None) -> Int32:
-        """1 if the phase with ``parity`` has completed (non-blocking ``mbarrier.test_wait``), else 0."""
-        return Int32(
-            _asm(
-                T.i32(),
-                [
-                    Int32(mbar.toint(loc=loc, ip=ip)).ir_value(),
-                    Int32(parity).ir_value(loc=loc, ip=ip),
-                ],
-                "{\n"
-                ".reg .pred p;\n"
-                "mbarrier.test_wait.parity.shared::cta.b64 p, [$1], $2;\n"
-                "selp.u32 $0, 1, 0, p;\n"
-                "}",
-                "=r,r,r",
-                loc,
-                ip,
-            )
-        )
-
-    @dsl_user_op
-    def _fence_proxy_async_smem(*, loc=None, ip=None) -> None:
-        _asm(None, [], "fence.proxy.async.shared::cta;", "", loc, ip)
 
     @dsl_user_op
     def _pzo_b32(w: Int32, *, loc=None, ip=None) -> Int32:
@@ -668,7 +615,7 @@ if _CUTE_AVAILABLE:
     def _lamport_wait(
         words: list, addrs: list, cnt: cute.Tensor, max_spins: cutlass.Constexpr[int]
     ):
-        """Re-read this thread's 16-B chunks ``words[i]`` (from ``addrs[i]``) until none holds a -0.0.
+        """Re-read this thread's 16-B chunks ``words[i]`` (from ``addrs[i]``) until none starts with -0.0.
 
         Warp-uniform: the whole warp loops while any lane still holds a sentinel, so the warp leaves converged.
         After ``max_spins`` rounds it waits for the producer grid and takes the final values. Counters: warps that
@@ -714,6 +661,20 @@ if _CUTE_AVAILABLE:
                     go = Int32(0)
             cute.arch.sync_warp()
 
+    @cute.jit
+    def _lamport_patch(
+        vals: list, addrs: list, cnt: cute.Tensor, max_spins: cutlass.Constexpr[int]
+    ):
+        """``vals``: this thread's chunks of an attention row as already loaded; returns them once published."""
+        chunks, words = [], []
+        for v in cutlass.range_constexpr(len(vals)):
+            chunk = cute.make_rmem_tensor(vals[v].shape, BFloat16)
+            chunk.store(vals[v])
+            chunks.append(chunk)
+            words.append(cute.recast_tensor(chunk, Int32))
+        _lamport_wait(words, addrs, cnt, max_spins)
+        return [c.load() for c in chunks]
+
     def _split_candidates(num_candidates: int, max_chunk: int):
         nchunks = -(-num_candidates // max_chunk)
         sizes = [
@@ -741,10 +702,10 @@ if _CUTE_AVAILABLE:
         another, so four slots make slot reuse safe. ``overlap`` keeps two chunks live and needs the registers.
 
         ``fgs_consumer`` reads the attention output (the last row of each token) while its producer is still
-        running, on the same grid and token order. The producer warp lands that row on a separate mbarrier, then
-        scans it in shared memory, re-reads every 16-B chunk that still holds a bf16 -0.0 from global memory
-        (warp-uniform backoff; after ``fgs_max_spins`` rounds it waits for the producer grid) and only then
-        releases the row to the consumer warps.
+        running, on the same grid, token order and producer loop. Each consumer warp tests the attention-row
+        chunks it took from the ring; a warp with a chunk that still starts with the bf16 -0.0 sentinel re-reads
+        them from global memory together (warp-uniform backoff; after ``fgs_max_spins`` rounds it waits for the
+        producer grid).
         """
 
         RED_SLOTS = 4
@@ -790,15 +751,10 @@ if _CUTE_AVAILABLE:
             assert not fgs_consumer or hidden_size // (_VEC * 32) <= 31
             self.fgs_consumer = fgs_consumer
             self.fgs_max_spins = fgs_max_spins
-            # A token's attention row is issued once its slot is free, i.e. at most S // R + 1 tokens after the
-            # oldest one still unchecked, so this many landing barriers are never reused while armed.
-            self.fgs_chk = stages // self.rows_per_token + 2
 
         def smem_bytes(self) -> int:
             red = self.RED_SLOTS * self.cwarps * self.slot_stride * 4
             nbytes = self.stages * self.H * 2 + red + (2 * self.stages + self.RED_SLOTS) * 8 + 256
-            if self.fgs_consumer:
-                nbytes += self.fgs_chk * 8
             return nbytes
 
         @cute.jit
@@ -912,135 +868,17 @@ if _CUTE_AVAILABLE:
                 vals[k] = cute.arch.shuffle_sync(total, offset=k)
 
         @cute.jit
-        def _fgs_produce(
-            self,
-            mB: cute.Tensor,
-            mP: cute.Tensor,
-            mA: cute.Tensor,
-            M: Int32,
-            ring: cute.Tensor,
-            full: cute.Pointer,
-            empty: cute.Pointer,
-            chk: cute.Pointer,
-            cnt: cute.Tensor,
-        ):
-            """Producer warp of the ``fgs_consumer`` build: issues rows like the default loop (each attention row
-            onto its own ``chk`` barrier) and, whenever the oldest unchecked attention row has landed, checks and
-            releases it. Neither waits for the other, so the ring stays as full as in the default build."""
-            K = self.N - 1
-            H = self.H
-            S = self.stages
-            R = self.rows_per_token
-            C = self.fgs_chk
-            row_bytes = H * 2
-            lane = cute.arch.lane_idx()
-            bidx, _, _ = cute.arch.block_idx()
-            gdim, _, _ = cute.arch.grid_dim()
-            attn = mA if self.fuse_add else mP
-            rows = (M - bidx + gdim - 1) // gdim * R
-            r = Int32(0)
-            j = Int32(0)
-            while j * R < rows:
-                idle = Int32(1)
-                if r < rows:
-                    slot = r % S
-                    parity = ((r // S) & 1) ^ 1
-                    if cute.arch.vote_any_sync(_mbarrier_test(empty + slot, parity) != 0):
-                        idle = Int32(0)
-                        if lane == 0:
-                            cute.arch.mbarrier_wait(empty + slot, parity)
-                            i = r % R
-                            tok = bidx + r // R * gdim
-                            if i == R - 1:
-                                landed = chk + (r // R) % C
-                                cute.arch.mbarrier_arrive_and_expect_tx(landed, row_bytes)
-                                _bulk_g2s(
-                                    ring.iterator + slot * H,
-                                    attn.iterator + cutlass.Int64(tok) * H,
-                                    landed,
-                                    row_bytes,
-                                )
-                            else:
-                                cute.arch.mbarrier_arrive_and_expect_tx(full + slot, row_bytes)
-                                src = mP.iterator + cutlass.Int64(tok) * H
-                                if i < K:
-                                    src = (
-                                        mB.iterator
-                                        + (cutlass.Int64(i) * cutlass.Int64(M) + cutlass.Int64(tok))
-                                        * H
-                                    )
-                                _bulk_g2s(ring.iterator + slot * H, src, full + slot, row_bytes)
-                        r = r + 1
-                if j * R + R - 1 < r:
-                    if cute.arch.vote_any_sync(_mbarrier_test(chk + j % C, (j // C) & 1) != 0):
-                        idle = Int32(0)
-                        self._fgs_release(ring, full, chk, attn, j, bidx + j * gdim, cnt)
-                        j = j + 1
-                if idle != 0:
-                    _nanosleep(Int32(32))
-
-        @cute.jit
-        def _fgs_release(
-            self,
-            ring: cute.Tensor,
-            full: cute.Pointer,
-            chk: cute.Pointer,
-            attn: cute.Tensor,
-            j: Int32,
-            tok: Int32,
-            cnt: cute.Tensor,
-        ):
-            """Check the landed attention row of the ``j``-th token (``tok``), patch it, hand it to the consumers."""
-            H = self.H
-            R = self.rows_per_token
-            NK = H // (_VEC * 32)
-            lane = cute.arch.lane_idx()
-            slot = (j * R + R - 1) % self.stages
-            cute.arch.mbarrier_wait(chk + j % self.fgs_chk, (j // self.fgs_chk) & 1)
-            dst = Int32((ring.iterator + slot * H).toint()) + lane * 16
-            src = (attn.iterator + cutlass.Int64(tok) * H).toint() + lane * 16
-            stale = Int32(0)
-            for k0 in cutlass.range_constexpr(0, NK, 7):
-                group = [_ld_shared_v4(dst + k * 512) for k in range(k0, min(k0 + 7, NK))]
-                for k, w in enumerate(group, k0):
-                    if _unpublished(w) != 0:
-                        stale = stale | (1 << k)
-            if cute.arch.vote_any_sync(stale != 0):
-                if lane == 0:
-                    _red_add(cnt.iterator.toint(), Int32(1))
-                spins = Int32(0)
-                delay = Int32(32)
-                go = Int32(1)
-                while go != 0:
-                    done = Int32(0)
-                    if spins == self.fgs_max_spins:
-                        if lane == 0:
-                            _red_add((cnt.iterator + 2).toint(), Int32(1))
-                        cute.arch.griddepcontrol_wait()
-                        done = Int32(1)
-                    else:
-                        _nanosleep(delay)
-                        delay = cutlass.min(delay * 2, Int32(1024))
-                    for k in cutlass.range_constexpr(NK):
-                        if ((stale >> k) & 1) != 0:
-                            w = _ld_relaxed_v4(src + k * 512)
-                            fresh = done
-                            if _unpublished(w) == 0:
-                                fresh = Int32(1)
-                            if fresh != 0:
-                                _st_shared_v4(dst + k * 512, w)
-                                stale = stale & ~(1 << k)
-                    if lane == 0:
-                        _red_add((cnt.iterator + 1).toint(), Int32(1))
-                    spins = spins + 1
-                    go = Int32(0)
-                    if cute.arch.vote_any_sync(stale != 0):
-                        go = Int32(1)
-                # Order these generic-proxy stores before the bulk copy that refills the slot.
-                _fence_proxy_async_smem()
-            cute.arch.sync_warp()
-            if lane == 0:
-                cute.arch.mbarrier_arrive(full + slot)
+        def _fgs_patch(self, vals: list, attn: cute.Tensor, tok: Int32, cnt: cute.Tensor):
+            """This thread's chunks of attention row ``tok``, re-read from global memory while unpublished."""
+            tidx, _, _ = cute.arch.thread_idx()
+            addrs = [
+                (
+                    attn.iterator
+                    + (cutlass.Int64(tok) * self.H + (tidx + v * self.consumers) * _VEC)
+                ).toint()
+                for v in range(self.V)
+            ]
+            return _lamport_patch(vals, addrs, cnt, self.fgs_max_spins)
 
         @cute.jit
         def _consume_token(
@@ -1061,6 +899,8 @@ if _CUTE_AVAILABLE:
             gU: cute.Tensor,
             eps: Float32,
             eps_out: Float32,
+            attn: Optional[cute.Tensor] = None,
+            cnt: Optional[cute.Tensor] = None,
         ):
             N = self.N
             K = N - 1
@@ -1099,12 +939,16 @@ if _CUTE_AVAILABLE:
                             cute.arch.sync_warp()
                             if lane == 0:
                                 cute.arch.mbarrier_arrive(empty + slot_a)
+                            if cutlass.const_expr(self.fgs_consumer):
+                                adds = self._fgs_patch(adds, attn, tok, cnt)
                             for v in cutlass.range_constexpr(V):
                                 vals[v] = (vals[v].to(Float32) + adds[v].to(Float32)).to(BFloat16)
                                 gU[(None, (tok, tidx + v * self.consumers))].store(vals[v])
                         cute.arch.sync_warp()
                         if lane == 0:
                             cute.arch.mbarrier_arrive(empty + slot)
+                        if cutlass.const_expr(self.fgs_consumer and not self.fuse_add and n == K):
+                            vals = self._fgs_patch(vals, attn, tok, cnt)
                         xs.append(vals)
                     for jj in cutlass.range_constexpr(nc):
                         ss = (Float32(0.0), Float32(0.0))
@@ -1241,18 +1085,12 @@ if _CUTE_AVAILABLE:
             full = smem.allocate_array(cutlass.Int64, num_elems=S)
             empty = smem.allocate_array(cutlass.Int64, num_elems=S)
             red_bar = smem.allocate_array(cutlass.Int64, num_elems=self.RED_SLOTS)
-            chk = None
-            if cutlass.const_expr(self.fgs_consumer):
-                chk = smem.allocate_array(cutlass.Int64, num_elems=self.fgs_chk)
             if tidx == 0:
                 for s in cutlass.range_constexpr(S):
                     cute.arch.mbarrier_init(full + s, 1)
                     cute.arch.mbarrier_init(empty + s, self.cwarps)
                 for s in cutlass.range_constexpr(self.RED_SLOTS):
                     cute.arch.mbarrier_init(red_bar + s, self.cwarps)
-                if cutlass.const_expr(self.fgs_consumer):
-                    for s in cutlass.range_constexpr(self.fgs_chk):
-                        cute.arch.mbarrier_init(chk + s, 1)
             cute.arch.mbarrier_init_fence()
             cute.arch.barrier()
 
@@ -1260,9 +1098,7 @@ if _CUTE_AVAILABLE:
                 cute.arch.griddepcontrol_wait()
 
             if warp == self.cwarps:
-                if cutlass.const_expr(self.fgs_consumer):
-                    self._fgs_produce(mB, mP, mA, M, ring, full, empty, chk, mCnt)
-                elif lane == 0:
+                if lane == 0:
                     it = Int32(0)
                     for tok in cutlass.range(bidx, M, gdim, unroll=1):
                         for i in cutlass.range_constexpr(R):
@@ -1283,7 +1119,10 @@ if _CUTE_AVAILABLE:
                         it = it + 1
             else:
                 args = (ring, full, empty, red_buf, red_bar, gR, gG, gW, gO, gU)
-                self._consumers(*args, M, eps, eps_out)
+                if cutlass.const_expr(self.fgs_consumer):
+                    self._consumers(*args, M, eps, eps_out, mA if self.fuse_add else mP, mCnt)
+                else:
+                    self._consumers(*args, M, eps, eps_out)
 
             if cutlass.const_expr(self.enable_pdl):
                 cute.arch.griddepcontrol_launch_dependents()
@@ -1304,6 +1143,8 @@ if _CUTE_AVAILABLE:
             M: Int32,
             eps: Float32,
             eps_out: Float32,
+            attn: Optional[cute.Tensor] = None,
+            cnt: Optional[cute.Tensor] = None,
         ):
             V = self.V
             tidx, _, _ = cute.arch.thread_idx()
@@ -1334,7 +1175,7 @@ if _CUTE_AVAILABLE:
             args = (sv, full, empty, red_buf, red_bar, q, w_out, acc, xf, stats, gO, gU)
             it = Int32(0)
             for tok in cutlass.range(bidx, M, gdim, unroll=1):
-                self._consume_token(tok, it, *args, eps, eps_out)
+                self._consume_token(tok, it, *args, eps, eps_out, attn, cnt)
                 it = it + 1
 
 
@@ -1448,7 +1289,7 @@ def _num_sms(device_index: int) -> int:
 def make_fgs_counters(device=None) -> torch.Tensor:
     """Counters of ``fgs_consumer`` calls, never reset by the kernels.
 
-    [waits (warps of the register kernel, rows of the pipe kernel), re-read rounds, fallbacks, unused].
+    [warps that waited, re-read rounds, fallbacks, unused].
     """
     return torch.zeros(4, dtype=torch.int32, device=device or "cuda")
 
