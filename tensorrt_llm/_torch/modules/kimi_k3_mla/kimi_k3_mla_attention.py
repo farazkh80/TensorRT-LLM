@@ -77,9 +77,11 @@ def _write_identity_rope_values(cos_sin: torch.Tensor) -> None:
     with torch.no_grad():
         flat[0::2] = 1.0
         flat[1::2] = 0.0
-    # Ensure the identity write reaches CUDA memory before any kernel
-    # launched from a different stream can read the table.
-    if cos_sin.is_cuda:
+    # Outside capture, make the write visible to kernels on other streams.
+    # Under capture (a resize inside a captured forward) the readers are the
+    # rope kernels later on the capturing stream, which stream order covers;
+    # a device synchronize there would invalidate the capture.
+    if cos_sin.is_cuda and not torch.cuda.is_current_stream_capturing():
         torch.cuda.synchronize(cos_sin.device)
 
 
