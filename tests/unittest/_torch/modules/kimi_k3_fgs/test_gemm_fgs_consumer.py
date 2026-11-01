@@ -168,6 +168,21 @@ def _ld_global_v4(addr: Int64, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _ld_relaxed_u32(addr: Int64, *, loc=None, ip=None):
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [addr.ir_value(loc=loc, ip=ip)],
+            "ld.relaxed.gpu.global.u32 $0, [$1];",
+            "=r,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
 def _st_global_v4(addr: Int64, v, *, loc=None, ip=None):
     llvm.inline_asm(
         None,
@@ -182,21 +197,30 @@ def _st_global_v4(addr: Int64, v, *, loc=None, ip=None):
 
 class BlockWriter:
     """Test producer: copies ``src`` -> ``dst`` ([L, M, K] views, K innermost) one (block_rows x block_cols) block
-    per CTA. Block p (l-major, then rows, then K) is published ``delay + ranks[p] * step`` after its CTA starts,
-    16 B per store instruction. It never writes sentinels."""
+    per CTA. Block p (l-major, then rows, then K) is published ``delay + ranks[p] * step`` after ``flag`` turns
+    non-zero (set on the consumer's stream right before the consumer), 16 B per store instruction. It never writes
+    sentinels."""
 
     def __init__(self, block_rows: int, block_cols: int, threads: int = 128):
         assert block_cols % 8 == 0
         self.block_rows, self.block_cols, self.threads = block_rows, block_cols, threads
 
     @cute.jit
-    def __call__(self, src, dst, ranks, delay_ns: Int64, step_ns: Int64, stream: cuda.CUstream):
-        self.kernel(src, dst, ranks, delay_ns, step_ns).launch(
+    def __call__(self, src, dst, ranks, flag, delay_ns: Int64, step_ns: Int64, stream: cuda.CUstream):
+        self.kernel(src, dst, ranks, flag, delay_ns, step_ns).launch(
             grid=(cute.size(ranks), 1, 1), block=(self.threads, 1, 1), stream=stream
         )
 
     @cute.kernel
-    def kernel(self, src: cute.Tensor, dst: cute.Tensor, ranks: cute.Tensor, delay_ns: Int64, step_ns: Int64):
+    def kernel(
+        self,
+        src: cute.Tensor,
+        dst: cute.Tensor,
+        ranks: cute.Tensor,
+        flag: cute.Tensor,
+        delay_ns: Int64,
+        step_ns: Int64,
+    ):
         p, _, _ = cute.arch.block_idx()
         tid, _, _ = cute.arch.thread_idx()
         m = src.shape[1]
@@ -207,6 +231,8 @@ class BlockWriter:
         mb = (p // blocks_k) % blocks_m
         lb = p // (blocks_k * blocks_m)
 
+        while _ld_relaxed_u32(flag.iterator.toint()) == 0:
+            cute.arch.nanosleep(sleep_time=200)
         target = cute.arch.globaltimer() + delay_ns + Int64(ranks[p]) * step_ns
         while cute.arch.globaltimer() < target:
             cute.arch.nanosleep(sleep_time=200)
@@ -238,16 +264,20 @@ def num_blocks(a: torch.Tensor, block_rows: int, block_cols: int) -> int:
     return L * -(-M // block_rows) * -(-K // block_cols)
 
 
-def late_write(src, dst, ranks, delay_us: float, step_us: float, block_rows: int, block_cols: int) -> None:
+def late_write(src, dst, ranks, delay_us: float, step_us: float, block_rows: int, block_cols: int, flag=None):
+    """Launch the writer on the current stream; without ``flag`` it starts at once."""
+    if flag is None:
+        flag = torch.ones(1, dtype=torch.int32, device="cuda")
     args = [from_dlpack(t, assumed_align=16).mark_layout_dynamic(leading_dim=2) for t in (src, dst)]
     ranks_t = from_dlpack(ranks, assumed_align=4).mark_layout_dynamic()
+    flag_t = from_dlpack(flag, assumed_align=4)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     key = (block_rows, block_cols)
     if key not in _WRITERS:
         _WRITERS[key] = cute.compile(
-            BlockWriter(block_rows, block_cols), *args, ranks_t, Int64(0), Int64(0), stream
+            BlockWriter(block_rows, block_cols), *args, ranks_t, flag_t, Int64(0), Int64(0), stream
         )
-    _WRITERS[key](*args, ranks_t, Int64(int(delay_us * 1e3)), Int64(int(step_us * 1e3)), stream)
+    _WRITERS[key](*args, ranks_t, flag_t, Int64(int(delay_us * 1e3)), Int64(int(step_us * 1e3)), stream)
 
 
 def block_shape(case: Case):
@@ -276,7 +306,8 @@ def ranks_for(pattern: str, n: int, seed: int = 0) -> torch.Tensor:
 def run_hazard(case: Case, pattern: str, variant: str = "c", delay_us: float = 300.0, step_us: float = 2.0):
     """Writer on its own stream first, consumer second; returns (output buffer, re-issues, published A).
 
-    The first block lands ``delay_us`` after the writer starts, well after the consumer's host launch path."""
+    The writer's clock starts at a flag the consumer's stream sets right before the consumer, so the first block
+    lands ``delay_us`` after the consumer started however slow the host launch path is."""
     ref_a = case.a
     slot_base = torch.full_like(case.base, -0.0)
     slot_a = case.with_a(slot_base)
@@ -290,10 +321,13 @@ def run_hazard(case: Case, pattern: str, variant: str = "c", delay_us: float = 3
     run_variant(case, case.with_a(warm_base), case.new_out()[1], variant)
     torch.cuda.synchronize()
 
+    flag = torch.zeros(1, dtype=torch.int32, device="cuda")
+    torch.cuda.synchronize()
     sp, sc = torch.cuda.Stream(), torch.cuda.Stream()
     with torch.cuda.stream(sp):
-        late_write(ref_a, slot_a, ranks, delay_us, step_us, br, bc)
+        late_write(ref_a, slot_a, ranks, delay_us, step_us, br, bc, flag)
     with torch.cuda.stream(sc):
+        flag.fill_(1)
         run_variant(case, slot_a, out, variant, counter=counter)
     torch.cuda.synchronize()
     return buf, int(counter.item()), bool(torch.equal(bits(slot_a), bits(ref_a)))
@@ -376,10 +410,13 @@ def test_one_late_chunk(name: str) -> None:
 
     counter = torch.zeros(1, dtype=torch.int32, device="cuda")
     buf, out = case.new_out()
+    flag = torch.zeros(1, dtype=torch.int32, device="cuda")
+    torch.cuda.synchronize()
     sp, sc = torch.cuda.Stream(), torch.cuda.Stream()
     with torch.cuda.stream(sp):
-        late_write(case.a, slot_a, ranks, 300.0, 0.0, br, bc)
+        late_write(case.a, slot_a, ranks, 300.0, 0.0, br, bc, flag)
     with torch.cuda.stream(sc):
+        flag.fill_(1)
         run_variant(case, slot_a, out, "c", counter=counter)
     torch.cuda.synchronize()
     diff = int((bits(buf) != bits(ref)).sum())
