@@ -96,7 +96,9 @@ def declare(layer_idx: int, hidden: int, bfa_width: int, proj_size: int, qkvg_wi
     if prefill():
         widths = {P_QKVG: qkvg_width, P_O: proj_size, P_CORE: proj_size, P_ATTN_O: hidden}
         for name in prefill_edges():
-            edges.declare(name, widths[name], layer_idx, max_rows=PREFILL_MAX_ROWS)
+            edges.declare(
+                name, widths[name], layer_idx, max_rows=PREFILL_MAX_ROWS, min_rows=PREFILL_MIN_ROWS
+            )
 
 
 def acquire(name: str, rows: int, readers: int = 1):

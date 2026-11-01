@@ -505,7 +505,7 @@ class Runner:
             from tensorrt_llm._torch.modules.kimi_k3_fgs import edges as k3_fgs_edges
 
             block_residual = residual
-            with k3_fgs_edges.model_scope():
+            with k3_fgs_edges.model_scope(rows=hidden_states.shape[0]):
                 for layer_idx in layer_indices:
                     layer = model.model.layers[layer_idx]
                     hidden_states, num_snapshots = layer(

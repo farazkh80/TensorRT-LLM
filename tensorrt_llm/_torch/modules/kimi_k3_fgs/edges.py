@@ -55,6 +55,8 @@ LAMPORT_MAX_ROWS = int(os.environ.get("TLLM_K3_FGS_LAMPORT_MAX_ROWS", "16"))
 _declared: Dict[str, Tuple[int, Set[int]]] = {}
 # Edge name -> slot rows, when a declaring module's row window ends above MAX_ROWS.
 _rows: Dict[str, int] = {}
+# Edge name -> (min, max) rows its declaring modules acquire it for.
+_windows: Dict[str, Tuple[int, int]] = {}
 _local = threading.local()
 # TLLM_K3_FGS_DEBUG=1: ``debug`` logs which path each kernel took, once per (site, rows, path).
 DEBUG = os.environ.get("TLLM_K3_FGS_DEBUG", "0") == "1"
@@ -103,8 +105,14 @@ def lamport_window() -> Tuple[int, int]:
     return MIN_ROWS, min(MAX_ROWS, LAMPORT_MAX_ROWS)
 
 
-def declare(name: str, width: int, layer_idx: int, max_rows: Optional[int] = None) -> None:
-    """Declare a [rows, width] bf16 edge used once per step by ``layer_idx``.
+def declare(
+    name: str,
+    width: int,
+    layer_idx: int,
+    max_rows: Optional[int] = None,
+    min_rows: Optional[int] = None,
+) -> None:
+    """Declare a [rows, width] bf16 edge used once per step by ``layer_idx`` for ``min_rows`` to ``max_rows`` rows.
 
     Registered by the next ``model_scope`` outside capture, with ``max(MAX_ROWS, max_rows)`` slot rows.
     """
@@ -112,6 +120,11 @@ def declare(name: str, width: int, layer_idx: int, max_rows: Optional[int] = Non
         _declared.setdefault(name, (width, set()))[1].add(layer_idx)
         if max_rows is not None and max_rows > _rows.get(name, MAX_ROWS):
             _rows[name] = max_rows
+        low, high = _windows.get(name, (MIN_ROWS, MAX_ROWS))
+        _windows[name] = (
+            min(low, MIN_ROWS if min_rows is None else min_rows),
+            max(high, MAX_ROWS if max_rows is None else max_rows),
+        )
 
 
 def _state():
@@ -126,11 +139,14 @@ def _state():
 
 
 @contextmanager
-def model_scope(layers: Optional[Iterable[int]] = None) -> Iterator[None]:
+def model_scope(
+    layers: Optional[Iterable[int]] = None, rows: Optional[int] = None
+) -> Iterator[None]:
     """Bracket one model forward; a no-op unless the mode has slots and an edge was declared.
 
     ``layers`` are the layer indices the forward runs (default: every declaring layer); an edge is registered only
-    for the declaring layers among them.
+    for the declaring layers among them. A forward of ``rows`` rows that no edge window covers runs without the
+    reset-stream fork / join.
     """
     if not slots() or not _declared:
         yield
@@ -163,9 +179,15 @@ def model_scope(layers: Optional[Iterable[int]] = None) -> Iterator[None]:
             " eager forward first)",
             key="k3_fgs_unregistered",
         )
+    if rows is not None and not any(
+        low <= rows <= high for name, (low, high) in _windows.items() if users[name]
+    ):
+        debug("model_scope", rows, "no edge serves these rows: no reset-stream fork / join")
+        yield
+        return
     debug(
         "model_scope",
-        0,
+        0 if rows is None else rows,
         f"reset-stream fork / join around the forward, {len(workspaces.ledger())} edges",
     )
     try:

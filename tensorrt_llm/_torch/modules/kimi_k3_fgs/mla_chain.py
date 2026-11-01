@@ -102,7 +102,7 @@ def declare(
         ATTN_O: hidden,
     }
     for name, _ in _EDGES:
-        edges.declare(name, widths[name], layer_idx, max_rows=MAX_ROWS)
+        edges.declare(name, widths[name], layer_idx, max_rows=MAX_ROWS, min_rows=MIN_ROWS)
 
 
 def weights_of(mla) -> Optional[Weights]:
