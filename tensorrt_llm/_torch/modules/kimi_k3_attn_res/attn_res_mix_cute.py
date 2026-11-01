@@ -349,40 +349,33 @@ if _CUTE_AVAILABLE:
                     row = n * M + tok
                     xs.append([gB[(None, (row, col0 + v * self.threads))].load() for v in range(V)])
                 if cutlass.const_expr(self.fgs_consumer):
-                    if cutlass.const_expr(self.fuse_add):
-                        last = [gP[(None, (tok, col0 + v * self.threads))].load() for v in range(V)]
-                    attn = self._lamport_row(gA if self.fuse_add else gP, tok, col0, mCnt)
-                    if cutlass.const_expr(not self.fuse_add):
-                        last = attn
+                    self._fgs_token(xs, gP, gA, gU, q, stats, tok, col0, mCnt)
                 else:
                     last = [gP[(None, (tok, col0 + v * self.threads))].load() for v in range(V)]
-                if cutlass.const_expr(self.fuse_add):
-                    for v in cutlass.range_constexpr(V):
-                        col = col0 + v * self.threads
-                        if cutlass.const_expr(self.fgs_consumer):
-                            a = attn[v]
-                        else:
+                    if cutlass.const_expr(self.fuse_add):
+                        for v in cutlass.range_constexpr(V):
+                            col = col0 + v * self.threads
                             a = gA[(None, (tok, col))].load()
-                        last[v] = (last[v].to(Float32) + a.to(Float32)).to(BFloat16)
-                        if cutlass.const_expr(self.fgs_producer):
-                            gU[(None, (tok, col))].store(_pzo(last[v]))
-                        else:
-                            gU[(None, (tok, col))].store(last[v])
-                xs.append(last)
+                            last[v] = (last[v].to(Float32) + a.to(Float32)).to(BFloat16)
+                            if cutlass.const_expr(self.fgs_producer):
+                                gU[(None, (tok, col))].store(_pzo(last[v]))
+                            else:
+                                gU[(None, (tok, col))].store(last[v])
+                    xs.append(last)
 
-                for n in cutlass.range_constexpr(N):
-                    ss = Float32(0.0)
-                    dot = Float32(0.0)
-                    for v in cutlass.range_constexpr(V):
-                        xf = xs[n][v].to(Float32)
-                        ss = ss + (xf * xf).reduce(
-                            cute.ReductionOp.ADD, init_val=Float32(0.0), reduction_profile=0
-                        )
-                        dot = dot + (xf * q[v]).reduce(
-                            cute.ReductionOp.ADD, init_val=Float32(0.0), reduction_profile=0
-                        )
-                    stats[n] = ss
-                    stats[N + n] = dot
+                    for n in cutlass.range_constexpr(N):
+                        ss = Float32(0.0)
+                        dot = Float32(0.0)
+                        for v in cutlass.range_constexpr(V):
+                            xf = xs[n][v].to(Float32)
+                            ss = ss + (xf * xf).reduce(
+                                cute.ReductionOp.ADD, init_val=Float32(0.0), reduction_profile=0
+                            )
+                            dot = dot + (xf * q[v]).reduce(
+                                cute.ReductionOp.ADD, init_val=Float32(0.0), reduction_profile=0
+                            )
+                        stats[n] = ss
+                        stats[N + n] = dot
 
                 if cutlass.const_expr(self.C > 1):
                     if it == 0:
@@ -448,11 +441,43 @@ if _CUTE_AVAILABLE:
                 cute.arch.griddepcontrol_launch_dependents()
 
         @cute.jit
-        def _lamport_row(self, src: cute.Tensor, tok: Int32, col0: Int32, cnt: cute.Tensor):
-            """This thread's chunks of row ``tok`` of ``src``, once its producer has published them."""
-            chunks, words, addrs = [], [], []
+        def _row_stats(self, x: list, q: list, stats: cute.Tensor, n: cutlass.Constexpr[int]):
+            ss = Float32(0.0)
+            dot = Float32(0.0)
             for v in cutlass.range_constexpr(self.V):
+                xf = x[v].to(Float32)
+                ss = ss + (xf * xf).reduce(
+                    cute.ReductionOp.ADD, init_val=Float32(0.0), reduction_profile=0
+                )
+                dot = dot + (xf * q[v]).reduce(
+                    cute.ReductionOp.ADD, init_val=Float32(0.0), reduction_profile=0
+                )
+            stats[n] = ss
+            stats[self.N + n] = dot
+
+        @cute.jit
+        def _fgs_token(
+            self,
+            xs: list,
+            gP: cute.Tensor,
+            gA: cute.Tensor,
+            gU: cute.Tensor,
+            q: list,
+            stats: cute.Tensor,
+            tok: Int32,
+            col0: Int32,
+            cnt: cute.Tensor,
+        ):
+            """Consumer token body: the bank rows' sums are computed while the attention row is in flight."""
+            K = self.N - 1
+            V = self.V
+            src = gA if self.fuse_add else gP
+            chunks, words, addrs = [], [], []
+            last = []
+            for v in cutlass.range_constexpr(V):
                 col = col0 + v * self.threads
+                if cutlass.const_expr(self.fuse_add):
+                    last.append(gP[(None, (tok, col))].load())
                 addr = (src.iterator + (cutlass.Int64(tok) * self.H + col * _VEC)).toint()
                 chunk = cute.make_rmem_tensor(src[(None, (tok, col))].shape, BFloat16)
                 w = cute.recast_tensor(chunk, Int32)
@@ -462,8 +487,22 @@ if _CUTE_AVAILABLE:
                 chunks.append(chunk)
                 words.append(w)
                 addrs.append(addr)
+            for n in cutlass.range_constexpr(K):
+                self._row_stats(xs[n], q, stats, n)
             _lamport_wait(words, addrs, cnt, self.fgs_max_spins)
-            return [c.load() for c in chunks]
+            for v in cutlass.range_constexpr(V):
+                a = chunks[v].load()
+                if cutlass.const_expr(self.fuse_add):
+                    col = col0 + v * self.threads
+                    last[v] = (last[v].to(Float32) + a.to(Float32)).to(BFloat16)
+                    if cutlass.const_expr(self.fgs_producer):
+                        gU[(None, (tok, col))].store(_pzo(last[v]))
+                    else:
+                        gU[(None, (tok, col))].store(last[v])
+                else:
+                    last.append(a)
+            xs.append(last)
+            self._row_stats(last, q, stats, K)
 
     @dsl_user_op
     def _bulk_g2s(
@@ -484,13 +523,13 @@ if _CUTE_AVAILABLE:
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
 
-    def _asm(result_type, operands, text, constraints, loc, ip):
+    def _asm(result_type, operands, text, constraints, loc, ip, pure=False):
         return llvm.inline_asm(
             result_type,
             operands,
             text,
             constraints,
-            has_side_effects=True,
+            has_side_effects=not pure,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
             loc=loc,
@@ -545,6 +584,7 @@ if _CUTE_AVAILABLE:
                 "=r,r,r,r,r",
                 loc,
                 ip,
+                pure=True,
             )
         )
 
@@ -561,30 +601,42 @@ if _CUTE_AVAILABLE:
         )
 
     @dsl_user_op
+    def _mbarrier_test(mbar: cute.Pointer, parity: Int32, *, loc=None, ip=None) -> Int32:
+        """1 if the phase with ``parity`` has completed (non-blocking ``mbarrier.test_wait``), else 0."""
+        return Int32(
+            _asm(
+                T.i32(),
+                [
+                    Int32(mbar.toint(loc=loc, ip=ip)).ir_value(),
+                    Int32(parity).ir_value(loc=loc, ip=ip),
+                ],
+                "{\n"
+                ".reg .pred p;\n"
+                "mbarrier.test_wait.parity.shared::cta.b64 p, [$1], $2;\n"
+                "selp.u32 $0, 1, 0, p;\n"
+                "}",
+                "=r,r,r",
+                loc,
+                ip,
+            )
+        )
+
+    @dsl_user_op
     def _fence_proxy_async_smem(*, loc=None, ip=None) -> None:
         _asm(None, [], "fence.proxy.async.shared::cta;", "", loc, ip)
 
     @dsl_user_op
     def _pzo_b32(w: Int32, *, loc=None, ip=None) -> Int32:
-        """Turn each bf16 -0.0 (0x8000) half of ``w`` into +0.0."""
+        """Turn each bf16 -0.0 half of ``w`` into +0.0: x + (+0) is x for every other value under round-to-nearest."""
         return Int32(
             _asm(
                 T.i32(),
                 [Int32(w).ir_value(loc=loc, ip=ip)],
-                "{\n"
-                ".reg .b32 lo, hi;\n"
-                "and.b32 lo, $1, 0xFFFF;\n"
-                "set.eq.u32.u32 lo, lo, 0x8000;\n"
-                "and.b32 lo, lo, 0x8000;\n"
-                "and.b32 hi, $1, 0xFFFF0000;\n"
-                "set.eq.u32.u32 hi, hi, 0x80000000;\n"
-                "and.b32 hi, hi, 0x80000000;\n"
-                "or.b32 lo, lo, hi;\n"
-                "xor.b32 $0, $1, lo;\n"
-                "}",
+                "{\n.reg .b32 z;\nmov.b32 z, 0;\nadd.rn.bf16x2 $0, $1, z;\n}",
                 "=r,r",
                 loc,
                 ip,
+                pure=True,
             )
         )
 
@@ -689,10 +741,10 @@ if _CUTE_AVAILABLE:
         another, so four slots make slot reuse safe. ``overlap`` keeps two chunks live and needs the registers.
 
         ``fgs_consumer`` reads the attention output (the last row of each token) while its producer is still
-        running, on the same grid and token order. The producer warp lands that row on a separate mbarrier; an
-        extra checker warp scans it in shared memory, re-reads every 16-B chunk that still holds a bf16 -0.0 from
-        global memory (warp-uniform backoff; after ``fgs_max_spins`` rounds it waits for the producer grid) and
-        only then releases the row to the consumer warps.
+        running, on the same grid and token order. The producer warp lands that row on a separate mbarrier, then
+        scans it in shared memory, re-reads every 16-B chunk that still holds a bf16 -0.0 from global memory
+        (warp-uniform backoff; after ``fgs_max_spins`` rounds it waits for the producer grid) and only then
+        releases the row to the consumer warps.
         """
 
         RED_SLOTS = 4
@@ -741,8 +793,6 @@ if _CUTE_AVAILABLE:
             # A token's attention row is issued once its slot is free, i.e. at most S // R + 1 tokens after the
             # oldest one still unchecked, so this many landing barriers are never reused while armed.
             self.fgs_chk = stages // self.rows_per_token + 2
-            if fgs_consumer:
-                self.threads += 32
 
         def smem_bytes(self) -> int:
             red = self.RED_SLOTS * self.cwarps * self.slot_stride * 4
@@ -872,42 +922,62 @@ if _CUTE_AVAILABLE:
             full: cute.Pointer,
             empty: cute.Pointer,
             chk: cute.Pointer,
+            cnt: cute.Tensor,
         ):
-            """The default producer loop, with each token's attention row landing on ``chk`` for the checker warp."""
+            """Producer warp of the ``fgs_consumer`` build: issues rows like the default loop (each attention row
+            onto its own ``chk`` barrier) and, whenever the oldest unchecked attention row has landed, checks and
+            releases it. Neither waits for the other, so the ring stays as full as in the default build."""
             K = self.N - 1
             H = self.H
             S = self.stages
             R = self.rows_per_token
+            C = self.fgs_chk
             row_bytes = H * 2
+            lane = cute.arch.lane_idx()
             bidx, _, _ = cute.arch.block_idx()
             gdim, _, _ = cute.arch.grid_dim()
             attn = mA if self.fuse_add else mP
-            it = Int32(0)
-            for tok in cutlass.range(bidx, M, gdim, unroll=1):
-                for i in cutlass.range_constexpr(R):
-                    r = it * R + i
+            rows = (M - bidx + gdim - 1) // gdim * R
+            r = Int32(0)
+            j = Int32(0)
+            while j * R < rows:
+                idle = Int32(1)
+                if r < rows:
                     slot = r % S
-                    cute.arch.mbarrier_wait(empty + slot, ((r // S) & 1) ^ 1)
-                    if cutlass.const_expr(i < R - 1):
-                        cute.arch.mbarrier_arrive_and_expect_tx(full + slot, row_bytes)
-                        if cutlass.const_expr(i < K):
-                            src = (
-                                mB.iterator
-                                + (cutlass.Int64(i) * cutlass.Int64(M) + cutlass.Int64(tok)) * H
-                            )
-                        else:
-                            src = mP.iterator + cutlass.Int64(tok) * H
-                        _bulk_g2s(ring.iterator + slot * H, src, full + slot, row_bytes)
-                    else:
-                        landed = chk + it % self.fgs_chk
-                        cute.arch.mbarrier_arrive_and_expect_tx(landed, row_bytes)
-                        _bulk_g2s(
-                            ring.iterator + slot * H,
-                            attn.iterator + cutlass.Int64(tok) * H,
-                            landed,
-                            row_bytes,
-                        )
-                it = it + 1
+                    parity = ((r // S) & 1) ^ 1
+                    if cute.arch.vote_any_sync(_mbarrier_test(empty + slot, parity) != 0):
+                        idle = Int32(0)
+                        if lane == 0:
+                            cute.arch.mbarrier_wait(empty + slot, parity)
+                            i = r % R
+                            tok = bidx + r // R * gdim
+                            if i == R - 1:
+                                landed = chk + (r // R) % C
+                                cute.arch.mbarrier_arrive_and_expect_tx(landed, row_bytes)
+                                _bulk_g2s(
+                                    ring.iterator + slot * H,
+                                    attn.iterator + cutlass.Int64(tok) * H,
+                                    landed,
+                                    row_bytes,
+                                )
+                            else:
+                                cute.arch.mbarrier_arrive_and_expect_tx(full + slot, row_bytes)
+                                src = mP.iterator + cutlass.Int64(tok) * H
+                                if i < K:
+                                    src = (
+                                        mB.iterator
+                                        + (cutlass.Int64(i) * cutlass.Int64(M) + cutlass.Int64(tok))
+                                        * H
+                                    )
+                                _bulk_g2s(ring.iterator + slot * H, src, full + slot, row_bytes)
+                        r = r + 1
+                if j * R + R - 1 < r:
+                    if cute.arch.vote_any_sync(_mbarrier_test(chk + j % C, (j // C) & 1) != 0):
+                        idle = Int32(0)
+                        self._fgs_release(ring, full, chk, attn, j, bidx + j * gdim, cnt)
+                        j = j + 1
+                if idle != 0:
+                    _nanosleep(Int32(32))
 
         @cute.jit
         def _fgs_release(
@@ -1191,8 +1261,7 @@ if _CUTE_AVAILABLE:
 
             if warp == self.cwarps:
                 if cutlass.const_expr(self.fgs_consumer):
-                    if lane == 0:
-                        self._fgs_produce(mB, mP, mA, M, ring, full, empty, chk)
+                    self._fgs_produce(mB, mP, mA, M, ring, full, empty, chk, mCnt)
                 elif lane == 0:
                     it = Int32(0)
                     for tok in cutlass.range(bidx, M, gdim, unroll=1):
@@ -1214,17 +1283,7 @@ if _CUTE_AVAILABLE:
                         it = it + 1
             else:
                 args = (ring, full, empty, red_buf, red_bar, gR, gG, gW, gO, gU)
-                if cutlass.const_expr(self.fgs_consumer):
-                    if warp == self.cwarps + 1:
-                        attn = mA if self.fuse_add else mP
-                        it = Int32(0)
-                        for tok in cutlass.range(bidx, M, gdim, unroll=1):
-                            self._fgs_release(ring, full, chk, attn, it, tok, mCnt)
-                            it = it + 1
-                    else:
-                        self._consumers(*args, M, eps, eps_out)
-                else:
-                    self._consumers(*args, M, eps, eps_out)
+                self._consumers(*args, M, eps, eps_out)
 
             if cutlass.const_expr(self.enable_pdl):
                 cute.arch.griddepcontrol_launch_dependents()

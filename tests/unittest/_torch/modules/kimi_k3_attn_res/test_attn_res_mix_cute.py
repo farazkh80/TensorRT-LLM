@@ -381,6 +381,27 @@ def test_fgs_consumer_falls_back_to_grid_wait(num_tokens: int, add: bool) -> Non
     assert waits > 0 and fallbacks == waits and rounds == 5 * waits, counters.tolist()
 
 
+@pytest.mark.parametrize("add", [True, False], ids=["add_norm", "snapshot_norm"])
+@torch.no_grad()
+def test_fgs_consumer_fallback_waits_for_pdl_producer(add: bool) -> None:
+    """With a spin budget far below the producer's delay, the fallback PDL wait must order with the producer grid."""
+    num_tokens, block = 8192, 256
+    x = _inputs(num_tokens, 3, seed=11)
+    attn = x["addend"] if add else x["prefix"]
+    ref = _default_call(x, attn, add)
+    _fgs_call(x, attn, add, make_fgs_counters(), fgs_max_spins=4)
+    buf = torch.empty_like(attn)
+    buf.view(torch.int16).fill_(-32768)
+    counters = make_fgs_counters()
+    order = torch.arange(num_tokens // block, dtype=torch.int32, device="cuda")
+    _publisher(block)(attn, buf, order, 50_000)
+    got = _fgs_call(x, buf, add, counters, fgs_max_spins=4)
+    torch.cuda.synchronize()
+    for a, b in zip(_as_tuple(got), _as_tuple(ref)):
+        assert torch.equal(a, b)
+    assert counters[2].item() > 0, counters.tolist()
+
+
 @pytest.mark.parametrize("mode", ["graph", "eager"])
 @pytest.mark.parametrize("num_tokens", [64, 1024], ids=["reg", "pipe"])
 @torch.no_grad()
