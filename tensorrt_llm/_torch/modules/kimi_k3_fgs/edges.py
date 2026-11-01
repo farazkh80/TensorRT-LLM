@@ -36,7 +36,7 @@ after the last release. Outside a scope, or for a batch outside the row window,
 import os
 import threading
 from contextlib import contextmanager
-from typing import Dict, Iterator, Optional, Set, Tuple
+from typing import Dict, Iterable, Iterator, Optional, Set, Tuple
 
 import torch
 
@@ -113,8 +113,12 @@ def _state():
 
 
 @contextmanager
-def model_scope() -> Iterator[None]:
-    """Bracket one model forward; a no-op unless ``lamport`` and an edge was declared."""
+def model_scope(layers: Optional[Iterable[int]] = None) -> Iterator[None]:
+    """Bracket one model forward; a no-op unless ``lamport`` and an edge was declared.
+
+    ``layers`` are the layer indices the forward runs (default: every declaring layer); an edge is registered only
+    for the declaring layers among them.
+    """
     if not slots() or not _declared:
         yield
         return
@@ -122,14 +126,16 @@ def model_scope() -> Iterator[None]:
     if workspaces.in_scope:
         yield
         return
-    missing = [name for name in _declared if name not in workspaces]
+    run = None if layers is None else set(layers)
+    users = {name: declared if run is None else declared & run for name, (_, declared) in _declared.items()}
+    missing = [name for name in _declared if users[name] and name not in workspaces]
     if missing and not torch.cuda.is_current_stream_capturing():
         from ..fine_grained_sync import ResetPolicy
 
         per_step = workspaces.reset_policy is ResetPolicy.STEP
         for name in missing:
-            width, layers = _declared[name]
-            num_slots = len(layers) if per_step else 2
+            width = _declared[name][0]
+            num_slots = len(users[name]) if per_step else 2
             workspaces.workspace(name, (_rows.get(name, MAX_ROWS), width), torch.bfloat16, slots=num_slots)
         logger.info(f"{ENV}=lamport: edge slots {workspaces.ledger()}")
     elif missing:
