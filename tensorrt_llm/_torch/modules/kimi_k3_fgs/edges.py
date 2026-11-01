@@ -16,6 +16,11 @@ same way: an input slot selects the report_valid consumer build of the GEMM, an
 output slot its producer build (.pzo, trigger at entry). A slot acquired with
 ``readers=n`` is released by the n-th consuming launch.
 
+``chain`` keeps the ``lamport`` edges and runs the whole decode KDA layer as one
+PDL chain of slot edges (``kda_chain``): pre-attention mix -> x_norm -> [f_a | b]
+and qkvg GEMMs -> f_b GEMM -> KdaDecodeT1 -> o_proj -> pre-MoE mix. The MoE input
+stays a plain buffer. ``chain_after`` launches [f_a | b] and f_b behind qkvg instead of ahead of it.
+
 Modules ``declare`` their edges at construction, once per layer. The model
 forward runs under ``model_scope``, which registers the declared edges on first
 use (outside a CUDA graph capture) and brackets the whole forward with one
@@ -37,7 +42,7 @@ import torch
 from ....logger import logger
 
 ENV = "TLLM_K3_FGS"
-MODES = ("off", "early", "lamport")
+MODES = ("off", "early", "lamport", "chain", "chain_after")
 # Below 16 rows the report_valid consumer is slower than the early-trigger path with a waiting consumer.
 MIN_ROWS = int(os.environ.get("TLLM_K3_FGS_MIN_ROWS", "16"))
 # Above 16 rows the consumer runs 32-row split-K tiles, slower than the table's GEMM at 64 rows.
@@ -55,6 +60,15 @@ def mode() -> str:
     return value
 
 
+def slots() -> bool:
+    """Whether producers get edge slots (``lamport``, and the ``chain`` modes, which add the decode KDA chain edges)."""
+    return mode() in ("lamport", "chain", "chain_after")
+
+
+def chain() -> bool:
+    return mode() in ("chain", "chain_after")
+
+
 def producer_early() -> bool:
     """Whether o_proj-input producers use their fine-grained-sync producer build."""
     return mode() != "off"
@@ -65,7 +79,7 @@ def declare(name: str, width: int, layer_idx: int) -> None:
 
     Registered by the next ``model_scope`` outside capture.
     """
-    if mode() == "lamport":
+    if slots():
         _declared.setdefault(name, (width, set()))[1].add(layer_idx)
 
 
@@ -82,7 +96,7 @@ def _state():
 @contextmanager
 def model_scope() -> Iterator[None]:
     """Bracket one model forward; a no-op unless ``lamport`` and an edge was declared."""
-    if mode() != "lamport" or not _declared:
+    if not slots() or not _declared:
         yield
         return
     workspaces, _ = _state()
@@ -117,10 +131,10 @@ def model_scope() -> Iterator[None]:
 def acquire(name: str, rows: int, readers: int = 1):
     """The next armed slot of ``name`` truncated to ``rows``, or None to keep the producer's own buffer.
 
-    The slot is released after ``readers`` launches of ``kimi_k3_cute_gemm`` consumed it. Only that module consumes
-    and releases slots, so none is handed out while it is off.
+    The slot is released after ``readers`` consuming launches (``consumed``). Slots are handed out only while
+    ``kimi_k3_cute_gemm`` is on, which consumes every GEMM input slot.
     """
-    if mode() != "lamport" or not MIN_ROWS <= rows <= MAX_ROWS or not hasattr(_local, "workspaces"):
+    if not slots() or not MIN_ROWS <= rows <= MAX_ROWS or not hasattr(_local, "workspaces"):
         return None
     from .. import kimi_k3_cute_gemm
 
