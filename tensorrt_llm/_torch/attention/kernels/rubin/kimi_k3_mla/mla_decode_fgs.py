@@ -32,14 +32,20 @@ the base kernels unchanged. Fixed-Q decode only (no ``is_var_q``, no softmax sta
     loads only after consuming the stage. Rows past ``K`` in the same page are never checked (they may hold
     anything, including -0.0). Both CTAs of a cluster poll, since each loads part of the tile.
 
-``fgs_producer`` (split-KV kernel, edges -> reduction and, for rows planned onto one split, -> W_UV):
-triggers dependents on entry; fp32 partial O / LSE are canonicalized (-0.0 -> +0.0); the bf16 output of
-single-split rows is converted with ``cvt.rn.pzo`` and stored as 16-B chunks.
+``fgs_producer`` (split-KV kernel, edges -> reduction and, for rows planned onto one split, -> W_UV): triggers
+dependents on entry; the bf16 output of single-split rows is converted with ``cvt.rn.pzo`` and stored as 16-B
+chunks. How fp32 partials are published depends on ``fgs_partials``:
+  * "lse" (default): the partial LSE of each (row, split) is the flag. The split kernel stores partial O, every
+    correction thread runs ``fence.acq_rel.gpu``, the CTA's correction warps meet at a named barrier, then the
+    canonical LSE is stored with ``st.relaxed.gpu``. Only the LSE entries need the sentinel.
+  * "all": partial O and LSE are canonicalized and every element is a flag (the whole read set needs the sentinel).
 
-``fgs_reduction`` (reduction kernel, both sides): PDL launch without ``griddepcontrol.wait``, trigger on entry;
-every partial LSE and partial O element is checked against the fp32 sentinel with a warp-uniform wait; each thread
-reduces 4 consecutive D elements (same per-element summation order as the base kernel) and even lanes store 16-B
-chunks of 8 bf16 (``cvt.rn.pzo``), because the W_UV TMA ``report_valid`` load checks only element 0 of a chunk.
+``fgs_reduction`` (reduction kernel, both sides): PDL launch without ``griddepcontrol.wait``, trigger on entry.
+Warp 0 waits (warp-uniform) until no partial LSE it reads is the fp32 sentinel; in "lse" mode the loads are
+``ld.relaxed.gpu`` followed by ``fence.acq_rel.gpu`` (acquire pattern) before the CTA barrier that precedes the O
+loads, which are ``ld.global.cg``; in "all" mode every O element is checked as well. Each thread reduces 4
+consecutive D elements (same per-element summation order as the base kernel) and even lanes store 16-B chunks of
+8 bf16 (``cvt.rn.pzo``), because the W_UV TMA ``report_valid`` load checks only element 0 of a chunk.
 
 ``pdl_early``: kernels without their FGS consumer flag are launched with PDL, trigger on entry and wait on entry.
 
@@ -47,8 +53,10 @@ Framework contract (sentinel = -0.0; bf16 0x8000, fp32 0x80000000):
   * fused_q (all 576 columns of the step's rows) holds the sentinel before W_UK / latent append write it.
   * The current cache rows of every MLA layer hold the sentinel before the latent append writes them
     (``fill_current_rows_sentinel``).
-  * The partial region read by the reduction (rows < H, splits < the request's split count, D + LSE) holds the
-    sentinel before the split kernel writes it (``fill_partials_sentinel``); bytes: ``partial_read_set_bytes``.
+  * "lse": the partial LSE entries read by the reduction (rows < H, splits < the request's split count) hold the
+    sentinel before the split kernel writes them (``fill_lse_sentinel``; bytes ``lse_flag_bytes``). The partial O
+    region is never reset. "all": the whole read set, O and LSE (``fill_partials_sentinel``;
+    ``partial_read_set_bytes``).
   * The attention output (W_UV input) holds the sentinel before the split kernel / reduction write it.
   * No producer of these buffers emits -0.0.
 """
@@ -130,6 +138,7 @@ _MSG_REISSUE = 1
 _MSG_BYTES = 16
 _EXTRA_SMEM = 128
 _RED_UNROLL = 4
+_FILL_LSE_THREADS = 256
 
 
 @cute.struct
@@ -179,6 +188,20 @@ def _st_global_b32(addr, w, *, loc=None, ip=None):
         [cutlass.Int64(addr).ir_value(loc=loc, ip=ip), cutlass.Int32(w).ir_value(loc=loc, ip=ip)],
         "st.global.b32 [$0], $1;",
         "l,r,~{memory}",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _st_relaxed_f32(addr, x, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [cutlass.Int64(addr).ir_value(loc=loc, ip=ip), cutlass.Float32(x).ir_value(loc=loc, ip=ip)],
+        "st.relaxed.gpu.global.f32 [$0], $1;",
+        "l,f,~{memory}",
         has_side_effects=True,
         asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc,
@@ -263,6 +286,7 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         fgs_consumer: bool = False,
         fgs_producer: bool = False,
         fgs_reduction: bool = False,
+        fgs_partials: str = "lse",
         pdl_early: bool = False,
         fgs_stats: bool = False,
         spin_limit: int = 0,
@@ -273,6 +297,7 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         self.fgs_consumer = fgs_consumer
         self.fgs_producer = fgs_producer
         self.fgs_reduction = fgs_reduction
+        self.fgs_partials = fgs_partials
         self.pdl_early = pdl_early
         self.fgs_stats = fgs_stats
         self.spin_limit = spin_limit
@@ -284,6 +309,8 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
                 raise ValueError("FGS MLA decode supports fixed-Q decode without softmax stats only")
             if self.is_persistent and fgs_consumer:
                 raise ValueError("FGS MLA decode consumer supports the non-persistent grid only")
+        if fgs_partials not in ("lse", "all"):
+            raise ValueError(f"fgs_partials must be 'lse' or 'all', got {fgs_partials!r}")
         if fgs_consumer and getattr(pipeline, "PipelineTmaUmmaRetry", None) is None:
             raise ValueError("fgs_consumer needs a CuTe DSL with TMA report_valid (PipelineTmaUmmaRetry)")
         if fgs_reduction and "split" in self.fgs_launch and not fgs_producer:
@@ -382,6 +409,11 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         directly by the split kernel and read nothing.
         """
         return sum(num_heads * s * (LATENT_DIM + 1) * 4 for s in splits_per_request if s > 1)
+
+    @staticmethod
+    def lse_flag_bytes(num_heads: int, splits_per_request) -> int:
+        """Bytes ``fill_lse_sentinel`` writes (the partial LSE entries the reduction reads)."""
+        return sum(num_heads * s * 4 for s in splits_per_request if s > 1)
 
     @cute.kernel
     def _fgs_split_kv_kernel(
@@ -1137,6 +1169,18 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         return load_q_producer_state, load_kv_producer_state, load_pt_consumer_state
 
     @cute.jit
+    def _fgs_lse_tile(self, common_params: SimpleNamespace, epilogue_params: SimpleNamespace):
+        """(gLSE, cLSE): this CTA's 64-row LSE tile (final or partial) and its coordinates, as in ``epilogue``."""
+        cta_rows = self.mma_pv_tiler[0] // self.cluster_shape_mnk[0]
+        coord = (common_params.blk_coord[0], common_params.blk_coord[1], common_params.blk_coord[2])
+        mLSE = epilogue_params.mLSE
+        if cutlass.const_expr(epilogue_params.mAccLSE is not None):
+            mLSE = epilogue_params.mAccLSE[None, common_params.blk_coord[3], None, None]
+        gLSE = cute.local_tile(mLSE, (cta_rows, 1, 1), coord, (1, 1, 1))
+        cLSE = cute.local_tile(cute.make_identity_tensor(mLSE.shape), (cta_rows, 1, 1), coord, (1, 1, 1))
+        return gLSE, cLSE
+
+    @cute.jit
     def _fgs_epilogue(
         self,
         common_params: SimpleNamespace,
@@ -1145,15 +1189,21 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         row_sum: cutlass.Float32,
         row_max: cutlass.Float32,
     ) -> pipeline.PipelineState:
-        # ``epilogue`` (fixed Q, no softmax stats) with partial O / LSE canonicalized and the bf16 output converted
-        # with cvt.rn.pzo; the bf16 path stores whole 16-B chunks (st.global.v4).
+        # ``epilogue`` (fixed Q, no softmax stats). bf16 output: cvt.rn.pzo, whole 16-B chunks. Partials:
+        #   "all": O and LSE canonicalized (the reduction checks every element);
+        #   "lse": plain O stores; every correction thread fences its O stores (fence.acq_rel.gpu), the 128 threads
+        #   meet at a named barrier, then thread r < 64 publishes the canonical LSE of tile row r with st.relaxed.gpu.
+        #   A reduction that acquires a non-sentinel LSE therefore sees all of this CTA's partial O.
         tidx = common_params.tidx % (self.num_compute_warps * self.threads_per_warp)
+        lse_flag = common_params.mAccO is not None and self.fgs_partials == "lse"
         if cutlass.const_expr(self.warps_in_n == 2):
             common_params.smem_exchange[tidx] = row_sum
-            self.epilogue_exchange_sync_bar.wait()
+            self.epilogue_exchange_sync_bar.arrive_and_wait()
             row_sum = row_sum + common_params.smem_exchange[
                 (tidx + 64) % (self.num_compute_warps * self.threads_per_warp)]
         common_params.mma_o_pipeline.consumer_wait(mma_o_consumer_state)
+        lse = cute.math.log2(row_sum, fastmath=True) + epilogue_params.softmax_scale_log2 * row_max
+        gLSE, cLSE = self._fgs_lse_tile(common_params, epilogue_params)
         for iter_n in cutlass.range_constexpr(self.iterations_pv_n):
             tmem_load_tiled_copy, tAcc, tTR_tAcc, tTR_gO, tTR_cO, tTR_rAcc = self._tmem_load_partition(
                 common_params, common_params.tiled_mma_pv, iter_n)
@@ -1165,8 +1215,9 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
                 tR2G_rO_src = cute.make_fragment_like(tTR_gO, self.o_dtype)
                 tR2G_rO_src.store(tTR_rAcc.load().to(self.o_dtype, pzo=True))
             else:
-                for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
-                    tTR_rAcc[i] = canon_f32(tTR_rAcc[i])
+                if cutlass.const_expr(not lse_flag):
+                    for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
+                        tTR_rAcc[i] = canon_f32(tTR_rAcc[i])
                 tR2G_rO_src = tTR_rAcc
             if cute.elem_less(tTR_cO[0][0], common_params.H):
                 cute.autovec_copy(
@@ -1174,44 +1225,15 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
                     tTR_gO,
                     l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
                 )
-            cta_pv_tiler = (
-                self.mma_pv_tiler[0] // self.cluster_shape_mnk[0],
-                self.mma_pv_tiler[1],
-                self.mma_pv_tiler[2],
-            )
-            gLSE = None
-            cLSE = None
-            if cutlass.const_expr(epilogue_params.mAccLSE is None):
-                gLSE = cute.local_tile(
-                    epilogue_params.mLSE,
-                    (cta_pv_tiler[0], 1, 1),
-                    (common_params.blk_coord[0], common_params.blk_coord[1], common_params.blk_coord[2]),
-                    (1, 1, 1),
-                )
-                cLSE = cute.local_tile(
-                    cute.make_identity_tensor(epilogue_params.mLSE.shape),
-                    (cta_pv_tiler[0], 1, 1),
-                    (common_params.blk_coord[0], common_params.blk_coord[1], common_params.blk_coord[2]),
-                    (1, 1, 1),
-                )
-            else:
-                gLSE = cute.local_tile(
-                    epilogue_params.mAccLSE[None, common_params.blk_coord[3], None, None],
-                    (cta_pv_tiler[0], 1, 1),
-                    (common_params.blk_coord[0], common_params.blk_coord[1], common_params.blk_coord[2]),
-                    (1, 1, 1),
-                )
-                cLSE = cute.local_tile(
-                    cute.make_identity_tensor(
-                        epilogue_params.mAccLSE[None, common_params.blk_coord[3], None, None].shape),
-                    (cta_pv_tiler[0], 1, 1),
-                    (common_params.blk_coord[0], common_params.blk_coord[1], common_params.blk_coord[2]),
-                    (1, 1, 1),
-                )
-            lse = cute.math.log2(row_sum, fastmath=True) + epilogue_params.softmax_scale_log2 * row_max
-            if cutlass.const_expr(self.warps_in_n == 2):
+            if cutlass.const_expr(not lse_flag and self.warps_in_n == 2):
                 if cute.elem_less(cLSE[tidx][0], common_params.H):
                     gLSE[tidx] = canon_f32(lse)
+        if cutlass.const_expr(lse_flag):
+            cute.arch.fence_acq_rel_gpu()
+            self.epilogue_exchange_sync_bar.arrive_and_wait()
+            if tidx < cute.size(gLSE):
+                if cute.elem_less(cLSE[tidx][0], common_params.H):
+                    _st_relaxed_f32((gLSE.iterator + cute.crd2idx(tidx, gLSE.layout)).toint(), canon_f32(lse))
         cute.arch.fence_view_async_tmem_load()
         common_params.mma_o_pipeline.consumer_release(mma_o_consumer_state)
         mma_o_consumer_state.advance()
@@ -1234,7 +1256,9 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         cute.arch.griddepcontrol_launch_dependents()
         if cutlass.const_expr(not self.fgs_reduction):
             cute.arch.griddepcontrol_wait()
-        check = self.fgs_reduction
+        check_lse = self.fgs_reduction
+        check_o = self.fgs_reduction and self.fgs_partials == "all"
+        lse_flag = self.fgs_reduction and self.fgs_partials == "lse"
         with_stats = self.fgs_stats and self.fgs_reduction
 
         bidx, bidy, bidz = cute.arch.block_idx()
@@ -1274,13 +1298,20 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
                     addrs[i] = (gLSE.iterator + cute.crd2idx(split_kv_idx, gLSE.layout)).toint()
                     bits[i] = cutlass.Int32(0)
                     if split_kv_idx < local_split_kv:
-                        bits[i] = _ld_cg_b32(addrs[i])
-                if cutlass.const_expr(check):
+                        if cutlass.const_expr(lse_flag):
+                            bits[i] = _ld_relaxed_b32(addrs[i])
+                        else:
+                            bits[i] = _ld_cg_b32(addrs[i])
+                if cutlass.const_expr(check_lse):
                     if cutlass.const_expr(with_stats):
                         lse_stats = cute.make_tensor(mStats.iterator + _STATS_RED_LSE, cute.make_layout(4))
                         _poll_words(bits, addrs, lse_per_thread, self.spin_limit, lse_stats, True)
                     else:
                         _poll_words(bits, addrs, lse_per_thread, self.spin_limit, bits, False)
+                if cutlass.const_expr(lse_flag):
+                    # Acquire pattern (relaxed loads that saw every published LSE, then a fence): the producer's
+                    # partial O stores are visible to this CTA's O loads after the barrier below.
+                    cute.arch.fence_acq_rel_gpu()
                 lse_max = -self.lse_dtype.inf
                 for i in cutlass.range_constexpr(lse_per_thread):
                     split_kv_idx = tidx + i * self.threads_per_warp
@@ -1322,7 +1353,7 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
                         split_idx = g
                     chunk_addr[u] = (gAccO.iterator + cute.crd2idx((split_idx, e0), gAccO.layout)).toint()
                 load_chunks(words, chunk_addr, _RED_UNROLL, active)
-                if cutlass.const_expr(check):
+                if cutlass.const_expr(check_o):
                     if cutlass.const_expr(with_stats):
                         o_stats = cute.make_tensor(mStats.iterator + _STATS_RED_O, cute.make_layout(4))
                         poll_chunks(words, chunk_addr, _RED_UNROLL, True, self.spin_limit, o_stats, True)
@@ -1368,24 +1399,23 @@ def _fill_partials_kernel(
     # Workspace layout of ``initialize_workspace`` (acc_o then acc_lse, fp32): acc_o[row, split, d, s, b] at
     # ((((b * S + s) * rows + row) * split_kv + split) * D + d), acc_lse[row, split, s, b] after all of acc_o.
     tidx, _, _ = cute.arch.thread_idx()
-    h, split, bs = cute.arch.block_idx()
+    h, bs, _ = cute.arch.block_idx()
     b = bs // seq_q_tiles
-    s = bs - b * seq_q_tiles
     local = split_kv
     if cutlass.const_expr(block_split_kvs is not None):
         local = cutlass.max(cutlass.min(block_split_kvs[b], split_kv), 1)
     k_tiles = (cache_seqs[b] + kv_tile - 1) // kv_tile
     per_cta = cutlass.max((k_tiles + local - 1) // local, 1)
     local = (k_tiles + per_cta - 1) // per_cta
-    read = split < local
     if cutlass.const_expr(block_split_kvs is not None):
-        read = read & (local != 1)
-    if read:
-        row = cutlass.Int64((b * seq_q_tiles + s) * rows + h) * cutlass.Int64(split_kv) + cutlass.Int64(split)
-        o_addr = ws_base + (row * LATENT_DIM + cutlass.Int64(tidx) * 4) * 4
-        st_global_v4(o_addr, F32_SENTINEL, F32_SENTINEL, F32_SENTINEL, F32_SENTINEL)
+        if local == 1:
+            local = cutlass.Int32(0)
+    lse_off = cutlass.Int64(batch) * cutlass.Int64(seq_q_tiles * rows) * cutlass.Int64(split_kv) * LATENT_DIM
+    for split in cutlass.range(local):
+        row = cutlass.Int64(bs * rows + h) * cutlass.Int64(split_kv) + cutlass.Int64(split)
+        st_global_v4(ws_base + (row * LATENT_DIM + cutlass.Int64(tidx) * 4) * 4,
+                     F32_SENTINEL, F32_SENTINEL, F32_SENTINEL, F32_SENTINEL)
         if tidx == 0:
-            lse_off = cutlass.Int64(batch) * cutlass.Int64(seq_q_tiles * rows) * cutlass.Int64(split_kv) * LATENT_DIM
             _st_global_b32(ws_base + (lse_off + row) * 4, F32_SENTINEL)
 
 
@@ -1403,7 +1433,60 @@ def _fill_partials_host(
     rows: cutlass.Constexpr,
 ):
     _fill_partials_kernel(ws_base, cache_seqs, block_split_kvs, split_kv, kv_tile, rows, seq_q_tiles, batch).launch(
-        grid=(heads, split_kv, batch * seq_q_tiles), block=(LATENT_DIM // 4, 1, 1), stream=stream)
+        grid=(heads, batch * seq_q_tiles, 1), block=(LATENT_DIM // 4, 1, 1), stream=stream)
+
+
+@cute.kernel
+def _fill_lse_kernel(
+    ws_base: cutlass.Int64,
+    cache_seqs: cute.Tensor,
+    block_split_kvs: Optional[cute.Tensor],
+    split_kv: cutlass.Int32,
+    heads: cutlass.Int32,
+    kv_tile: cutlass.Constexpr,
+    rows: cutlass.Constexpr,
+    seq_q_tiles: cutlass.Int32,
+    batch: cutlass.Int32,
+):
+    # acc_lse[row, split, s, b] (fp32) follows acc_o in the workspace; see ``_fill_partials_kernel``.
+    tidx, _, _ = cute.arch.thread_idx()
+    bs, _, _ = cute.arch.block_idx()
+    b = bs // seq_q_tiles
+    local = split_kv
+    if cutlass.const_expr(block_split_kvs is not None):
+        local = cutlass.max(cutlass.min(block_split_kvs[b], split_kv), 1)
+    k_tiles = (cache_seqs[b] + kv_tile - 1) // kv_tile
+    per_cta = cutlass.max((k_tiles + local - 1) // local, 1)
+    local = (k_tiles + per_cta - 1) // per_cta
+    read = local > 0
+    if cutlass.const_expr(block_split_kvs is not None):
+        read = read & (local != 1)
+    if read:
+        lse_base = ws_base + (cutlass.Int64(batch) * cutlass.Int64(seq_q_tiles * rows) * cutlass.Int64(split_kv)
+                              * LATENT_DIM) * 4
+        tile_base = cutlass.Int64(bs) * cutlass.Int64(rows) * cutlass.Int64(split_kv)
+        for idx in cutlass.range(tidx, heads * local, _FILL_LSE_THREADS):
+            row = idx // local
+            split = idx - row * local
+            _st_global_b32(lse_base + (tile_base + cutlass.Int64(row) * cutlass.Int64(split_kv)
+                                       + cutlass.Int64(split)) * 4, F32_SENTINEL)
+
+
+@cute.jit
+def _fill_lse_host(
+    ws_base: cutlass.Int64,
+    cache_seqs: cute.Tensor,
+    block_split_kvs: Optional[cute.Tensor],
+    split_kv: cutlass.Int32,
+    heads: cutlass.Int32,
+    seq_q_tiles: cutlass.Int32,
+    batch: cutlass.Int32,
+    stream: cuda.CUstream,
+    kv_tile: cutlass.Constexpr,
+    rows: cutlass.Constexpr,
+):
+    _fill_lse_kernel(ws_base, cache_seqs, block_split_kvs, split_kv, heads, kv_tile, rows, seq_q_tiles,
+                     batch).launch(grid=(batch * seq_q_tiles, 1, 1), block=(_FILL_LSE_THREADS, 1, 1), stream=stream)
 
 
 @cute.kernel
@@ -1459,7 +1542,8 @@ def _from_torch(t, leading_dim=0, align=4):
 
 def fill_partials_sentinel(split_workspace, num_heads: int, seq_q_tiles: int, cache_seqs, split_kv: int,
                            block_split_kvs=None, kv_tile: int = 128, rows: int = 128):
-    """Sentinel-fill the split-KV partials the reduction will read (one launch, graph-capturable).
+    """Sentinel-fill the split-KV partials (O and LSE) the reduction reads (``fgs_partials="all"``; one launch,
+    one CTA per row and request, graph-capturable).
 
     ``split_workspace`` is the split region the decode kernel receives as ``workspace`` (its acc_o / acc_lse);
     ``cache_seqs`` / ``block_split_kvs`` are the step's KV lengths and split plan, as passed to the decode.
@@ -1479,6 +1563,29 @@ def fill_partials_sentinel(split_workspace, num_heads: int, seq_q_tiles: int, ca
     fn = _FILL_CACHE.get(key)
     if fn is None:
         fn = cute.compile(_fill_partials_host, *args, kv_tile, rows)
+        _FILL_CACHE[key] = fn
+    fn(*args)
+
+
+def fill_lse_sentinel(split_workspace, num_heads: int, seq_q_tiles: int, cache_seqs, split_kv: int,
+                      block_split_kvs=None, kv_tile: int = 128, rows: int = 128):
+    """Sentinel-fill only the partial LSE entries the reduction will read (``fgs_partials="lse"``; one launch,
+    one CTA per request and q tile, graph-capturable). Same arguments as ``fill_partials_sentinel``."""
+    batch = int(cache_seqs.shape[0])
+    key = ("lse", block_split_kvs is None, kv_tile, rows)
+    args = [
+        cutlass.Int64(split_workspace.data_ptr()),
+        _from_torch(cache_seqs),
+        None if block_split_kvs is None else _from_torch(block_split_kvs),
+        cutlass.Int32(split_kv),
+        cutlass.Int32(num_heads),
+        cutlass.Int32(seq_q_tiles),
+        cutlass.Int32(batch),
+        _current_stream(),
+    ]
+    fn = _FILL_CACHE.get(key)
+    if fn is None:
+        fn = cute.compile(_fill_lse_host, *args, kv_tile, rows)
         _FILL_CACHE[key] = fn
     fn(*args)
 
