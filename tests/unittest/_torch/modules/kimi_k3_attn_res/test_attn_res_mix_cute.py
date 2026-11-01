@@ -21,6 +21,15 @@ from tensorrt_llm._torch.modules.kimi_k3_attn_res.attn_res_mix_cute import (
 )
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
+try:
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass import Int32, Int64
+    from cutlass._mlir.dialects import llvm
+    from cutlass.cutlass_dsl import T, dsl_user_op
+except ImportError:
+    cutlass = None
+
 HIDDEN_SIZE = 7168
 EPS = 1e-5
 # Dispatch boundaries (16/17, 64/65), pipe grids below one CTA per SM (65..211) and mixed-step token counts.
@@ -238,15 +247,73 @@ def _as_tuple(result):
     return result if isinstance(result, tuple) else (result,)
 
 
+if cutlass is not None:
+
+    @dsl_user_op
+    def _globaltimer(*, loc=None, ip=None):
+        return Int64(
+            llvm.inline_asm(
+                T.i64(),
+                [],
+                "mov.u64 $0, %globaltimer;",
+                "=l",
+                has_side_effects=True,
+                is_align_stack=False,
+                asm_dialect=llvm.AsmDialect.AD_ATT,
+                loc=loc,
+                ip=ip,
+            )
+        )
+
+    class _LatePublisher:
+        """Stand-in FGS producer: CTA j copies block ``order[j]`` of ``src`` to ``dst`` (j + 1) * ``delay_ns`` after it
+        starts, in whole 16-B chunks. It triggers its dependents at entry, so a consumer launched after it with PDL
+        starts only once every publishing CTA is resident."""
+
+        def __init__(self, block_rows: int):
+            self.block_rows = block_rows
+
+        @cute.jit
+        def __call__(
+            self, src: cute.Tensor, dst: cute.Tensor, order: cute.Tensor, delay_ns: Int32, stream
+        ):
+            vec = (1, 8)
+            self.kernel(
+                cute.zipped_divide(src, vec), cute.zipped_divide(dst, vec), order, delay_ns
+            ).launch(grid=[cute.size(order, mode=[0]), 1, 1], block=[256, 1, 1], stream=stream)
+
+        @cute.kernel
+        def kernel(self, gS: cute.Tensor, gD: cute.Tensor, order: cute.Tensor, delay_ns: Int32):
+            cute.arch.griddepcontrol_launch_dependents()
+            tidx, _, _ = cute.arch.thread_idx()
+            j, _, _ = cute.arch.block_idx()
+            due = _globaltimer() + Int64(delay_ns) * Int64(j + 1)
+            now = _globaltimer()
+            while now < due:
+                now = _globaltimer()
+            cols = HIDDEN_SIZE // 8
+            first = order[j] * self.block_rows
+            for i in cutlass.range(tidx, self.block_rows * cols, 256, unroll=1):
+                gD[(None, (first + i // cols, i % cols))].store(
+                    gS[(None, (first + i // cols, i % cols))].load()
+                )
+
+
 @functools.lru_cache(maxsize=None)
-def _sleep_cycles_per_us() -> float:
-    torch.cuda._sleep(1_000_000)
-    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    start.record()
-    torch.cuda._sleep(10_000_000)
-    end.record()
-    end.synchronize()
-    return 10_000_000 / (start.elapsed_time(end) * 1e3)
+def _publisher(block_rows: int):
+    act = cute.runtime.make_fake_compact_tensor(
+        cutlass.BFloat16, (cute.sym_int(), HIDDEN_SIZE), stride_order=(1, 0), assumed_align=16
+    )
+    order = cute.runtime.make_fake_compact_tensor(Int32, (cute.sym_int(),))
+    return cute.compile(
+        _LatePublisher(block_rows),
+        act,
+        act,
+        order,
+        Int32(1),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
 
 
 @pytest.mark.parametrize("add", [True, False], ids=["add_norm", "snapshot_norm"])
@@ -270,7 +337,11 @@ def test_fgs_consumer_ready_input_matches_default(num_tokens, num_candidates, ad
 @pytest.mark.parametrize("num_tokens,block", [(64, 8), (1024, 128)], ids=["reg", "pipe"])
 @torch.no_grad()
 def test_fgs_consumer_late_rows_match_default(num_tokens: int, block: int, add: bool, order: str):
-    """The attention output starts as -0.0 sentinels and is published block by block from another stream."""
+    """The attention output starts as -0.0 and a stand-in producer publishes it block by block.
+
+    Whether the consumer reaches a row before it lands depends on scheduling, so only the result is checked;
+    test_fgs_consumer_falls_back_to_grid_wait covers re-reads deterministically.
+    """
     x = _inputs(num_tokens, 3, seed=4)
     attn = x["addend"] if add else x["prefix"]
     ref = _default_call(x, attn, add)
@@ -279,34 +350,35 @@ def test_fgs_consumer_late_rows_match_default(num_tokens: int, block: int, add: 
     if order == "reverse":
         blocks.reverse()
     elif order == "random":
-        blocks = [
-            blocks[i]
-            for i in torch.randperm(len(blocks), generator=torch.Generator().manual_seed(0))
-        ]
+        blocks = torch.randperm(len(blocks), generator=torch.Generator().manual_seed(0)).tolist()
     buf = torch.empty_like(attn)
     buf.view(torch.int16).fill_(-32768)
     counters = make_fgs_counters()
-    rate = _sleep_cycles_per_us()
+    publish = _publisher(block)
+    publish(attn, buf, torch.tensor(blocks, dtype=torch.int32, device="cuda"), 20_000)
+    got = _fgs_call(x, buf, add, counters)
     torch.cuda.synchronize()
-    # Hold both streams until everything is queued, so the consumer really starts before the rows land.
-    torch.cuda._sleep(int(2000 * rate))
-    ready = torch.cuda.Event()
-    ready.record()
-    producer, consumer = torch.cuda.Stream(), torch.cuda.Stream()
-    with torch.cuda.stream(producer):
-        producer.wait_event(ready)
-        for b in blocks:
-            torch.cuda._sleep(int(20 * rate))
-            buf[b * block : (b + 1) * block].copy_(attn[b * block : (b + 1) * block])
-    with torch.cuda.stream(consumer):
-        consumer.wait_event(ready)
-        got = _fgs_call(x, buf, add, counters)
+    for a, b in zip(_as_tuple(got), _as_tuple(ref)):
+        assert torch.equal(a, b)
+    assert counters[2].item() == 0, counters.tolist()
+
+
+@pytest.mark.parametrize("add", [True, False], ids=["add_norm", "snapshot_norm"])
+@pytest.mark.parametrize("num_tokens", [64, 1024], ids=["reg", "pipe"])
+@torch.no_grad()
+def test_fgs_consumer_falls_back_to_grid_wait(num_tokens: int, add: bool) -> None:
+    """Chunks that keep a -0.0 past the spin budget are re-read, then taken as final after the PDL wait."""
+    x = _inputs(num_tokens, 3, seed=9)
+    attn = x["addend"] if add else x["prefix"]
+    attn.view(torch.int16)[::5, ::8] = -32768
+    ref = _default_call(x, attn, add)
+    counters = make_fgs_counters()
+    got = _fgs_call(x, attn, add, counters, fgs_max_spins=4)
     torch.cuda.synchronize()
     for a, b in zip(_as_tuple(got), _as_tuple(ref)):
         assert torch.equal(a, b)
     waits, rounds, fallbacks, _ = counters.tolist()
-    assert waits > 0 and rounds >= waits, counters.tolist()
-    assert fallbacks == 0
+    assert waits > 0 and fallbacks == waits and rounds == 5 * waits, counters.tolist()
 
 
 @pytest.mark.parametrize("mode", ["graph", "eager"])
