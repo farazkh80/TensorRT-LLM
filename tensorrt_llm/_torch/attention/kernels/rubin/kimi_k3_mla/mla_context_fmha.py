@@ -17,6 +17,16 @@
 q, k: [T, H, 192]; v, o: [T, H, 128]; cu_seqlens: int32 [B + 1] on device, shared by q and kv (no cached
 prefix). The kernel is the Blackwell CuTe DSL FMHA in ``context_fmha`` (st.global epilogue) with SM107 tuning
 applied through ``tuning``.
+
+Fine-grained-sync (Lamport) builds, launched with PDL (see ``mla_fgs``):
+
+* ``fgs_consumer``: no ``griddepcontrol.wait``; Q, K and V are read with TMA ``report_valid`` against the bf16 -0.0
+  sentinel and re-loaded until valid (CuTe DSL >= 4.9). Producers of q / k / v must never write -0.0 as data and
+  must publish each 16-B chunk with one store whose first element lands last or together. ``cu_seqlens`` is read
+  without a wait, so it must be ready before the chain.
+* ``fgs_producer``: triggers its dependents at entry and stores O with -0.0 mapped to +0.0 (cvt.rn.pzo).
+* ``fgs_stats`` (int32 [4], zeroed by the caller): re-issued loads, CTAs that re-issued, of which Q, of which K.
+* ``fgs_retry_limit`` (diagnostic): a CTA traps after that many re-issues or sweeps without progress.
 """
 
 import functools
@@ -30,10 +40,10 @@ from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cute.typing import Float32, Int32
 
 try:
-    from .context_fmha.fmha import BlackwellFusedMultiHeadAttentionForward
+    from .context_fmha.fmha import FGS_STATS_LEN, BlackwellFusedMultiHeadAttentionForward
     from .context_fmha.helpers import fmha_helpers as fmha_utils
 except ImportError:
-    from context_fmha.fmha import BlackwellFusedMultiHeadAttentionForward
+    from context_fmha.fmha import FGS_STATS_LEN, BlackwellFusedMultiHeadAttentionForward
     from context_fmha.helpers import fmha_helpers as fmha_utils
 
 HEAD_DIM_QK = 192
@@ -53,7 +63,14 @@ DEFAULT_TUNING = (
 
 
 @functools.cache
-def _compile(num_heads: int, tuning: tuple):
+def _compile(
+    num_heads: int,
+    tuning: tuple,
+    fgs_consumer: bool = False,
+    fgs_producer: bool = False,
+    fgs_retry_limit: int = 0,
+    fgs_stats: bool = False,
+):
     is_persistent = dict(tuning).get("persistent", False)
     fmha = BlackwellFusedMultiHeadAttentionForward(
         qk_acc_dtype=cutlass.Float32,
@@ -66,6 +83,9 @@ def _compile(num_heads: int, tuning: tuple):
         enable_skip_correction=True,
         use_tma_store=False,
         tuning=dict(tuning),
+        fgs_consumer=fgs_consumer,
+        fgs_producer=fgs_producer,
+        fgs_retry_limit=fgs_retry_limit,
     )
     sym_s_q, sym_s_k, sym_seq = cute.sym_int(), cute.sym_int(), cute.sym_int()
     bf16 = cutlass.BFloat16
@@ -84,6 +104,10 @@ def _compile(num_heads: int, tuning: tuple):
     )
     cu_q = make_fake_compact_tensor(Int32, (sym_seq,), assumed_align=16)
     cu_k = make_fake_compact_tensor(Int32, (sym_seq,), assumed_align=16)
+    fgs = fgs_consumer or fgs_producer
+    extra = (
+        (make_fake_compact_tensor(Int32, (FGS_STATS_LEN,), assumed_align=16),) if fgs_stats else ()
+    )
     return cute.compile(
         fmha,
         q,
@@ -104,7 +128,8 @@ def _compile(num_heads: int, tuning: tuple):
         None,
         None,
         make_fake_stream(use_tvm_ffi_env_stream=True),
-        False,
+        fgs,
+        *extra,
         options="--enable-tvm-ffi --opt-level 2",
     )
 
@@ -131,15 +156,40 @@ def mla_context_fmha(
     max_seqlen: int,
     softmax_scale: float,
     tuning: Optional[dict] = None,
+    *,
+    fgs_consumer: bool = False,
+    fgs_producer: bool = False,
+    fgs_retry_limit: int = 0,
+    fgs_stats: Optional[torch.Tensor] = None,
 ) -> None:
     """Causal attention of every sequence in ``cu_seqlens`` onto itself; writes o in place."""
     if not supported(q, k, v, o):
         raise ValueError("mla_context_fmha needs contiguous bf16 q/k [T, H, 192], v/o [T, H, 128]")
     if cu_seqlens.dtype != torch.int32 or not cu_seqlens.is_contiguous():
         raise ValueError("cu_seqlens must be a contiguous int32 tensor")
+    if fgs_stats is not None and (
+        not fgs_consumer
+        or fgs_stats.dtype != torch.int32
+        or fgs_stats.shape != (FGS_STATS_LEN,)
+        or fgs_stats.device != q.device
+    ):
+        raise ValueError(
+            f"fgs_stats must be int32[{FGS_STATS_LEN}] on {q.device} with fgs_consumer"
+        )
+    fgs = fgs_consumer or fgs_producer
     total, num_heads, _ = q.shape
     key = tuple(sorted((tuning if tuning is not None else dict(DEFAULT_TUNING)).items()))
-    kernel = _compile(num_heads, key)
+    if fgs:
+        kernel = _compile(
+            num_heads,
+            key,
+            fgs_consumer=fgs_consumer,
+            fgs_producer=fgs_producer,
+            fgs_retry_limit=fgs_retry_limit,
+            fgs_stats=fgs_stats is not None,
+        )
+    else:
+        kernel = _compile(num_heads, key)
     q5 = q.view(1, total, num_heads, 1, HEAD_DIM_QK)
     k5 = k.view(1, total, num_heads, 1, HEAD_DIM_QK)
     v5 = v.view(1, total, num_heads, 1, HEAD_DIM_V)
@@ -172,5 +222,6 @@ def mla_context_fmha(
         Int32(0),
         None,
         None,
-        False,
+        fgs,
+        *((fgs_stats,) if fgs_stats is not None else ()),
     )
