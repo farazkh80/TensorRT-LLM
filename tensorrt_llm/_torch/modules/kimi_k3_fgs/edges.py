@@ -79,7 +79,8 @@ def chain() -> bool:
 def producer_early(rows: Optional[int] = None) -> bool:
     """Whether o_proj-input producers use their fine-grained-sync producer build.
 
-    In the chain modes only for ``rows`` inside the chain window: outside it a layer runs the Step 0 kernels.
+    In the chain modes only for ``rows`` inside the chain window: outside it a layer runs the stock kernels (no early
+    trigger).
     """
     value = mode()
     if value in ("chain", "chain_after") and rows is not None:
@@ -116,7 +117,7 @@ def _state():
 
 @contextmanager
 def model_scope(layers: Optional[Iterable[int]] = None) -> Iterator[None]:
-    """Bracket one model forward; a no-op unless ``lamport`` and an edge was declared.
+    """Bracket one model forward; a no-op unless the mode has slots and an edge was declared.
 
     ``layers`` are the layer indices the forward runs (default: every declaring layer); an edge is registered only
     for the declaring layers among them.
