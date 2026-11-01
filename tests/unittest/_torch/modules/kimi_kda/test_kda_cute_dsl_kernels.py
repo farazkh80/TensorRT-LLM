@@ -298,6 +298,81 @@ def test_decode_fgs_producer_matches_default(batch: int, inputs: str, producer: 
     assert torch.equal(conv, conv_ref)
 
 
+def _decode_fgs_run(t: _DecodeInputs, **kwargs):
+    rows = torch.full((t.batch, DIM + 64), -0.0, device="cuda", dtype=torch.bfloat16)
+    conv, state = t.conv.clone(), t.state.clone()
+    t.run_cute(conv, state, rows[:, :DIM].view(t.batch, H, D), **kwargs)
+    return rows.view(torch.int16), conv, state
+
+
+def _canonical_inputs(t: _DecodeInputs) -> None:
+    for buf in (t.qkvg, t.bfa, t.g):
+        bits = buf.view(torch.int16)
+        bits.copy_(torch.where(bits == _BF16_NEG_ZERO, 0, bits))
+
+
+@pytest.mark.parametrize("producer", [False, True], ids=["consumer", "consumer_producer"])
+@pytest.mark.parametrize("batch", [1, 4, 16, 33])
+@torch.no_grad()
+def test_decode_fgs_consumer_ready_input(batch: int, producer: bool) -> None:
+    """Inputs written before launch: the same bits as the default (or producer) build and no reload."""
+    t = _DecodeInputs(batch, seed=70 + batch)
+    _canonical_inputs(t)
+    ref, conv_ref, state_ref = _decode_fgs_run(t, fgs_producer=producer)
+    stats = torch.zeros(2, device="cuda", dtype=torch.int32)
+    out, conv, state = _decode_fgs_run(t, fgs_consumer=True, fgs_producer=producer, fgs_stats=stats)
+    assert torch.equal(out, ref)
+    assert torch.equal(state, state_ref)
+    assert torch.equal(conv, conv_ref)
+    assert stats.tolist() == [0, 0]
+
+
+@torch.no_grad()
+def test_decode_fgs_consumer_waits_for_late_inputs() -> None:
+    """qkvg, g and bfa start as -0.0 and another stream publishes them after a delay. One row
+    (96 CTAs) leaves SMs free for the writer; whether the consumer saw a sentinel depends on
+    scheduling, so only the result is checked."""
+    t = _DecodeInputs(1, seed=3)
+    _canonical_inputs(t)
+    ref, conv_ref, state_ref = _decode_fgs_run(t)
+    final = (t.qkvg.clone(), t.g.clone(), t.bfa.clone())
+    stats = torch.zeros(2, device="cuda", dtype=torch.int32)
+    _decode_fgs_run(t, fgs_consumer=True, fgs_stats=stats)
+    for buf in (t.qkvg, t.g, t.bfa):
+        buf.fill_(-0.0)
+    stats.zero_()
+    writer = torch.cuda.Stream()
+    writer.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(writer):
+        for buf, value in zip((t.g, t.bfa, t.qkvg), (final[1], final[2], final[0])):
+            torch.cuda._sleep(100_000)
+            buf.copy_(value)
+    out, conv, state = _decode_fgs_run(t, fgs_consumer=True, fgs_stats=stats)
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref)
+    assert torch.equal(state, state_ref)
+    assert torch.equal(conv, conv_ref)
+    assert stats[1].item() == 0
+
+
+@torch.no_grad()
+def test_decode_fgs_consumer_falls_back_to_grid_wait() -> None:
+    """Chunks that stay -0.0 past the spin budget are taken as final after griddepcontrol.wait."""
+    t = _DecodeInputs(4, seed=5)
+    _canonical_inputs(t)
+    t.qkvg.view(torch.int16)[0, 40] = _BF16_NEG_ZERO
+    t.qkvg.view(torch.int16)[3, 3 * DIM + 24] = _BF16_NEG_ZERO
+    t.g.view(torch.int16)[1, 136] = _BF16_NEG_ZERO
+    t.bfa.view(torch.int16)[2, 128] = _BF16_NEG_ZERO
+    ref, conv_ref, state_ref = _decode_fgs_run(t)
+    stats = torch.zeros(2, device="cuda", dtype=torch.int32)
+    out, conv, state = _decode_fgs_run(t, fgs_consumer=True, fgs_max_spins=4, fgs_stats=stats)
+    assert torch.equal(out, ref)
+    assert torch.equal(state, state_ref)
+    assert torch.equal(conv, conv_ref)
+    assert stats[1].item() > 0
+
+
 @pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("gate_layout", ["qkvg_slice", "contiguous"])
 @pytest.mark.parametrize("tokens", [1, 3, 64, 1000])
