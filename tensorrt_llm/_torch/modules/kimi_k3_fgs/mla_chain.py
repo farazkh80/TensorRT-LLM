@@ -56,7 +56,7 @@ _EDGES = (
 )
 
 MIN_ROWS = int(os.environ.get("TLLM_K3_FGS_MLA_MIN_ROWS", "1"))
-MAX_ROWS = int(os.environ.get("TLLM_K3_FGS_MLA_MAX_ROWS", "64"))
+MAX_ROWS = int(os.environ.get("TLLM_K3_FGS_MLA_MAX_ROWS", "32"))
 # Split-plan buffer capacity (requests); the stock planner serves up to 1024.
 _PLAN_CAPACITY = 1024
 
