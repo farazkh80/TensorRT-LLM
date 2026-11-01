@@ -46,8 +46,10 @@ ENV = "TLLM_K3_FGS"
 MODES = ("off", "early", "lamport", "chain", "chain_after")
 # Below 16 rows the report_valid consumer is slower than the early-trigger path with a waiting consumer.
 MIN_ROWS = int(os.environ.get("TLLM_K3_FGS_MIN_ROWS", "16"))
-# Above 16 rows the consumer runs 32-row split-K tiles, slower than the table's GEMM at 64 rows.
 MAX_ROWS = int(os.environ.get("TLLM_K3_FGS_MAX_ROWS", "16"))
+# Above 16 rows the o_proj consumer of a ``lamport`` edge (outside a chain) runs 32-row split-K tiles, slower than the
+# table's GEMM at 64 rows.
+LAMPORT_MAX_ROWS = int(os.environ.get("TLLM_K3_FGS_LAMPORT_MAX_ROWS", "16"))
 
 # Edge name -> (row width, layers that declared it).
 _declared: Dict[str, Tuple[int, Set[int]]] = {}
@@ -72,9 +74,20 @@ def chain() -> bool:
     return mode() in ("chain", "chain_after")
 
 
-def producer_early() -> bool:
-    """Whether o_proj-input producers use their fine-grained-sync producer build."""
-    return mode() != "off"
+def producer_early(rows: Optional[int] = None) -> bool:
+    """Whether o_proj-input producers use their fine-grained-sync producer build.
+
+    In the chain modes only for ``rows`` inside the chain window: outside it a layer runs the Step 0 kernels.
+    """
+    value = mode()
+    if value in ("chain", "chain_after") and rows is not None:
+        return MIN_ROWS <= rows <= MAX_ROWS
+    return value != "off"
+
+
+def lamport_window() -> Tuple[int, int]:
+    """Row window of the ``lamport`` o_proj-input edges used outside a chain."""
+    return MIN_ROWS, min(MAX_ROWS, LAMPORT_MAX_ROWS)
 
 
 def declare(name: str, width: int, layer_idx: int, max_rows: Optional[int] = None) -> None:
