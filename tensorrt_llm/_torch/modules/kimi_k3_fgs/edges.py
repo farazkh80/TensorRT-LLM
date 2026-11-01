@@ -137,7 +137,7 @@ def model_scope(layers: Optional[Iterable[int]] = None) -> Iterator[None]:
             width = _declared[name][0]
             num_slots = len(users[name]) if per_step else 2
             workspaces.workspace(name, (_rows.get(name, MAX_ROWS), width), torch.bfloat16, slots=num_slots)
-        logger.info(f"{ENV}=lamport: edge slots {workspaces.ledger()}")
+        logger.info(f"{ENV}={mode()}: edge slots {workspaces.ledger()}")
     elif missing:
         logger.warning_once(
             f"{ENV}=lamport: edges {missing} are first used inside a CUDA graph capture and"
