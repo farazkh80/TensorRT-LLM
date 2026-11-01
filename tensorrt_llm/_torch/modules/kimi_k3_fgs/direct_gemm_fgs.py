@@ -84,8 +84,6 @@ _COMPILE_OPTIONS = "--ptxas-options -maxrregcount=64"
 #: BF16 elements per 16 B output chunk.
 _CHUNK = 8
 _BF16_NEG_ZERO = 0x8000
-#: 0x80008000 as int32: the sentinel in both halves of a word.
-_NEG_ZERO_PAIR = -0x7FFF8000
 _SPIN_NS_MIN = 32
 _SPIN_NS_MAX = 2048
 
@@ -223,16 +221,40 @@ def _st_global_v4(addr, words, *, loc=None, ip=None):
     )
 
 
-def _has_sentinel(words, elements: bool):
-    """Whether a 16 B chunk (four int32) holds the bf16 -0.0 sentinel: in element 0, or with ``elements`` in any
-    element (per word, a 16-bit lane of ``w ^ 0x80008000`` is zero; carry-free zero-lane test)."""
-    if not elements:
-        return (words[0] & 0xFFFF) == _BF16_NEG_ZERO
-    lanes = Int32(0)
-    for w in words:
-        x = w ^ Int32(_NEG_ZERO_PAIR)
-        lanes = lanes | ((x - Int32(0x00010001)) & (x ^ Int32(-1)))
-    return (lanes & Int32(_NEG_ZERO_PAIR)) != 0
+@dsl_user_op
+def _min_s16x2(acc, words, *, loc=None, ip=None):
+    """Lane-wise signed 16-bit minimum of ``acc`` and the four words of a chunk."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(v).ir_value(loc=loc, ip=ip) for v in (acc, *words)],
+            "{ .reg .b32 t, u; min.s16x2 t, $1, $2; min.s16x2 u, $3, $4; min.s16x2 t, t, u; "
+            "min.s16x2 $0, t, $5; }",
+            "=r,r,r,r,r,r",
+            has_side_effects=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+def _has_sentinel(lanes_min):
+    """Whether a lane-wise s16 minimum holds the bf16 -0.0 sentinel: 0x8000 is the smallest s16 value, so the
+    minimum over a set of elements is 0x8000 exactly when one of them is."""
+    return ((lanes_min & 0xFFFF) == _BF16_NEG_ZERO) | (((lanes_min >> 16) & 0xFFFF) == _BF16_NEG_ZERO)
+
+
+#: Lane-wise s16 minimum start value (0x7FFF7FFF).
+_LANES_MAX = 0x7FFF7FFF
+
+
+def _chunk_bad(acc, words, elements: bool):
+    """Fold a chunk into the running check: the lane minimum with ``elements``, else whether element 0 is the
+    sentinel (``acc`` is then a Boolean)."""
+    if elements:
+        return _min_s16x2(acc, words)
+    return acc | ((words[0] & 0xFFFF) == _BF16_NEG_ZERO)
 
 
 @dsl_user_op
@@ -687,8 +709,14 @@ class DirectFgsGemmKernel:
     @cute.jit
     def _chunk_unwritten(self, addr, offset: cutlass.Constexpr[int], relaxed: cutlass.Constexpr[bool]):
         if const_expr(self.check_elements):
-            return _has_sentinel(_ld_chunk(addr, offset, relaxed), True)
+            return _has_sentinel(_min_s16x2(Int32(_LANES_MAX), _ld_chunk(addr, offset, relaxed)))
         return (_ld_head(addr, offset, relaxed) & 0xFFFF) == _BF16_NEG_ZERO
+
+    def _check_start(self):
+        return Int32(_LANES_MAX) if self.check_elements else cutlass.Boolean(False)
+
+    def _check_done(self, acc):
+        return _has_sentinel(acc) if self.check_elements else acc
 
     @cute.jit
     def _wait_heads_written(self, tA: cute.Tensor, m_base, retry_count: cute.Tensor):
@@ -728,7 +756,7 @@ class DirectFgsGemmKernel:
         holds written ones."""
         num_k_tiles: cutlass.Constexpr = self.num_k_tiles
         words = cute.recast_tensor(a_regs, Int32)
-        bad = cutlass.Boolean(False)
+        acc = self._check_start()
         for k_tile in cutlass.range_constexpr(num_k_tiles):
             if const_expr(self.relaxed_first):
                 first = _ld_relaxed_v4(tA[row, None, 0].iterator.toint(), k_tile * self.k_tile_bytes, False)
@@ -736,7 +764,8 @@ class DirectFgsGemmKernel:
                     words[k_tile, j] = first[j]
             else:
                 cute.copy(copy_a, tA[row, None, k_tile], a_regs[k_tile, None])
-            bad = bad | _has_sentinel([words[k_tile, j] for j in range(4)], self.check_elements)
+            acc = _chunk_bad(acc, [words[k_tile, j] for j in range(4)], self.check_elements)
+        bad = self._check_done(acc)
         pending = cute.arch.vote_any_sync(bad)
         rounds = Int32(0)
         sleep_ns = Int32(_SPIN_NS_MIN)
@@ -744,12 +773,13 @@ class DirectFgsGemmKernel:
             _nanosleep(sleep_ns)
             sleep_ns = cute.min(sleep_ns * 2, Int32(_SPIN_NS_MAX))
             rounds = rounds + 1
-            bad = cutlass.Boolean(False)
+            acc = self._check_start()
             for k_tile in cutlass.range_constexpr(num_k_tiles):
                 reloaded = _ld_relaxed_v4(tA[row, None, 0].iterator.toint(), k_tile * self.k_tile_bytes, True)
                 for j in cutlass.range_constexpr(4):
                     words[k_tile, j] = reloaded[j]
-                bad = bad | _has_sentinel(reloaded, self.check_elements)
+                acc = _chunk_bad(acc, reloaded, self.check_elements)
+            bad = self._check_done(acc)
             pending = self._keep_waiting(cute.arch.vote_any_sync(bad), rounds)
         self._count(retry_count, rounds, bad)
 
@@ -761,11 +791,12 @@ class DirectFgsGemmKernel:
         num_rows: cutlass.Constexpr = self.rows_per_block
         num_k_tiles: cutlass.Constexpr = self.num_k_tiles
         words = cute.recast_tensor(a_rows, Int32)
-        bad = cutlass.Boolean(False)
+        acc = self._check_start()
         for mi in cutlass.range_constexpr(num_rows):
             for k_tile in cutlass.range_constexpr(num_k_tiles):
                 cute.copy(copy_a, tA[m_base + mi, None, k_tile], a_rows[mi, k_tile, None])
-                bad = bad | _has_sentinel([words[mi, k_tile, j] for j in range(4)], self.check_elements)
+                acc = _chunk_bad(acc, [words[mi, k_tile, j] for j in range(4)], self.check_elements)
+        bad = self._check_done(acc)
         pending = cute.arch.vote_any_sync(bad)
         rounds = Int32(0)
         sleep_ns = Int32(_SPIN_NS_MIN)
@@ -773,7 +804,7 @@ class DirectFgsGemmKernel:
             _nanosleep(sleep_ns)
             sleep_ns = cute.min(sleep_ns * 2, Int32(_SPIN_NS_MAX))
             rounds = rounds + 1
-            bad = cutlass.Boolean(False)
+            acc = self._check_start()
             for mi in cutlass.range_constexpr(num_rows):
                 for k_tile in cutlass.range_constexpr(num_k_tiles):
                     reloaded = _ld_relaxed_v4(
@@ -781,7 +812,8 @@ class DirectFgsGemmKernel:
                     )
                     for j in cutlass.range_constexpr(4):
                         words[mi, k_tile, j] = reloaded[j]
-                    bad = bad | _has_sentinel(reloaded, self.check_elements)
+                    acc = _chunk_bad(acc, reloaded, self.check_elements)
+            bad = self._check_done(acc)
             pending = self._keep_waiting(cute.arch.vote_any_sync(bad), rounds)
         self._count(retry_count, rounds, bad)
 

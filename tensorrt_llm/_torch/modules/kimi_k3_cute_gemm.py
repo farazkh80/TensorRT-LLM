@@ -22,8 +22,8 @@ stores whole 16 B chunks). ``rubin`` runs ``kimi_k3_fgs.dense_gemm_fgs``, split-
 with ``TLLM_K3_FGS_DIRECT=1`` (any slot) or ``=consumer`` (input slot only); a strided input at split-K rows runs the
 ``rubin`` build at ``_FGS_SMALL_TACTIC``. The direct consumer checks every element. A direct producer stores with
 ``.pzo`` only when every reader of its slot checks every element (edges in ``TLLM_K3_FGS_ELEMENT_EDGES``), else it
-stores whole 16 B chunks as ``TLLM_K3_FGS_DIRECT_PRODUCER`` says: ``group8`` (default), ``head_last``, or ``splitk``
-(the split-K fallback above).
+stores whole 16 B chunks as ``TLLM_K3_FGS_DIRECT_PRODUCER`` says: ``auto`` (default: ``group8`` for the rows in
+``_DIRECT_GROUP8``, else ``splitk``), ``group8``, ``head_last``, or ``splitk`` (the split-K fallback above).
 
 A shape without an entry runs the ``rubin`` backend under the TRT-LLM autotuner. Non-BF16 operands keep the
 cuBLAS matmul; empty problems launch nothing.
@@ -168,7 +168,12 @@ def _fgs_direct_mode() -> str:
 
 @functools.lru_cache(maxsize=None)
 def _direct_producer() -> str:
-    return os.environ.get("TLLM_K3_FGS_DIRECT_PRODUCER", "group8")
+    return os.environ.get("TLLM_K3_FGS_DIRECT_PRODUCER", "auto")
+
+
+# (N, K, M) where the direct producer's group8 store is within a few % of the plain store (multi-wave grids); the
+# other fi_direct rows with an output slot take the split-K producer.
+_DIRECT_GROUP8 = {(49152, 7168, 1)}
 
 
 @functools.lru_cache(maxsize=None)
@@ -311,6 +316,8 @@ def _fgs_linear(x, weight, out, consume: bool, produce: bool, out_edge: Optional
     direct_store = ""
     if produce:
         direct_store = "pzo" if out_edge in _element_checked_edges() else _direct_producer()
+        if direct_store == "auto":
+            direct_store = "group8" if (n, k, m) in _DIRECT_GROUP8 else "splitk"
     if (
         backend == "fi_direct"
         and (_fgs_direct_mode() == "1" or (_fgs_direct_mode() == "consumer" and not produce))
@@ -383,7 +390,7 @@ def linear(
             out,
             in_lease is not None,
             out_lease is not None,
-            None if out_lease is None else out_lease.name,
+            None if out_lease is None or _fgs_direct_mode() == "0" else out_lease.workspace.name,
         )
         _debug(
             f"linear N={n} K={k}",
