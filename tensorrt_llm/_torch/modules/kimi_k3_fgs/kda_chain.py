@@ -24,11 +24,14 @@ gated norm reads the gate columns of the p_qkvg slot unchecked: chain_dv2 is a p
 completed when the norm starts.
 """
 
+import atexit
+import collections
 import os
 from typing import Dict, Optional, Tuple
 
 import torch
 
+from ....logger import logger
 from .. import kimi_k3_cute_gemm
 from . import edges
 
@@ -138,6 +141,23 @@ def prefill_begin(rows: int) -> Optional[Prefill]:
             return None
         leases[name] = lease
     return Prefill(leases)
+
+
+# Prefill layer-forwards by outcome ("on" or the refusal), logged every PREFILL_LOG_EVERY forwards.
+prefill_outcomes: collections.Counter = collections.Counter()
+PREFILL_LOG_EVERY = 20
+
+
+def note_prefill(layer_idx: int, refusal: Optional[str]) -> None:
+    """Count one prefill layer-forward; log each new outcome once and the totals periodically."""
+    if not prefill_outcomes:
+        atexit.register(lambda: logger.info(f"TLLM_K3_FGS prefill chain layer-forwards: {dict(prefill_outcomes)}"))
+    outcome = "on" if refusal is None else f"off: {refusal}"
+    if outcome not in prefill_outcomes:
+        logger.info(f"TLLM_K3_FGS prefill chain, first {outcome!r} at KDA layer {layer_idx}")
+    prefill_outcomes[outcome] += 1
+    if sum(prefill_outcomes.values()) % PREFILL_LOG_EVERY == 0:
+        logger.info(f"TLLM_K3_FGS prefill chain layer-forwards: {dict(prefill_outcomes)}")
 
 
 def consume(leases) -> None:

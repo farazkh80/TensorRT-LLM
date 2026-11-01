@@ -56,6 +56,8 @@ _declared: Dict[str, Tuple[int, Set[int]]] = {}
 # Edge name -> slot rows, when a declaring module's row window ends above MAX_ROWS.
 _rows: Dict[str, int] = {}
 _local = threading.local()
+# Why the last acquire returned None (process-wide, so a missing scope in another thread shows too).
+_refusal = [""]
 
 
 def mode() -> str:
@@ -168,19 +170,37 @@ def acquire(name: str, rows: int, readers: int = 1, window: Optional[Tuple[int, 
     which consumes every GEMM input slot.
     """
     low, high = (MIN_ROWS, MAX_ROWS) if window is None else window
-    if not slots() or not low <= rows <= high or not hasattr(_local, "workspaces"):
-        return None
+    if not slots():
+        return _refuse(f"{ENV}={mode()} has no slots")
+    if not low <= rows <= high:
+        return _refuse(f"{rows} rows outside [{low}, {high}]")
+    if not hasattr(_local, "workspaces"):
+        return _refuse(f"no model_scope opened in thread {threading.current_thread().name}")
     from .. import kimi_k3_cute_gemm
 
-    if not kimi_k3_cute_gemm.enabled() or not kimi_k3_cute_gemm.fgs_dsl():
-        return None
+    if not kimi_k3_cute_gemm.enabled():
+        return _refuse("TLLM_K3_CUTE_GEMM off")
+    if not kimi_k3_cute_gemm.fgs_dsl():
+        return _refuse("CuTe DSL without the v1 mbarriers (needs 4.9)")
     workspaces, live = _state()
-    if not workspaces.in_scope or name not in workspaces:
-        return None
+    if not workspaces.in_scope:
+        return _refuse("outside a model_scope")
+    if name not in workspaces:
+        return _refuse(f"edge {name} not registered")
     lease = workspaces.acquire(name, rows=rows)
     live[lease.tensor.data_ptr()] = lease
     _local.readers[lease.tensor.data_ptr()] = readers
     return lease
+
+
+def _refuse(reason: str) -> None:
+    _refusal[0] = reason
+    return None
+
+
+def last_refusal() -> str:
+    """Why the last ``acquire`` returned None."""
+    return _refusal[0]
 
 
 def lease_containing(t: torch.Tensor):
