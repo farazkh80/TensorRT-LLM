@@ -32,6 +32,17 @@ sentinel): work items are issued in head groups (all rows of heads
 grid looping over the items), PDL dependents are released at kernel entry, and
 each 16-B chunk of the output is written by one 16-B store with -0.0 mapped to
 +0.0. Values are otherwise bit-identical to the default build.
+
+``fgs_consumer`` reads the projection inputs (x and the output gate from qkvg, g, beta)
+from fine-grained-sync slots instead of waiting for the PDL primary grid: the state
+rows are prefetched first, then every input is read as 16-B chunks with coherent
+``ld.relaxed.gpu`` loads, and a chunk counts as written once its element 0 is not the
+BF16 -0.0 sentinel (its producer writes each chunk with one 16-B store and never
+stores -0.0). The wait is warp-uniform: while any lane of a setup warp holds an
+unwritten chunk, the whole warp sleeps (exponential backoff) and reloads all of its
+chunks, and leaves the loop together. After ``max_spins`` rounds the warp falls back to
+``griddepcontrol.wait`` and takes the values it then reads. Both modes combine: the
+consumer of qkvg / g / beta is then also the producer of the core output.
 """
 
 from functools import cache
@@ -40,6 +51,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
+from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream, make_fake_tensor
 from cutlass.cutlass_dsl import T, dsl_user_op
@@ -52,6 +64,9 @@ D = 128
 CONV_ITEMS = 3 * D // 4
 SETUP_ITEMS = CONV_ITEMS + D
 L2_EPS = 1.0e-6
+BF16_NEG_ZERO = 0x8000
+SPIN_NS_MIN = 32
+SPIN_NS_MAX = 2048
 
 
 def cta_smem_bytes(warps: int, ring: int) -> int:
@@ -114,6 +129,58 @@ def _bf16x2_pzo(lo, hi, hw, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _ld_relaxed_v4(addr, reload, *, loc=None, ip=None):
+    """16-B ``ld.relaxed.gpu.global`` (never served from a stale L1 line) as four int32; a
+    ``reload`` is never merged with or hoisted above an earlier load of the address."""
+    res = llvm.inline_asm(
+        ir.Type.parse("!llvm.struct<(i32,i32,i32,i32)>"),
+        [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)],
+        "ld.relaxed.gpu.global.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l,~{memory}" if reload else "=r,=r,=r,=r,l",
+        has_side_effects=reload,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return [cutlass.Int32(llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(4)]
+
+
+@dsl_user_op
+def _bf16_at(w0, w1, w2, w3, e, *, loc=None, ip=None):
+    """FP32 value of BF16 element ``e`` (0..7) of the 16-B chunk held in words w0..w3."""
+    return F32(
+        llvm.inline_asm(
+            T.f32(),
+            [cutlass.Int32(v).ir_value(loc=loc, ip=ip) for v in (w0, w1, w2, w3, e)],
+            "{ .reg .pred p; .reg .b32 a, b, s; "
+            "and.b32 s, $5, 2; setp.ne.b32 p, s, 0; selp.b32 a, $2, $1, p; selp.b32 b, $4, $3, p; "
+            "and.b32 s, $5, 4; setp.ne.b32 p, s, 0; selp.b32 a, b, a, p; "
+            "and.b32 s, $5, 1; setp.ne.b32 p, s, 0; and.b32 b, a, 0xFFFF0000; shl.b32 a, a, 16; "
+            "selp.b32 $0, b, a, p; }",
+            "=f,r,r,r,r,r",
+            has_side_effects=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _nanosleep(ns, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [cutlass.Int32(ns).ir_value(loc=loc, ip=ip)],
+        "nanosleep.u32 $0;",
+        "r",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def _store_global_v4(addr, w0, w1, w2, w3, *, loc=None, ip=None):
     llvm.inline_asm(
         None,
@@ -151,6 +218,9 @@ class KdaDecodeT1:
         hw_pzo: bool = False,
         head_group: int = 0,
         persistent_ctas: int = 0,
+        fgs_consumer: bool = False,
+        max_spins: int = 0,
+        with_stats: bool = False,
     ):
         assert v_split in (1, 2, 4)
         self.heads = heads
@@ -190,6 +260,14 @@ class KdaDecodeT1:
         self.persistent = persistent_ctas > 0
         self.persistent_ctas = persistent_ctas
         assert not (self.persistent and early_state)
+        # Conv items fill warps 0-2 and gate items the next four, so every setup warp has one
+        # role per iteration and the validity wait stays warp-uniform.
+        assert CONV_ITEMS % 32 == 0 and SETUP_ITEMS % 32 == 0 and self.threads % 32 == 0
+        assert not fgs_consumer or (use_pdl and not early_state and not self.persistent)
+        assert fgs_consumer or not with_stats
+        self.fgs_consumer = fgs_consumer
+        self.max_spins = max_spins
+        self.with_stats = with_stats
 
     @cute.jit
     def __call__(
@@ -206,6 +284,7 @@ class KdaDecodeT1:
         output_gate: cute.Tensor,
         norm_weight: cute.Tensor,
         output: cute.Tensor,
+        stats: cute.Tensor | None,
         stream: cuda.CUstream,
     ):
         H = self.heads
@@ -259,7 +338,19 @@ class KdaDecodeT1:
         if cutlass.const_expr(self.persistent):
             grid = [cute.min(rows * (H * self.v_split), self.persistent_ctas), 1, 1]
         self.kernel(
-            x_v, w_v, cs_v, g_v, b_v, A_log, dt_v, state_indices, st_v, og_v, norm_weight, out_v
+            x_v,
+            w_v,
+            cs_v,
+            g_v,
+            b_v,
+            A_log,
+            dt_v,
+            state_indices,
+            st_v,
+            og_v,
+            norm_weight,
+            out_v,
+            stats,
         ).launch(
             grid=grid,
             block=[self.threads, 1, 1],
@@ -311,6 +402,7 @@ class KdaDecodeT1:
         output_gate: cute.Tensor,
         norm_weight: cute.Tensor,
         output: cute.Tensor,
+        stats: cute.Tensor | None,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bx, by, _ = cute.arch.block_idx()
@@ -358,6 +450,7 @@ class KdaDecodeT1:
             tidx,
             lane,
             warp,
+            stats,
         )
 
         if cutlass.const_expr(self.persistent):
@@ -421,6 +514,7 @@ class KdaDecodeT1:
         tidx,
         lane,
         warp,
+        stats,
         row,
         head,
         rank,
@@ -437,12 +531,17 @@ class KdaDecodeT1:
 
         # Only the thread that stages a state row reads it back, so staging needs no CTA barrier.
         state_regs = cute.make_rmem_tensor((4, self.rows_per_warp), F32)
-        if cutlass.const_expr(wait_inputs and self.early_state):
+        # The FGS consumer prefetches the state (no producer writes it) and validates its inputs
+        # per 16-B chunk instead of waiting for the primary grid.
+        prefetch = wait_inputs and (self.early_state or self.fgs_consumer)
+        if cutlass.const_expr(prefetch):
             self._load_state(state, state_s, state_regs, lane, warp, row_base, head, slot)
-        if cutlass.const_expr(wait_inputs and self.use_pdl):
+        if cutlass.const_expr(wait_inputs and self.use_pdl and not self.fgs_consumer):
             cute.arch.griddepcontrol_wait()
-        if cutlass.const_expr(not (wait_inputs and self.early_state)):
+        if cutlass.const_expr(not prefetch):
             self._load_state(state, state_s, state_regs, lane, warp, row_base, head, slot)
+        spins = cutlass.Int32(0)
+        waited = cutlass.Int32(0)
 
         # Setup: 96 conv items (4 channels of q, k or v each) and 128 gate items. Conv items
         # are always the first iteration (threads >= 128), so tidx < CONV_ITEMS owns one.
@@ -467,7 +566,17 @@ class KdaDecodeT1:
                         hist[(None, j)],
                     )
                 cur = cute.make_rmem_tensor((4,), BF16)
-                cute.copy(copy_bf16x4, _aligned(x[(None, cl, sec, head, row)], 8), cur)
+                if cutlass.const_expr(self.fgs_consumer):
+                    # Lanes 2i and 2i+1 share the 16-B chunk of channels 8i..8i+7.
+                    words = cute.make_rmem_tensor((4,), cutlass.Int32)
+                    addr = x[(None, cl - cl % 2, sec, head, row)].iterator.toint()
+                    spins, waited = self._fgs_wait(words, 1, addr, addr, addr, spins, waited)
+                    odd = cl % 2 == 1
+                    cur_bits = cute.recast_tensor(cur, cutlass.Int32)
+                    cur_bits[0] = cutlass.Int32(cutlass.select_(odd, words[2], words[0]))
+                    cur_bits[1] = cutlass.Int32(cutlass.select_(odd, words[3], words[1]))
+                else:
+                    cute.copy(copy_bf16x4, _aligned(x[(None, cl, sec, head, row)], 8), cur)
                 silu = cute.make_rmem_tensor((4,), F32)
                 for e in cutlass.range_constexpr(4):
                     # Lane-local element (channel e, tap t) sits at 3 * e + t.
@@ -494,12 +603,41 @@ class KdaDecodeT1:
             elif item < SETUP_ITEMS:
                 c = item - CONV_ITEMS
                 a = cute.math.exp(A_log[head], fastmath=True)
-                g = raw_gate[c, head, row].to(F32) + dt_bias[c, head]
-                decay_s[c] = cute.math.exp(self.lower_bound * _sigmoid(a * g), fastmath=True)
-                gate_s[c] = _sigmoid(output_gate[c, head, row].to(F32))
-                normw_s[c] = norm_weight[c]
-                if c == 0:
-                    scalars[0] = _sigmoid(raw_beta[head, row].to(F32))
+                if cutlass.const_expr(self.fgs_consumer):
+                    # Eight lanes share each 16-B chunk of g and of the output gate; every lane
+                    # also checks the chunk holding this head's beta.
+                    words = cute.make_rmem_tensor((12,), cutlass.Int32)
+                    spins, waited = self._fgs_wait(
+                        words,
+                        3,
+                        (raw_gate[(None, head, row)].iterator + (c - c % 8)).toint(),
+                        (output_gate[(None, head, row)].iterator + (c - c % 8)).toint(),
+                        (raw_beta[(None, row)].iterator + (head - head % 8)).toint(),
+                        spins,
+                        waited,
+                    )
+                    g = _bf16_at(words[0], words[1], words[2], words[3], c % 8) + dt_bias[c, head]
+                    decay_s[c] = cute.math.exp(self.lower_bound * _sigmoid(a * g), fastmath=True)
+                    gate_s[c] = _sigmoid(_bf16_at(words[4], words[5], words[6], words[7], c % 8))
+                    normw_s[c] = norm_weight[c]
+                    if c == 0:
+                        scalars[0] = _sigmoid(
+                            _bf16_at(words[8], words[9], words[10], words[11], head % 8)
+                        )
+                else:
+                    g = raw_gate[c, head, row].to(F32) + dt_bias[c, head]
+                    decay_s[c] = cute.math.exp(self.lower_bound * _sigmoid(a * g), fastmath=True)
+                    gate_s[c] = _sigmoid(output_gate[c, head, row].to(F32))
+                    normw_s[c] = norm_weight[c]
+                    if c == 0:
+                        scalars[0] = _sigmoid(raw_beta[head, row].to(F32))
+
+        if cutlass.const_expr(self.with_stats):
+            if lane == 0:
+                if spins > 0:
+                    cute.arch.atomic_add(stats.iterator, spins)
+                if waited > 0:
+                    cute.arch.atomic_add(stats.iterator + 1, waited)
 
         if cutlass.const_expr(self.v_split > 1):
             # Every CTA of the cluster reads the old conv window; rank 0 overwrites it only
@@ -641,6 +779,40 @@ class KdaDecodeT1:
             cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
 
+    @cute.jit
+    def _fgs_wait(
+        self, words: cute.Tensor, chunks: cutlass.Constexpr[int], a0, a1, a2, spins, waited
+    ):
+        """Load ``chunks`` 16-B chunks at a0..a2 into ``words`` and return once every lane of the
+        warp holds written ones; returns (spins + reload rounds, waited)."""
+        addrs = (a0, a1, a2)
+        bad = cutlass.Boolean(False)
+        for i in cutlass.range_constexpr(chunks):
+            w = _ld_relaxed_v4(addrs[i], False)
+            for j in cutlass.range_constexpr(4):
+                words[4 * i + j] = w[j]
+            bad = bad | ((words[4 * i] & 0xFFFF) == BF16_NEG_ZERO)
+        pending = cute.arch.vote_any_sync(bad)
+        sleep_ns = cutlass.Int32(SPIN_NS_MIN)
+        rounds = cutlass.Int32(0)
+        while pending:
+            if waited > 0 or rounds >= self.max_spins:
+                # The primary grid has completed: the values read next are final.
+                cute.arch.griddepcontrol_wait()
+                waited = cutlass.Int32(1)
+            else:
+                _nanosleep(sleep_ns)
+                sleep_ns = cute.min(sleep_ns * 2, cutlass.Int32(SPIN_NS_MAX))
+            rounds = rounds + 1
+            bad = cutlass.Boolean(False)
+            for i in cutlass.range_constexpr(chunks):
+                w = _ld_relaxed_v4(addrs[i], True)
+                for j in cutlass.range_constexpr(4):
+                    words[4 * i + j] = w[j]
+                bad = bad | ((words[4 * i] & 0xFFFF) == BF16_NEG_ZERO)
+            pending = cute.arch.vote_any_sync(bad) & (waited == 0)
+        return spins + rounds, waited
+
 
 @cache
 def _compile(
@@ -660,6 +832,9 @@ def _compile(
     hw_pzo: bool = False,
     head_group: int = 0,
     persistent_ctas: int = 0,
+    fgs_consumer: bool = False,
+    max_spins: int = 0,
+    with_stats: bool = False,
 ):
     d = heads * D
     rows, slots, conv_slots = cute.sym_int(), cute.sym_int(), cute.sym_int()
@@ -699,6 +874,7 @@ def _compile(
             stride=(cute.sym_int64(divisibility=8 if store16 else 4), D, 1),
             assumed_align=16 if store16 else 8,
         ),
+        make_fake_tensor(cutlass.Int32, (2,), stride=(1,), assumed_align=8) if with_stats else None,
         make_fake_stream(use_tvm_ffi_env_stream=True),
     )
     op = KdaDecodeT1(
@@ -718,6 +894,9 @@ def _compile(
         hw_pzo,
         head_group,
         persistent_ctas,
+        fgs_consumer,
+        max_spins,
+        with_stats,
     )
     return cute.compile(op, *args, options="--enable-tvm-ffi")
 
@@ -890,6 +1069,9 @@ def kda_decode_t1(
     fgs_persistent: bool = False,
     fgs_head_group: int | None = None,
     fgs_ctas: int | None = None,
+    fgs_consumer: bool = False,
+    fgs_max_spins: int = 1 << 16,
+    fgs_stats: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fused T=1 KDA decode; updates ``conv_state`` and ``state`` rows in place.
 
@@ -914,6 +1096,16 @@ def kda_decode_t1(
     resident CTA slot: SMs x ``min_blocks``) that loops over the items in that order,
     so the entry trigger releases the consumer at once instead of after the last wave
     has started.
+
+    ``fgs_consumer`` reads x, the output gate, raw_gate and raw_beta as fine-grained-sync
+    slots (see the module docstring) instead of waiting for the PDL primary grid. Each of
+    them must be armed with -0.0 before its producer runs, have 16-B aligned rows whose
+    stride is a multiple of 8 elements, and be published by one 16-B store per 16-B
+    chunk, never as -0.0. The state and conv pools and ``state_indices`` are read before
+    any input is validated, so they must be complete when the kernel launches. Warps
+    that still see a sentinel after ``fgs_max_spins`` reload rounds wait for the primary
+    grid and take the values they then read. ``fgs_stats`` (int32 [2], zeroed by the
+    caller) accumulates reload rounds and fallbacks per setup warp.
     """
     B = x.shape[0]
     heads = x.shape[1] // (3 * D)
@@ -941,6 +1133,22 @@ def kda_decode_t1(
         raise ValueError("kda_decode_t1: fgs_producer needs 16-B aligned output rows")
     if fgs_persistent and not fgs_producer:
         raise ValueError("kda_decode_t1: fgs_persistent needs fgs_producer")
+    if fgs_consumer:
+        if fgs_persistent or early_state or not use_pdl:
+            raise ValueError(
+                "kda_decode_t1: fgs_consumer needs the per-item grid, PDL and no early_state"
+            )
+        for name, t in (
+            ("x", x),
+            ("output_gate", output_gate),
+            ("raw_gate", raw_gate),
+            ("raw_beta", raw_beta),
+        ):
+            if t.stride(0) % 8 or t.data_ptr() % 16:
+                raise ValueError(f"kda_decode_t1: fgs_consumer needs 16-B aligned {name} rows")
+    with_stats = fgs_consumer and fgs_stats is not None
+    if with_stats and (fgs_stats.dtype != torch.int32 or fgs_stats.numel() < 2):
+        raise ValueError("kda_decode_t1: fgs_stats must be an int32 tensor of 2 elements")
     if fgs_head_group is None:
         fgs_head_group = heads
     if fgs_producer and heads % fgs_head_group:
@@ -1002,6 +1210,9 @@ def kda_decode_t1(
         hw_pzo=fgs_producer,
         head_group=fgs_head_group if fgs_producer else 0,
         persistent_ctas=persistent_ctas,
+        fgs_consumer=fgs_consumer,
+        max_spins=fgs_max_spins if fgs_consumer else 0,
+        with_stats=with_stats,
     )
     fn(
         x,
@@ -1016,5 +1227,6 @@ def kda_decode_t1(
         output_gate,
         norm_weight,
         output,
+        fgs_stats if with_stats else None,
     )
     return output
