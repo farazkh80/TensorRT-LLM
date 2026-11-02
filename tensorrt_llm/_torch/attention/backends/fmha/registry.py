@@ -34,6 +34,7 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
     scope, so backends can import trtllm attention classes at module scope
     without an import cycle.
     """
+    from .cute_dsl_mla_context import CuteDslMlaContextFmha
     from .flashinfer_sparse_mla import FlashInferSparseMlaFmha
     from .msa_decode import MsaDecodeFmha
     from .msa_prefill import MsaPrefillFmha
@@ -44,6 +45,8 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
         "fp4_mla": Fp4MlaFmha,
         "triton_custom_mask": TritonCustomMaskFmha,
         "cute_dsl_mla": CuteDslMlaFmha,
+        # Kimi K3 MLA context in CuTe DSL; inert unless TLLM_K3_CUTE_MLA enables "ctx" on a K3 layer.
+        "cute_dsl_mla_context": CuteDslMlaContextFmha,
         # A pair, not a priority: msa_decode serves a MiniMax-M3 MSA layer's
         # generation phase and msa_prefill its context phase, and neither will
         # take the other's.

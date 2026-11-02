@@ -642,12 +642,18 @@ class CuteDslMlaFmha(PhasedFmha):
         page_table_layer = block_offsets[pool_idx, :, 0, :]
         cache_seqs_base = params.sequence_lengths.to(torch.int32)
         # The page-table batch dimension determines the kernel launch batch.
-        page_table = (
-            page_table_layer[meta.num_contexts : meta.num_contexts + batch_size]
-            .transpose(0, 1)
-            .to(torch.int32)
-        )
-        if layers_in_pool > 1:
+        page_rows = page_table_layer[meta.num_contexts : meta.num_contexts + batch_size]
+        page_table = page_rows.transpose(0, 1).to(torch.int32)
+        # The Kimi K3 CuTe latent append already wrote page_rows^T + layer_in_pool for this layer.
+        k3_stash = getattr(meta, "_k3_cute_mla_page_table", None)
+        if k3_stash is not None and k3_stash[:3] == (
+            attn.layer_idx,
+            page_rows.data_ptr(),
+            batch_size,
+        ):
+            meta._k3_cute_mla_page_table = None
+            page_table = k3_stash[3]
+        elif layers_in_pool > 1:
             page_table = page_table + layer_in_pool
 
         # KVCacheManager exposes NHD pages as [num_pages, 1, page_size, 1, head_dim].
@@ -742,7 +748,14 @@ class CuteDslMlaFmha(PhasedFmha):
         wave_clusters = max(runner._get_max_active_blocks() // runner._CLUSTER_SHAPE_MNK[0], 1)
         key = (batch_size, rows_per_request, wave_clusters, cache_seqs.data_ptr(), plan.data_ptr())
         if getattr(meta, "_cute_dsl_mla_split_plan_key", None) != key:
-            launch_mla_split_kv_plan(
+            launch = launch_mla_split_kv_plan
+            from tensorrt_llm._torch.attention.mla import k3_cute_mla_enabled
+
+            if k3_cute_mla_enabled("plan"):
+                from tensorrt_llm._torch.attention.kernels.rubin.kimi_k3_mla.mla_split_kv_plan import (
+                    launch_mla_split_kv_plan as launch,
+                )
+            launch(
                 cache_seqs,
                 plan,
                 num_requests=batch_size,

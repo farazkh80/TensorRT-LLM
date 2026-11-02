@@ -20,10 +20,15 @@ from ....mapping import Mapping
 from ....quantization import QuantAlgo
 from ...attention.backends import TrtllmAttention
 from ...attention.backends.interface import PositionalEmbeddingParams, RopeParams
-from ...attention.mla import MLA
+from ...attention.mla import MLA, k3_cute_mla_enabled
 from ...model_config import ModelConfig
 from ...utils import AuxStreamType
 from ..linear import Linear, TensorParallelMode
+
+try:
+    from ..kimi_k3_fgs import edges as k3_fgs_edges
+except ImportError:
+    k3_fgs_edges = None
 
 
 def _make_pos_embd_params(
@@ -229,6 +234,19 @@ class KimiK3MLAAttention(MLA):
         _install_identity_rope_table(self.mqa)
         self.rotary_emb = None
         self.apply_rotary_emb = False
+        # The identity table makes every MLA rope a copy, so the CuTe latent append may replace the rope kernel.
+        self._k3_cute_latent_append = True
+        # Lets cute_dsl_mla_context serve this layer's context phase (TLLM_K3_CUTE_MLA=ctx).
+        self.mha._k3_cute_ctx = True
+        # Taken by kimi_k3_cute_gemm when TLLM_K3_CUTE_GEMM=1.
+        self._k3_cute_gemm_bmm = True
+        for name in ("kv_a_proj_with_mqa", "q_a_proj", "q_b_proj", "o_proj", "g_proj"):
+            module = getattr(self, name, None)
+            if isinstance(module, Linear):
+                module._k3_cute_gemm = True
+        # TLLM_K3_FGS=lamport: the output gate writes into a slot of this edge, read only by o_proj.
+        if self.use_output_gate and k3_fgs_edges is not None:
+            k3_fgs_edges.declare("mla.gated", self.o_proj.in_features, self.layer_idx)
 
     def _apply_output_gate(
         self,
@@ -239,5 +257,26 @@ class KimiK3MLAAttention(MLA):
         # sharding, so the multiply composes with the helix-CP output
         # projection.
         if self.use_output_gate:
-            return attn_output * self.g_proj(hidden_states).sigmoid()
+            gate = self.g_proj(hidden_states)
+            if k3_cute_mla_enabled("gate"):
+                from ...attention.kernels.rubin.kimi_k3_mla.mla_output_gate import (
+                    mla_output_gate,
+                    supported,
+                )
+
+                if supported(attn_output, gate):
+                    rows = attn_output.shape[0]
+                    if k3_fgs_edges is not None and k3_fgs_edges.producer_early(rows):
+                        lease = k3_fgs_edges.acquire(
+                            "mla.gated", rows, window=k3_fgs_edges.lamport_window()
+                        )
+                        # The producer build stores into a separate buffer, never in place.
+                        out = (
+                            torch.empty_like(attn_output)
+                            if lease is None
+                            else lease.tensor.view(attn_output.shape)
+                        )
+                        return mla_output_gate(attn_output, gate, out=out, fgs_producer=True)
+                    return mla_output_gate(attn_output, gate)
+            return attn_output * gate.sigmoid()
         return attn_output

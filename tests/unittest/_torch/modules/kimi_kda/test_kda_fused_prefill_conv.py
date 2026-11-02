@@ -178,3 +178,52 @@ def test_fused_conv_warmed_layout_accepts_new_buffers_in_graph(
         torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
         previous_outputs = qkv
         previous_values = tuple(t.clone() for t in qkv)
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [dict(fgs_consumer=True), dict(fgs_producer=True), dict(fgs_consumer=True, fgs_producer=True)],
+    ids=["consumer", "producer", "consumer_producer"],
+)
+@torch.inference_mode()
+def test_fused_conv_fgs_modes_match_default(mode: dict) -> None:
+    """Fine-grained-sync builds on written inputs: the default build's bits (-0.0 read as +0.0
+    for a producer, which must also cover every chunk of -0.0 outputs) and no reload."""
+    heads, lengths = 6, [0, 1, 2, 3, 31, 32, 33, 65, 200]
+    batch = make_batch(heads, lengths, hidden_size=8, initial="mixed")
+    total, channels = sum(lengths), 3 * heads * 128
+    torch.manual_seed(5)
+    src = torch.randn(total, 4 * heads * 128, device="cuda", dtype=torch.bfloat16) * 3.0
+    src.view(torch.int16).masked_fill_(src.view(torch.int16) == -32768, 0)
+    weight = torch.randn(channels, 4, device="cuda", dtype=torch.bfloat16) * 0.5
+
+    def run(fill, **kwargs):
+        state = clone_pool(batch.conv)
+        qkv = tuple(
+            torch.full((1, total, heads, 128), fill, device="cuda", dtype=torch.bfloat16)
+            for _ in range(3)
+        )
+        fused_prefill_conv(
+            src,
+            weight,
+            state,
+            batch.metadata.query_start_loc,
+            batch.indices,
+            batch.metadata.has_initial_states,
+            max(lengths),
+            *qkv,
+            **kwargs,
+        )
+        return [t.view(torch.int16) for t in qkv], state
+
+    ref, state_ref = run(0.0)
+    stats = torch.zeros(2, device="cuda", dtype=torch.int32)
+    extra = dict(fgs_stats=stats) if mode.get("fgs_consumer") else {}
+    out, state = run(-0.0, **mode, **extra)
+    for actual, expected in zip(out, ref):
+        if mode.get("fgs_producer"):
+            expected = torch.where(expected == -32768, 0, expected)
+            assert not (actual == -32768).any()
+        assert torch.equal(actual, expected)
+    assert torch.equal(state, state_ref)
+    assert stats.tolist() == [0, 0]
