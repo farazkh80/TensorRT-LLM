@@ -44,8 +44,9 @@ from ....logger import logger
 
 ENV = "TLLM_K3_FGS"
 MODES = ("off", "early", "lamport", "chain", "chain_after")
-# Below 16 rows the report_valid consumer is slower than the early-trigger path with a waiting consumer.
-MIN_ROWS = int(os.environ.get("TLLM_K3_FGS_MIN_ROWS", "16"))
+# The chain modes pay from 8 rows; from 4 rows down the decode projections include direct GEMMs, whose fine-grained-sync
+# builds cost more than the chain saves. The ``lamport`` edges alone lose below 16 rows.
+MIN_ROWS = int(os.environ.get("TLLM_K3_FGS_MIN_ROWS", "8"))
 MAX_ROWS = int(os.environ.get("TLLM_K3_FGS_MAX_ROWS", "16"))
 # Above 16 rows the o_proj consumer of a ``lamport`` edge (outside a chain) runs 32-row split-K tiles, slower than the
 # table's GEMM at 64 rows.
@@ -211,6 +212,11 @@ def model_scope(
         _local.live.clear()
         _local.readers.clear()
         _local.step.clear()
+
+
+def reset_stream() -> torch.cuda.Stream:
+    """The reset stream of this thread's edge workspaces."""
+    return _state()[0].reset_stream
 
 
 def step_cache() -> dict:
