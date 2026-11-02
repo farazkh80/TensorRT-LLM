@@ -11,11 +11,13 @@ kernel is a report_valid / Lamport consumer of its inputs and an early-triggerin
        \\-> latent append --fused_q[..., 512:], this step's cache rows--> split_kv
   output gate --gated--> o_proj --attn_o--> pre-MoE mix (consumer only: the MoE input is a plain buffer)
 
-:func:`begin` launches the layer's step inputs right before its pre-attention mix: the decode page table, once per
-forward the split-KV plan, and the -0.0 sentinel in this step's cache rows and in the partial LSE entries the
-reduction reads. They are plain (non-PDL) launches and the mix is a PDL launch, so they are complete when the mix
-starts and triggers the chain. One split-KV workspace serves every MLA layer: the next layer's begin runs behind the
-MoE, after this layer's reduction completed. The chain covers decode batches of ``TLLM_K3_FGS_MLA_MIN_ROWS`` to
+:func:`begin` launches the layer's step inputs on the edge workspaces' reset stream, beside the pre-attention mix
+and the head-phase GEMMs: the decode page table, once per forward the split-KV plan, and the -0.0 sentinel in this
+step's cache rows and in the partial LSE entries the reduction reads. The reset stream forks from the main stream
+where the mix is launched, behind the previous layer's MoE and so behind the previous MLA layer's reduction, the last
+reader of the split-KV workspace and plan that every MLA layer shares. :func:`run` joins it right before the latent
+append, the first writer of this step's cache rows; split_kv and the reduction, which read the page table, plan and
+sentinels, follow on the main stream. The chain covers decode batches of ``TLLM_K3_FGS_MLA_MIN_ROWS`` to
 ``TLLM_K3_FGS_MLA_MAX_ROWS`` rows; any edge without a slot leaves the whole layer on the stock path.
 """
 
@@ -55,7 +57,8 @@ _EDGES = (
     (ATTN_O, 1),
 )
 
-MIN_ROWS = int(os.environ.get("TLLM_K3_FGS_MLA_MIN_ROWS", "1"))
+# At 1 row Step 0 runs g_proj / o_proj as direct GEMMs, which the chain's split-K builds do not match bit-exactly.
+MIN_ROWS = int(os.environ.get("TLLM_K3_FGS_MLA_MIN_ROWS", "2"))
 MAX_ROWS = int(os.environ.get("TLLM_K3_FGS_MLA_MAX_ROWS", "32"))
 # Split-plan buffer capacity (requests); the stock planner serves up to 1024.
 _PLAN_CAPACITY = 1024
@@ -142,10 +145,17 @@ def weights_of(mla) -> Optional[Weights]:
 class Chain:
     """One MLA layer's slots and decode-step inputs, from :func:`begin` to :func:`run`."""
 
-    def __init__(self, leases: Dict[str, object], decode: "_Decode", weights: Weights):
+    def __init__(
+        self,
+        leases: Dict[str, object],
+        decode: "_Decode",
+        weights: Weights,
+        prepared: torch.cuda.Event,
+    ):
         self.leases = leases
         self.decode = decode
         self.weights = weights
+        self.prepared = prepared
 
     def slot(self, name: str) -> torch.Tensor:
         return self.leases[name].tensor
@@ -159,8 +169,8 @@ def begin(
     max_requests: int,
     weights: Weights,
 ) -> Optional[Chain]:
-    """Acquire every slot of one MLA layer's decode step and launch its step inputs, or return None (nothing held,
-    nothing launched).
+    """Acquire every slot of one MLA layer's decode step and launch its step inputs on the reset stream, or return
+    None (nothing held, nothing launched).
 
     ``kv_pool`` is the layer's ``get_buffers`` view, ``page_rows`` its ``[B, max_blocks]`` block offsets and
     ``kv_lens`` the int32 KV lengths including this step's token; ``owner`` keeps the layer's persistent buffers.
@@ -183,8 +193,13 @@ def begin(
                 edges.release(held)
             return None
         leases[name] = lease
-    decode.prepare()
-    return Chain(leases, decode, weights)
+    side = edges.reset_stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        decode.prepare()
+    prepared = torch.cuda.Event()
+    prepared.record(side)
+    return Chain(leases, decode, weights, prepared)
 
 
 def run(chain: Chain) -> torch.Tensor:
@@ -225,6 +240,7 @@ def run(chain: Chain) -> torch.Tensor:
         q[..., :nope].transpose(0, 1), w.k_b, fused_q[..., :kv_lora].transpose(0, 1)
     )
     d = chain.decode
+    torch.cuda.current_stream().wait_event(chain.prepared)
     k.latent_append(
         q[..., nope:],
         kv_c,
@@ -365,6 +381,20 @@ class _Decode:
         self.use_workspace = split_kv > 1 and fitting >= 1
         self.split_kv = max(1, min(split_kv, fitting))
         self.q_tiles = q_tiles
+        # Persistent buffers are allocated here, on the main stream; prepare() runs on the reset stream.
+        max_blocks = page_rows.shape[1]
+        self.page_table_buf = _owned(
+            owner,
+            ("page_table", max_blocks, batch, page_rows.device),
+            lambda: torch.empty_strided(
+                (max_blocks, batch), (1, max_blocks), dtype=torch.int32, device=page_rows.device
+            ),
+        )
+        self.plan_buf = (
+            _shared("mla_split_plan", _PLAN_CAPACITY, torch.int32, kv_pool.device)[:batch]
+            if self.use_workspace
+            else None
+        )
         self.page_table = None
         self.plan = None
 
@@ -373,20 +403,9 @@ class _Decode:
         from ...attention.kernels.rubin.kimi_k3_mla import mla_decode_fgs
         from ...attention.kernels.rubin.kimi_k3_mla.mla_latent_append import mla_decode_page_table
 
-        batch, max_blocks = self.page_rows.shape
-        pt = _owned(
-            self.owner,
-            ("page_table", max_blocks, batch, self.page_rows.device),
-            lambda: torch.empty_strided(
-                (max_blocks, batch),
-                (1, max_blocks),
-                dtype=torch.int32,
-                device=self.page_rows.device,
-            ),
-        )
-        self.page_table = mla_decode_page_table(self.kv_pool, self.page_rows, pt)
+        self.page_table = mla_decode_page_table(self.kv_pool, self.page_rows, self.page_table_buf)
         if self.use_workspace:
-            self.plan = _split_plan(self.runner, self.kv_lens, batch, self.heads)
+            self.plan = _split_plan(self.runner, self.kv_lens, self.plan_buf, self.heads)
         mla_decode_fgs.fill_current_rows_sentinel(self.c_latent, self.page_table, self.kv_lens, 1)
         if self.use_workspace:
             mla_decode_fgs.fill_lse_sentinel(
@@ -469,9 +488,10 @@ def _decode_pool_views(kv_pool: torch.Tensor, kv_lora: int, rope: int):
     return pages[..., :kv_lora].permute(1, 2, 0), pages[..., kv_lora:].permute(1, 2, 0)
 
 
-def _split_plan(runner, kv_lens: torch.Tensor, batch: int, heads: int) -> torch.Tensor:
-    """This forward's per-request split counts (``CuteDslMlaFmha._split_kv_plan``), launched by the first MLA layer
-    that needs them."""
+def _split_plan(runner, kv_lens: torch.Tensor, buf: torch.Tensor, heads: int) -> torch.Tensor:
+    """This forward's per-request split counts (``CuteDslMlaFmha._split_kv_plan``) in ``buf``, launched by the first
+    MLA layer that needs them."""
+    batch = buf.shape[0]
     step = edges.step_cache()
     key = ("mla_split_plan", kv_lens.data_ptr(), batch)
     plan = step.get(key)
@@ -484,13 +504,12 @@ def _split_plan(runner, kv_lens: torch.Tensor, batch: int, heads: int) -> torch.
             )
         else:
             from ...attention.backends.fmha.cute_dsl_mla import launch_mla_split_kv_plan as launch
-        plan = _shared("mla_split_plan", _PLAN_CAPACITY, torch.int32, kv_lens.device)[:batch]
         launch(
             kv_lens,
-            plan,
+            buf,
             num_requests=batch,
             rows_per_request=runner.get_num_q_tiles(heads, 1),
             wave_clusters=max(runner._get_max_active_blocks() // runner._CLUSTER_SHAPE_MNK[0], 1),
         )
-        step[key] = plan
+        plan = step[key] = buf
     return plan
