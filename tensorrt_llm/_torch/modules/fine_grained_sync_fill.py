@@ -225,6 +225,17 @@ def compile_sentinel_fill(threads: int = 256, unroll: int = 4) -> Callable:
     return fn
 
 
+# Largest piece one fill launch / span covers: the kernel indexes 32-bit words with Int32.
+_MAX_FILL_BYTES = 1 << 32
+
+
+def _vector_pieces(num_vecs: int) -> List[Tuple[int, int]]:
+    """``(first vector, vectors)`` pieces of at most ``_MAX_FILL_BYTES`` covering ``num_vecs``
+    16-byte vectors."""
+    piece = _MAX_FILL_BYTES // _VECTOR_BYTES
+    return [(first, min(piece, num_vecs - first)) for first in range(0, num_vecs, piece)]
+
+
 def sentinel_fill_(
     tensor: torch.Tensor, word: int, max_ctas: int = 16, threads: int = 256, unroll: int = 4
 ) -> torch.Tensor:
@@ -240,23 +251,22 @@ def sentinel_fill_(
     nbytes = tensor.numel() * tensor.element_size()
     num_vecs = nbytes // _VECTOR_BYTES
     if num_vecs:
-        if num_vecs * 4 >= 2**31:
-            raise ValueError(f"sentinel_fill_ supports up to 8 GiB, got {nbytes} bytes")
         fn = compile_sentinel_fill(threads, unroll)
-        num_ctas = max(1, min(max_ctas, -(-num_vecs // (threads * unroll))))
-        chunk = num_ctas * threads * unroll
-        rounds = num_vecs // chunk
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-        fn(
-            _words_ptr(tensor.data_ptr()),
-            cutlass.Int32(num_vecs * 4),
-            cutlass.Int64(num_vecs),
-            cutlass.Int64(rounds * chunk),
-            cutlass.Int32(rounds),
-            cutlass.Int32(word),
-            cutlass.Int32(num_ctas),
-            stream,
-        )
+        for first, piece_vecs in _vector_pieces(num_vecs):
+            num_ctas = max(1, min(max_ctas, -(-piece_vecs // (threads * unroll))))
+            chunk = num_ctas * threads * unroll
+            rounds = piece_vecs // chunk
+            fn(
+                _words_ptr(tensor.data_ptr() + first * _VECTOR_BYTES),
+                cutlass.Int32(piece_vecs * 4),
+                cutlass.Int64(piece_vecs),
+                cutlass.Int64(rounds * chunk),
+                cutlass.Int32(rounds),
+                cutlass.Int32(word),
+                cutlass.Int32(num_ctas),
+                stream,
+            )
     tail = nbytes - num_vecs * _VECTOR_BYTES
     if tail:
         flat = tensor.view(-1).view(torch.uint8)[num_vecs * _VECTOR_BYTES :]
@@ -321,10 +331,8 @@ def sentinel_fill_spans_(
             raise ValueError("sentinel_fill_spans_ needs contiguous, 16-byte-aligned tensors")
         nbytes = tensor.numel() * tensor.element_size()
         num_vecs = nbytes // _VECTOR_BYTES
-        if num_vecs * 4 >= 2**31:
-            raise ValueError(f"sentinel_fill_spans_ supports up to 8 GiB per span, got {nbytes}")
-        if num_vecs:
-            vector_spans.append((tensor.data_ptr(), num_vecs, word))
+        for first, piece_vecs in _vector_pieces(num_vecs):
+            vector_spans.append((tensor.data_ptr() + first * _VECTOR_BYTES, piece_vecs, word))
         if nbytes % _VECTOR_BYTES:
             sentinel_fill_(
                 tensor.view(-1)[num_vecs * _VECTOR_BYTES // tensor.element_size() :], word

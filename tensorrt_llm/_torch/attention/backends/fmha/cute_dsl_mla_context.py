@@ -21,8 +21,9 @@ workspace and are not read after the call) and the trtllm-gen context FMHA. Call
 latent cache, cached-prefix / chunked prefill, softmax stats) run ``FallbackFmha`` unchanged.
 
 The latent row arrives either as ``forward_args.latent_cache`` or, when ``MLA`` skipped the concat, as its two halves
-in ``metadata._k3_ctx_latent = (layer_idx, compressed_kv, k_pe)``. A layer with those halves is always claimed, so
-the concat is materialized here before any fallback to ``thop.attention`` (which needs the contiguous row).
+in ``metadata._k3_ctx_latent = (layer_idx, compressed_kv, k_pe)``. A layer with those halves, or with the
+contiguous V that ``MLA`` writes for this library, is always claimed, so the concat and the kv-shaped V are
+restored here before any fallback to ``thop.attention``.
 """
 
 import math
@@ -35,7 +36,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
     PredefinedAttentionMask,
 )
-from tensorrt_llm._utils import get_sm_version, prefer_pinned
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings import DataType
 
 from .fallback import FallbackFmha
@@ -88,7 +89,9 @@ class CuteDslMlaContextFmha(PhasedFmha):
         *,
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
-        if phase == FmhaPhase.CONTEXT and self._latent_parts(metadata) is not None:
+        if phase == FmhaPhase.CONTEXT and (
+            self._latent_parts(metadata) is not None or self._has_contiguous_v(v)
+        ):
             return True
         return self._serves(q, metadata, forward_args, phase=phase)
 
@@ -121,6 +124,7 @@ class CuteDslMlaContextFmha(PhasedFmha):
             and forward_args.attention_sinks is None
             and metadata.beam_width == 1
             and getattr(metadata, "helix_position_offsets", None) is None
+            and not getattr(metadata, "enable_helix", False)
             and not metadata.is_cross
         )
 
@@ -151,6 +155,16 @@ class CuteDslMlaContextFmha(PhasedFmha):
             if parts is not None:
                 metadata._k3_ctx_latent = None
 
+    def _has_contiguous_v(self, v: Optional[torch.Tensor]) -> bool:
+        """MLA wrote V contiguous for this library; only its fallback restores the layout thop expects."""
+        attn = self.attn
+        return (
+            getattr(attn, "_k3_cute_ctx", False)
+            and v is not None
+            and v.dim() == 2
+            and v.stride(0) == attn.num_heads * attn.v_head_dim
+        )
+
     def _fallback_v(self, v: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         """Restore the kv-shaped V layout the thop MLA context path expects (row stride H * (nope + v))."""
         attn = self.attn
@@ -168,16 +182,12 @@ class CuteDslMlaContextFmha(PhasedFmha):
     def _ctx_cu_seqlens(
         meta: "TrtllmAttentionMetadata", batch: int, device: torch.device
     ) -> torch.Tensor:
-        """Context cu_seqlens as an H2D copy of the host prefix sums (no device kernel), reused while the lengths
-        are unchanged. Prefill runs eager, so the host lengths are this step's."""
-        lens = meta.seq_lens[:batch].tolist()
-        cached = getattr(meta, "_k3_ctx_cu_seqlens", None)
-        if cached is None or cached[0] != lens or cached[1].device != device:
-            cu = torch.zeros(batch + 1, dtype=torch.int32, pin_memory=prefer_pinned())
-            cu[1:] = torch.tensor(lens, dtype=torch.int32).cumsum(0)
-            cached = (lens, cu.to(device, non_blocking=True))
-            meta._k3_ctx_cu_seqlens = cached
-        return cached[1]
+        """Context cu_seqlens from the metadata's fixed-address buffer (prefix sums of seq_lens_cuda, built once
+        per iteration). A copy from a temporary pinned host buffer would leave a captured graph reading freed
+        memory."""
+        cu = meta.mla_prepare_ctx_cu_seqlens()
+        assert cu is not None and cu.shape[0] == batch + 1 and cu.device == device
+        return cu
 
     def run_mla_context(self, params: FmhaParams) -> None:
         from tensorrt_llm._torch.attention.kernels.rubin.kimi_k3_mla.mla_context_append import (

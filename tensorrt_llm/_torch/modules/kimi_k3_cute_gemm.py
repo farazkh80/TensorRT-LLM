@@ -25,7 +25,8 @@ with ``TLLM_K3_FGS_DIRECT=1`` (any slot) or ``=consumer`` (input slot only); a s
 stores whole 16 B chunks as ``TLLM_K3_FGS_DIRECT_PRODUCER`` says: ``auto`` (default: ``group8`` for the rows in
 ``_DIRECT_GROUP8``, else ``splitk``), ``group8``, ``head_last``, or ``splitk`` (the split-K fallback above).
 
-A shape without an entry runs the ``rubin`` backend under the TRT-LLM autotuner.
+A shape without an entry runs the ``rubin`` backend under the TRT-LLM autotuner. Non-BF16 operands keep the
+cuBLAS matmul; empty problems launch nothing.
 """
 
 import functools
@@ -329,7 +330,8 @@ def _fgs_linear(
     ):
         _fgs_direct(x, weight, out, tactic, consume, direct_store)
         return
-    if consume and not produce and dense and n == 7168 and k == 12288:
+    # The decode o_proj consumer; prefill rows take the table's GEMM below.
+    if consume and not produce and dense and n == 7168 and k == 12288 and m <= 2 * _FI_MAX_M:
         _fgs_consume(x, weight, out)
         return
     if backend == "rubin" or not dense:
@@ -371,8 +373,14 @@ def linear(
     """
     m, k = x.shape
     n = weight.shape[0]
+    if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+        return torch.matmul(x, weight.t(), out=out)
+    # DLPack export rejects tensors that require grad (nn.Linear parameters); detach() is a view.
+    x, weight = x.detach(), weight.detach()
     if out is None:
         out = x.new_empty(m, n)
+    if m == 0 or n == 0:
+        return out
     dense = _row_major(x) and _row_major(out)
     in_lease, out_lease = _fgs_leases(x, out)
     if in_lease is not None or out_lease is not None:
@@ -461,8 +469,13 @@ def bmm(x: torch.Tensor, weight: torch.Tensor, out: Optional[torch.Tensor] = Non
     innermost."""
     b, m, k = x.shape
     n = weight.shape[1]
+    if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+        return torch.bmm(x, weight.transpose(1, 2), out=out)
+    x, weight = x.detach(), weight.detach()
     if out is None:
         out = x.new_empty(b, m, n)
+    if b == 0 or m == 0 or n == 0:
+        return out
     if (
         m > 64
         and x.stride(0) == 0

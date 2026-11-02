@@ -105,6 +105,12 @@ def _run_stock_and_cute(lens, layers, layer_idx, q, k, ckv, k_pe):
         cu = torch.tensor(cu_list(lens), dtype=torch.int32, device="cuda")
         meta_cu = metadata.mla_prepare_ctx_cu_seqlens()
         assert meta_cu is not None and torch.equal(meta_cu.to(torch.int32), cu)
+        from tensorrt_llm._torch.attention.backends.fmha.cute_dsl_mla_context import (
+            CuteDslMlaContextFmha,
+        )
+
+        plugin_cu = CuteDslMlaContextFmha._ctx_cu_seqlens(metadata, len(lens), cu.device)
+        assert plugin_cu.dtype == torch.int32 and torch.equal(plugin_cu, cu)
         kv_lens = metadata.kv_lens_cuda_runtime[: len(lens)].to(torch.int32)
         k_cute = k.clone()
         mla_context_append(
