@@ -37,6 +37,9 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
     load_pretrained_config,
     unwrap_kimi_text_config,
 )
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import (
+    resolve_mamba_metadata_cls,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MixedMambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.model_loader import (
     ModelLoader,
@@ -513,7 +516,7 @@ class Runner:
                 False,
             )
             residual_addend = None
-            with k3_fgs_edges.model_scope(layer_indices):
+            with k3_fgs_edges.model_scope(layer_indices, rows=hidden_states.shape[0]):
                 for layer_idx in layer_indices:
                     layer = model.model.layers[layer_idx]
                     if fold:
@@ -741,6 +744,9 @@ class Runner:
                 max_draft_len=seq_len_q - 1,
                 max_total_draft_tokens=seq_len_q - 1,
             )
+        # As the executor does: without the model's recurrent-state metadata, Kimi K3 prefill reads
+        # cu_seqlens back to the host and cannot be graph-captured.
+        attn_metadata.mamba_metadata_cls = resolve_mamba_metadata_cls(self.model)
         attn_metadata.prepare()
         hidden_size = pretrained_config.hidden_size
         position_ids = torch.tensor(

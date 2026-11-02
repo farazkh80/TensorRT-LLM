@@ -2619,7 +2619,7 @@ class KimiLinearModel(DecoderModel):
             if spec_metadata is not None
             else None
         )
-        with k3_fgs_edges.model_scope():
+        with k3_fgs_edges.model_scope(rows=hidden_states.shape[0]):
             for i, layer in enumerate(self.layers):
                 # DFlash/DSpark hidden-state capture. The drafter is distilled on
                 # the aggregated stream value -- the pre-norm softmax mixture its
