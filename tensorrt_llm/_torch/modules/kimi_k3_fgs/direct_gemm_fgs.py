@@ -133,9 +133,7 @@ def validate_tactic(tactic: DirectTactic, m: int, n: int, k: int) -> None:
     if not 1 <= tactic.rows_per_block <= m or m % tactic.rows_per_block:
         raise ValueError(f"rows_per_block={tactic.rows_per_block} must divide M={m}")
     if n <= 0 or n % tactic.outputs_per_block:
-        raise ValueError(
-            f"N={n} must be divisible by outputs_per_block={tactic.outputs_per_block}"
-        )
+        raise ValueError(f"N={n} must be divisible by outputs_per_block={tactic.outputs_per_block}")
     k_tile = tactic.block_size * _VECTOR_WIDTH
     if k <= 0 or k % k_tile:
         raise ValueError(f"K={k} must be divisible by {k_tile}")
@@ -242,7 +240,9 @@ def _min_s16x2(acc, words, *, loc=None, ip=None):
 def _has_sentinel(lanes_min):
     """Whether a lane-wise s16 minimum holds the bf16 -0.0 sentinel: 0x8000 is the smallest s16 value, so the
     minimum over a set of elements is 0x8000 exactly when one of them is."""
-    return ((lanes_min & 0xFFFF) == _BF16_NEG_ZERO) | (((lanes_min >> 16) & 0xFFFF) == _BF16_NEG_ZERO)
+    return ((lanes_min & 0xFFFF) == _BF16_NEG_ZERO) | (
+        ((lanes_min >> 16) & 0xFFFF) == _BF16_NEG_ZERO
+    )
 
 
 #: Lane-wise s16 minimum start value (0x7FFF7FFF).
@@ -299,7 +299,10 @@ def _bf16x2_bits(lo, hi, pzo: bool, *, loc=None, ip=None):
     return Int32(
         llvm.inline_asm(
             T.i32(),
-            [cutlass.Float32(hi).ir_value(loc=loc, ip=ip), cutlass.Float32(lo).ir_value(loc=loc, ip=ip)],
+            [
+                cutlass.Float32(hi).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(lo).ir_value(loc=loc, ip=ip),
+            ],
             f"{cvt} $0, $1, $2;",
             "=r,f,f",
             has_side_effects=False,
@@ -565,12 +568,12 @@ class DirectFgsGemmKernel:
                         if const_expr(self.head_last and ni == 0):
                             head_bits[mi] = out_bits
                             if not is_head:
-                                cute.recast_tensor(gC, cutlass.Int16)[m_base + mi, n_base] = cutlass.Int16(
-                                    out_bits
+                                cute.recast_tensor(gC, cutlass.Int16)[m_base + mi, n_base] = (
+                                    cutlass.Int16(out_bits)
                                 )
                         else:
-                            cute.recast_tensor(gC, cutlass.Int16)[m_base + mi, n_base + ni] = cutlass.Int16(
-                                out_bits
+                            cute.recast_tensor(gC, cutlass.Int16)[m_base + mi, n_base + ni] = (
+                                cutlass.Int16(out_bits)
                             )
                     else:
                         gC[m_base + mi, n_base + ni] = total.to(self.element_type)
@@ -578,7 +581,9 @@ class DirectFgsGemmKernel:
                 if is_head:
                     self._wait_chunk_tails(gC, m_base, n_base, retry_count)
                     for mi in cutlass.range_constexpr(num_rows):
-                        cute.recast_tensor(gC, cutlass.Int16)[m_base + mi, n_base] = cutlass.Int16(head_bits[mi])
+                        cute.recast_tensor(gC, cutlass.Int16)[m_base + mi, n_base] = cutlass.Int16(
+                            head_bits[mi]
+                        )
 
         if const_expr(self.use_pdl and not self.early_trigger):
             cute.arch.griddepcontrol_launch_dependents()
@@ -636,7 +641,12 @@ class DirectFgsGemmKernel:
             cutlass.Float32,
             cute.make_layout(
                 (groups, num_rows, outputs_per_block, num_warps),
-                stride=(num_rows * outputs_per_block * num_warps, outputs_per_block * num_warps, num_warps, 1),
+                stride=(
+                    num_rows * outputs_per_block * num_warps,
+                    outputs_per_block * num_warps,
+                    num_warps,
+                    1,
+                ),
             ),
             byte_alignment=16,
         )
@@ -663,7 +673,9 @@ class DirectFgsGemmKernel:
                 for k_tile in cutlass.range_constexpr(num_k_tiles):
                     for vi in cutlass.range_constexpr(vector_width):
                         for ni in cutlass.range_constexpr(outputs_per_block):
-                            acc[mi, ni] = _fma_f32_bf16(a_rows[mi, k_tile, vi], b_regs[ni, k_tile, vi], acc[mi, ni])
+                            acc[mi, ni] = _fma_f32_bf16(
+                                a_rows[mi, k_tile, vi], b_regs[ni, k_tile, vi], acc[mi, ni]
+                            )
             for mi in cutlass.range_constexpr(num_rows):
                 for ni in cutlass.range_constexpr(outputs_per_block):
                     acc[mi, ni] = cute.arch.warp_reduction_sum(acc[mi, ni])
@@ -680,11 +692,17 @@ class DirectFgsGemmKernel:
                 for c in (2 * j, 2 * j + 1):
                     total = cutlass.Float32(0.0)
                     for warp in cutlass.range_constexpr(num_warps):
-                        total = total + partials[c // outputs_per_block, tidx, c % outputs_per_block, warp]
+                        total = (
+                            total
+                            + partials[c // outputs_per_block, tidx, c % outputs_per_block, warp]
+                        )
                     pair.append(total)
                 words.append(_bf16x2_bits(pair[0], pair[1], True))
             _st_global_v4(
-                (gC.iterator + cute.crd2idx((m_base + tidx, block_idx * _CHUNK), gC.layout)).toint(), words
+                (
+                    gC.iterator + cute.crd2idx((m_base + tidx, block_idx * _CHUNK), gC.layout)
+                ).toint(),
+                words,
             )
 
         if const_expr(self.use_pdl and not self.early_trigger):
@@ -707,7 +725,9 @@ class DirectFgsGemmKernel:
                 cute.arch.atomic_add(retry_count.iterator + 1, Int32(1))
 
     @cute.jit
-    def _chunk_unwritten(self, addr, offset: cutlass.Constexpr[int], relaxed: cutlass.Constexpr[bool]):
+    def _chunk_unwritten(
+        self, addr, offset: cutlass.Constexpr[int], relaxed: cutlass.Constexpr[bool]
+    ):
         if const_expr(self.check_elements):
             return _has_sentinel(_min_s16x2(Int32(_LANES_MAX), _ld_chunk(addr, offset, relaxed)))
         return (_ld_head(addr, offset, relaxed) & 0xFFFF) == _BF16_NEG_ZERO
@@ -728,7 +748,9 @@ class DirectFgsGemmKernel:
         bad = cutlass.Boolean(False)
         for mi in cutlass.range_constexpr(num_rows):
             for k_tile in cutlass.range_constexpr(num_k_tiles):
-                bad = bad | self._chunk_unwritten(tA[m_base + mi, None, 0].iterator.toint(), k_tile * k_stride, False)
+                bad = bad | self._chunk_unwritten(
+                    tA[m_base + mi, None, 0].iterator.toint(), k_tile * k_stride, False
+                )
         pending = cute.arch.vote_any_sync(bad)
         rounds = Int32(0)
         sleep_ns = Int32(_SPIN_NS_MIN)
@@ -750,7 +772,12 @@ class DirectFgsGemmKernel:
 
     @cute.jit
     def _load_a_checked(
-        self, copy_a: cute.CopyAtom, tA: cute.Tensor, row, a_regs: cute.Tensor, retry_count: cute.Tensor
+        self,
+        copy_a: cute.CopyAtom,
+        tA: cute.Tensor,
+        row,
+        a_regs: cute.Tensor,
+        retry_count: cute.Tensor,
     ):
         """Load this thread's chunks of activation ``row`` into ``a_regs`` and return once every lane of the warp
         holds written ones."""
@@ -759,7 +786,9 @@ class DirectFgsGemmKernel:
         acc = self._check_start()
         for k_tile in cutlass.range_constexpr(num_k_tiles):
             if const_expr(self.relaxed_first):
-                first = _ld_relaxed_v4(tA[row, None, 0].iterator.toint(), k_tile * self.k_tile_bytes, False)
+                first = _ld_relaxed_v4(
+                    tA[row, None, 0].iterator.toint(), k_tile * self.k_tile_bytes, False
+                )
                 for j in cutlass.range_constexpr(4):
                     words[k_tile, j] = first[j]
             else:
@@ -775,7 +804,9 @@ class DirectFgsGemmKernel:
             rounds = rounds + 1
             acc = self._check_start()
             for k_tile in cutlass.range_constexpr(num_k_tiles):
-                reloaded = _ld_relaxed_v4(tA[row, None, 0].iterator.toint(), k_tile * self.k_tile_bytes, True)
+                reloaded = _ld_relaxed_v4(
+                    tA[row, None, 0].iterator.toint(), k_tile * self.k_tile_bytes, True
+                )
                 for j in cutlass.range_constexpr(4):
                     words[k_tile, j] = reloaded[j]
                 acc = _chunk_bad(acc, reloaded, self.check_elements)
@@ -785,7 +816,12 @@ class DirectFgsGemmKernel:
 
     @cute.jit
     def _load_rows_checked(
-        self, copy_a: cute.CopyAtom, tA: cute.Tensor, m_base, a_rows: cute.Tensor, retry_count: cute.Tensor
+        self,
+        copy_a: cute.CopyAtom,
+        tA: cute.Tensor,
+        m_base,
+        a_rows: cute.Tensor,
+        retry_count: cute.Tensor,
     ):
         """``_load_a_checked`` for all of the CTA's rows at once, before any FMA."""
         num_rows: cutlass.Constexpr = self.rows_per_block
@@ -940,7 +976,9 @@ def default_check_mode(tactic: DirectTactic, k: int) -> str:
     """``rows`` (one round trip, the reloaded data is used directly: no fence), or ``heads_before_b`` for multi-row
     tactics whose weight registers exceed ``_HEADS_BEFORE_B_REGS``."""
     b_regs = tactic.outputs_per_block * k // (tactic.block_size * _VECTOR_WIDTH) * 4
-    return "heads_before_b" if tactic.rows_per_block > 1 and b_regs > _HEADS_BEFORE_B_REGS else "rows"
+    return (
+        "heads_before_b" if tactic.rows_per_block > 1 and b_regs > _HEADS_BEFORE_B_REGS else "rows"
+    )
 
 
 @functools.cache

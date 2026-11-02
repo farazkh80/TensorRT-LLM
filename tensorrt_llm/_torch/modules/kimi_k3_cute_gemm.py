@@ -305,7 +305,9 @@ def _fgs_direct(x, weight, out, tactic, consume: bool, produce: str) -> None:
     )
 
 
-def _fgs_linear(x, weight, out, consume: bool, produce: bool, out_edge: Optional[str] = None) -> None:
+def _fgs_linear(
+    x, weight, out, consume: bool, produce: bool, out_edge: Optional[str] = None
+) -> None:
     """``linear`` on edge-slot operands: the fine-grained-sync build of the table entry's kernel."""
     from .kimi_k3_fgs.splitk_gemm_fgs import SplitKTactic, default_tactic, run_splitk_dense_fgs
 
