@@ -36,7 +36,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
     PredefinedAttentionMask,
 )
-from tensorrt_llm._utils import get_sm_version, prefer_pinned
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings import DataType
 
 from .fallback import FallbackFmha
@@ -182,16 +182,12 @@ class CuteDslMlaContextFmha(PhasedFmha):
     def _ctx_cu_seqlens(
         meta: "TrtllmAttentionMetadata", batch: int, device: torch.device
     ) -> torch.Tensor:
-        """Context cu_seqlens as an H2D copy of the host prefix sums (no device kernel), reused while the lengths
-        are unchanged. Prefill runs eager, so the host lengths are this step's."""
-        lens = meta.seq_lens[:batch].tolist()
-        cached = getattr(meta, "_k3_ctx_cu_seqlens", None)
-        if cached is None or cached[0] != lens or cached[1].device != device:
-            cu = torch.zeros(batch + 1, dtype=torch.int32, pin_memory=prefer_pinned())
-            cu[1:] = torch.tensor(lens, dtype=torch.int32).cumsum(0)
-            cached = (lens, cu.to(device, non_blocking=True))
-            meta._k3_ctx_cu_seqlens = cached
-        return cached[1]
+        """Context cu_seqlens from the metadata's fixed-address buffer (prefix sums of seq_lens_cuda, built once
+        per iteration). A copy from a temporary pinned host buffer would leave a captured graph reading freed
+        memory."""
+        cu = meta.mla_prepare_ctx_cu_seqlens()
+        assert cu is not None and cu.shape[0] == batch + 1 and cu.device == device
+        return cu
 
     def run_mla_context(self, params: FmhaParams) -> None:
         from tensorrt_llm._torch.attention.kernels.rubin.kimi_k3_mla.mla_context_append import (

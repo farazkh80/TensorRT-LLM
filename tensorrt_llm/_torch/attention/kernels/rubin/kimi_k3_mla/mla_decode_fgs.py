@@ -41,11 +41,12 @@ chunks. How fp32 partials are published depends on ``fgs_partials``:
   * "all": partial O and LSE are canonicalized and every element is a flag (the whole read set needs the sentinel).
 
 ``fgs_reduction`` (reduction kernel, both sides): PDL launch without ``griddepcontrol.wait``, trigger on entry.
-Warp 0 waits (warp-uniform) until no partial LSE it reads is the fp32 sentinel; in "lse" mode the loads are
-``ld.relaxed.gpu`` followed by ``fence.acq_rel.gpu`` (acquire pattern) before the CTA barrier that precedes the O
-loads, which are ``ld.global.cg``; in "all" mode every O element is checked as well. Each thread reduces 4
-consecutive D elements (same per-element summation order as the base kernel) and even lanes store 16-B chunks of
-8 bf16 (``cvt.rn.pzo``), because the W_UV TMA ``report_valid`` load checks only element 0 of a chunk.
+Warp 0 waits (warp-uniform, backoff capped at 128 ns) until no partial LSE it reads is the fp32 sentinel; in
+"lse" mode the loads are ``ld.relaxed.gpu`` followed by ``fence.acquire.gpu`` (acquire pattern) before the CTA
+barrier that precedes the O loads, which are ``ld.global.cg``; in "all" mode every O element is checked as well.
+Each thread reduces 4 consecutive D elements (same per-element summation order as the base kernel), with the O
+loads of up to 8 splits issued before the first add, and even lanes store 16-B chunks of 8 bf16 (``cvt.rn.pzo``),
+because the W_UV TMA ``report_valid`` load checks only element 0 of a chunk.
 
 ``pdl_early``: kernels without their FGS consumer flag are launched with PDL, trigger on entry and wait on entry.
 
@@ -70,6 +71,7 @@ import cutlass.cute as cute
 import cutlass.cute.nvgpu.cpasync as cpasync
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
+from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
@@ -136,7 +138,8 @@ _MSG_DONE = 0
 _MSG_REISSUE = 1
 _MSG_BYTES = 16
 _EXTRA_SMEM = 128
-_RED_UNROLL = 4
+_RED_UNROLL = 8
+_RED_SPIN_NS_MAX = 128
 _FILL_LSE_THREADS = 256
 
 
@@ -177,6 +180,36 @@ def _ld_relaxed_b32(addr, *, loc=None, ip=None):
             loc=loc,
             ip=ip,
         )
+    )
+
+
+@dsl_user_op
+def _ld_cg_v4_ordered(addr, *, loc=None, ip=None):
+    """``mla_fgs.ld_cg_v4`` marked side-effecting, so it stays ahead of the code that consumes it."""
+    res = llvm.inline_asm(
+        ir.Type.parse("!llvm.struct<(i32,i32,i32,i32)>"),
+        [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)],
+        "ld.global.cg.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return [cutlass.Int32(llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(4)]
+
+
+@dsl_user_op
+def _fence_acquire_gpu(*, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [],
+        "fence.acquire.gpu;",
+        "~{memory}",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -223,11 +256,12 @@ def _poll_words(
     spin_limit: cutlass.Constexpr,
     stats: cute.Tensor,
     with_stats: cutlass.Constexpr,
+    sleep_max: cutlass.Constexpr = SPIN_NS_MAX,
 ):
     """Warp-uniform wait until no lane's ``n`` fp32 words (int32 rmem ``bits``, already loaded) is the sentinel.
 
     Lanes without work hold non-sentinel bits. Same protocol and stats layout as ``mla_fgs.poll_chunks`` for 4-B
-    elements: reloads are ``ld.relaxed.gpu`` of the pending words only.
+    elements: reloads are ``ld.relaxed.gpu`` of the pending words only; the backoff doubles up to ``sleep_max`` ns.
     """
     pending = cutlass.Int32(0)
     for i in cutlass.range_constexpr(n):
@@ -239,7 +273,7 @@ def _poll_words(
         again = cutlass.Boolean(True)
         while again:
             nanosleep(sleep_ns)
-            sleep_ns = cutlass.min(sleep_ns * 2, cutlass.Int32(SPIN_NS_MAX))
+            sleep_ns = cutlass.min(sleep_ns * 2, cutlass.Int32(sleep_max))
             pending = cutlass.Int32(0)
             for i in cutlass.range_constexpr(n):
                 if bits[i] == cutlass.Int32(F32_SENTINEL):
@@ -1450,13 +1484,19 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
                         lse_stats = cute.make_tensor(
                             mStats.iterator + _STATS_RED_LSE, cute.make_layout(4)
                         )
-                        _poll_words(bits, addrs, lse_per_thread, self.spin_limit, lse_stats, True)
+                        _poll_words(
+                            bits, addrs, lse_per_thread, self.spin_limit, lse_stats, True,
+                            _RED_SPIN_NS_MAX,
+                        )  # fmt: skip
                     else:
-                        _poll_words(bits, addrs, lse_per_thread, self.spin_limit, bits, False)
+                        _poll_words(
+                            bits, addrs, lse_per_thread, self.spin_limit, bits, False,
+                            _RED_SPIN_NS_MAX,
+                        )  # fmt: skip
                 if cutlass.const_expr(lse_flag):
-                    # Acquire pattern (relaxed loads that saw every published LSE, then a fence): the producer's
-                    # partial O stores are visible to this CTA's O loads after the barrier below.
-                    cute.arch.fence_acq_rel_gpu()
+                    # Acquire pattern (relaxed loads that saw every published LSE, then fence.acquire): the
+                    # producer's partial O stores are visible to this CTA's O loads after the barrier below.
+                    _fence_acquire_gpu()
                 lse_max = -self.lse_dtype.inf
                 for i in cutlass.range_constexpr(lse_per_thread):
                     split_kv_idx = tidx + i * self.threads_per_warp
@@ -1487,8 +1527,8 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
             pipeline.sync(barrier_id=4)
 
             # Thread t reduces D elements [4t, 4t + 4) of this band, splits in order (same per-element order as the
-            # base kernel); lane pairs then form one 16-B chunk of 8 bf16 that the even lane stores. Splits are
-            # loaded and checked _RED_UNROLL at a time; slots past the last split re-load split g and are not added.
+            # base kernel); lane pairs then form one 16-B chunk of 8 bf16 that the even lane stores. Up to
+            # _RED_UNROLL splits are in flight: every load of a group is issued before the first add.
             gAccO = mAccO[q_tile_row, None, None, q_tile, bidz]
             e0 = d_tile_idx * self.reducer_d_tile + tidx * 4
             active = tidx * 4 < self.reducer_d_tile
@@ -1498,13 +1538,15 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
             chunk_addr = cute.make_rmem_tensor(cute.make_layout(_RED_UNROLL), cutlass.Int64)
             for g in cutlass.range(0, local_split_kv, _RED_UNROLL, unroll=1):
                 for u in cutlass.range_constexpr(_RED_UNROLL):
-                    split_idx = g + u
-                    if split_idx >= local_split_kv:
-                        split_idx = g
                     chunk_addr[u] = (
-                        gAccO.iterator + cute.crd2idx((split_idx, e0), gAccO.layout)
+                        gAccO.iterator + cute.crd2idx((g + u, e0), gAccO.layout)
                     ).toint()
-                load_chunks(words, chunk_addr, _RED_UNROLL, active)
+                    for j in cutlass.range_constexpr(4):
+                        words[4 * u + j] = cutlass.Int32(0)
+                    if active and g + u < local_split_kv:
+                        w = _ld_cg_v4_ordered(chunk_addr[u])
+                        for j in cutlass.range_constexpr(4):
+                            words[4 * u + j] = w[j]
                 if cutlass.const_expr(check_o):
                     if cutlass.const_expr(with_stats):
                         o_stats = cute.make_tensor(

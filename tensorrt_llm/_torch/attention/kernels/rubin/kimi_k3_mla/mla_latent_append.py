@@ -37,7 +37,8 @@ Fine-grained sync (Lamport) modes, both opt-in and combinable:
                 ``ld.global.cg`` and, while it holds the -0.0 sentinel, reloaded by the warp-uniform wait of
                 ``mla_fgs.poll_chunks``.
   fgs_producer  fused_q[..., latent:] and the cache rows are published to FGS consumers: dependents are triggered
-                on entry and every 16-B chunk is one ``st.global.v4`` with -0.0 stored as +0.0.
+                on entry and every 16-B chunk is one ``st.global.v4`` with -0.0 stored as +0.0 (with
+                ``fgs_consumer`` the copied chunks already hold no -0.0, so they are stored as loaded).
 In either mode the page table is not written (the decode kernel prefetches it before its first wait, so it must be
 complete before the step: ``mla_decode_page_table``).
 """
@@ -209,7 +210,8 @@ def _append_fgs(
     if cutlass.const_expr(consumer):
         poll_chunks(words, addrs, 1, False, spin_limit, mStats, with_stats)
     if active:
-        if cutlass.const_expr(producer):
+        # A chunk that passed the consumer wait holds no -0.0 element, so only the producer-only build canonicalizes.
+        if cutlass.const_expr(producer and not consumer):
             st_global_v4(
                 dst,
                 canon_bf16x2(words[0]),
