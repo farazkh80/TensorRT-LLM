@@ -7,7 +7,7 @@ o_proj inputs (KDA decode core, MLA output gate) in their fine-grained-sync
 producer mode, which releases PDL dependents at kernel entry; the o_proj
 consumer still waits for producer completion. ``lamport`` additionally hands
 those producers a sentinel-armed slot of an :class:`EdgeWorkspaces` edge when the
-decode batch is in ``[MIN_ROWS, MAX_ROWS]``; ``kimi_k3_cute_gemm.linear`` recognizes
+decode batch is in ``lamport_window()``; ``kimi_k3_cute_gemm.linear`` recognizes
 the slot, runs the report_valid consumer on it and releases it, which re-arms the
 slot on the workspaces' reset stream.
 
@@ -45,11 +45,13 @@ from ....logger import logger
 ENV = "TLLM_K3_FGS"
 MODES = ("off", "early", "lamport", "chain", "chain_after")
 # The chain modes pay from 8 rows; from 4 rows down the decode projections include direct GEMMs, whose fine-grained-sync
-# builds cost more than the chain saves. The ``lamport`` edges alone lose below 16 rows.
+# builds cost more than the chain saves.
 MIN_ROWS = int(os.environ.get("TLLM_K3_FGS_MIN_ROWS", "8"))
 MAX_ROWS = int(os.environ.get("TLLM_K3_FGS_MAX_ROWS", "16"))
-# Above 16 rows the o_proj consumer of a ``lamport`` edge (outside a chain) runs 32-row split-K tiles, slower than the
+# A ``lamport`` edge outside a chain pays only at 16 rows: below, the report_valid consumer is slower than the
+# early-trigger path with a waiting consumer; above, the o_proj consumer runs 32-row split-K tiles, slower than the
 # table's GEMM at 64 rows.
+LAMPORT_MIN_ROWS = int(os.environ.get("TLLM_K3_FGS_LAMPORT_MIN_ROWS", "16"))
 LAMPORT_MAX_ROWS = int(os.environ.get("TLLM_K3_FGS_LAMPORT_MAX_ROWS", "16"))
 
 
@@ -117,7 +119,7 @@ def producer_early(rows: Optional[int] = None) -> bool:
 
 def lamport_window() -> Tuple[int, int]:
     """Row window of the ``lamport`` o_proj-input edges used outside a chain."""
-    return MIN_ROWS, min(MAX_ROWS, LAMPORT_MAX_ROWS)
+    return max(MIN_ROWS, LAMPORT_MIN_ROWS), min(MAX_ROWS, LAMPORT_MAX_ROWS)
 
 
 def declare(
