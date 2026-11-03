@@ -141,6 +141,12 @@ _BMM_TABLE: Dict[Tuple[int, int, int], List[Tuple[int, str, Optional[tuple]]]] =
         (64, "rubin", ("base", False, (64, 128), (1, 1), 0)),
     ],
 }
+# (B, N, K) -> persistent-grid cap (CTAs) of the fine-grained-sync BMM. The MLA decode W_UK / W_UV launches make the
+# decode step faster at 132 CTAs than at one per SM; each output tile is still computed by one CTA (bit-exact).
+_FGS_BMM_MAX_CTAS: Dict[Tuple[int, int, int], int] = {
+    (96, 128, 512): 132,
+    (96, 512, 128): 132,
+}
 
 
 @functools.lru_cache(maxsize=None)
@@ -199,6 +205,11 @@ _FGS_TACTICS = (
 # split-K rows, which the stock path autotunes) and prefill rows.
 _FGS_SMALL_TACTIC = ("base", False, (64, 128), (1, 1), 0, 1)
 _FGS_LARGE_TACTIC = ("base", True, (256, 256), (2, 1), 0, 1)
+# (N, K) -> (max_m, split-K tactic) of the fine-grained-sync build in place of the table's ``fi_splitk`` tactic (MLA
+# decode g_proj). Applied only over a split-K 1 table tactic: a different split changes the reduction order.
+_FGS_SPLITK_TACTICS: Dict[Tuple[int, int], Tuple[int, tuple]] = {
+    (12288, 7168): (16, (128, 16, 1, 4)),
+}
 
 
 @functools.lru_cache(maxsize=None)
@@ -267,7 +278,9 @@ def _fgs_leases(*tensors):
     return tuple(fgs_edges.lease_containing(t) for t in tensors)
 
 
-def _fgs_rubin(x3, w3, out3, tactic, consume: bool, produce: bool) -> None:
+def _fgs_rubin(
+    x3, w3, out3, tactic, consume: bool, produce: bool, max_ctas: Optional[int] = None
+) -> None:
     from .kimi_k3_fgs.dense_gemm_fgs import run_gemm_fgs
 
     if tactic is None:
@@ -283,6 +296,7 @@ def _fgs_rubin(x3, w3, out3, tactic, consume: bool, produce: bool) -> None:
         pzo=produce,
         early_trigger=produce,
         use_pdl=_pdl(),
+        max_ctas=max_ctas,
     )
 
 
@@ -315,6 +329,9 @@ def _fgs_linear(
     n = weight.shape[0]
     dense = _row_major(x) and _row_major(out)
     backend, tactic = _select(_GEMM_TABLE.get((n, k)), m)
+    fgs_tactic = _FGS_SPLITK_TACTICS.get((n, k))
+    if backend == "fi_splitk" and tactic[2] == 1 and fgs_tactic is not None and m <= fgs_tactic[0]:
+        tactic = fgs_tactic[1]
     direct_store = ""
     if produce:
         direct_store = "pzo" if out_edge in _element_checked_edges() else _direct_producer()
@@ -491,7 +508,15 @@ def bmm(x: torch.Tensor, weight: torch.Tensor, out: Optional[torch.Tensor] = Non
     if in_lease is not None or out_lease is not None:
         from .kimi_k3_fgs import edges as fgs_edges
 
-        _fgs_rubin(x, weight, out, tactic, in_lease is not None, out_lease is not None)
+        _fgs_rubin(
+            x,
+            weight,
+            out,
+            tactic,
+            in_lease is not None,
+            out_lease is not None,
+            _FGS_BMM_MAX_CTAS.get((b, n, k)),
+        )
         _debug(
             f"bmm B={b} N={n} K={k}",
             m,
