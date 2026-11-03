@@ -1053,12 +1053,13 @@ def run_gemm_fgs(
     swizzle_size: int = 1,
     use_pdl: bool = True,
     retry_counter: Optional[torch.Tensor] = None,
+    max_ctas: Optional[int] = None,
 ) -> torch.Tensor:
     """``out[L, M, N] = a[L, M, K] @ w[L, N, K]^T`` in BF16 at an in-tree ``base`` tactic.
 
     Any operand may be a strided view with K (``a``, ``w``) / N (``out``) innermost and 16 B aligned rows, as for the
     in-tree batched runner. Defaults are the report_valid consumer; ``retry_counter`` (int32[``RETRY_COUNTER_SLOTS``])
-    accumulates the A re-issues.
+    accumulates the A re-issues. ``max_ctas`` caps the persistent grid (default: the device's max active clusters).
     """
     if a.dim() != 3 or w.dim() != 3 or out.dim() != 3:
         raise ValueError("run_gemm_fgs takes [L, M, K], [L, N, K], [L, M, N] operands")
@@ -1077,7 +1078,10 @@ def run_gemm_fgs(
         raise ValueError(f"retry_counter must be int32[{RETRY_COUNTER_SLOTS}]")
 
     device_index = a.get_device()
-    clusters = _max_active_clusters(device_index, cluster_mn[0] * cluster_mn[1])
+    cluster_size = cluster_mn[0] * cluster_mn[1]
+    clusters = _max_active_clusters(device_index, cluster_size)
+    if max_ctas is not None:
+        clusters = max(1, min(clusters, max_ctas // cluster_size))
     a_ptr = make_ptr(cutlass.BFloat16, a.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
     b_ptr = make_ptr(cutlass.BFloat16, w.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
     c_mnl = out.permute(1, 2, 0)

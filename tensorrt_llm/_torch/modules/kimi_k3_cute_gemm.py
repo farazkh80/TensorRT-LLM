@@ -141,6 +141,12 @@ _BMM_TABLE: Dict[Tuple[int, int, int], List[Tuple[int, str, Optional[tuple]]]] =
         (64, "rubin", ("base", False, (64, 128), (1, 1), 0)),
     ],
 }
+# (B, N, K) -> persistent-grid cap (CTAs) of the fine-grained-sync BMM. The MLA decode W_UK / W_UV launches make the
+# decode step faster at 132 CTAs than at one per SM; each output tile is still computed by one CTA (bit-exact).
+_FGS_BMM_MAX_CTAS: Dict[Tuple[int, int, int], int] = {
+    (96, 128, 512): 132,
+    (96, 512, 128): 132,
+}
 
 
 @functools.lru_cache(maxsize=None)
@@ -267,7 +273,9 @@ def _fgs_leases(*tensors):
     return tuple(fgs_edges.lease_containing(t) for t in tensors)
 
 
-def _fgs_rubin(x3, w3, out3, tactic, consume: bool, produce: bool) -> None:
+def _fgs_rubin(
+    x3, w3, out3, tactic, consume: bool, produce: bool, max_ctas: Optional[int] = None
+) -> None:
     from .kimi_k3_fgs.dense_gemm_fgs import run_gemm_fgs
 
     if tactic is None:
@@ -283,6 +291,7 @@ def _fgs_rubin(x3, w3, out3, tactic, consume: bool, produce: bool) -> None:
         pzo=produce,
         early_trigger=produce,
         use_pdl=_pdl(),
+        max_ctas=max_ctas,
     )
 
 
@@ -491,7 +500,15 @@ def bmm(x: torch.Tensor, weight: torch.Tensor, out: Optional[torch.Tensor] = Non
     if in_lease is not None or out_lease is not None:
         from .kimi_k3_fgs import edges as fgs_edges
 
-        _fgs_rubin(x, weight, out, tactic, in_lease is not None, out_lease is not None)
+        _fgs_rubin(
+            x,
+            weight,
+            out,
+            tactic,
+            in_lease is not None,
+            out_lease is not None,
+            _FGS_BMM_MAX_CTAS.get((b, n, k)),
+        )
         _debug(
             f"bmm B={b} N={n} K={k}",
             m,
