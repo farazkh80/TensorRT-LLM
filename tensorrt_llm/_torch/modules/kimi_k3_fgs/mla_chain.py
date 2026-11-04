@@ -63,7 +63,7 @@ _EDGES = (
 )
 
 # At 1 row the table's g_proj / o_proj are direct GEMMs; the chain runs their direct FGS builds
-# (``kimi_k3_cute_gemm``), which match Step 0 bit for bit.
+# (``kimi_k3_cute_gemm``), which match the stock path bit for bit.
 MIN_ROWS = int(os.environ.get("TLLM_K3_FGS_MLA_MIN_ROWS", "1"))
 MAX_ROWS = int(os.environ.get("TLLM_K3_FGS_MLA_MAX_ROWS", "32"))
 # Split-KV clusters without K tiles exit at entry (``KimiK3MlaDecodeFgs(fgs_skip_empty=True)``).

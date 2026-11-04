@@ -1353,7 +1353,13 @@ def kda_decode_t1(
     them must be armed with -0.0 before its producer runs, have 16-B aligned rows whose
     stride is a multiple of 8 elements, and be published by one 16-B store per 16-B
     chunk, never as -0.0. The state and conv pools and ``state_indices`` are read before
-    any input is validated, so they must be complete when the kernel launches.
+    any input is validated, so they must be complete when the kernel launches. Warps
+    that still see a sentinel after ``fgs_max_spins`` reload rounds wait for the primary
+    grid and take the values they then read. ``fgs_stats`` (int32 [2], zeroed by the
+    caller) accumulates reload rounds and fallbacks per setup warp. ``fgs_late_gate``
+    (consumer only, ignored otherwise) validates the output gate in the epilogue instead
+    of the setup, after the state update.
+
     ``fgs_head_order`` (int32 [H] on the device, a permutation of the heads; producer only, in
     place of ``fgs_head_split``) is the head of each head-group position: e.g. the heads a
     producer of the inputs publishes first, first.
@@ -1363,12 +1369,6 @@ def kda_decode_t1(
     storing thread also stores -0.0 over the same chunk of ``fgs_arm``. The caller must order
     the kernel's completion before that slot's next producer (a launch without PDL in between).
     ``fgs_arm_delay_ns`` delays each arming store (hazard tests).
-
-    ``fgs_late_gate`` (consumer only, ignored otherwise) validates the output gate in the
-    epilogue instead of the setup, after the state update. Warps
-    that still see a sentinel after ``fgs_max_spins`` reload rounds wait for the primary
-    grid and take the values they then read. ``fgs_stats`` (int32 [2], zeroed by the
-    caller) accumulates reload rounds and fallbacks per setup warp.
     """
     B = x.shape[0]
     heads = x.shape[1] // (3 * D)

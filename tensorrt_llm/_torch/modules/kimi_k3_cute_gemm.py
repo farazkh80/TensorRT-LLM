@@ -384,7 +384,8 @@ def _fgs_rubin(
 def _fgs_direct(
     x, weight, out, tactic, consume: bool, produce: str, in_edge: Optional[str]
 ) -> None:
-    """``produce``: "" (no output slot), "pzo" (element-checked readers), "group8", "head_last" or "cluster"."""
+    """``produce``: "" (no output slot), "pzo" (element-checked readers), "group8", "head_last", "cluster" or
+    "chunk"."""
     from .kimi_k3_fgs.direct_gemm_fgs import DirectTactic, run_direct_dense_fgs
 
     elem0, check_mode = _direct_check()
