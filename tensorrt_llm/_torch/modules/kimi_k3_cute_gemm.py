@@ -277,10 +277,11 @@ _FGS_TACTICS = (
 # split-K rows, which the stock path autotunes) and prefill rows.
 _FGS_SMALL_TACTIC = ("base", False, (64, 128), (1, 1), 0, 1)
 _FGS_LARGE_TACTIC = ("base", True, (256, 256), (2, 1), 0, 1)
-# (N, K) -> (max_m, split-K tactic) of the fine-grained-sync build in place of the table's ``fi_splitk`` tactic (MLA
-# decode g_proj). Applied only over a split-K 1 table tactic: a different split changes the reduction order.
-_FGS_SPLITK_TACTICS: Dict[Tuple[int, int], Tuple[int, tuple]] = {
-    (12288, 7168): (16, (128, 16, 1, 4)),
+# (N, K) -> [(max_m, split-K tactic)], ascending max_m: the fine-grained-sync build's tactic in place of the table's
+# ``fi_splitk`` tactic (MLA decode g_proj). Applied only over a split-K 1 table tactic: a different split changes the
+# reduction order.
+_FGS_SPLITK_TACTICS: Dict[Tuple[int, int], List[Tuple[int, tuple]]] = {
+    (12288, 7168): [(16, (128, 16, 1, 4)), (32, (128, 32, 1, 4))],
 }
 
 
@@ -439,9 +440,13 @@ def _fgs_linear(
     n = weight.shape[0]
     dense = _row_major(x) and _row_major(out)
     backend, tactic = _select(_GEMM_TABLE.get((n, k)), m)
-    fgs_tactic = _FGS_SPLITK_TACTICS.get((n, k))
-    if backend == "fi_splitk" and tactic[2] == 1 and fgs_tactic is not None and m <= fgs_tactic[0]:
-        tactic = fgs_tactic[1]
+    if backend == "fi_splitk" and tactic[2] == 1:
+        fgs_tactic = next(
+            (t for max_m, t in _FGS_SPLITK_TACTICS.get((n, k), ()) if m <= max_m), None
+        )
+        if fgs_tactic is not None:
+            tactic = fgs_tactic
+            _debug(f"linear N={n} K={k}", m, f"fgs split-K tactic {fgs_tactic}")
     direct_store = ""
     if produce:
         direct_store = "pzo" if out_edge in _element_checked_edges() else _direct_producer(n)
