@@ -39,6 +39,10 @@ Fine-grained sync (Lamport) modes, both opt-in and combinable:
   fgs_producer  fused_q[..., latent:] and the cache rows are published to FGS consumers: dependents are triggered
                 on entry and every 16-B chunk is one ``st.global.v4`` with -0.0 stored as +0.0 (with
                 ``fgs_consumer`` the copied chunks already hold no -0.0, so they are stored as loaded).
+  rearm_ckv     (with fgs_consumer) the latent append is the last reader of compressed_kv: each thread stores the
+                -0.0 sentinel over the compressed_kv chunk it copied, after its own load, so the slot is armed for its
+                next producer without the framework's fill. ``rearm_delay_ns`` > 0 sleeps that long before the
+                re-arm (hazard tests only).
 In either mode the page table is not written (the decode kernel prefetches it before its first wait, so it must be
 complete before the step: ``mla_decode_page_table``).
 """
@@ -53,12 +57,29 @@ from cutlass.base_dsl.dsl import BaseDSL
 from cutlass.cute.runtime import make_ptr
 
 try:
-    from .mla_fgs import STATS_LEN, canon_bf16x2, load_chunks, poll_chunks, st_global_v4
+    from .mla_fgs import (
+        BF16_SENTINEL,
+        STATS_LEN,
+        canon_bf16x2,
+        load_chunks,
+        poll_chunks,
+        sleep_ns,
+        st_global_v4,
+    )
 except ImportError:
-    from mla_fgs import STATS_LEN, canon_bf16x2, load_chunks, poll_chunks, st_global_v4
+    from mla_fgs import (
+        BF16_SENTINEL,
+        STATS_LEN,
+        canon_bf16x2,
+        load_chunks,
+        poll_chunks,
+        sleep_ns,
+        st_global_v4,
+    )
 
 THREADS = 256
 VEC = 8  # bf16 elements per 16-byte access
+SENTINEL_X2 = (BF16_SENTINEL | (BF16_SENTINEL << 16)) - (1 << 32)
 
 
 @cute.jit
@@ -141,6 +162,8 @@ def _append_fgs(
     producer: cutlass.Constexpr,
     spin_limit: cutlass.Constexpr,
     with_stats: cutlass.Constexpr,
+    rearm_ckv: cutlass.Constexpr,
+    rearm_delay_ns: cutlass.Constexpr,
 ):
     """The q_pe and cache-row roles in FGS mode: one 16-B chunk per thread, source / destination byte addresses
     computed (step inputs read) before the input wait; lanes without a chunk stay converged for the wait."""
@@ -153,6 +176,7 @@ def _append_fgs(
     src = cutlass.Int64(0)
     dst = cutlass.Int64(0)
     active = cutlass.Boolean(False)
+    is_ckv = cutlass.Boolean(False)
     if bidx < ctas_q:
         gid = bidx * cutlass.Int32(THREADS) + tidx
         if gid < num_tokens * cutlass.Int32(num_heads * rope_vecs):
@@ -195,6 +219,7 @@ def _append_fgs(
                     src = mCkv.iterator.toint() + cutlass.Int64(2) * (
                         cutlass.Int64(t) * ckv_stride + cutlass.Int64(v * cutlass.Int32(VEC))
                     )
+                    is_ckv = cutlass.Boolean(True)
                 else:
                     src = mKpe.iterator.toint() + cutlass.Int64(2) * (
                         cutlass.Int64(t) * kpe_stride
@@ -221,6 +246,13 @@ def _append_fgs(
             )
         else:
             st_global_v4(dst, words[0], words[1], words[2], words[3])
+        if cutlass.const_expr(rearm_ckv):
+            # Each compressed_kv chunk has exactly one reader thread, and its load completed above.
+            if is_ckv:
+                if cutlass.const_expr(rearm_delay_ns > 0):
+                    sleep_ns(rearm_delay_ns)
+                s = cutlass.Int32(SENTINEL_X2)
+                st_global_v4(src, s, s, s, s)
 
 
 @cute.kernel
@@ -261,6 +293,8 @@ def _latent_append_kernel(
     producer: cutlass.Constexpr,
     spin_limit: cutlass.Constexpr,
     with_stats: cutlass.Constexpr,
+    rearm_ckv: cutlass.Constexpr,
+    rearm_delay_ns: cutlass.Constexpr,
 ):
     if cutlass.const_expr(producer):
         cute.arch.griddepcontrol_launch_dependents()
@@ -282,7 +316,8 @@ def _latent_append_kernel(
             _append_fgs(
                 mQpe, mFusedQ, mCkv, mKpe, mPool, mPtIn, mKvLens, mStats, num_tokens, seq_len_q, ctas_q,
                 pt_in_stride, page_offset, q_tok_stride, q_head_stride, ckv_stride, kpe_stride, pool_row_stride,
-                num_heads, latent, rope, page_size, consumer, producer, spin_limit, with_stats,
+                num_heads, latent, rope, page_size, consumer, producer, spin_limit, with_stats, rearm_ckv,
+                rearm_delay_ns,
             )  # fmt: skip
         else:
             if cutlass.const_expr(write_meta):
@@ -401,6 +436,8 @@ def _latent_append_host(
     producer: cutlass.Constexpr,
     spin_limit: cutlass.Constexpr,
     with_stats: cutlass.Constexpr,
+    rearm_ckv: cutlass.Constexpr,
+    rearm_delay_ns: cutlass.Constexpr,
 ):
     mQpe = cute.make_tensor(
         q_pe_ptr,
@@ -462,6 +499,8 @@ def _latent_append_host(
         producer,
         spin_limit,
         with_stats,
+        rearm_ckv,
+        rearm_delay_ns,
     ).launch(
         grid=(ctas_q + ctas_kv + ctas_pt + n_meta, 1, 1),
         block=(THREADS, 1, 1),
@@ -488,7 +527,7 @@ def _compiled(key: tuple, addrs, stream) -> Callable:
     fn = _COMPILED.get(key)
     if fn is None:
         (num_heads, latent, rope, page_size, write_pt, write_meta, consumer, producer, spin_limit,
-         with_stats) = key  # fmt: skip
+         with_stats, rearm_ckv, rearm_delay_ns) = key  # fmt: skip
         one32, eight64 = cutlass.Int32(1), cutlass.Int64(8)
         with BaseDSL.enable_pyir():
             fn = cute.compile(
@@ -507,6 +546,8 @@ def _compiled(key: tuple, addrs, stream) -> Callable:
                 producer,
                 spin_limit,
                 with_stats,
+                rearm_ckv,
+                rearm_delay_ns,
             )
         _COMPILED[key] = fn
     return fn
@@ -570,6 +611,8 @@ def mla_latent_append(
     fgs_producer: bool = False,
     fgs_stats: Optional[torch.Tensor] = None,
     fgs_spin_limit: int = 0,
+    fgs_rearm_ckv: bool = False,
+    fgs_rearm_delay_ns: int = 0,
 ) -> Optional[torch.Tensor]:
     """Append this step's latent rows to the paged cache and copy q_pe into fused_q.
 
@@ -585,8 +628,12 @@ def mla_latent_append(
     Returns the page table the CuTe MLA decode kernel consumes ([max_blocks, B]), or None in the FGS modes
     (``fgs_consumer`` / ``fgs_producer``, see the module docstring), which never write it: the caller provides it
     before the step (``mla_decode_page_table``). ``fgs_stats`` (int32 [4]) accumulates the consumer's wait
-    statistics; ``fgs_spin_limit`` > 0 traps after that many reload sweeps (diagnostic).
+    statistics; ``fgs_spin_limit`` > 0 traps after that many reload sweeps (diagnostic). ``fgs_rearm_ckv``
+    (needs ``fgs_consumer``) re-arms every compressed_kv chunk after it is read; ``fgs_rearm_delay_ns`` delays that
+    (hazard tests).
     """
+    if fgs_rearm_ckv and not fgs_consumer:
+        raise ValueError("fgs_rearm_ckv re-arms an FGS input slot: it needs fgs_consumer")
     fgs = fgs_consumer or fgs_producer
     num_tokens, num_heads, rope = q_pe.shape
     latent = compressed_kv.shape[-1]
@@ -677,8 +724,9 @@ def mla_latent_append(
     )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     spin_limit = fgs_spin_limit if fgs_consumer else 0
+    rearm_delay = fgs_rearm_delay_ns if fgs_rearm_ckv else 0
     key = (num_heads, latent, rope, page_size, write_pt, write_meta, fgs_consumer, fgs_producer, spin_limit,
-           with_stats)  # fmt: skip
+           with_stats, fgs_rearm_ckv, rearm_delay)  # fmt: skip
     fn = _compiled(key, addrs, stream)
     i32, i64 = cutlass.Int32, cutlass.Int64
     fn(
@@ -731,7 +779,7 @@ def mla_decode_page_table(
     pt = page_table_rows.data_ptr()
     addrs = (base, base, base, base, base, pt, pt, page_table_out.data_ptr(), pt, pt, pt, pt)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    key = (1, 8, 8, kv_pool.shape[2], True, False, False, False, 0, False)
+    key = (1, 8, 8, kv_pool.shape[2], True, False, False, False, 0, False, False, 0)
     fn = _compiled(key, addrs, stream)
     i32, i64 = cutlass.Int32, cutlass.Int64
     fn(

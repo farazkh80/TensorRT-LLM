@@ -21,6 +21,7 @@ sentinels, follow on the main stream. The chain covers decode batches of ``TLLM_
 ``TLLM_K3_FGS_MLA_MAX_ROWS`` rows; any edge without a slot leaves the whole layer on the stock path.
 """
 
+import functools
 import math
 import os
 from typing import Dict, NamedTuple, Optional
@@ -62,6 +63,11 @@ MIN_ROWS = int(os.environ.get("TLLM_K3_FGS_MLA_MIN_ROWS", "2"))
 MAX_ROWS = int(os.environ.get("TLLM_K3_FGS_MLA_MAX_ROWS", "32"))
 # Split-KV clusters without K tiles exit at entry (``KimiK3MlaDecodeFgs(fgs_skip_empty=True)``).
 SKIP_EMPTY_SPLITS = os.environ.get("TLLM_K3_FGS_MLA_SKIP_EMPTY", "0") == "1"
+# In-kernel sentinel re-arm (comma list): ``kv_c`` = the latent append re-arms compressed_kv after reading it (its last
+# reader); ``gated`` = the output gate arms the slot of the edge's next use in the step. The framework fill still
+# runs for these slots (redundant); TLLM_K3_FGS_MLA_REARM_DELAY_NS delays the re-arm stores (hazard tests).
+REARM = frozenset(filter(None, os.environ.get("TLLM_K3_FGS_MLA_REARM", "").split(",")))
+REARM_DELAY_NS = int(os.environ.get("TLLM_K3_FGS_MLA_REARM_DELAY_NS", "0"))
 # Split-plan buffer capacity (requests); the stock planner serves up to 1024.
 _PLAN_CAPACITY = 1024
 
@@ -283,11 +289,25 @@ def _kernels():
         mla_rmsnorm,
     )
 
-    return _Kernels(
-        mla_rmsnorm.mla_rmsnorm,
-        mla_latent_append.mla_latent_append,
-        mla_output_gate.mla_output_gate,
-    )
+    latent_append = mla_latent_append.mla_latent_append
+    gate = mla_output_gate.mla_output_gate
+    if "kv_c" in REARM:
+        latent_append = functools.partial(
+            latent_append, fgs_rearm_ckv=True, fgs_rearm_delay_ns=REARM_DELAY_NS
+        )
+    if "gated" in REARM:
+        gate = functools.partial(_gate_arming_next_use, gate)
+    return _Kernels(mla_rmsnorm.mla_rmsnorm, latent_append, gate)
+
+
+def _gate_arming_next_use(gate, o, g, out=None, **kwargs):
+    lease = edges.lease_containing(out)
+    ws = None if lease is None else lease.workspace
+    arm = None
+    if ws is not None and lease.slot + 1 < ws.num_slots:
+        # The slot the next acquire of this edge in the step hands out (the cursor walks the slots in order).
+        arm = ws._lease_tensor(lease.slot + 1, lease.tensor.shape[0])
+    return gate(o, g, out=out, fgs_arm=arm, fgs_arm_delay_ns=REARM_DELAY_NS, **kwargs)
 
 
 class _Kernels(NamedTuple):
