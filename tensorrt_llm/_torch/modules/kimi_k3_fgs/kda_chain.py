@@ -217,6 +217,8 @@ def _core_knob() -> Optional[Dict[str, object]]:
       split=s      head order interleaved over o_proj's split-K slices within each part (persistent default:
                    o_proj's split at the rows; else 1)
       hg=g         heads per publication group (persistent default ``split``; else 1 with ``first``, H without)
+      carveout=p   preferred smem carveout, percent (persistent default o_proj's; -1 / unset: the kernel's own), so
+                   an o_proj CTA fits beside 3 core CTAs instead of a drained SM
 
     and for ``persistent``:
 
@@ -224,7 +226,6 @@ def _core_knob() -> Optional[Dict[str, object]]:
       pf=0|1       prefetch the next item's state rows (1)
       regs=r       register cap per thread (0: none); default the smallest above 64 (the 4-CTA bound) that keeps a
                    (cps+1)-th core CTA off the SM, so the free slot is left to o_proj
-      carveout=p   preferred smem carveout, percent (default o_proj's; -1: the kernel's own)
     """
     value = os.environ.get(CORE_ENV, "").strip()
     if value in ("", "0"):
@@ -245,7 +246,6 @@ def _core_knob() -> Optional[Dict[str, object]]:
     knob.setdefault("pf", 1)
     cap = (_SM_REGS // ((knob["cps"] + 1) * _CORE_THREADS) // 8 + 1) * 8
     knob.setdefault("regs", min(255, cap) if cap > 64 else 0)
-    knob.setdefault("carveout", getattr(kimi_k3_cute_gemm, "_VSPLITK_CARVEOUT", 100))
     knob.setdefault("ogate", 0)
     knob.setdefault("first", 0)
     return knob
@@ -298,13 +298,17 @@ def core_kwargs(rows: int, heads: int = 96) -> Dict[str, object]:
         kwargs["fgs_head_order"] = head_order(heads, first, split, device)
     elif split > 1:
         kwargs["fgs_head_split"] = split
+    carveout = knob.get(
+        "carveout", getattr(kimi_k3_cute_gemm, "_VSPLITK_CARVEOUT", 100) if persistent else -1
+    )
+    if carveout >= 0:
+        kwargs["fgs_smem_carveout"] = carveout
     if persistent:
         sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
         kwargs.update(
             fgs_persistent=True,
             fgs_ctas=knob.get("ctas") or knob["cps"] * sms,
             fgs_prefetch_next=bool(knob["pf"]),
-            fgs_smem_carveout=None if knob["carveout"] < 0 else knob["carveout"],
             max_regs=knob["regs"],
         )
     if knob["ogate"]:

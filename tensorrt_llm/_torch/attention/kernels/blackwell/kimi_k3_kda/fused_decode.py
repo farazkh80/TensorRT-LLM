@@ -613,6 +613,18 @@ class KdaDecodeT1:
             self._load_state(state, state_s, state_regs, lane, warp, row_base, head, slot)
         spins = cutlass.Int32(0)
         waited = cutlass.Int32(0)
+        lanes_used = self.rows_per_cta // 4
+        gate_words = cute.make_rmem_tensor((4,), cutlass.Int32)
+        gate_addr = cutlass.Int64(0)
+        if cutlass.const_expr(self.late_gate):
+            # Warp 0 issues its output-gate load now and checks it only in the epilogue. Lanes 2i
+            # and 2i+1 share the chunk of channels 8i..8i+7; idle lanes load the CTA's first one.
+            if tidx < 32:
+                ch0 = row_base + 4 * cute.min(lane, cutlass.Int32(lanes_used - 1))
+                gate_addr = (output_gate[(None, head, row)].iterator + (ch0 - ch0 % 8)).toint()
+                first = _ld_relaxed_v4(gate_addr, True)
+                for j in cutlass.range_constexpr(4):
+                    gate_words[j] = first[j]
 
         # Setup: 96 conv items (4 channels of q, k or v each) and 128 gate items. Conv items
         # are always the first iteration (threads >= 128), so tidx < CONV_ITEMS owns one.
@@ -820,7 +832,6 @@ class KdaDecodeT1:
         cute.arch.barrier()
 
         # Gated RMSNorm: lane l of warp 0 owns this CTA's rows 4l..4l+3.
-        lanes_used = self.rows_per_cta // 4
         o_regs = cute.make_rmem_tensor((4,), F32)
         sum_sq = F32(0.0)
         if tidx < 32:
@@ -842,18 +853,27 @@ class KdaDecodeT1:
                 sum_sq = total
         gate_r = cute.make_rmem_tensor((4,), F32)
         if cutlass.const_expr(self.late_gate):
-            # Lanes 2i and 2i+1 share the output-gate chunk of channels 8i..8i+7; idle lanes
-            # check the CTA's first chunk so the wait stays warp-uniform.
             if tidx < 32:
-                ch0 = row_base + 4 * cute.min(lane, cutlass.Int32(lanes_used - 1))
-                words = cute.make_rmem_tensor((4,), cutlass.Int32)
-                addr = (output_gate[(None, head, row)].iterator + (ch0 - ch0 % 8)).toint()
                 gate_spins, gate_waited = self._fgs_wait(
-                    words, 1, addr, addr, addr, cutlass.Int32(0), cutlass.Int32(0)
+                    gate_words,
+                    1,
+                    gate_addr,
+                    gate_addr,
+                    gate_addr,
+                    cutlass.Int32(0),
+                    cutlass.Int32(0),
+                    loaded=True,
                 )
+                ch0 = row_base + 4 * cute.min(lane, cutlass.Int32(lanes_used - 1))
                 for e in cutlass.range_constexpr(4):
                     gate_r[e] = _sigmoid(
-                        _bf16_at(words[0], words[1], words[2], words[3], (ch0 + e) % 8)
+                        _bf16_at(
+                            gate_words[0],
+                            gate_words[1],
+                            gate_words[2],
+                            gate_words[3],
+                            (ch0 + e) % 8,
+                        )
                     )
                 if cutlass.const_expr(self.with_stats):
                     if lane == 0:
@@ -911,16 +931,26 @@ class KdaDecodeT1:
 
     @cute.jit
     def _fgs_wait(
-        self, words: cute.Tensor, chunks: cutlass.Constexpr[int], a0, a1, a2, spins, waited
+        self,
+        words: cute.Tensor,
+        chunks: cutlass.Constexpr[int],
+        a0,
+        a1,
+        a2,
+        spins,
+        waited,
+        loaded: cutlass.Constexpr[bool] = False,
     ):
-        """Load ``chunks`` 16-B chunks at a0..a2 into ``words`` and return once every lane of the
-        warp holds written ones; returns (spins + reload rounds, waited)."""
+        """Load ``chunks`` 16-B chunks at a0..a2 into ``words`` (``loaded``: they already hold a
+        first load) and return once every lane of the warp holds written ones; returns
+        (spins + reload rounds, waited)."""
         addrs = (a0, a1, a2)
         bad = cutlass.Boolean(False)
         for i in cutlass.range_constexpr(chunks):
-            w = _ld_relaxed_v4(addrs[i], False)
-            for j in cutlass.range_constexpr(4):
-                words[4 * i + j] = w[j]
+            if cutlass.const_expr(not loaded):
+                first = _ld_relaxed_v4(addrs[i], False)
+                for j in cutlass.range_constexpr(4):
+                    words[4 * i + j] = first[j]
             bad = bad | ((words[4 * i] & 0xFFFF) == BF16_NEG_ZERO)
         pending = cute.arch.vote_any_sync(bad)
         sleep_ns = cutlass.Int32(SPIN_NS_MIN)
