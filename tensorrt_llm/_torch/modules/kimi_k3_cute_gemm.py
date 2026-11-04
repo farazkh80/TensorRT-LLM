@@ -467,8 +467,9 @@ def _fgs_linear(
     ):
         _fgs_direct(x, weight, out, tactic, consume, direct_store, in_edge)
         return
-    # The decode o_proj consumer; prefill rows take the table's GEMM below.
-    if consume and not produce and dense and n == 7168 and k == 12288 and m <= 2 * _FI_MAX_M:
+    # The decode o_proj consumer at the table's split-K / direct rows; its rubin rows (17 and up) take the table's
+    # GEMM below, since a split-K build would change their reduction order.
+    if consume and not produce and dense and n == 7168 and k == 12288 and backend != "rubin":
         _fgs_consume(x, weight, out)
         return
     if backend == "rubin" or not dense:
