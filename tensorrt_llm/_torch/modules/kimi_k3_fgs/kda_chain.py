@@ -26,8 +26,9 @@ The pre-attention mix (pipe kernel, no producer mode) and BT16 prep (no consumer
 gated norm reads the gate columns of the p_qkvg slot unchecked: chain_dv2 is a plain launch, so the qkvg GEMM has
 completed when the norm starts.
 
-``TLLM_K3_FGS_KDA_CORE=persistent`` (off by default) runs the decode KdaDecodeT1 producer of ``CORE`` as one resident
-wave that leaves an o_proj CTA room on every SM (:func:`core_kwargs`).
+``TLLM_K3_FGS_KDA_CORE`` (off by default; :func:`core_kwargs`) runs the decode KdaDecodeT1 producer of ``CORE`` as one
+resident wave that leaves an o_proj CTA room on every SM (``persistent``) and / or lets the chained core wait for the
+output gate only in its epilogue (``ogate=1``).
 """
 
 import atexit
@@ -199,18 +200,22 @@ def note_prefill(layer_idx: int, refusal: Optional[str]) -> None:
 
 
 CORE_ENV = "TLLM_K3_FGS_KDA_CORE"
-_CORE_KEYS = ("rows", "cps", "ctas", "hg", "split", "pf", "regs", "carveout")
+_CORE_KEYS = ("rows", "cps", "ctas", "hg", "split", "pf", "regs", "carveout", "ogate")
 _SM_REGS = 65536
 _CORE_THREADS = 256
 
 
 @functools.lru_cache(maxsize=None)
 def _core_knob() -> Optional[Dict[str, object]]:
-    """``TLLM_K3_FGS_KDA_CORE``: empty / ``0`` off; ``persistent`` with optional ``key=value`` overrides, comma
-    separated (e.g. ``persistent,cps=2``):
+    """``TLLM_K3_FGS_KDA_CORE``: empty / ``0`` off; else comma separated items, ``persistent`` and / or
+    ``key=value`` (e.g. ``persistent,cps=2``, ``ogate=1``, ``persistent,ogate=1``):
 
-      rows=lo:hi   decode rows it applies to (9:16: one 4-CTA/SM wave holds the core at <= 8 rows, and o_proj's
-                   8-row tile does not fit beside it)
+      ogate=0|1    the consumer core validates the output gate in its epilogue (0)
+      rows=lo:hi   decode rows it applies to (persistent: 9:16, since one 4-CTA/SM wave holds the core at <= 8 rows
+                   and o_proj's 8-row tile does not fit beside it; else 1:64)
+
+    and for ``persistent``:
+
       cps=n        core CTAs per SM (3); ctas=n sets the grid instead
       split=s      head order interleaved over o_proj's split-K slices (default: o_proj's split at the rows)
       hg=g         heads per publication group (default ``split``: one head of every K slice)
@@ -222,15 +227,16 @@ def _core_knob() -> Optional[Dict[str, object]]:
     value = os.environ.get(CORE_ENV, "").strip()
     if value in ("", "0"):
         return None
-    knob: Dict[str, object] = {}
+    knob: Dict[str, object] = {"persistent": False}
     for item in (v.strip() for v in value.split(",")):
         if item in ("persistent", "1"):
+            knob["persistent"] = True
             continue
         key, sep, val = item.partition("=")
         if not sep or key not in _CORE_KEYS:
             raise ValueError(f"{CORE_ENV}: bad item {item!r}; keys: {', '.join(_CORE_KEYS)}")
         knob[key] = tuple(int(v) for v in val.split(":")) if key == "rows" else int(val)
-    knob.setdefault("rows", (9, 16))
+    knob.setdefault("rows", (9, 16) if knob["persistent"] else (1, 64))
     if len(knob["rows"]) == 1:
         knob["rows"] = knob["rows"] * 2
     knob.setdefault("cps", 3)
@@ -238,6 +244,7 @@ def _core_knob() -> Optional[Dict[str, object]]:
     cap = (_SM_REGS // ((knob["cps"] + 1) * _CORE_THREADS) // 8 + 1) * 8
     knob.setdefault("regs", min(255, cap) if cap > 64 else 0)
     knob.setdefault("carveout", getattr(kimi_k3_cute_gemm, "_VSPLITK_CARVEOUT", 100))
+    knob.setdefault("ogate", 0)
     return knob
 
 
@@ -253,21 +260,26 @@ def _o_proj_split(rows: int) -> int:
 def core_kwargs(rows: int) -> Dict[str, object]:
     """Extra ``kda_decode_t1`` kwargs of the decode core when it produces a ``CORE`` slot (empty unless
     ``TLLM_K3_FGS_KDA_CORE`` covers ``rows``): a persistent grid of ``cps`` CTAs per SM that leaves one o_proj CTA
-    room on each SM, publishing all rows of one head of each of o_proj's split-K slices per group."""
+    room on each SM, publishing all rows of one head of each of o_proj's split-K slices per group; the late
+    output-gate wait (applies only to the consumer build)."""
     knob = _core_knob()
     if knob is None or not knob["rows"][0] <= rows <= knob["rows"][1]:
         return {}
-    split = knob.get("split") or _o_proj_split(rows)
-    sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
-    kwargs = dict(
-        fgs_persistent=True,
-        fgs_ctas=knob.get("ctas") or knob["cps"] * sms,
-        fgs_head_group=knob.get("hg") or split,
-        fgs_head_split=split,
-        fgs_prefetch_next=bool(knob["pf"]),
-        fgs_smem_carveout=None if knob["carveout"] < 0 else knob["carveout"],
-        max_regs=knob["regs"],
-    )
+    kwargs: Dict[str, object] = {}
+    if knob["persistent"]:
+        split = knob.get("split") or _o_proj_split(rows)
+        sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+        kwargs.update(
+            fgs_persistent=True,
+            fgs_ctas=knob.get("ctas") or knob["cps"] * sms,
+            fgs_head_group=knob.get("hg") or split,
+            fgs_head_split=split,
+            fgs_prefetch_next=bool(knob["pf"]),
+            fgs_smem_carveout=None if knob["carveout"] < 0 else knob["carveout"],
+            max_regs=knob["regs"],
+        )
+    if knob["ogate"]:
+        kwargs["fgs_late_gate"] = True
     if rows not in _core_logged:
         _core_logged.add(rows)
         logger.info(f"{CORE_ENV} rows={rows}: {kwargs}")

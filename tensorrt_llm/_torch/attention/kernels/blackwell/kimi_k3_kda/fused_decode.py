@@ -43,7 +43,9 @@ unwritten chunk, the whole warp sleeps (exponential backoff) and reloads all of 
 chunks, and leaves the loop together. After ``max_spins`` rounds the warp falls back to
 ``griddepcontrol.wait`` and takes the values it then reads. Both modes combine: the
 consumer of qkvg / g / beta is then also the producer of the core output, also as a
-one-wave persistent grid, where every item validates its own inputs.
+one-wave persistent grid, where every item validates its own inputs. With ``late_gate``
+the consumer validates the output gate only in the epilogue (warp 0, right before the
+gated RMSNorm), so the state update does not wait for it.
 """
 
 from functools import cache
@@ -225,6 +227,7 @@ class KdaDecodeT1:
         head_split: int = 1,
         prefetch_next: bool = False,
         smem_carveout: int | None = None,
+        late_gate: bool = False,
     ):
         assert v_split in (1, 2, 4)
         self.heads = heads
@@ -278,6 +281,8 @@ class KdaDecodeT1:
         assert CONV_ITEMS % 32 == 0 and SETUP_ITEMS % 32 == 0 and self.threads % 32 == 0
         assert not fgs_consumer or (use_pdl and not early_state)
         assert fgs_consumer or not with_stats
+        assert fgs_consumer or not late_gate
+        self.late_gate = late_gate
         self.fgs_consumer = fgs_consumer
         self.max_spins = max_spins
         self.with_stats = with_stats
@@ -644,7 +649,25 @@ class KdaDecodeT1:
             elif item < SETUP_ITEMS:
                 c = item - CONV_ITEMS
                 a = cute.math.exp(A_log[head], fastmath=True)
-                if cutlass.const_expr(self.fgs_consumer):
+                if cutlass.const_expr(self.late_gate):
+                    words = cute.make_rmem_tensor((8,), cutlass.Int32)
+                    spins, waited = self._fgs_wait(
+                        words,
+                        2,
+                        (raw_gate[(None, head, row)].iterator + (c - c % 8)).toint(),
+                        (raw_beta[(None, row)].iterator + (head - head % 8)).toint(),
+                        0,
+                        spins,
+                        waited,
+                    )
+                    g = _bf16_at(words[0], words[1], words[2], words[3], c % 8) + dt_bias[c, head]
+                    decay_s[c] = cute.math.exp(self.lower_bound * _sigmoid(a * g), fastmath=True)
+                    normw_s[c] = norm_weight[c]
+                    if c == 0:
+                        scalars[0] = _sigmoid(
+                            _bf16_at(words[4], words[5], words[6], words[7], head % 8)
+                        )
+                elif cutlass.const_expr(self.fgs_consumer):
                     # Eight lanes share each 16-B chunk of g and of the output gate; every lane
                     # also checks the chunk holding this head's beta.
                     words = cute.make_rmem_tensor((12,), cutlass.Int32)
@@ -793,6 +816,27 @@ class KdaDecodeT1:
                 for peer in cutlass.range_constexpr(self.v_split):
                     total += _load_peer_f32((scalars.iterator + 1).toint(), peer)
                 sum_sq = total
+        gate_r = cute.make_rmem_tensor((4,), F32)
+        if cutlass.const_expr(self.late_gate):
+            # Lanes 2i and 2i+1 share the output-gate chunk of channels 8i..8i+7; idle lanes
+            # check the CTA's first chunk so the wait stays warp-uniform.
+            if tidx < 32:
+                ch0 = row_base + 4 * cute.min(lane, cutlass.Int32(lanes_used - 1))
+                words = cute.make_rmem_tensor((4,), cutlass.Int32)
+                addr = (output_gate[(None, head, row)].iterator + (ch0 - ch0 % 8)).toint()
+                gate_spins, gate_waited = self._fgs_wait(
+                    words, 1, addr, addr, addr, cutlass.Int32(0), cutlass.Int32(0)
+                )
+                for e in cutlass.range_constexpr(4):
+                    gate_r[e] = _sigmoid(
+                        _bf16_at(words[0], words[1], words[2], words[3], (ch0 + e) % 8)
+                    )
+                if cutlass.const_expr(self.with_stats):
+                    if lane == 0:
+                        if gate_spins > 0:
+                            cute.arch.atomic_add(stats.iterator, gate_spins)
+                        if gate_waited > 0:
+                            cute.arch.atomic_add(stats.iterator + 1, gate_waited)
         if cutlass.const_expr(self.store16):
             # Even lanes store their own four channels and their odd neighbour's as one 16-B chunk.
             if tidx < 32:
@@ -802,7 +846,10 @@ class KdaDecodeT1:
                     yf[e] = F32(0.0)
                     if lane < lanes_used:
                         ch = row_base + 4 * lane + e
-                        yf[e] = o_regs[e] * rstd * normw_s[ch] * gate_s[ch]
+                        if cutlass.const_expr(self.late_gate):
+                            yf[e] = o_regs[e] * rstd * normw_s[ch] * gate_r[e]
+                        else:
+                            yf[e] = o_regs[e] * rstd * normw_s[ch] * gate_s[ch]
                 for e in cutlass.range_constexpr(4):
                     yf[4 + e] = cute.arch.shuffle_sync_down(yf[e], 1)
                 if lane < lanes_used:
@@ -822,7 +869,10 @@ class KdaDecodeT1:
                 y = cute.make_rmem_tensor((4,), BF16)
                 for e in cutlass.range_constexpr(4):
                     ch = row_base + 4 * lane + e
-                    y[e] = (o_regs[e] * rstd * normw_s[ch] * gate_s[ch]).to(BF16)
+                    if cutlass.const_expr(self.late_gate):
+                        y[e] = (o_regs[e] * rstd * normw_s[ch] * gate_r[e]).to(BF16)
+                    else:
+                        y[e] = (o_regs[e] * rstd * normw_s[ch] * gate_s[ch]).to(BF16)
                     if slot_req < 0:
                         y[e] = BF16(0.0)
                 cute.copy(
@@ -895,6 +945,7 @@ def _compile(
     prefetch_next: bool = False,
     smem_carveout: int | None = None,
     max_regs: int = 0,
+    late_gate: bool = False,
 ):
     d = heads * D
     rows, slots, conv_slots = cute.sym_int(), cute.sym_int(), cute.sym_int()
@@ -960,6 +1011,7 @@ def _compile(
         head_split,
         prefetch_next,
         smem_carveout,
+        late_gate,
     )
     options = "--enable-tvm-ffi"
     if max_regs:
@@ -1142,6 +1194,7 @@ def kda_decode_t1(
     fgs_prefetch_next: bool = False,
     fgs_smem_carveout: int | None = None,
     max_regs: int = 0,
+    fgs_late_gate: bool = False,
 ) -> torch.Tensor:
     """Fused T=1 KDA decode; updates ``conv_state`` and ``state`` rows in place.
 
@@ -1182,7 +1235,9 @@ def kda_decode_t1(
     them must be armed with -0.0 before its producer runs, have 16-B aligned rows whose
     stride is a multiple of 8 elements, and be published by one 16-B store per 16-B
     chunk, never as -0.0. The state and conv pools and ``state_indices`` are read before
-    any input is validated, so they must be complete when the kernel launches. Warps
+    any input is validated, so they must be complete when the kernel launches.
+    ``fgs_late_gate`` (consumer only, ignored otherwise) validates the output gate in the
+    epilogue instead of the setup, after the state update. Warps
     that still see a sentinel after ``fgs_max_spins`` reload rounds wait for the primary
     grid and take the values they then read. ``fgs_stats`` (int32 [2], zeroed by the
     caller) accumulates reload rounds and fallbacks per setup warp.
@@ -1306,6 +1361,7 @@ def kda_decode_t1(
         prefetch_next=fgs_prefetch_next,
         smem_carveout=fgs_smem_carveout,
         max_regs=max_regs,
+        late_gate=fgs_late_gate and fgs_consumer,
     )
     fn(
         x,
