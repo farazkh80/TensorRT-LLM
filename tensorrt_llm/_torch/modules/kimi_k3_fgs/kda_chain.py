@@ -274,8 +274,12 @@ def head_order(heads: int, first: int, split: int, device) -> torch.Tensor:
 _core_logged = set()
 
 
-def _o_proj_split(rows: int) -> int:
-    """Split-K of the decode o_proj FGS consumer at ``rows`` (``kimi_k3_cute_gemm._fgs_consume``; 3 if unknown)."""
+def _o_proj_split(rows: int, heads: int) -> int:
+    """Split-K of the chained decode o_proj at ``rows``: the split-K FGS consumer (``_fgs_consume``) where the table
+    runs a split-K kernel, else the ``rubin`` build at split-K 1 (3 if unknown)."""
+    table = getattr(kimi_k3_cute_gemm, "_GEMM_TABLE", {}).get((7168, heads * 128))
+    if table is not None and kimi_k3_cute_gemm._select(table, rows)[0] == "rubin":
+        return 1
     tactics = getattr(kimi_k3_cute_gemm, "_FGS_TACTICS", ())
     return next((t[1][2] for t in tactics if rows <= t[0]), 3)
 
@@ -316,7 +320,7 @@ def core_kwargs(rows: int, heads: int = 96, lease=None) -> Dict[str, object]:
     if knob is None or not knob["rows"][0] <= rows <= knob["rows"][1]:
         return kwargs
     persistent = knob["persistent"]
-    split = knob.get("split") or (_o_proj_split(rows) if persistent else 1)
+    split = knob.get("split") or (_o_proj_split(rows, heads) if persistent else 1)
     first = knob["first"]
     hg = knob.get("hg") or (split if persistent else 1 if first else 0)
     if hg:
