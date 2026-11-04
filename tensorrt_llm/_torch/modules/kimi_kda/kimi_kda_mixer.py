@@ -49,8 +49,9 @@ from ._kda_kernels import KDAKernelDispatch, fused_kda_post_conv
 
 try:
     from ..kimi_k3_fgs import edges as k3_fgs_edges
+    from ..kimi_k3_fgs import kda_chain as k3_kda_chain
 except ImportError:
-    k3_fgs_edges = None
+    k3_fgs_edges = k3_kda_chain = None
 
 if TYPE_CHECKING:
     from ..mamba.mamba2_metadata import Mamba2Metadata
@@ -1365,6 +1366,7 @@ class KimiKDALinearAttention(nn.Module):
             )
             if lease is not None:
                 args = args[:-1] + (lease.tensor.view(B, H, hd),)
+                fgs_kwargs.update(k3_kda_chain.core_kwargs(B))
         return fused_decode.kda_decode_t1(
             *args,
             lower_bound=self.gate_lower_bound,
