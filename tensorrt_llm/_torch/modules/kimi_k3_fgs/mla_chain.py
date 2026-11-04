@@ -19,6 +19,10 @@ reader of the split-KV workspace and plan that every MLA layer shares. :func:`ru
 append, the first writer of this step's cache rows; split_kv and the reduction, which read the page table, plan and
 sentinels, follow on the main stream. The chain covers decode batches of ``TLLM_K3_FGS_MLA_MIN_ROWS`` to
 ``TLLM_K3_FGS_MLA_MAX_ROWS`` rows; any edge without a slot leaves the whole layer on the stock path.
+
+The chain's reduction reduces several head rows per CTA from 8 decode rows up (``TLLM_K3_FGS_MLA_RED_ROWS``, default
+``auto``): fewer CTAs let W_UV, its PDL dependent, launch sooner; the output is bit-identical. With
+``TLLM_K3_FGS_DEBUG=1`` the path log names the rows per CTA (and the skip-empty split clusters when on) per row count.
 """
 
 import functools
@@ -63,10 +67,9 @@ MIN_ROWS = int(os.environ.get("TLLM_K3_FGS_MLA_MIN_ROWS", "2"))
 MAX_ROWS = int(os.environ.get("TLLM_K3_FGS_MLA_MAX_ROWS", "32"))
 # Split-KV clusters without K tiles exit at entry (``KimiK3MlaDecodeFgs(fgs_skip_empty=True)``).
 SKIP_EMPTY_SPLITS = os.environ.get("TLLM_K3_FGS_MLA_SKIP_EMPTY", "0") == "1"
-# Split-KV reduction: head rows per CTA (1, 2, 4, or ``auto``: 1 below 8 decode rows, 2 below 16, else 4; fewer CTAs
-# let W_UV, its PDL dependent, launch sooner) and the launch's preferred smem carveout in percent (unset: the
-# driver's default for its 1 KB per CTA).
-RED_ROWS = os.environ.get("TLLM_K3_FGS_MLA_RED_ROWS", "1")
+# Split-KV reduction: head rows per CTA (1, 2, 4, or ``auto``: 1 below 8 decode rows, 2 below 16, else 4) and the
+# launch's preferred smem carveout in percent (unset: the driver's default for its 1 KB per CTA).
+RED_ROWS = os.environ.get("TLLM_K3_FGS_MLA_RED_ROWS", "auto")
 RED_CARVEOUT = int(os.environ.get("TLLM_K3_FGS_MLA_RED_CARVEOUT", "-1"))
 
 
@@ -465,6 +468,10 @@ class _Decode:
         plan = self.plan if self.use_workspace else None
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         red_rows = _red_rows(batch) if plan is not None else 1
+        if plan is not None:
+            edges.debug("mla.reduction", batch, f"{red_rows} head rows per CTA")
+        if SKIP_EMPTY_SPLITS:
+            edges.debug("mla.split_kv", batch, "split clusters without K tiles exit at entry")
         key = (
             self.page_size,
             heads,
