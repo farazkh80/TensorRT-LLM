@@ -30,8 +30,9 @@ A direct producer stores with ``.pzo`` only when every reader of its slot checks
 ``cluster`` (cluster gather), ``chunk`` (one CTA per chunk, ``group8`` where a row's chunk needs more than 1024
 threads or a CTA holds several rows) or ``splitk`` (the split-K fallback above, not bit-exact with ``fi_direct``);
 items ``<N>:<store>`` in the comma list override the store for an output width N.
-``TLLM_K3_FGS_QKVG_ORDER=<h1>`` makes the ``rubin`` producer build of the KDA qkvg projection compute the q / k / v
-tiles of heads 0 .. h1 - 1 first (``dense_gemm_fgs`` ``n_order``; same tiles, bit-exact).
+The ``rubin`` producer build of the KDA qkvg projection computes the q / k / v tiles of heads 0 .. h1 - 1 first
+(``dense_gemm_fgs`` ``n_order``; same tiles, bit-exact): h1 = 70 at 9..16 rows by default (the rows the KDA core's
+late-gate, head-major producer order runs at), ``TLLM_K3_FGS_QKVG_ORDER=<h1>`` at every row (0: stock order).
 
 A shape without an entry runs the ``rubin`` backend under the TRT-LLM autotuner. Non-BF16 operands keep the
 cuBLAS matmul; empty problems launch nothing.
@@ -245,9 +246,23 @@ _QKVG = (49152, 7168)
 _QKVG_HEADS = 96
 
 
+# Default head-ordered qkvg tiles: (min rows, max rows, h1).
+_QKVG_ORDER_DEFAULT = (9, 16, 70)
+
+
 @functools.lru_cache(maxsize=None)
-def _qkvg_order() -> int:
-    return int(os.environ.get("TLLM_K3_FGS_QKVG_ORDER", "0"))
+def _qkvg_order_env() -> Optional[int]:
+    value = os.environ.get("TLLM_K3_FGS_QKVG_ORDER")
+    return None if value is None else int(value)
+
+
+def _qkvg_order(m: int) -> int:
+    h1 = _qkvg_order_env()
+    if h1 is None:
+        low, high, h1 = _QKVG_ORDER_DEFAULT
+        if not low <= m <= high:
+            h1 = 0
+    return h1
 
 
 # Preferred smem carveout (percent) of the vendored split-K launches.
@@ -455,8 +470,11 @@ def _fgs_linear(
         if backend != "rubin":
             tactic = _FGS_SMALL_TACTIC
         n_order = None
-        if produce and backend == "rubin" and (n, k) == _QKVG and _qkvg_order() > 0:
-            n_order = (_QKVG_HEADS, _qkvg_order())
+        if produce and backend == "rubin" and (n, k) == _QKVG:
+            h1 = _qkvg_order(m)
+            if h1 > 0:
+                n_order = (_QKVG_HEADS, h1)
+            _debug(f"linear N={n} K={k}", m, f"fgs rubin qkvg tile order h1={h1}")
         _fgs_rubin(
             x.unsqueeze(0),
             weight.unsqueeze(0),
