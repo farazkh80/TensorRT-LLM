@@ -200,7 +200,7 @@ def note_prefill(layer_idx: int, refusal: Optional[str]) -> None:
 
 
 CORE_ENV = "TLLM_K3_FGS_KDA_CORE"
-_CORE_KEYS = ("rows", "cps", "ctas", "hg", "split", "pf", "regs", "carveout", "ogate")
+_CORE_KEYS = ("rows", "cps", "ctas", "hg", "split", "first", "pf", "regs", "carveout", "ogate")
 _SM_REGS = 65536
 _CORE_THREADS = 256
 
@@ -213,12 +213,14 @@ def _core_knob() -> Optional[Dict[str, object]]:
       ogate=0|1    the consumer core validates the output gate in its epilogue (0)
       rows=lo:hi   decode rows it applies to (persistent: 9:16, since one 4-CTA/SM wave holds the core at <= 8 rows
                    and o_proj's 8-row tile does not fit beside it; else 1:64)
+      first=n      heads 0..n-1 (the heads qkvg publishes first) before the others (0: no split of the heads)
+      split=s      head order interleaved over o_proj's split-K slices within each part (persistent default:
+                   o_proj's split at the rows; else 1)
+      hg=g         heads per publication group (persistent default ``split``; else 1 with ``first``, H without)
 
     and for ``persistent``:
 
       cps=n        core CTAs per SM (3); ctas=n sets the grid instead
-      split=s      head order interleaved over o_proj's split-K slices (default: o_proj's split at the rows)
-      hg=g         heads per publication group (default ``split``: one head of every K slice)
       pf=0|1       prefetch the next item's state rows (1)
       regs=r       register cap per thread (0: none); default the smallest above 64 (the 4-CTA bound) that keeps a
                    (cps+1)-th core CTA off the SM, so the free slot is left to o_proj
@@ -245,7 +247,26 @@ def _core_knob() -> Optional[Dict[str, object]]:
     knob.setdefault("regs", min(255, cap) if cap > 64 else 0)
     knob.setdefault("carveout", getattr(kimi_k3_cute_gemm, "_VSPLITK_CARVEOUT", 100))
     knob.setdefault("ogate", 0)
+    knob.setdefault("first", 0)
     return knob
+
+
+_head_orders: Dict[tuple, torch.Tensor] = {}
+
+
+def head_order(heads: int, first: int, split: int, device) -> torch.Tensor:
+    """int32 [heads] head of each core group position: heads ``[0, first)`` then the rest, each part interleaved over
+    ``split`` equal head ranges (``h mod (heads / split)`` major). Built on the first (eager) call."""
+    key = (heads, first, split, str(device))
+    if key not in _head_orders:
+        span = heads // split
+        order = [
+            h
+            for part in (range(first), range(first, heads))
+            for h in sorted(part, key=lambda h: (h % span, h // span))
+        ]
+        _head_orders[key] = torch.tensor(order, dtype=torch.int32, device=device)
+    return _head_orders[key]
 
 
 _core_logged = set()
@@ -257,23 +278,31 @@ def _o_proj_split(rows: int) -> int:
     return next((t[1][2] for t in tactics if rows <= t[0]), 3)
 
 
-def core_kwargs(rows: int) -> Dict[str, object]:
+def core_kwargs(rows: int, heads: int = 96) -> Dict[str, object]:
     """Extra ``kda_decode_t1`` kwargs of the decode core when it produces a ``CORE`` slot (empty unless
     ``TLLM_K3_FGS_KDA_CORE`` covers ``rows``): a persistent grid of ``cps`` CTAs per SM that leaves one o_proj CTA
-    room on each SM, publishing all rows of one head of each of o_proj's split-K slices per group; the late
-    output-gate wait (applies only to the consumer build)."""
+    room on each SM, publishing all rows of one head of each of o_proj's split-K slices per group; the heads qkvg
+    publishes first, first; the late output-gate wait (applies only to the consumer build)."""
     knob = _core_knob()
     if knob is None or not knob["rows"][0] <= rows <= knob["rows"][1]:
         return {}
     kwargs: Dict[str, object] = {}
-    if knob["persistent"]:
-        split = knob.get("split") or _o_proj_split(rows)
+    persistent = knob["persistent"]
+    split = knob.get("split") or (_o_proj_split(rows) if persistent else 1)
+    first = knob["first"]
+    hg = knob.get("hg") or (split if persistent else 1 if first else 0)
+    if hg:
+        kwargs["fgs_head_group"] = hg
+    if first:
+        device = torch.device("cuda", torch.cuda.current_device())
+        kwargs["fgs_head_order"] = head_order(heads, first, split, device)
+    elif split > 1:
+        kwargs["fgs_head_split"] = split
+    if persistent:
         sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
         kwargs.update(
             fgs_persistent=True,
             fgs_ctas=knob.get("ctas") or knob["cps"] * sms,
-            fgs_head_group=knob.get("hg") or split,
-            fgs_head_split=split,
             fgs_prefetch_next=bool(knob["pf"]),
             fgs_smem_carveout=None if knob["carveout"] < 0 else knob["carveout"],
             max_regs=knob["regs"],
