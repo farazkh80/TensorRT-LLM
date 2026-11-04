@@ -20,10 +20,14 @@ stores whole 16 B chunks). ``rubin`` runs ``kimi_k3_fgs.dense_gemm_fgs``, split-
 ``kimi_k3_fgs.splitk_gemm_fgs``, ``fi_direct`` rows FlashInfer's default split-K tactic, or
 ``kimi_k3_fgs.direct_gemm_fgs`` at the table tactic (dense, 32 B aligned operands, N % 8 == 0 for an output slot)
 with ``TLLM_K3_FGS_DIRECT=1`` (any slot) or ``=consumer`` (input slot only); a strided input at split-K rows runs the
-``rubin`` build at ``_FGS_SMALL_TACTIC``. The direct consumer checks every element. A direct producer stores with
-``.pzo`` only when every reader of its slot checks every element (edges in ``TLLM_K3_FGS_ELEMENT_EDGES``), else it
-stores whole 16 B chunks as ``TLLM_K3_FGS_DIRECT_PRODUCER`` says: ``auto`` (default: ``group8`` for the rows in
-``_DIRECT_GROUP8``, else ``splitk``), ``group8``, ``head_last``, or ``splitk`` (the split-K fallback above).
+``rubin`` build at ``_FGS_SMALL_TACTIC``. The direct consumer checks every element, or with
+``TLLM_K3_FGS_DIRECT_CHECK=elem0`` only element 0 of each 16 B chunk (the TMA report_valid rule; sound because every
+producer of a direct GEMM's input slot stores whole chunks) except on slots written by a ``.pzo`` direct producer;
+``TLLM_K3_FGS_DIRECT_CHECK_MODE`` overrides its check mode. A direct producer stores with ``.pzo`` only when every
+reader of its slot checks every element (edges in ``TLLM_K3_FGS_ELEMENT_EDGES``), else it stores whole 16 B chunks as
+``TLLM_K3_FGS_DIRECT_PRODUCER`` says: ``auto`` (default: ``group8`` for the rows in ``_DIRECT_GROUP8``, else
+``splitk``), ``group8``, ``head_last``, ``cluster`` (cluster gather) or ``splitk`` (the split-K fallback above); items
+``<N>:<store>`` in the comma list override the store for an output width N.
 
 A shape without an entry runs the ``rubin`` backend under the TRT-LLM autotuner. Non-BF16 operands keep the
 cuBLAS matmul; empty problems launch nothing.
@@ -172,9 +176,46 @@ def _fgs_direct_mode() -> str:
     return os.environ.get("TLLM_K3_FGS_DIRECT", "0")
 
 
+_DIRECT_STORES = ("auto", "group8", "head_last", "cluster", "splitk")
+_DIRECT_CHECK_MODES = ("rows", "row", "heads", "heads_before_b")
+
+
 @functools.lru_cache(maxsize=None)
-def _direct_producer() -> str:
-    return os.environ.get("TLLM_K3_FGS_DIRECT_PRODUCER", "auto")
+def _direct_stores() -> Tuple[str, Dict[int, str]]:
+    """``TLLM_K3_FGS_DIRECT_PRODUCER``: (default store, {N: store})."""
+    default, by_n = "auto", {}
+    for item in filter(
+        None, (v.strip() for v in os.environ.get("TLLM_K3_FGS_DIRECT_PRODUCER", "").split(","))
+    ):
+        n, _, store = item.rpartition(":")
+        if store not in _DIRECT_STORES:
+            raise ValueError(
+                f"TLLM_K3_FGS_DIRECT_PRODUCER: {store!r}; valid: {', '.join(_DIRECT_STORES)}"
+            )
+        if n:
+            by_n[int(n)] = store
+        else:
+            default = store
+    return default, by_n
+
+
+def _direct_producer(n: int) -> str:
+    default, by_n = _direct_stores()
+    return by_n.get(n, default)
+
+
+@functools.lru_cache(maxsize=None)
+def _direct_check() -> Tuple[bool, Optional[str]]:
+    """(element 0 only, check mode or None for the kernel's default) of the direct consumer."""
+    check = os.environ.get("TLLM_K3_FGS_DIRECT_CHECK", "elements")
+    if check not in ("elements", "elem0"):
+        raise ValueError(f"TLLM_K3_FGS_DIRECT_CHECK={check!r}; valid: elements, elem0")
+    mode = os.environ.get("TLLM_K3_FGS_DIRECT_CHECK_MODE") or None
+    if mode is not None and mode not in _DIRECT_CHECK_MODES:
+        raise ValueError(
+            f"TLLM_K3_FGS_DIRECT_CHECK_MODE={mode!r}; valid: {', '.join(_DIRECT_CHECK_MODES)}"
+        )
+    return check == "elem0", mode
 
 
 # (N, K, M) where the direct producer's group8 store is within a few % of the plain store (multi-wave grids); the
@@ -300,10 +341,13 @@ def _fgs_rubin(
     )
 
 
-def _fgs_direct(x, weight, out, tactic, consume: bool, produce: str) -> None:
-    """``produce``: "" (no output slot), "pzo" (element-checked readers), "group8" or "head_last"."""
+def _fgs_direct(
+    x, weight, out, tactic, consume: bool, produce: str, in_edge: Optional[str]
+) -> None:
+    """``produce``: "" (no output slot), "pzo" (element-checked readers), "group8", "head_last" or "cluster"."""
     from .kimi_k3_fgs.direct_gemm_fgs import DirectTactic, run_direct_dense_fgs
 
+    elem0, check_mode = _direct_check()
     run_direct_dense_fgs(
         x,
         weight.t(),
@@ -311,16 +355,25 @@ def _fgs_direct(x, weight, out, tactic, consume: bool, produce: str) -> None:
         _pdl(),
         DirectTactic(*tactic),
         check_valid=consume,
+        check_mode=check_mode if consume else None,
+        check_elements=not (elem0 and in_edge not in _element_checked_edges()),
         pdl_wait_activation=not consume,
         pzo=bool(produce),
         early_trigger=bool(produce),
         head_last=produce == "head_last",
         group8=produce == "group8",
+        gather=produce == "cluster",
     )
 
 
 def _fgs_linear(
-    x, weight, out, consume: bool, produce: bool, out_edge: Optional[str] = None
+    x,
+    weight,
+    out,
+    consume: bool,
+    produce: bool,
+    out_edge: Optional[str] = None,
+    in_edge: Optional[str] = None,
 ) -> None:
     """``linear`` on edge-slot operands: the fine-grained-sync build of the table entry's kernel."""
     from .kimi_k3_fgs.splitk_gemm_fgs import SplitKTactic, default_tactic, run_splitk_dense_fgs
@@ -334,7 +387,7 @@ def _fgs_linear(
         tactic = fgs_tactic[1]
     direct_store = ""
     if produce:
-        direct_store = "pzo" if out_edge in _element_checked_edges() else _direct_producer()
+        direct_store = "pzo" if out_edge in _element_checked_edges() else _direct_producer(n)
         if direct_store == "auto":
             direct_store = "group8" if (n, k, m) in _DIRECT_GROUP8 else "splitk"
     if (
@@ -345,7 +398,7 @@ def _fgs_linear(
         and out.data_ptr() % 32 == 0
         and (not produce or (n % 8 == 0 and direct_store != "splitk"))
     ):
-        _fgs_direct(x, weight, out, tactic, consume, direct_store)
+        _fgs_direct(x, weight, out, tactic, consume, direct_store, in_edge)
         return
     # The decode o_proj consumer; prefill rows take the table's GEMM below.
     if consume and not produce and dense and n == 7168 and k == 12288 and m <= 2 * _FI_MAX_M:
@@ -410,6 +463,7 @@ def linear(
             in_lease is not None,
             out_lease is not None,
             None if out_lease is None or _fgs_direct_mode() == "0" else out_lease.workspace.name,
+            None if in_lease is None or _fgs_direct_mode() == "0" else in_lease.workspace.name,
         )
         _debug(
             f"linear N={n} K={k}",

@@ -53,7 +53,11 @@ CONSUMERS = {
     "rows_wait": dict(check_valid=True, check_mode="rows", pdl_wait_activation=True),
     "rows_uncapped": dict(check_valid=True, check_mode="rows", min_ctas_per_sm=1),
     "rows_elem0": dict(check_valid=True, check_mode="rows", check_elements=False),
+    "row_elem0": dict(check_valid=True, check_mode="row", check_elements=False),
     "heads_elem0": dict(check_valid=True, check_mode="heads", check_elements=False),
+    "heads_before_b_elem0": dict(
+        check_valid=True, check_mode="heads_before_b", check_elements=False
+    ),
     "row_relaxed_elem0": dict(
         check_valid=True, check_mode="row", relaxed_first=True, check_elements=False
     ),
@@ -63,8 +67,12 @@ PRODUCERS = {
     "pzo_early": dict(DEFAULT, pzo=True, early_trigger=True),
     "group8": dict(DEFAULT, pzo=True, early_trigger=True, group8=True),
     "head_last": dict(DEFAULT, pzo=True, early_trigger=True, head_last=True),
+    "gather": dict(DEFAULT, pzo=True, early_trigger=True, gather=True),
     "consumer_pzo": dict(check_valid=True, pzo=True, early_trigger=True),
     "consumer_group8": dict(check_valid=True, pzo=True, early_trigger=True, group8=True),
+    "consumer_elem0_gather": dict(
+        check_valid=True, check_elements=False, pzo=True, early_trigger=True, gather=True
+    ),
 }
 # Reload rounds after which a wait gives up and is counted (retry_counter[1]) instead of hanging the test.
 SPIN_LIMIT = 200_000
@@ -438,6 +446,14 @@ def test_late_out_of_order_producer(name: str, pattern: str) -> None:
     )
 
 
+@pytest.mark.parametrize("pattern", ["forward", "reverse", "random", "one_late"])
+@pytest.mark.parametrize("name", HAZARD_CASES)
+def test_late_out_of_order_producer_elem0(name: str, pattern: str) -> None:
+    """The element-0 consumer at its dispatch default mode (whole-chunk writer)."""
+    mode = fgs.default_check_mode(fgs.DirectTactic(*CASES[name][3]), CASES[name][2])
+    check_hazard(name, pattern, f"{mode}_elem0")
+
+
 @pytest.mark.parametrize("variant", ["row", "heads", "heads_before_b", "rows_elem0", "heads_elem0"])
 @pytest.mark.parametrize("name", ["bfa1", "bfa2", "qkvg1"])
 def test_late_producer_other_check_modes(name: str, variant: str) -> None:
@@ -453,15 +469,19 @@ def test_partially_written_chunks(name: str, variant: str) -> None:
     check_hazard(name, "random", variant, split_us=50.0)
 
 
-@pytest.mark.parametrize("store", ["pzo", "group8", "head_last"])
+@pytest.mark.parametrize(
+    "store,elem0",
+    [("pzo", False), ("group8", False), ("head_last", False), ("group8", True), ("gather", True)],
+)
 @pytest.mark.parametrize(
     "producer,consumer", [("oproj1", "qkvg1"), ("oproj1", "gproj1"), ("oproj1", "bfa1")]
 )
-def test_live_pair_into_consumer(producer: str, consumer: str, store: str) -> None:
-    """o_proj-shaped producer build (``store``, .pzo, entry trigger) writes a -0.0 slot that an element-checking
-    consumer build reads, PDL-chained on one stream, three steps with new producer inputs and the slot re-armed in
-    between (the model's step reuse): every step equals FlashInfer on the canonicalized intermediate, so no L1 line
-    of an earlier step's slot contents is consumed. ``pzo`` is the direct-to-direct pair (2 B stores)."""
+def test_live_pair_into_consumer(producer: str, consumer: str, store: str, elem0: bool) -> None:
+    """o_proj-shaped producer build (``store``, .pzo, entry trigger) writes a -0.0 slot that a consumer build reads
+    (every element checked, or element 0 only behind a whole-chunk ``store``), PDL-chained on one stream, three steps
+    with new producer inputs and the slot re-armed in between (the model's step reuse): every step equals FlashInfer
+    on the canonicalized intermediate, so no L1 line of an earlier step's slot contents is consumed. ``pzo`` is the
+    direct-to-direct pair (2 B stores)."""
     _, w1, t1 = inputs(producer)
     _, w2, t2 = inputs(consumer, seed=5)
     assert w1.shape[0] == w2.shape[1]
@@ -494,6 +514,7 @@ def test_live_pair_into_consumer(producer: str, consumer: str, store: str) -> No
             t2,
             retry_counter=counter,
             check_mode=mode,
+            check_elements=not elem0,
             spin_limit=SPIN_LIMIT,
         )
         torch.cuda.synchronize()
@@ -507,3 +528,136 @@ def test_live_pair_into_consumer(producer: str, consumer: str, store: str) -> No
             f"{producer}->{consumer} step {step}: {counter[0].item()} reloads"
         )
         print(f"{producer}->{consumer} step {step}: {counter[0].item()} reload rounds")
+
+
+@dsl_user_op
+def _ld_relaxed_v4(addr: Int64, *, loc=None, ip=None):
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [addr.ir_value(loc=loc, ip=ip)],
+        "ld.relaxed.gpu.global.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return [Int32(llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(4)]
+
+
+def _is_neg0(half):
+    return (half & 0xFFFF) == 0x8000
+
+
+class ChunkObserver:
+    """Polls every 16 B chunk of a -0.0-armed buffer while its producer runs. ``seen[c]`` becomes 1 when chunk c is
+    first read with element 0 published and no -0.0 left, 2 when element 0 is published but another element is
+    still -0.0 (a torn chunk an element-0 reader would accept), and stays 0 if element 0 is never seen published
+    within ``timeout_ns``."""
+
+    def __init__(self, threads: int = 256):
+        self.threads = threads
+
+    @cute.jit
+    def __call__(self, buf, seen, timeout_ns: Int64, stream: cuda.CUstream):
+        self.kernel(buf, seen, timeout_ns).launch(
+            grid=(OBSERVER_CTAS, 1, 1), block=(self.threads, 1, 1), stream=stream
+        )
+
+    @cute.kernel
+    def kernel(self, buf, seen, timeout_ns: Int64):
+        bid, _, _ = cute.arch.block_idx()
+        tid, _, _ = cute.arch.thread_idx()
+        first = bid * self.threads + tid
+        stride = OBSERVER_CTAS * self.threads
+        nchunks = cute.size(seen)
+        give_up = cute.arch.globaltimer() + timeout_ns
+        pending = cutlass.Boolean(True)
+        while pending & (cute.arch.globaltimer() < give_up):
+            pending = cutlass.Boolean(False)
+            for c in cutlass.range(first, nchunks, stride, unroll=1):
+                if seen[c] == 0:
+                    w = _ld_relaxed_v4(buf.iterator.toint() + Int64(c) * 16)
+                    if _is_neg0(w[0]):
+                        pending = cutlass.Boolean(True)
+                    else:
+                        torn = cutlass.Boolean(False)
+                        for i in cutlass.range_constexpr(4):
+                            torn = torn | _is_neg0(w[i]) | _is_neg0(w[i] >> 16)
+                        if torn:
+                            seen[c] = 2
+                        else:
+                            seen[c] = 1
+
+
+OBSERVER_CTAS = 16
+OBSERVER_TIMEOUT_NS = 200_000_000
+_OBSERVER = []
+
+
+def observe(buf: torch.Tensor, produce, lead_ns: int = 200_000):
+    """Arm ``buf`` with -0.0, start the observer on its own stream, then run ``produce`` on another stream after a
+    ``lead_ns`` GPU sleep (the observer is polling before the first store). Returns (torn, never published)."""
+    flat = bits(buf).view(-1)
+    seen = torch.zeros(flat.numel() // 8, dtype=torch.int32, device="cuda")
+    flat.fill_(NEG0)
+    args = (
+        from_dlpack(flat, assumed_align=16).mark_layout_dynamic(),
+        from_dlpack(seen, assumed_align=4).mark_layout_dynamic(),
+    )
+    so, sp = torch.cuda.Stream(), torch.cuda.Stream()
+    torch.cuda.synchronize()
+    with torch.cuda.stream(so):
+        stream = cuda.CUstream(so.cuda_stream)
+        if not _OBSERVER:
+            _OBSERVER.append(cute.compile(ChunkObserver(), *args, Int64(0), stream))
+        _OBSERVER[0](*args, Int64(OBSERVER_TIMEOUT_NS), stream)
+    with torch.cuda.stream(sp):
+        gpu_sleep(lead_ns)
+        produce()
+    torch.cuda.synchronize()
+    return int((seen == 2).sum()), int((seen == 0).sum())
+
+
+def test_chunk_tear_observer_catches_split_writer() -> None:
+    """Negative control: a writer that publishes elements 0-3 of each chunk 50 us before 4-7 must be seen torn."""
+    x, _, _ = inputs("qkvg2", seed=4)
+    slot = torch.empty_like(x)
+    ranks = ranks_for("random", x.shape[1] // BLOCK_COLS)
+    late_write(x, torch.empty_like(x), ranks, 0.0, 0.0, split_us=50.0)
+    torn, unpublished = observe(slot, lambda: late_write(x, slot, ranks, 0.0, 0.5, split_us=50.0))
+    assert unpublished == 0
+    assert torch.equal(bits(slot), bits(x))
+    assert torn > 0, "the observer saw no torn chunk behind a split writer"
+    print(f"split writer: {torn} torn chunks of {x.numel() // 8}")
+
+
+TEAR_REPS = 10
+
+
+@pytest.mark.parametrize("store", ["group8", "gather", "pzo_early"])
+@pytest.mark.parametrize("name", ["bfa1", "bfa4", "oproj1", "qkvg1", "qkvg2"])
+def test_producer_publishes_whole_chunks(name: str, store: str) -> None:
+    """``group8`` / ``gather`` never expose a chunk with element 0 published and another element still -0.0, over
+    repeated runs, and stay bit-exact. ``pzo_early`` (2 B stores) is the racy reference: its tears are printed, not
+    asserted (they depend on timing)."""
+    x, w, tactic = inputs(name, seed=6)
+    ref = flashinfer(x, w, tactic)
+    bits(ref)[bits(ref) == NEG0] = 0
+    out = torch.empty_like(ref)
+    counter = torch.zeros(fgs.RETRY_COUNTER_SLOTS, dtype=torch.int32, device="cuda")
+    flags = dict(PRODUCERS[store], spin_limit=SPIN_LIMIT)
+    run(x, w, tactic, flags, counter, buf=torch.empty_like(ref))
+    total = 0
+    for _ in range(TEAR_REPS):
+        torn, unpublished = observe(
+            out,
+            lambda: fgs.run_direct_dense_fgs(
+                x, w.t(), out, True, tactic, retry_counter=counter, **flags
+            ),
+        )
+        assert unpublished == 0, f"{name}/{store}: {unpublished} chunks never published"
+        assert torch.equal(bits(out), bits(ref)), f"{name}/{store}: output differs"
+        total += torn
+    print(f"{name}/{store}: {total} torn chunks in {TEAR_REPS} runs")
+    if store != "pzo_early":
+        assert total == 0, f"{name}/{store}: {total} torn chunks"
