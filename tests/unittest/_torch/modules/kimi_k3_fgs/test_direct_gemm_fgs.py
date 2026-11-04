@@ -590,7 +590,7 @@ class ChunkObserver:
 
 
 OBSERVER_CTAS = 16
-OBSERVER_TIMEOUT_NS = 200_000_000
+OBSERVER_TIMEOUT_NS = 2_000_000_000
 _OBSERVER = []
 
 
@@ -605,12 +605,14 @@ def observe(buf: torch.Tensor, produce, lead_ns: int = 200_000):
         from_dlpack(seen, assumed_align=4).mark_layout_dynamic(),
     )
     so, sp = torch.cuda.Stream(), torch.cuda.Stream()
+    # Everything compiles before the observer starts its clock.
+    if not _OBSERVER:
+        stream = cuda.CUstream(so.cuda_stream)
+        _OBSERVER.append(cute.compile(ChunkObserver(), *args, Int64(0), stream))
+    gpu_sleep(0)
     torch.cuda.synchronize()
     with torch.cuda.stream(so):
-        stream = cuda.CUstream(so.cuda_stream)
-        if not _OBSERVER:
-            _OBSERVER.append(cute.compile(ChunkObserver(), *args, Int64(0), stream))
-        _OBSERVER[0](*args, Int64(OBSERVER_TIMEOUT_NS), stream)
+        _OBSERVER[0](*args, Int64(OBSERVER_TIMEOUT_NS), cuda.CUstream(so.cuda_stream))
     with torch.cuda.stream(sp):
         gpu_sleep(lead_ns)
         produce()
