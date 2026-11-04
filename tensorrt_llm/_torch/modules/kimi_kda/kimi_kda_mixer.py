@@ -1366,7 +1366,7 @@ class KimiKDALinearAttention(nn.Module):
             )
             if lease is not None:
                 args = args[:-1] + (lease.tensor.view(B, H, hd),)
-                fgs_kwargs.update(k3_kda_chain.core_kwargs(B))
+                fgs_kwargs.update(k3_kda_chain.core_kwargs(B, H, lease))
         return fused_decode.kda_decode_t1(
             *args,
             lower_bound=self.gate_lower_bound,

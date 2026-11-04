@@ -46,6 +46,10 @@ consumer of qkvg / g / beta is then also the producer of the core output, also a
 one-wave persistent grid, where every item validates its own inputs. With ``late_gate``
 the consumer validates the output gate only in the epilogue (warp 0, right before the
 gated RMSNorm), so the state update does not wait for it.
+
+``arm`` (with ``fgs_producer``) re-arms another slot of the output edge in the kernel: the
+thread that stores an output chunk also stores the -0.0 sentinel over the same chunk of
+``arm``, the next use's slot, so that slot needs no framework fill.
 """
 
 from functools import cache
@@ -68,6 +72,8 @@ CONV_ITEMS = 3 * D // 4
 SETUP_ITEMS = CONV_ITEMS + D
 L2_EPS = 1.0e-6
 BF16_NEG_ZERO = 0x8000
+# Two bf16 -0.0 sentinels in one 32-bit word (0x80008000).
+BF16X2_NEG_ZERO = -0x7FFF8000
 SPIN_NS_MIN = 32
 SPIN_NS_MAX = 2048
 
@@ -184,6 +190,22 @@ def _nanosleep(ns, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _globaltimer(*, loc=None, ip=None):
+    return cutlass.Int64(
+        llvm.inline_asm(
+            T.i64(),
+            [],
+            "mov.u64 $0, %globaltimer;",
+            "=l",
+            has_side_effects=True,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def _store_global_v4(addr, w0, w1, w2, w3, *, loc=None, ip=None):
     llvm.inline_asm(
         None,
@@ -229,6 +251,8 @@ class KdaDecodeT1:
         smem_carveout: int | None = None,
         late_gate: bool = False,
         with_head_order: bool = False,
+        with_arm: bool = False,
+        arm_delay_ns: int = 0,
     ):
         assert v_split in (1, 2, 4)
         self.heads = heads
@@ -287,6 +311,10 @@ class KdaDecodeT1:
         assert fgs_consumer or not with_stats
         assert fgs_consumer or not late_gate
         self.late_gate = late_gate
+        # arm_delay_ns (hazard tests): each arming thread first waits that long on %globaltimer.
+        assert store16 or not with_arm
+        self.with_arm = with_arm
+        self.arm_delay_ns = arm_delay_ns
         self.fgs_consumer = fgs_consumer
         self.max_spins = max_spins
         self.with_stats = with_stats
@@ -308,6 +336,7 @@ class KdaDecodeT1:
         output: cute.Tensor,
         stats: cute.Tensor | None,
         head_order: cute.Tensor | None,
+        arm: cute.Tensor | None,
         stream: cuda.CUstream,
     ):
         H = self.heads
@@ -354,6 +383,12 @@ class KdaDecodeT1:
             output.iterator,
             cute.make_layout((vec, D // vec, H, rows), stride=(1, vec, D, output.stride[0])),
         )
+        arm_v = None
+        if cutlass.const_expr(self.with_arm):
+            arm_v = cute.make_tensor(
+                arm.iterator,
+                cute.make_layout((vec, D // vec, H, rows), stride=(1, vec, D, arm.stride[0])),
+            )
         cluster = [self.v_split, 1, 1] if self.v_split > 1 else None
         grid = [H * self.v_split, rows, 1]
         if cutlass.const_expr(self.head_group > 0):
@@ -378,6 +413,7 @@ class KdaDecodeT1:
             out_v,
             stats,
             head_order,
+            arm_v,
         ).launch(
             grid=grid,
             block=[self.threads, 1, 1],
@@ -436,6 +472,7 @@ class KdaDecodeT1:
         output: cute.Tensor,
         stats: cute.Tensor | None,
         head_order: cute.Tensor | None,
+        arm: cute.Tensor | None,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bx, by, _ = cute.arch.block_idx()
@@ -484,6 +521,7 @@ class KdaDecodeT1:
             lane,
             warp,
             stats,
+            arm,
         )
 
         if cutlass.const_expr(self.persistent):
@@ -581,6 +619,7 @@ class KdaDecodeT1:
         lane,
         warp,
         stats,
+        arm,
         row,
         head,
         rank,
@@ -907,6 +946,14 @@ class KdaDecodeT1:
                         _store_global_v4(
                             chunk.iterator.toint(), packed[0], packed[1], packed[2], packed[3]
                         )
+                        if cutlass.const_expr(self.with_arm):
+                            if cutlass.const_expr(self.arm_delay_ns > 0):
+                                t0 = _globaltimer()
+                                while _globaltimer() - t0 < self.arm_delay_ns:
+                                    _nanosleep(cutlass.Int32(256))
+                            neg = cutlass.Int32(BF16X2_NEG_ZERO)
+                            arm_chunk = arm[(None, rank * (lanes_used // 2) + lane // 2, head, row)]
+                            _store_global_v4(arm_chunk.iterator.toint(), neg, neg, neg, neg)
         else:
             if tidx < lanes_used:
                 rstd = cute.math.rsqrt(sum_sq * (1.0 / D) + self.norm_eps)
@@ -1001,6 +1048,8 @@ def _compile(
     max_regs: int = 0,
     late_gate: bool = False,
     with_head_order: bool = False,
+    with_arm: bool = False,
+    arm_delay_ns: int = 0,
 ):
     d = heads * D
     rows, slots, conv_slots = cute.sym_int(), cute.sym_int(), cute.sym_int()
@@ -1044,6 +1093,11 @@ def _compile(
         make_fake_tensor(cutlass.Int32, (heads,), stride=(1,), assumed_align=4)
         if with_head_order
         else None,
+        make_fake_tensor(
+            BF16, (rows, heads, D), stride=(cute.sym_int64(divisibility=8), D, 1), assumed_align=16
+        )
+        if with_arm
+        else None,
         make_fake_stream(use_tvm_ffi_env_stream=True),
     )
     op = KdaDecodeT1(
@@ -1071,6 +1125,8 @@ def _compile(
         smem_carveout,
         late_gate,
         with_head_order,
+        with_arm,
+        arm_delay_ns,
     )
     options = "--enable-tvm-ffi"
     if max_regs:
@@ -1255,6 +1311,8 @@ def kda_decode_t1(
     max_regs: int = 0,
     fgs_late_gate: bool = False,
     fgs_head_order: torch.Tensor | None = None,
+    fgs_arm: torch.Tensor | None = None,
+    fgs_arm_delay_ns: int = 0,
 ) -> torch.Tensor:
     """Fused T=1 KDA decode; updates ``conv_state`` and ``state`` rows in place.
 
@@ -1299,6 +1357,12 @@ def kda_decode_t1(
     ``fgs_head_order`` (int32 [H] on the device, a permutation of the heads; producer only, in
     place of ``fgs_head_split``) is the head of each head-group position: e.g. the heads a
     producer of the inputs publishes first, first.
+
+    ``fgs_arm`` (producer only; BF16 [B, H, 128], 16-B aligned rows, another slot of the
+    output's edge, typically its next use) is re-armed by the kernel: every output chunk's
+    storing thread also stores -0.0 over the same chunk of ``fgs_arm``. The caller must order
+    the kernel's completion before that slot's next producer (a launch without PDL in between).
+    ``fgs_arm_delay_ns`` delays each arming store (hazard tests).
 
     ``fgs_late_gate`` (consumer only, ignored otherwise) validates the output gate in the
     epilogue instead of the setup, after the state update. Warps
@@ -1363,6 +1427,18 @@ def kda_decode_t1(
         raise ValueError(
             "kda_decode_t1: fgs_head_order needs fgs_producer, no fgs_head_split and an int32 [H] "
             "tensor on the input's device"
+        )
+    if fgs_arm is not None and (
+        not fgs_producer
+        or fgs_arm.dtype != torch.bfloat16
+        or fgs_arm.shape != output.shape
+        or fgs_arm.stride()[1:] != (D, 1)
+        or fgs_arm.stride(0) % 8
+        or fgs_arm.data_ptr() % 16
+    ):
+        raise ValueError(
+            "kda_decode_t1: fgs_arm needs fgs_producer and a BF16 [B, H, 128] tensor with 16-B "
+            "aligned rows"
         )
     if fgs_head_split != 1 and (not fgs_producer or heads % fgs_head_split):
         raise ValueError(
@@ -1439,6 +1515,8 @@ def kda_decode_t1(
         max_regs=max_regs,
         late_gate=fgs_late_gate and fgs_consumer,
         with_head_order=fgs_head_order is not None,
+        with_arm=fgs_arm is not None,
+        arm_delay_ns=fgs_arm_delay_ns if fgs_arm is not None else 0,
     )
     fn(
         x,
@@ -1455,5 +1533,6 @@ def kda_decode_t1(
         output,
         fgs_stats if with_stats else None,
         fgs_head_order,
+        fgs_arm,
     )
     return output
