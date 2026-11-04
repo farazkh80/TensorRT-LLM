@@ -244,6 +244,14 @@ def nanosleep(ns, *, loc=None, ip=None):
     )
 
 
+@cute.jit
+def sleep_ns(ns: cutlass.Constexpr):
+    """Busy-wait at least ``ns`` ns of %globaltimer (hazard-test delays)."""
+    t0 = cutlass.Int32(cute.arch.globaltimer_lo())
+    while cutlass.Int32(cute.arch.globaltimer_lo()) - t0 < cutlass.Int32(ns):
+        nanosleep(cutlass.Int32(256))
+
+
 @dsl_user_op
 def trap(*, loc=None, ip=None):
     llvm.inline_asm(
