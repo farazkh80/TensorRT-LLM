@@ -19,18 +19,19 @@ fine-grained-sync build of the table entry's kernel at its tactic: an input slot
 stores whole 16 B chunks). ``rubin`` runs ``kimi_k3_fgs.dense_gemm_fgs``, split-K entries
 ``kimi_k3_fgs.splitk_gemm_fgs``, ``fi_direct`` rows FlashInfer's default split-K tactic, or
 ``kimi_k3_fgs.direct_gemm_fgs`` at the table tactic (dense, 32 B aligned operands, N % 8 == 0 for an output slot)
-with ``TLLM_K3_FGS_DIRECT=1`` (any slot) or ``=consumer`` (input slot only); a strided input at split-K rows runs the
-``rubin`` build at ``_FGS_SMALL_TACTIC``. The direct consumer checks every element, or with
-``TLLM_K3_FGS_DIRECT_CHECK=elem0`` only element 0 of each 16 B chunk (the TMA report_valid rule; sound because every
-producer of a direct GEMM's input slot stores whole chunks) except on slots written by a ``.pzo`` direct producer;
-``TLLM_K3_FGS_DIRECT_CHECK_MODE`` overrides its check mode. A direct producer stores with ``.pzo`` only when every
-reader of its slot checks every element (edges in ``TLLM_K3_FGS_ELEMENT_EDGES``), else it stores whole 16 B chunks as
-``TLLM_K3_FGS_DIRECT_PRODUCER`` says: ``auto`` (default: ``group8`` for the rows in ``_DIRECT_GROUP8``, else
-``splitk``), ``group8``, ``head_last``, ``cluster`` (cluster gather), ``chunk`` (one CTA per chunk, ``group8`` where a
-row's chunk needs more than 1024 threads or a CTA holds several rows) or ``splitk`` (the split-K fallback above); items
-``<N>:<store>`` in the comma list override the store for an output width N. ``TLLM_K3_FGS_QKVG_ORDER=<h1>`` makes the
-``rubin`` producer build of the KDA qkvg projection compute the q / k / v tiles of heads 0 .. h1 - 1 first
-(``dense_gemm_fgs`` ``n_order``; same tiles, bit-exact).
+(``TLLM_K3_FGS_DIRECT=1``, the default: any slot; ``=consumer``: input slots only; ``=0``: the split-K fallbacks); a
+strided input at split-K rows runs the ``rubin`` build at ``_FGS_SMALL_TACTIC``. The direct consumer checks element 0
+of each 16 B chunk (``TLLM_K3_FGS_DIRECT_CHECK=elem0``, the default: the TMA report_valid rule, sound because every
+producer of a direct GEMM's input slot stores whole chunks), every element on slots written by a ``.pzo`` direct
+producer, or every element everywhere with ``=elements``; ``TLLM_K3_FGS_DIRECT_CHECK_MODE`` overrides its check mode.
+A direct producer stores with ``.pzo`` only when every reader of its slot checks every element (edges in
+``TLLM_K3_FGS_ELEMENT_EDGES``, default ``mla.g``: the output gate), else it stores whole 16 B chunks as
+``TLLM_K3_FGS_DIRECT_PRODUCER`` says: ``auto`` (default: ``_DIRECT_AUTO_STORE``), ``group8``, ``head_last``,
+``cluster`` (cluster gather), ``chunk`` (one CTA per chunk, ``group8`` where a row's chunk needs more than 1024
+threads or a CTA holds several rows) or ``splitk`` (the split-K fallback above, not bit-exact with ``fi_direct``);
+items ``<N>:<store>`` in the comma list override the store for an output width N.
+``TLLM_K3_FGS_QKVG_ORDER=<h1>`` makes the ``rubin`` producer build of the KDA qkvg projection compute the q / k / v
+tiles of heads 0 .. h1 - 1 first (``dense_gemm_fgs`` ``n_order``; same tiles, bit-exact).
 
 A shape without an entry runs the ``rubin`` backend under the TRT-LLM autotuner. Non-BF16 operands keep the
 cuBLAS matmul; empty problems launch nothing.
@@ -176,7 +177,7 @@ def fgs_dsl() -> bool:
 
 @functools.lru_cache(maxsize=None)
 def _fgs_direct_mode() -> str:
-    return os.environ.get("TLLM_K3_FGS_DIRECT", "0")
+    return os.environ.get("TLLM_K3_FGS_DIRECT", "1")
 
 
 _DIRECT_STORES = ("auto", "group8", "head_last", "cluster", "chunk", "splitk")
@@ -210,7 +211,7 @@ def _direct_producer(n: int) -> str:
 @functools.lru_cache(maxsize=None)
 def _direct_check() -> Tuple[bool, Optional[str]]:
     """(element 0 only, check mode or None for the kernel's default) of the direct consumer."""
-    check = os.environ.get("TLLM_K3_FGS_DIRECT_CHECK", "elements")
+    check = os.environ.get("TLLM_K3_FGS_DIRECT_CHECK", "elem0")
     if check not in ("elements", "elem0"):
         raise ValueError(f"TLLM_K3_FGS_DIRECT_CHECK={check!r}; valid: elements, elem0")
     mode = os.environ.get("TLLM_K3_FGS_DIRECT_CHECK_MODE") or None
@@ -221,15 +222,17 @@ def _direct_check() -> Tuple[bool, Optional[str]]:
     return check == "elem0", mode
 
 
-# (N, K, M) where the direct producer's group8 store is within a few % of the plain store (multi-wave grids); the
-# other fi_direct rows with an output slot take the split-K producer.
-_DIRECT_GROUP8 = {(49152, 7168, 1)}
+# Chunk-safe store of the ``auto`` direct producer by output width N (ready input): cluster gather on the single-wave
+# bfa grid, group8 on the multi-wave ones.
+_DIRECT_AUTO_STORE = {224: "cluster"}
 
 
 @functools.lru_cache(maxsize=None)
 def _element_checked_edges() -> frozenset:
     """Edges whose every reader checks every element (no direct GEMM consumer reads a fi_direct output today)."""
-    return frozenset(e for e in os.environ.get("TLLM_K3_FGS_ELEMENT_EDGES", "").split(",") if e)
+    return frozenset(
+        e for e in os.environ.get("TLLM_K3_FGS_ELEMENT_EDGES", "mla.g").split(",") if e
+    )
 
 
 @functools.lru_cache(maxsize=None)
@@ -369,6 +372,13 @@ def _fgs_direct(
     from .kimi_k3_fgs.direct_gemm_fgs import DirectTactic, run_direct_dense_fgs
 
     elem0, check_mode = _direct_check()
+    check_elements = not (elem0 and in_edge not in _element_checked_edges())
+    _debug(
+        f"linear N={weight.shape[0]} K={x.shape[1]}",
+        x.shape[0],
+        f"fgs direct {tuple(tactic)} consumer={'-' if not consume else 'elements' if check_elements else 'elem0'}"
+        f"{'' if check_mode is None else ' ' + check_mode} producer={produce or '-'}",
+    )
     chunk = {}
     if produce == "chunk":
         # 512-thread CTAs (two per SM at 64 registers), weights three steps ahead: best at o_proj M=1.
@@ -386,7 +396,7 @@ def _fgs_direct(
         DirectTactic(*tactic),
         check_valid=consume,
         check_mode=check_mode if consume else None,
-        check_elements=not (elem0 and in_edge not in _element_checked_edges()),
+        check_elements=check_elements,
         pdl_wait_activation=not consume,
         pzo=bool(produce),
         early_trigger=bool(produce),
@@ -421,7 +431,7 @@ def _fgs_linear(
     if produce:
         direct_store = "pzo" if out_edge in _element_checked_edges() else _direct_producer(n)
         if direct_store == "auto":
-            direct_store = "group8" if (n, k, m) in _DIRECT_GROUP8 else "splitk"
+            direct_store = _DIRECT_AUTO_STORE.get(n, "group8")
         if direct_store == "chunk" and backend == "fi_direct":
             block_size, outputs_per_block, rows_per_block = tactic
             if rows_per_block != 1 or (8 // outputs_per_block) % max(1, 512 // block_size):
