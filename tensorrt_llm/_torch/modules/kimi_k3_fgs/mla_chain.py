@@ -63,6 +63,19 @@ MIN_ROWS = int(os.environ.get("TLLM_K3_FGS_MLA_MIN_ROWS", "2"))
 MAX_ROWS = int(os.environ.get("TLLM_K3_FGS_MLA_MAX_ROWS", "32"))
 # Split-KV clusters without K tiles exit at entry (``KimiK3MlaDecodeFgs(fgs_skip_empty=True)``).
 SKIP_EMPTY_SPLITS = os.environ.get("TLLM_K3_FGS_MLA_SKIP_EMPTY", "0") == "1"
+# Split-KV reduction: head rows per CTA (1, 2, 4, or ``auto``: 1 below 8 decode rows, 2 below 16, else 4; fewer CTAs
+# let W_UV, its PDL dependent, launch sooner) and the launch's preferred smem carveout in percent (unset: the
+# driver's default for its 1 KB per CTA).
+RED_ROWS = os.environ.get("TLLM_K3_FGS_MLA_RED_ROWS", "1")
+RED_CARVEOUT = int(os.environ.get("TLLM_K3_FGS_MLA_RED_CARVEOUT", "-1"))
+
+
+def _red_rows(batch: int) -> int:
+    if RED_ROWS == "auto":
+        return 1 if batch < 8 else 2 if batch < 16 else 4
+    return int(RED_ROWS)
+
+
 # In-kernel sentinel re-arm (comma list): ``kv_c`` = the latent append re-arms compressed_kv after reading it (its last
 # reader); ``gated`` = the output gate arms the slot of the edge's next use in the step. The framework fill still
 # runs for these slots (redundant); TLLM_K3_FGS_MLA_REARM_DELAY_NS delays the re-arm stores (hazard tests).
@@ -451,7 +464,15 @@ class _Decode:
         split_ws = self.split_ws if self.use_workspace else None
         plan = self.plan if self.use_workspace else None
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-        key = (self.page_size, heads, self.use_workspace, plan is not None, fused_q.device)
+        red_rows = _red_rows(batch) if plan is not None else 1
+        key = (
+            self.page_size,
+            heads,
+            self.use_workspace,
+            plan is not None,
+            red_rows,
+            fused_q.device,
+        )
         fn = self._compiled.get(key)
         if fn is None:
             import tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops as ops
@@ -463,6 +484,8 @@ class _Decode:
                 True, var_split, num_heads=heads, seq_len_q=1,
                 reducer_max_splits=ops.MLA_DECODE_MAX_SPLITS if var_split else 32,
                 fgs_consumer=True, fgs_producer=True, fgs_reduction=True, fgs_skip_empty=SKIP_EMPTY_SPLITS,
+                fgs_red_rows=red_rows,
+                fgs_red_carveout=RED_CARVEOUT if RED_CARVEOUT >= 0 else None,
             )  # fmt: skip
 
             def ct(t, leading, align=16):
