@@ -14,6 +14,10 @@ Producer (the output feeds a report_valid consumer):
 - ``early_trigger``: ``griddepcontrol.launch_dependents`` at kernel entry instead of after the epilogue.
 - ``raster_along="n"`` (scheduler, with ``swizzle_size``): consecutive tiles walk N first, so output row blocks
   complete in row order instead of all in the last tile round.
+- ``n_order=(heads, h1)``: the N tiles are four sections (q | k | v | gate) of ``heads`` one-tile heads, and the
+  scheduler's N index t is mapped to the tile it computes and stores as: the q, k, v tiles of heads 0 .. h1 - 1,
+  head-major, then the gate tiles of those heads, then all four tiles of each remaining head. Each tile's math is
+  unchanged; the first ``3 * h1`` tiles (the first persistent round when the grid holds them) complete whole heads.
 
 Consumer (A is a sentinel-armed edge slot; B, the weights, is never checked):
 
@@ -92,6 +96,7 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
         wait_input: bool = True,
         store_wait: bool = False,
         retry_poll: Literal["try", "test"] = "try",
+        n_order: Optional[Tuple[int, int]] = None,
     ):
         super().__init__(
             acc_dtype=acc_dtype,
@@ -121,6 +126,7 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
         self.wait_input = wait_input or not use_pdl
         self.store_wait = store_wait and not self.wait_input
         self.retry_poll = retry_poll
+        self.n_order = n_order
         self.a_copy_kwargs = {"report_valid": True} if report_valid else {}
         self.retry_warp_id = 6
         if retry_warp:
@@ -484,7 +490,9 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
                     cur_tile_coord[2],
                 )
                 tAgA_slice = tAgA[(None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])]
-                tBgB_slice = tBgB[(None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])]
+                tBgB_slice = tBgB[
+                    (None, self._n_tile(mma_tile_coord_mnl[1]), None, mma_tile_coord_mnl[2])
+                ]
 
                 ab_producer.reset()
                 peek_ab_empty_status = ab_producer.try_acquire()
@@ -660,12 +668,13 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
 
             while work_tile.is_valid_tile:
                 cur_tile_coord = work_tile.tile_idx
+                n_tile = self._n_tile(cur_tile_coord[1])
                 mma_tile_coord_mnl = (
                     cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
-                    cur_tile_coord[1],
+                    n_tile,
                     cur_tile_coord[2],
                 )
-                tile_stamp_idx = cur_tile_coord[0] * tiles_n + cur_tile_coord[1]
+                tile_stamp_idx = cur_tile_coord[0] * tiles_n + n_tile
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 
@@ -729,6 +738,25 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
 
         if cutlass.const_expr(not self.early_trigger and self.use_pdl):
             cute.arch.griddepcontrol_launch_dependents()
+
+    @cute.jit
+    def _n_tile(self, t):
+        """The N tile the scheduler's N index ``t`` computes (``n_order``)."""
+        n = t
+        if cutlass.const_expr(self.n_order is not None):
+            heads, h1 = self.n_order
+            if t < 3 * h1:
+                head = t // 3
+                n = (t - 3 * head) * heads + head
+            else:
+                u = t - 3 * h1
+                if u < h1:
+                    n = 3 * heads + u
+                else:
+                    w = u - h1
+                    q = w // 4
+                    n = (w - 4 * q) * heads + h1 + q
+        return n
 
     @cute.jit
     def _retry_leader(
@@ -1028,6 +1056,16 @@ def _scratch(device: torch.device, name: str, numel: int) -> torch.Tensor:
     return _SCRATCH[key]
 
 
+def _check_n_order(n_order: Optional[Tuple[int, int]], n: int, mma_mn: Tuple[int, int]) -> None:
+    if n_order is None:
+        return
+    heads, h1 = n_order
+    if n != 4 * heads * mma_mn[1] or not 0 < h1 <= heads:
+        raise ValueError(
+            f"n_order {n_order} needs N = 4 x heads x tile N ({mma_mn[1]}) and 0 < h1 <= heads, got N={n}"
+        )
+
+
 def _parse_tactic(tactic: tuple):
     variant, use_2cta, mma_mn, cluster_mn, max_stage = tactic[:5]
     split_k = tactic[5] if len(tactic) > 5 else 1
@@ -1054,12 +1092,14 @@ def run_gemm_fgs(
     use_pdl: bool = True,
     retry_counter: Optional[torch.Tensor] = None,
     max_ctas: Optional[int] = None,
+    n_order: Optional[Tuple[int, int]] = None,
 ) -> torch.Tensor:
     """``out[L, M, N] = a[L, M, K] @ w[L, N, K]^T`` in BF16 at an in-tree ``base`` tactic.
 
     Any operand may be a strided view with K (``a``, ``w``) / N (``out``) innermost and 16 B aligned rows, as for the
     in-tree batched runner. Defaults are the report_valid consumer; ``retry_counter`` (int32[``RETRY_COUNTER_SLOTS``])
     accumulates the A re-issues. ``max_ctas`` caps the persistent grid (default: the device's max active clusters).
+    ``n_order`` (heads, h1) is the kernel's head-ordered tile mapping.
     """
     if a.dim() != 3 or w.dim() != 3 or out.dim() != 3:
         raise ValueError("run_gemm_fgs takes [L, M, K], [L, N, K], [L, M, N] operands")
@@ -1072,6 +1112,7 @@ def run_gemm_fgs(
     if (k > 1 and (a.stride(2) != 1 or w.stride(2) != 1)) or (n > 1 and out.stride(2) != 1):
         raise ValueError("K must be innermost in a and w, N innermost in out")
     use_2cta, mma_mn, cluster_mn, max_stage = _parse_tactic(tactic)
+    _check_n_order(n_order, n, mma_mn)
     if retry_counter is None:
         retry_counter = _scratch(a.device, "retry", RETRY_COUNTER_SLOTS)
     elif retry_counter.dtype != torch.int32 or retry_counter.numel() != RETRY_COUNTER_SLOTS:
@@ -1101,6 +1142,7 @@ def run_gemm_fgs(
         wait_input=wait_input,
         store_wait=store_wait,
         retry_poll=retry_poll,
+        n_order=n_order,
     )
     key = (
         "strided",
@@ -1162,6 +1204,7 @@ def run_dense_fgs(
     use_pdl: bool = True,
     tactic: tuple = O_PROJ_TACTIC,
     stamps: Optional[torch.Tensor] = None,
+    n_order: Optional[Tuple[int, int]] = None,
 ) -> torch.Tensor:
     """``out[M, N] = a[M, K] @ w[N, K]^T`` in BF16 with the producer roles; all three row-major and dense.
 
@@ -1176,6 +1219,7 @@ def run_dense_fgs(
     if tuple(out.shape) != (m, n) or w.shape[1] != k:
         raise ValueError(f"shapes a {tuple(a.shape)} w {tuple(w.shape)} out {tuple(out.shape)}")
     use_2cta, mma_mn, cluster_mn, max_stage = _parse_tactic(tactic)
+    _check_n_order(n_order, n, mma_mn)
     timeline = stamps is not None
     if timeline and (stamps.dtype != torch.int32 or stamps.numel() < timeline_slots(m, n, tactic)):
         raise ValueError(f"stamps must be int32 with >= {timeline_slots(m, n, tactic)} elements")
@@ -1200,6 +1244,7 @@ def run_dense_fgs(
         use_pdl,
         timeline,
         clusters,
+        n_order,
     )
     compiled = _COMPILED.get(key)
     if compiled is None:
@@ -1215,6 +1260,7 @@ def run_dense_fgs(
             early_trigger=early_trigger,
             use_pdl=use_pdl,
             timeline=timeline,
+            n_order=n_order,
         )
         compiled = cute.compile(
             gemm.wrapper_fgs,

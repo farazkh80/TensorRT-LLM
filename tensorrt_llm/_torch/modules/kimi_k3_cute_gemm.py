@@ -27,7 +27,9 @@ producer of a direct GEMM's input slot stores whole chunks) except on slots writ
 reader of its slot checks every element (edges in ``TLLM_K3_FGS_ELEMENT_EDGES``), else it stores whole 16 B chunks as
 ``TLLM_K3_FGS_DIRECT_PRODUCER`` says: ``auto`` (default: ``group8`` for the rows in ``_DIRECT_GROUP8``, else
 ``splitk``), ``group8``, ``head_last``, ``cluster`` (cluster gather) or ``splitk`` (the split-K fallback above); items
-``<N>:<store>`` in the comma list override the store for an output width N.
+``<N>:<store>`` in the comma list override the store for an output width N. ``TLLM_K3_FGS_QKVG_ORDER=<h1>`` makes the
+``rubin`` producer build of the KDA qkvg projection compute the q / k / v tiles of heads 0 .. h1 - 1 first
+(``dense_gemm_fgs`` ``n_order``; same tiles, bit-exact).
 
 A shape without an entry runs the ``rubin`` backend under the TRT-LLM autotuner. Non-BF16 operands keep the
 cuBLAS matmul; empty problems launch nothing.
@@ -234,6 +236,16 @@ def _x5() -> bool:
     return os.environ.get("TLLM_K3_CUTE_GEMM_X5", "1") == "1" and fgs_dsl()
 
 
+# KDA qkvg projection (N, K) and its heads (q | k | v | gate sections of one-tile heads).
+_QKVG = (49152, 7168)
+_QKVG_HEADS = 96
+
+
+@functools.lru_cache(maxsize=None)
+def _qkvg_order() -> int:
+    return int(os.environ.get("TLLM_K3_FGS_QKVG_ORDER", "0"))
+
+
 # Preferred smem carveout (percent) of the vendored split-K launches.
 _VSPLITK_CARVEOUT = 100
 # Report_valid consumer tactic per launch rows (<= 8, <= 16, <= 32) and whether it requests only its footprint.
@@ -320,7 +332,14 @@ def _fgs_leases(*tensors):
 
 
 def _fgs_rubin(
-    x3, w3, out3, tactic, consume: bool, produce: bool, max_ctas: Optional[int] = None
+    x3,
+    w3,
+    out3,
+    tactic,
+    consume: bool,
+    produce: bool,
+    max_ctas: Optional[int] = None,
+    n_order: Optional[Tuple[int, int]] = None,
 ) -> None:
     from .kimi_k3_fgs.dense_gemm_fgs import run_gemm_fgs
 
@@ -338,6 +357,7 @@ def _fgs_rubin(
         early_trigger=produce,
         use_pdl=_pdl(),
         max_ctas=max_ctas,
+        n_order=n_order,
     )
 
 
@@ -408,7 +428,18 @@ def _fgs_linear(
     if backend == "rubin" or not dense:
         if backend != "rubin":
             tactic = _FGS_SMALL_TACTIC
-        _fgs_rubin(x.unsqueeze(0), weight.unsqueeze(0), out.unsqueeze(0), tactic, consume, produce)
+        n_order = None
+        if produce and backend == "rubin" and (n, k) == _QKVG and _qkvg_order() > 0:
+            n_order = (_QKVG_HEADS, _qkvg_order())
+        _fgs_rubin(
+            x.unsqueeze(0),
+            weight.unsqueeze(0),
+            out.unsqueeze(0),
+            tactic,
+            consume,
+            produce,
+            n_order=n_order,
+        )
         return
     exact = backend == "vsplitk"
     for r in range(0, m, _FI_MAX_M):
