@@ -60,6 +60,11 @@ checks element 0 only (TMA ``report_valid``, KdaDecodeT1, the mixes) could accep
   the cluster barrier (release) and the other CTAs exit; the leader waits on the barrier (acquire) and stores each
   row's chunk with one 16 B store. Exited threads do not hold the barrier, and the leader, whose shared memory the
   others write, cannot exit before all of them arrived. Needs ``pzo`` and N % 8 == 0.
+- ``chunk``: one CTA per chunk column, ``chunk_parallel`` (P, default ``G``) default-build sub-blocks of ``block_size``
+  threads side by side, each computing ``G / P`` default column groups in turn (bit-identical per column); thread 0
+  stores the chunk with one 16 B store. The weights are streamed ``chunk_prefetch`` K tiles ahead across the column
+  groups instead of being held for a whole K loop, so the next group's loads overlap the current group's FMAs.
+  Needs ``pzo``, N % 8 == 0, one row per CTA and ``P * block_size`` <= 1024.
 
 The kernel never writes sentinels; the caller owns sentinel initialization of the activation buffer.
 """
@@ -393,6 +398,9 @@ class DirectFgsGemmKernel:
         head_last: bool = False,
         group8: bool = False,
         gather: bool = False,
+        chunk: bool = False,
+        chunk_prefetch: int = 3,
+        chunk_parallel: int = 0,
         min_ctas_per_sm: int = 1,
         spin_limit: int = 0,
     ) -> None:
@@ -401,10 +409,22 @@ class DirectFgsGemmKernel:
             raise ValueError(f"check_mode must be one of {_CHECK_MODES}, got {check_mode!r}")
         if relaxed_first and (not check_valid or check_mode != "row"):
             raise ValueError("relaxed_first applies to the row check only")
-        if (head_last or group8 or gather) and not pzo:
-            raise ValueError("head_last, group8 and gather need pzo")
-        if head_last + group8 + gather > 1:
-            raise ValueError("head_last, group8 and gather are alternatives")
+        if (head_last or group8 or gather or chunk) and not pzo:
+            raise ValueError("head_last, group8, gather and chunk need pzo")
+        if head_last + group8 + gather + chunk > 1:
+            raise ValueError("head_last, group8, gather and chunk are alternatives")
+        groups = _CHUNK // tactic.outputs_per_block
+        chunk_parallel = chunk_parallel or groups
+        if chunk and (
+            tactic.rows_per_block != 1
+            or groups % chunk_parallel
+            or chunk_parallel * tactic.block_size > 1024
+            or chunk_prefetch < 1
+        ):
+            raise ValueError(
+                f"chunk needs one row per CTA, P | G, P x block_size <= 1024, prefetch >= 1: {tactic}, "
+                f"P={chunk_parallel}"
+            )
         self.element_type = element_type
         self.num_rows = num_rows
         self.rows_per_block = tactic.rows_per_block
@@ -427,6 +447,9 @@ class DirectFgsGemmKernel:
         self.head_last = head_last
         self.group8 = group8
         self.gather = gather
+        self.chunk = chunk
+        self.chunk_prefetch = chunk_prefetch
+        self.chunk_parallel = chunk_parallel
         self.group = _CHUNK // tactic.outputs_per_block
         self.min_ctas_per_sm = min_ctas_per_sm
         self.spin_limit = spin_limit
@@ -453,7 +476,16 @@ class DirectFgsGemmKernel:
             num_bits_per_copy=self.vector_width * self.element_type.width,
             load_cache_mode=cute.nvgpu.LoadCacheMode.STREAMING,
         )
-        if const_expr(self.group8):
+        if const_expr(self.chunk):
+            self.kernel_chunk(gA, gB, gC, retry_count, copy_a, copy_b).launch(
+                grid=[cute.ceil_div(n, _CHUNK), self.num_rows, 1],
+                block=[self.chunk_parallel * self.block_size, 1, 1],
+                smem=_CHUNK * self.num_warps * 4,
+                stream=stream,
+                use_pdl=self.use_pdl,
+                min_blocks_per_mp=self.min_ctas_per_sm,
+            )
+        elif const_expr(self.group8):
             self.kernel_group8(gA, gB, gC, retry_count, copy_a, copy_b).launch(
                 grid=[cute.ceil_div(n, _CHUNK), self.num_rows // self.rows_per_block, 1],
                 block=[self.block_size, 1, 1],
@@ -659,6 +691,119 @@ class DirectFgsGemmKernel:
 
         if const_expr(self.use_pdl and not self.early_trigger):
             cute.arch.griddepcontrol_launch_dependents()
+
+    @cute.kernel
+    def kernel_chunk(
+        self,
+        gA: cute.Tensor,
+        gB: cute.Tensor,
+        gC: cute.Tensor,
+        retry_count: cute.Tensor,
+        copy_a: cute.CopyAtom,
+        copy_b: cute.CopyAtom,
+    ) -> None:
+        if const_expr(self.early_trigger):
+            cute.arch.griddepcontrol_launch_dependents()
+        tidx, _, _ = cute.arch.thread_idx()
+        chunk_idx, row, _ = cute.arch.block_idx()
+
+        outputs_per_block: cutlass.Constexpr = self.outputs_per_block
+        vector_width: cutlass.Constexpr = self.vector_width
+        block_size: cutlass.Constexpr = self.block_size
+        num_warps: cutlass.Constexpr = self.num_warps
+        num_k_tiles: cutlass.Constexpr = self.num_k_tiles
+        passes: cutlass.Constexpr = self.group // self.chunk_parallel
+        steps: cutlass.Constexpr = passes * self.num_k_tiles
+        prefetch: cutlass.Constexpr = min(self.chunk_prefetch, steps)
+
+        sub_block = tidx // block_size
+        t = tidx - sub_block * block_size
+        warp = t // cute.arch.WARP_SIZE
+
+        if const_expr(self.use_pdl and self.pdl_wait_activation):
+            cute.arch.griddepcontrol_wait()
+
+        gA_vec = cute.logical_divide(gA, (None, vector_width))
+        gB_vec = cute.logical_divide(gB, (None, vector_width))
+        tA_all = cute.logical_divide(gA_vec, (None, (None, block_size)))
+        tB_all = cute.logical_divide(gB_vec, (None, (None, block_size)))
+        tA = tA_all[None, (None, (t, None))]
+
+        # Step s = (pass, K tile): pass p computes column group p * P + sub_block.
+        b_regs = cute.make_rmem_tensor(
+            cute.make_layout(
+                (outputs_per_block, steps, vector_width),
+                stride=(steps * vector_width, vector_width, 1),
+            ),
+            self.element_type,
+        )
+        n_first = chunk_idx * _CHUNK + sub_block * outputs_per_block
+        for step in cutlass.range_constexpr(prefetch):
+            self._load_b_step(copy_b, tB_all, b_regs, n_first, t, step)
+
+        a_rows = cute.make_rmem_tensor(
+            cute.make_layout(
+                (1, num_k_tiles, vector_width), stride=(num_k_tiles * vector_width, vector_width, 1)
+            ),
+            self.element_type,
+        )
+        if const_expr(self.check_valid):
+            self._load_rows_checked(copy_a, tA, row, a_rows, retry_count)
+        else:
+            for k_tile in cutlass.range_constexpr(num_k_tiles):
+                cute.copy(copy_a, tA[row, None, k_tile], a_rows[0, k_tile, None])
+
+        smem = cutlass.utils.SmemAllocator()
+        partials = smem.allocate_tensor(
+            cutlass.Float32,
+            cute.make_layout((_CHUNK, num_warps), stride=(num_warps, 1)),
+            byte_alignment=16,
+        )
+        for p in cutlass.range_constexpr(passes):
+            acc = cute.make_rmem_tensor(cute.make_layout((outputs_per_block,)), cutlass.Float32)
+            acc.fill(0.0)
+            for k_tile in cutlass.range_constexpr(num_k_tiles):
+                step = p * num_k_tiles + k_tile
+                if const_expr(step + prefetch < steps):
+                    self._load_b_step(copy_b, tB_all, b_regs, n_first, t, step + prefetch)
+                for vi in cutlass.range_constexpr(vector_width):
+                    for ni in cutlass.range_constexpr(outputs_per_block):
+                        acc[ni] = _fma_f32_bf16(
+                            a_rows[0, k_tile, vi], b_regs[ni, step, vi], acc[ni]
+                        )
+            for ni in cutlass.range_constexpr(outputs_per_block):
+                acc[ni] = cute.arch.warp_reduction_sum(acc[ni])
+            if cute.arch.lane_idx() == 0:
+                for ni in cutlass.range_constexpr(outputs_per_block):
+                    col = (p * self.chunk_parallel + sub_block) * outputs_per_block + ni
+                    partials[col, warp] = acc[ni]
+        cute.arch.sync_threads()
+        if tidx == 0:
+            words = []
+            for j in cutlass.range_constexpr(_CHUNK // 2):
+                pair = []
+                for c in (2 * j, 2 * j + 1):
+                    total = cutlass.Float32(0.0)
+                    for w in cutlass.range_constexpr(num_warps):
+                        total = total + partials[c, w]
+                    pair.append(total)
+                words.append(_bf16x2_bits(pair[0], pair[1], True))
+            _st_global_v4(
+                (gC.iterator + cute.crd2idx((row, chunk_idx * _CHUNK), gC.layout)).toint(), words
+            )
+
+        if const_expr(self.use_pdl and not self.early_trigger):
+            cute.arch.griddepcontrol_launch_dependents()
+
+    @cute.jit
+    def _load_b_step(self, copy_b, tB_all, b_regs, n_first, t, step: cutlass.Constexpr[int]):
+        """Issue the weight loads of chunk step ``step`` (pass ``step // num_k_tiles``, its K tile)."""
+        p = step // self.num_k_tiles
+        k_tile = step - p * self.num_k_tiles
+        for ni in cutlass.range_constexpr(self.outputs_per_block):
+            n = n_first + p * self.chunk_parallel * self.outputs_per_block + ni
+            tB = tB_all[n, (None, (t, None))]
+            cute.copy(copy_b, tB[None, k_tile], b_regs[ni, step, None])
 
     @cute.kernel
     def kernel_group8(
@@ -984,6 +1129,9 @@ def _get_compiled_direct_kernel(
     head_last: bool,
     group8: bool,
     gather: bool,
+    chunk: bool,
+    chunk_prefetch: int,
+    chunk_parallel: int,
     min_ctas_per_sm: int,
     spin_limit: int,
 ):
@@ -1005,6 +1153,9 @@ def _get_compiled_direct_kernel(
         head_last=head_last,
         group8=group8,
         gather=gather,
+        chunk=chunk,
+        chunk_prefetch=chunk_prefetch,
+        chunk_parallel=chunk_parallel,
         min_ctas_per_sm=min_ctas_per_sm,
         spin_limit=spin_limit,
     )
@@ -1091,6 +1242,9 @@ def run_direct_dense_fgs(
     head_last: bool = False,
     group8: bool = False,
     gather: bool = False,
+    chunk: bool = False,
+    chunk_prefetch: int = 3,
+    chunk_parallel: int = 0,
     min_ctas_per_sm: int | None = None,
     spin_limit: int = 0,
 ):
@@ -1110,10 +1264,12 @@ def run_direct_dense_fgs(
     if min_ctas_per_sm is None:
         roles = check_valid or pzo or early_trigger or head_last or group8 or gather
         min_ctas_per_sm = (
-            default_min_ctas_per_sm(tactic, m, n, k, a.get_device(), group8) if roles else 1
+            default_min_ctas_per_sm(tactic, m, n, k, a.get_device(), group8)
+            if roles and not chunk
+            else 1
         )
-    if (head_last or group8 or gather) and n % _CHUNK:
-        raise ValueError(f"head_last / group8 / gather need N % {_CHUNK} == 0, got N={n}")
+    if (head_last or group8 or gather or chunk) and n % _CHUNK:
+        raise ValueError(f"head_last / group8 / gather / chunk need N % {_CHUNK} == 0, got N={n}")
     if retry_counter is None:
         retry_counter = _scratch_retry_counter(a.device)
     elif (
@@ -1139,6 +1295,9 @@ def run_direct_dense_fgs(
         head_last,
         group8,
         gather,
+        chunk,
+        chunk_prefetch,
+        chunk_parallel,
         min_ctas_per_sm,
         spin_limit,
     )

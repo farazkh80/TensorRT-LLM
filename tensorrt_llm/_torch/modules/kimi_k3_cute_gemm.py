@@ -26,7 +26,8 @@ producer of a direct GEMM's input slot stores whole chunks) except on slots writ
 ``TLLM_K3_FGS_DIRECT_CHECK_MODE`` overrides its check mode. A direct producer stores with ``.pzo`` only when every
 reader of its slot checks every element (edges in ``TLLM_K3_FGS_ELEMENT_EDGES``), else it stores whole 16 B chunks as
 ``TLLM_K3_FGS_DIRECT_PRODUCER`` says: ``auto`` (default: ``group8`` for the rows in ``_DIRECT_GROUP8``, else
-``splitk``), ``group8``, ``head_last``, ``cluster`` (cluster gather) or ``splitk`` (the split-K fallback above); items
+``splitk``), ``group8``, ``head_last``, ``cluster`` (cluster gather), ``chunk`` (one CTA per chunk, ``group8`` where a
+row's chunk needs more than 1024 threads or a CTA holds several rows) or ``splitk`` (the split-K fallback above); items
 ``<N>:<store>`` in the comma list override the store for an output width N. ``TLLM_K3_FGS_QKVG_ORDER=<h1>`` makes the
 ``rubin`` producer build of the KDA qkvg projection compute the q / k / v tiles of heads 0 .. h1 - 1 first
 (``dense_gemm_fgs`` ``n_order``; same tiles, bit-exact).
@@ -178,7 +179,7 @@ def _fgs_direct_mode() -> str:
     return os.environ.get("TLLM_K3_FGS_DIRECT", "0")
 
 
-_DIRECT_STORES = ("auto", "group8", "head_last", "cluster", "splitk")
+_DIRECT_STORES = ("auto", "group8", "head_last", "cluster", "chunk", "splitk")
 _DIRECT_CHECK_MODES = ("rows", "row", "heads", "heads_before_b")
 
 
@@ -368,6 +369,15 @@ def _fgs_direct(
     from .kimi_k3_fgs.direct_gemm_fgs import DirectTactic, run_direct_dense_fgs
 
     elem0, check_mode = _direct_check()
+    chunk = {}
+    if produce == "chunk":
+        # 512-thread CTAs (two per SM at 64 registers), weights three steps ahead: best at o_proj M=1.
+        parallel = max(1, 512 // tactic[0])
+        chunk = dict(
+            chunk_parallel=parallel,
+            chunk_prefetch=3,
+            min_ctas_per_sm=1024 // (parallel * tactic[0]),
+        )
     run_direct_dense_fgs(
         x,
         weight.t(),
@@ -383,6 +393,8 @@ def _fgs_direct(
         head_last=produce == "head_last",
         group8=produce == "group8",
         gather=produce == "cluster",
+        chunk=produce == "chunk",
+        **chunk,
     )
 
 
@@ -410,6 +422,10 @@ def _fgs_linear(
         direct_store = "pzo" if out_edge in _element_checked_edges() else _direct_producer(n)
         if direct_store == "auto":
             direct_store = "group8" if (n, k, m) in _DIRECT_GROUP8 else "splitk"
+        if direct_store == "chunk" and backend == "fi_direct":
+            block_size, outputs_per_block, rows_per_block = tactic
+            if rows_per_block != 1 or (8 // outputs_per_block) % max(1, 512 // block_size):
+                direct_store = "group8"
     if (
         backend == "fi_direct"
         and (_fgs_direct_mode() == "1" or (_fgs_direct_mode() == "consumer" and not produce))

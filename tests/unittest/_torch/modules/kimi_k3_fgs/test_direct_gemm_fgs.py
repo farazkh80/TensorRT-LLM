@@ -68,6 +68,15 @@ PRODUCERS = {
     "group8": dict(DEFAULT, pzo=True, early_trigger=True, group8=True),
     "head_last": dict(DEFAULT, pzo=True, early_trigger=True, head_last=True),
     "gather": dict(DEFAULT, pzo=True, early_trigger=True, gather=True),
+    "chunk": dict(DEFAULT, pzo=True, early_trigger=True, chunk=True),
+    "chunk_prefetch1": dict(DEFAULT, pzo=True, early_trigger=True, chunk=True, chunk_prefetch=1),
+    "chunk_p1": dict(DEFAULT, pzo=True, early_trigger=True, chunk=True, chunk_parallel=1),
+    "chunk_p2_prefetch6": dict(
+        DEFAULT, pzo=True, early_trigger=True, chunk=True, chunk_parallel=2, chunk_prefetch=6
+    ),
+    "consumer_elem0_chunk": dict(
+        check_valid=True, check_elements=False, pzo=True, early_trigger=True, chunk=True
+    ),
     "consumer_pzo": dict(check_valid=True, pzo=True, early_trigger=True),
     "consumer_group8": dict(check_valid=True, pzo=True, early_trigger=True, group8=True),
     "consumer_elem0_gather": dict(
@@ -151,6 +160,8 @@ def _negative_zero_inputs(name: str):
 @pytest.mark.parametrize("name,variant", [(n, v) for n in CASES for v in PRODUCERS])
 def test_producer_build_changes_only_negative_zero(name: str, variant: str, armed: bool) -> None:
     """``armed``: the output starts as -0.0, so head_last chunk heads wait for the rest of their chunk."""
+    if "chunk" in variant and CASES[name][3][2] != 1:
+        pytest.skip("chunk takes one row per CTA")
     x, w, tactic = _negative_zero_inputs(name)
     ref = flashinfer(x, w, tactic)
     counter = torch.zeros(fgs.RETRY_COUNTER_SLOTS, dtype=torch.int32, device="cuda")
@@ -471,7 +482,14 @@ def test_partially_written_chunks(name: str, variant: str) -> None:
 
 @pytest.mark.parametrize(
     "store,elem0",
-    [("pzo", False), ("group8", False), ("head_last", False), ("group8", True), ("gather", True)],
+    [
+        ("pzo", False),
+        ("group8", False),
+        ("head_last", False),
+        ("group8", True),
+        ("gather", True),
+        ("chunk", True),
+    ],
 )
 @pytest.mark.parametrize(
     "producer,consumer", [("oproj1", "qkvg1"), ("oproj1", "gproj1"), ("oproj1", "bfa1")]
@@ -636,12 +654,14 @@ def test_chunk_tear_observer_catches_split_writer() -> None:
 TEAR_REPS = 10
 
 
-@pytest.mark.parametrize("store", ["group8", "gather", "pzo_early"])
+@pytest.mark.parametrize("store", ["group8", "gather", "chunk", "pzo_early"])
 @pytest.mark.parametrize("name", ["bfa1", "bfa4", "oproj1", "qkvg1", "qkvg2"])
 def test_producer_publishes_whole_chunks(name: str, store: str) -> None:
-    """``group8`` / ``gather`` never expose a chunk with element 0 published and another element still -0.0, over
-    repeated runs, and stay bit-exact. ``pzo_early`` (2 B stores) is the racy reference: its tears are printed, not
-    asserted (they depend on timing)."""
+    """``group8`` / ``gather`` / ``chunk`` never expose a chunk with element 0 published and another element still
+    -0.0, over repeated runs, and stay bit-exact. ``pzo_early`` (2 B stores) is the racy reference: its tears are
+    printed, not asserted (they depend on timing)."""
+    if store == "chunk" and CASES[name][3][2] != 1:
+        pytest.skip("chunk takes one row per CTA")
     x, w, tactic = inputs(name, seed=6)
     ref = flashinfer(x, w, tactic)
     bits(ref)[bits(ref) == NEG0] = 0
