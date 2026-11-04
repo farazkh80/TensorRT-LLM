@@ -50,6 +50,17 @@ because the W_UV TMA ``report_valid`` load checks only element 0 of a chunk.
 
 ``pdl_early``: kernels without their FGS consumer flag are launched with PDL, trigger on entry and wait on entry.
 
+``fgs_skip_empty`` (split-KV kernel, non-persistent grid): a cluster whose (request, split) has no K tile exits right
+after the PDL trigger (and wait), before barrier init, TMEM allocation and the cluster sync. The grid is sized for the
+runner's split_kv and the per-request plan usually uses fewer splits; an empty cluster still holds two SMs (1 CTA /
+SM) while it runs, and the dependents launch only once every split CTA has started.
+
+``fgs_red_rows`` (FGS reduction, "lse" partials, one D band): R in {2, 4} head rows per 128-thread CTA instead of
+one, so the grid has R times fewer CTAs. Each row gets 128 / R threads that reduce 4R consecutive D elements each;
+one whole warp still computes the row's LSE, and every output element is still summed over the splits in order by one
+thread, so the output is bit-identical. ``fgs_red_carveout``: preferred shared-memory carveout (percent) of the
+reduction launch, so that more than the 1 KB-per-CTA default carveout's CTAs fit on an SM.
+
 Framework contract (sentinel = -0.0; bf16 0x8000, fp32 0x80000000):
   * fused_q (all 576 columns of the step's rows) holds the sentinel before W_UK / latent append write it.
   * The current cache rows of every MLA layer hold the sentinel before the latent append writes them
@@ -295,13 +306,23 @@ def _poll_words(
 
 
 class _PdlLaunch:
-    def __init__(self, launcher, extra_smem: int = 0):
+    def __init__(
+        self, launcher, extra_smem: int = 0, rows: int = 1, carveout: Optional[int] = None
+    ):
         self._launcher = launcher
         self._extra_smem = extra_smem
+        self._rows = rows
+        self._carveout = carveout
 
     def launch(self, **kwargs):
         if self._extra_smem:
             kwargs["smem"] = kwargs["smem"] + self._extra_smem
+        if self._rows > 1:
+            grid = kwargs["grid"]
+            kwargs["grid"] = (grid[0] // self._rows, grid[1], grid[2])
+            kwargs["smem"] = kwargs["smem"] * self._rows
+        if self._carveout is not None:
+            kwargs["preferred_smem_carveout"] = self._carveout
         return self._launcher.launch(use_pdl=True, **kwargs)
 
 
@@ -324,6 +345,9 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         fgs_stats: bool = False,
         spin_limit: int = 0,
         launch: tuple = ("split", "reduction"),
+        fgs_skip_empty: bool = False,
+        fgs_red_rows: int = 1,
+        fgs_red_carveout: Optional[int] = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -335,15 +359,20 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         self.fgs_stats = fgs_stats
         self.spin_limit = spin_limit
         self.fgs_launch = frozenset(launch)
-        self._fgs_split = fgs_consumer or fgs_producer or pdl_early
+        self.fgs_skip_empty = fgs_skip_empty
+        self.fgs_red_rows = fgs_red_rows
+        self.fgs_red_carveout = fgs_red_carveout
+        self._fgs_split = fgs_consumer or fgs_producer or pdl_early or fgs_skip_empty
         self._fgs_red = fgs_reduction or pdl_early
         if self._fgs_split or self._fgs_red:
             if self.is_var_q or self.emit_softmax_stats:
                 raise ValueError(
                     "FGS MLA decode supports fixed-Q decode without softmax stats only"
                 )
-            if self.is_persistent and fgs_consumer:
-                raise ValueError("FGS MLA decode consumer supports the non-persistent grid only")
+            if self.is_persistent and (fgs_consumer or fgs_skip_empty):
+                raise ValueError(
+                    "FGS MLA decode consumer / fgs_skip_empty support the non-persistent grid only"
+                )
         if fgs_partials not in ("lse", "all"):
             raise ValueError(f"fgs_partials must be 'lse' or 'all', got {fgs_partials!r}")
         if fgs_consumer and getattr(pipeline, "PipelineTmaUmmaRetry", None) is None:
@@ -353,6 +382,17 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         if fgs_reduction and "split" in self.fgs_launch and not fgs_producer:
             raise ValueError(
                 "fgs_reduction reads sentinel-checked partials: the split kernel needs fgs_producer"
+            )
+        if fgs_red_rows not in (1, 2, 4):
+            raise ValueError(f"fgs_red_rows must be 1, 2 or 4, got {fgs_red_rows}")
+        if fgs_red_rows > 1 and not (
+            fgs_reduction
+            and fgs_partials == "lse"
+            and self.reducer_d_tiles == 1
+            and self.num_heads % fgs_red_rows == 0
+        ):
+            raise ValueError(
+                "fgs_red_rows needs fgs_reduction, 'lse' partials, one D band and num_heads divisible by it"
             )
         if fgs_stats and not (fgs_consumer or fgs_reduction):
             raise ValueError(
@@ -461,7 +501,11 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
             return _NoLaunch()
         if not self._fgs_red:
             return _Base.reduction_kernel(self, *args)
-        return _PdlLaunch(self._fgs_reduction_kernel(*args, self._fgs_stats_tensor))
+        if self.fgs_red_rows > 1:
+            kernel = self._fgs_reduction_rows_kernel(*args, self._fgs_stats_tensor)
+        else:
+            kernel = self._fgs_reduction_kernel(*args, self._fgs_stats_tensor)
+        return _PdlLaunch(kernel, rows=self.fgs_red_rows, carveout=self.fgs_red_carveout)
 
     def issue_q_tma_load(self, *args):
         if self.fgs_consumer:
@@ -535,7 +579,72 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         cute.arch.griddepcontrol_launch_dependents()
         if cutlass.const_expr(not self.fgs_consumer):
             cute.arch.griddepcontrol_wait()
+        args = (
+            tiled_mma_qk, tiled_mma_pv, tma_atom_q_latent, mQL, tma_atom_q_rope, mQR, tma_atom_c_latent, mCL,
+            tma_atom_c_rope, mKR, tma_atom_c_latent_transpose, mCLT, mPT, mO, mLSE, mAccO, mAccLSE, split_kv,
+            cache_seqs, kv_bounds, cum_seq_lens_q, block_split_kvs, softmax_scale_log2, output_scale,
+            q_latent_smem_layout_staged, q_rope_smem_layout_staged, kc_smem_layout_staged, p_smem_layout_staged,
+            vc_smem_layout_staged, kc_smem_layout_for_tma, vc_smem_layout_for_tma, cta_layout_vmnk,
+            tile_sched_params, SharedStorage, mCLraw, mStats,
+        )  # fmt: skip
+        if cutlass.const_expr(self.fgs_skip_empty):
+            # Both CTAs of a cluster share (request, split), so they leave together before any cluster-scope
+            # barrier, TMEM allocation or DSMEM traffic.
+            tile_sched = create_mla_static_tile_scheduler(
+                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+            )
+            k_tile_count = self.get_k_tile_count(
+                split_kv,
+                cache_seqs,
+                cum_seq_lens_q,
+                block_split_kvs,
+                tile_sched.initial_work_tile_info().tile_idx,
+            )[1]
+            if k_tile_count > 0:
+                self._fgs_split_kv_body(*args)
+        else:
+            self._fgs_split_kv_body(*args)
 
+    @cute.jit
+    def _fgs_split_kv_body(
+        self,
+        tiled_mma_qk: cute.TiledMma,
+        tiled_mma_pv: cute.TiledMma,
+        tma_atom_q_latent: Optional[cute.CopyAtom],
+        mQL: cute.Tensor,
+        tma_atom_q_rope: Optional[cute.CopyAtom],
+        mQR: cute.Tensor,
+        tma_atom_c_latent: Optional[cute.CopyAtom],
+        mCL: cute.Tensor,
+        tma_atom_c_rope: Optional[cute.CopyAtom],
+        mKR: cute.Tensor,
+        tma_atom_c_latent_transpose: Optional[cute.CopyAtom],
+        mCLT: cute.Tensor,
+        mPT: cute.Tensor,
+        mO: Optional[cute.Tensor],
+        mLSE: cute.Tensor,
+        mAccO: Optional[cute.Tensor],
+        mAccLSE: Optional[cute.Tensor],
+        split_kv: cutlass.Int32,
+        cache_seqs: cute.Tensor,
+        kv_bounds: Optional[cute.Tensor],
+        cum_seq_lens_q: Optional[cute.Tensor],
+        block_split_kvs: cute.Tensor,
+        softmax_scale_log2: cutlass.Float32,
+        output_scale: cutlass.Float32,
+        q_latent_smem_layout_staged: cute.ComposedLayout,
+        q_rope_smem_layout_staged: cute.ComposedLayout,
+        kc_smem_layout_staged: cute.ComposedLayout,
+        p_smem_layout_staged: cute.ComposedLayout,
+        vc_smem_layout_staged: cute.ComposedLayout,
+        kc_smem_layout_for_tma: cute.ComposedLayout,
+        vc_smem_layout_for_tma: cute.ComposedLayout,
+        cta_layout_vmnk: cute.Layout,
+        tile_sched_params: MLAStaticTileSchedulerParams,
+        SharedStorage: cutlass.Constexpr,
+        mCLraw: cute.Tensor,
+        mStats: Optional[cute.Tensor],
+    ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -1572,6 +1681,159 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
                     mO.iterator + cute.crd2idx((head_idx, e0, bidy, bidz), mO.layout)
                 ).toint()
                 st_global_v4(out_addr, w0, w1, n0, n1)
+        return
+
+    @cute.kernel
+    def _fgs_reduction_rows_kernel(
+        self,
+        mO: cute.Tensor,
+        mLSE: cute.Tensor,
+        mAccO: cute.Tensor,
+        mAccLSE: cute.Tensor,
+        split_kv: cutlass.Int32,
+        cache_seqs: cute.Tensor,
+        kv_bounds: Optional[cute.Tensor],
+        cum_seq_lens_q: Optional[cute.Tensor],
+        block_split_kvs: cute.Tensor,
+        mStats: Optional[cute.Tensor],
+    ):
+        # ``_fgs_reduction_kernel`` ("lse" partials, one D band) for ``fgs_red_rows`` head rows per CTA.
+        rows = self.fgs_red_rows
+        row_threads = self.threads_per_warp * self.num_compute_warps // rows
+        row_warps = row_threads // self.threads_per_warp
+        elems = LATENT_DIM // row_threads
+        chunks = elems // 4
+        unroll = max(_RED_UNROLL // chunks, 1)
+        with_stats = self.fgs_stats
+        cute.arch.griddepcontrol_launch_dependents()
+
+        bidx, bidy, bidz = cute.arch.block_idx()
+        tidx, _, _ = cute.arch.thread_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        lane = tidx % self.threads_per_warp
+        row = warp_idx // row_warps
+        row_tidx = tidx - row * row_threads
+        head_idx = bidx * rows + row
+
+        smem = utils.SmemAllocator()
+        storage = smem.allocate(rows * self.reducer_max_splits * self.acc_dtype.width // 8, 16)
+        smem_lse_scale = cute.make_tensor(
+            cute.recast_ptr(storage, dtype=self.acc_dtype),
+            cute.make_layout((self.reducer_max_splits, rows)),
+        )
+
+        flat_q_row = bidy * self.num_heads + head_idx
+        q_tile = flat_q_row >> 7
+        q_tile_row = flat_q_row & 127
+        local_split_kv = split_kv
+        if cutlass.const_expr(self.is_var_split_kv):
+            local_split_kv = cutlass.max(cutlass.min(block_split_kvs[bidz], split_kv), 1)
+        k_tile_total = cute.ceil_div(cache_seqs[bidz], self.mma_qk_tiler[1])
+        k_tile_per_cta = cutlass.max(cute.ceil_div(k_tile_total, local_split_kv), 1)
+        local_split_kv = cute.ceil_div(k_tile_total, k_tile_per_cta)
+
+        reduce_row = cutlass.Boolean(True)
+        if cutlass.const_expr(self.is_var_split_kv):
+            reduce_row = local_split_kv != 1
+        if reduce_row:
+            gLSE = mAccLSE[q_tile_row, None, q_tile, bidz]
+            if warp_idx % row_warps == 0:
+                lse_per_thread = cute.ceil_div(self.reducer_max_splits, self.threads_per_warp)
+                local_lse = cute.make_rmem_tensor(cute.make_layout(lse_per_thread), self.lse_dtype)
+                bits = cute.make_rmem_tensor(cute.make_layout(lse_per_thread), cutlass.Int32)
+                addrs = cute.make_rmem_tensor(cute.make_layout(lse_per_thread), cutlass.Int64)
+                for i in cutlass.range_constexpr(lse_per_thread):
+                    split_kv_idx = lane + i * self.threads_per_warp
+                    addrs[i] = (gLSE.iterator + cute.crd2idx(split_kv_idx, gLSE.layout)).toint()
+                    bits[i] = cutlass.Int32(0)
+                    if split_kv_idx < local_split_kv:
+                        bits[i] = _ld_relaxed_b32(addrs[i])
+                if cutlass.const_expr(with_stats):
+                    lse_stats = cute.make_tensor(
+                        mStats.iterator + _STATS_RED_LSE, cute.make_layout(4)
+                    )
+                    _poll_words(
+                        bits,
+                        addrs,
+                        lse_per_thread,
+                        self.spin_limit,
+                        lse_stats,
+                        True,
+                        _RED_SPIN_NS_MAX,
+                    )
+                else:
+                    _poll_words(
+                        bits, addrs, lse_per_thread, self.spin_limit, bits, False, _RED_SPIN_NS_MAX
+                    )
+                _fence_acquire_gpu()
+                lse_max = -self.lse_dtype.inf
+                for i in cutlass.range_constexpr(lse_per_thread):
+                    split_kv_idx = lane + i * self.threads_per_warp
+                    local_lse[i] = -self.lse_dtype.inf
+                    if split_kv_idx < local_split_kv:
+                        local_lse[i] = _as_f32(bits[i])
+                    lse_max = cute.arch.fmax(lse_max, local_lse[i])
+                lse_max = cute.arch.warp_reduction_max(lse_max)
+                lse_max = lse_max if lse_max != -self.lse_dtype.inf else 0.0
+                sum_lse = 0.0
+                for i in cutlass.range_constexpr(lse_per_thread):
+                    sum_lse += cute.math.exp2(local_lse[i] - lse_max, fastmath=True)
+                sum_lse = cute.arch.warp_reduction_sum(sum_lse)
+                global_lse = (
+                    lse_max + cute.math.log2(sum_lse, fastmath=True)
+                    if not sum_lse == self.lse_dtype(0.0) or sum_lse != sum_lse
+                    else self.lse_dtype.inf
+                )
+                if lane == 0:
+                    mLSE[head_idx, bidy, bidz] = canon_f32(global_lse)
+                for i in cutlass.range_constexpr(lse_per_thread):
+                    split_kv_idx = lane + i * self.threads_per_warp
+                    if cute.elem_less(split_kv_idx, local_split_kv):
+                        smem_lse_scale[split_kv_idx, row] = cute.math.exp2(
+                            local_lse[i] - global_lse, fastmath=True
+                        )
+
+            pipeline.sync(barrier_id=4)
+
+            # Thread t of a row reduces D elements [elems * t, elems * (t + 1)), splits in order, ``unroll`` splits
+            # of loads in flight; it then stores its elements as 16-B chunks of 8 bf16.
+            gAccO = mAccO[q_tile_row, None, None, q_tile, bidz]
+            e0 = row_tidx * elems
+            rAccO = cute.make_rmem_tensor(cute.make_layout(elems), self.acc_dtype)
+            rAccO.fill(0.0)
+            words = cute.make_rmem_tensor(cute.make_layout(4 * chunks * unroll), cutlass.Int32)
+            for g in cutlass.range(0, local_split_kv, unroll, unroll=1):
+                for u in cutlass.range_constexpr(unroll):
+                    for c in cutlass.range_constexpr(chunks):
+                        for j in cutlass.range_constexpr(4):
+                            words[4 * (u * chunks + c) + j] = cutlass.Int32(0)
+                        if g + u < local_split_kv:
+                            w = _ld_cg_v4_ordered(
+                                (
+                                    gAccO.iterator + cute.crd2idx((g + u, e0 + 4 * c), gAccO.layout)
+                                ).toint()
+                            )
+                            for j in cutlass.range_constexpr(4):
+                                words[4 * (u * chunks + c) + j] = w[j]
+                for u in cutlass.range_constexpr(unroll):
+                    if g + u < local_split_kv:
+                        for c in cutlass.range_constexpr(chunks):
+                            for j in cutlass.range_constexpr(4):
+                                rAccO[4 * c + j] += (
+                                    _as_f32(words[4 * (u * chunks + c) + j])
+                                    * smem_lse_scale[g + u, row]
+                                )
+            for k in cutlass.range_constexpr(elems // 8):
+                out_addr = (
+                    mO.iterator + cute.crd2idx((head_idx, e0 + 8 * k, bidy, bidz), mO.layout)
+                ).toint()
+                st_global_v4(
+                    out_addr,
+                    bf16x2_pzo(rAccO[8 * k], rAccO[8 * k + 1], True),
+                    bf16x2_pzo(rAccO[8 * k + 2], rAccO[8 * k + 3], True),
+                    bf16x2_pzo(rAccO[8 * k + 4], rAccO[8 * k + 5], True),
+                    bf16x2_pzo(rAccO[8 * k + 6], rAccO[8 * k + 7], True),
+                )
         return
 
 

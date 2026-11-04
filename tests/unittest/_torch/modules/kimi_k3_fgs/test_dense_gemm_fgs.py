@@ -114,3 +114,56 @@ def test_timeline(raster_along: str) -> None:
     if raster_along == "n":
         # Row blocks complete in row order: the first quarter well before the last.
         assert first < 0.5 * last
+
+
+QKVG_N, QKVG_K, QKVG_HEADS = 49152, 7168, 96
+
+
+@pytest.mark.parametrize("m", [16, 64])
+@pytest.mark.parametrize("h1", [1, 70, 96])
+def test_qkvg_head_order_is_bit_exact(m: int, h1: int) -> None:
+    """Head-ordered tiles (producer and consumer + producer builds) equal the table GEMM up to -0.0."""
+    g = torch.Generator(device="cuda").manual_seed(3)
+    a = torch.randn(m, QKVG_K, device="cuda", dtype=torch.bfloat16, generator=g)
+    w = torch.randn(QKVG_N, QKVG_K, device="cuda", dtype=torch.bfloat16, generator=g) * 0.02
+    tactic = kimi_k3_cute_gemm._select(kimi_k3_cute_gemm._GEMM_TABLE[(QKVG_N, QKVG_K)], m)[1]
+    ref = _canonical(kimi_k3_cute_gemm.linear(a, w))
+    for consume in (False, True):
+        out = torch.full((m, QKVG_N), float("nan"), device="cuda", dtype=torch.bfloat16)
+        fgs.run_gemm_fgs(
+            a.unsqueeze(0),
+            w.unsqueeze(0),
+            out.unsqueeze(0),
+            tactic,
+            report_valid=consume,
+            retry_warp=consume,
+            wait_input=not consume,
+            pzo=True,
+            early_trigger=True,
+            n_order=(QKVG_HEADS, h1),
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(_canonical(out), ref), f"consume={consume}"
+
+
+def test_qkvg_head_order_stores_heads_first() -> None:
+    """With h1 = 70 the q / k / v tiles of heads 0..69 are stored before the gate tiles of heads 2..95."""
+    m = 16
+    g = torch.Generator(device="cuda").manual_seed(4)
+    a = torch.randn(m, QKVG_K, device="cuda", dtype=torch.bfloat16, generator=g)
+    w = torch.randn(QKVG_N, QKVG_K, device="cuda", dtype=torch.bfloat16, generator=g) * 0.02
+    tactic = kimi_k3_cute_gemm._select(kimi_k3_cute_gemm._GEMM_TABLE[(QKVG_N, QKVG_K)], m)[1]
+    tiles_n = QKVG_N // tactic[2][1]
+    stamps = torch.zeros(fgs.timeline_slots(m, QKVG_N, tactic), dtype=torch.int32, device="cuda")
+    out = torch.empty(m, QKVG_N, device="cuda", dtype=torch.bfloat16)
+    fgs.run_dense_fgs(
+        a, w, out, raster_along="m", tactic=tactic, stamps=stamps, n_order=(QKVG_HEADS, 70)
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(_canonical(out), _canonical(kimi_k3_cute_gemm.linear(a, w)))
+    starts = stamps[tiles_n:].to(torch.int64)
+    base = starts[starts != 0].min()
+    t = ((stamps[:tiles_n].to(torch.int64) - base) % (1 << 32)).view(4, QKVG_HEADS)
+    if starts[starts != 0].numel() < 3 * 70:
+        pytest.skip("fewer persistent CTAs than the 210 head-ordered tiles of round 1")
+    assert t[:3, :70].max() < t[3, 2:].min()

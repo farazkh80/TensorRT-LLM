@@ -19,11 +19,20 @@ fine-grained-sync build of the table entry's kernel at its tactic: an input slot
 stores whole 16 B chunks). ``rubin`` runs ``kimi_k3_fgs.dense_gemm_fgs``, split-K entries
 ``kimi_k3_fgs.splitk_gemm_fgs``, ``fi_direct`` rows FlashInfer's default split-K tactic, or
 ``kimi_k3_fgs.direct_gemm_fgs`` at the table tactic (dense, 32 B aligned operands, N % 8 == 0 for an output slot)
-with ``TLLM_K3_FGS_DIRECT=1`` (any slot) or ``=consumer`` (input slot only); a strided input at split-K rows runs the
-``rubin`` build at ``_FGS_SMALL_TACTIC``. The direct consumer checks every element. A direct producer stores with
-``.pzo`` only when every reader of its slot checks every element (edges in ``TLLM_K3_FGS_ELEMENT_EDGES``), else it
-stores whole 16 B chunks as ``TLLM_K3_FGS_DIRECT_PRODUCER`` says: ``auto`` (default: ``group8`` for the rows in
-``_DIRECT_GROUP8``, else ``splitk``), ``group8``, ``head_last``, or ``splitk`` (the split-K fallback above).
+(``TLLM_K3_FGS_DIRECT=1``, the default: any slot; ``=consumer``: input slots only; ``=0``: the split-K fallbacks); a
+strided input at split-K rows runs the ``rubin`` build at ``_FGS_SMALL_TACTIC``. The direct consumer checks element 0
+of each 16 B chunk (``TLLM_K3_FGS_DIRECT_CHECK=elem0``, the default: the TMA report_valid rule, sound because every
+producer of a direct GEMM's input slot stores whole chunks), every element on slots written by a ``.pzo`` direct
+producer, or every element everywhere with ``=elements``; ``TLLM_K3_FGS_DIRECT_CHECK_MODE`` overrides its check mode.
+A direct producer stores with ``.pzo`` only when every reader of its slot checks every element (edges in
+``TLLM_K3_FGS_ELEMENT_EDGES``, default ``mla.g``: the output gate), else it stores whole 16 B chunks as
+``TLLM_K3_FGS_DIRECT_PRODUCER`` says: ``auto`` (default: ``_DIRECT_AUTO_STORE``), ``group8``, ``head_last``,
+``cluster`` (cluster gather), ``chunk`` (one CTA per chunk, ``group8`` where a row's chunk needs more than 1024
+threads or a CTA holds several rows) or ``splitk`` (the split-K fallback above, not bit-exact with ``fi_direct``);
+items ``<N>:<store>`` in the comma list override the store for an output width N.
+The ``rubin`` producer build of the KDA qkvg projection computes the q / k / v tiles of heads 0 .. h1 - 1 first
+(``dense_gemm_fgs`` ``n_order``; same tiles, bit-exact): h1 = 70 at 9..16 rows by default (the rows the KDA core's
+late-gate, head-major producer order runs at), ``TLLM_K3_FGS_QKVG_ORDER=<h1>`` at every row (0: stock order).
 
 A shape without an entry runs the ``rubin`` backend under the TRT-LLM autotuner. Non-BF16 operands keep the
 cuBLAS matmul; empty problems launch nothing.
@@ -169,28 +178,91 @@ def fgs_dsl() -> bool:
 
 @functools.lru_cache(maxsize=None)
 def _fgs_direct_mode() -> str:
-    return os.environ.get("TLLM_K3_FGS_DIRECT", "0")
+    return os.environ.get("TLLM_K3_FGS_DIRECT", "1")
+
+
+_DIRECT_STORES = ("auto", "group8", "head_last", "cluster", "chunk", "splitk")
+_DIRECT_CHECK_MODES = ("rows", "row", "heads", "heads_before_b")
 
 
 @functools.lru_cache(maxsize=None)
-def _direct_producer() -> str:
-    return os.environ.get("TLLM_K3_FGS_DIRECT_PRODUCER", "auto")
+def _direct_stores() -> Tuple[str, Dict[int, str]]:
+    """``TLLM_K3_FGS_DIRECT_PRODUCER``: (default store, {N: store})."""
+    default, by_n = "auto", {}
+    for item in filter(
+        None, (v.strip() for v in os.environ.get("TLLM_K3_FGS_DIRECT_PRODUCER", "").split(","))
+    ):
+        n, _, store = item.rpartition(":")
+        if store not in _DIRECT_STORES:
+            raise ValueError(
+                f"TLLM_K3_FGS_DIRECT_PRODUCER: {store!r}; valid: {', '.join(_DIRECT_STORES)}"
+            )
+        if n:
+            by_n[int(n)] = store
+        else:
+            default = store
+    return default, by_n
 
 
-# (N, K, M) where the direct producer's group8 store is within a few % of the plain store (multi-wave grids); the
-# other fi_direct rows with an output slot take the split-K producer.
-_DIRECT_GROUP8 = {(49152, 7168, 1)}
+def _direct_producer(n: int) -> str:
+    default, by_n = _direct_stores()
+    return by_n.get(n, default)
+
+
+@functools.lru_cache(maxsize=None)
+def _direct_check() -> Tuple[bool, Optional[str]]:
+    """(element 0 only, check mode or None for the kernel's default) of the direct consumer."""
+    check = os.environ.get("TLLM_K3_FGS_DIRECT_CHECK", "elem0")
+    if check not in ("elements", "elem0"):
+        raise ValueError(f"TLLM_K3_FGS_DIRECT_CHECK={check!r}; valid: elements, elem0")
+    mode = os.environ.get("TLLM_K3_FGS_DIRECT_CHECK_MODE") or None
+    if mode is not None and mode not in _DIRECT_CHECK_MODES:
+        raise ValueError(
+            f"TLLM_K3_FGS_DIRECT_CHECK_MODE={mode!r}; valid: {', '.join(_DIRECT_CHECK_MODES)}"
+        )
+    return check == "elem0", mode
+
+
+# Chunk-safe store of the ``auto`` direct producer by output width N (ready input): cluster gather on the single-wave
+# bfa grid, group8 on the multi-wave ones.
+_DIRECT_AUTO_STORE = {224: "cluster"}
 
 
 @functools.lru_cache(maxsize=None)
 def _element_checked_edges() -> frozenset:
     """Edges whose every reader checks every element (no direct GEMM consumer reads a fi_direct output today)."""
-    return frozenset(e for e in os.environ.get("TLLM_K3_FGS_ELEMENT_EDGES", "").split(",") if e)
+    return frozenset(
+        e for e in os.environ.get("TLLM_K3_FGS_ELEMENT_EDGES", "mla.g").split(",") if e
+    )
 
 
 @functools.lru_cache(maxsize=None)
 def _x5() -> bool:
     return os.environ.get("TLLM_K3_CUTE_GEMM_X5", "1") == "1" and fgs_dsl()
+
+
+# KDA qkvg projection (N, K) and its heads (q | k | v | gate sections of one-tile heads).
+_QKVG = (49152, 7168)
+_QKVG_HEADS = 96
+
+
+# Default head-ordered qkvg tiles: (min rows, max rows, h1).
+_QKVG_ORDER_DEFAULT = (9, 16, 70)
+
+
+@functools.lru_cache(maxsize=None)
+def _qkvg_order_env() -> Optional[int]:
+    value = os.environ.get("TLLM_K3_FGS_QKVG_ORDER")
+    return None if value is None else int(value)
+
+
+def _qkvg_order(m: int) -> int:
+    h1 = _qkvg_order_env()
+    if h1 is None:
+        low, high, h1 = _QKVG_ORDER_DEFAULT
+        if not low <= m <= high:
+            h1 = 0
+    return h1
 
 
 # Preferred smem carveout (percent) of the vendored split-K launches.
@@ -205,10 +277,11 @@ _FGS_TACTICS = (
 # split-K rows, which the stock path autotunes) and prefill rows.
 _FGS_SMALL_TACTIC = ("base", False, (64, 128), (1, 1), 0, 1)
 _FGS_LARGE_TACTIC = ("base", True, (256, 256), (2, 1), 0, 1)
-# (N, K) -> (max_m, split-K tactic) of the fine-grained-sync build in place of the table's ``fi_splitk`` tactic (MLA
-# decode g_proj). Applied only over a split-K 1 table tactic: a different split changes the reduction order.
-_FGS_SPLITK_TACTICS: Dict[Tuple[int, int], Tuple[int, tuple]] = {
-    (12288, 7168): (16, (128, 16, 1, 4)),
+# (N, K) -> [(max_m, split-K tactic)], ascending max_m: the fine-grained-sync build's tactic in place of the table's
+# ``fi_splitk`` tactic (MLA decode g_proj). Applied only over a split-K 1 table tactic: a different split changes the
+# reduction order.
+_FGS_SPLITK_TACTICS: Dict[Tuple[int, int], List[Tuple[int, tuple]]] = {
+    (12288, 7168): [(16, (128, 16, 1, 4)), (32, (128, 32, 1, 4))],
 }
 
 
@@ -279,7 +352,14 @@ def _fgs_leases(*tensors):
 
 
 def _fgs_rubin(
-    x3, w3, out3, tactic, consume: bool, produce: bool, max_ctas: Optional[int] = None
+    x3,
+    w3,
+    out3,
+    tactic,
+    consume: bool,
+    produce: bool,
+    max_ctas: Optional[int] = None,
+    n_order: Optional[Tuple[int, int]] = None,
 ) -> None:
     from .kimi_k3_fgs.dense_gemm_fgs import run_gemm_fgs
 
@@ -297,13 +377,34 @@ def _fgs_rubin(
         early_trigger=produce,
         use_pdl=_pdl(),
         max_ctas=max_ctas,
+        n_order=n_order,
     )
 
 
-def _fgs_direct(x, weight, out, tactic, consume: bool, produce: str) -> None:
-    """``produce``: "" (no output slot), "pzo" (element-checked readers), "group8" or "head_last"."""
+def _fgs_direct(
+    x, weight, out, tactic, consume: bool, produce: str, in_edge: Optional[str]
+) -> None:
+    """``produce``: "" (no output slot), "pzo" (element-checked readers), "group8", "head_last", "cluster" or
+    "chunk"."""
     from .kimi_k3_fgs.direct_gemm_fgs import DirectTactic, run_direct_dense_fgs
 
+    elem0, check_mode = _direct_check()
+    check_elements = not (elem0 and in_edge not in _element_checked_edges())
+    _debug(
+        f"linear N={weight.shape[0]} K={x.shape[1]}",
+        x.shape[0],
+        f"fgs direct {tuple(tactic)} consumer={'-' if not consume else 'elements' if check_elements else 'elem0'}"
+        f"{'' if check_mode is None else ' ' + check_mode} producer={produce or '-'}",
+    )
+    chunk = {}
+    if produce == "chunk":
+        # 512-thread CTAs (two per SM at 64 registers), weights three steps ahead: best at o_proj M=1.
+        parallel = max(1, 512 // tactic[0])
+        chunk = dict(
+            chunk_parallel=parallel,
+            chunk_prefetch=3,
+            min_ctas_per_sm=1024 // (parallel * tactic[0]),
+        )
     run_direct_dense_fgs(
         x,
         weight.t(),
@@ -311,16 +412,27 @@ def _fgs_direct(x, weight, out, tactic, consume: bool, produce: str) -> None:
         _pdl(),
         DirectTactic(*tactic),
         check_valid=consume,
+        check_mode=check_mode if consume else None,
+        check_elements=check_elements,
         pdl_wait_activation=not consume,
         pzo=bool(produce),
         early_trigger=bool(produce),
         head_last=produce == "head_last",
         group8=produce == "group8",
+        gather=produce == "cluster",
+        chunk=produce == "chunk",
+        **chunk,
     )
 
 
 def _fgs_linear(
-    x, weight, out, consume: bool, produce: bool, out_edge: Optional[str] = None
+    x,
+    weight,
+    out,
+    consume: bool,
+    produce: bool,
+    out_edge: Optional[str] = None,
+    in_edge: Optional[str] = None,
 ) -> None:
     """``linear`` on edge-slot operands: the fine-grained-sync build of the table entry's kernel."""
     from .kimi_k3_fgs.splitk_gemm_fgs import SplitKTactic, default_tactic, run_splitk_dense_fgs
@@ -329,14 +441,22 @@ def _fgs_linear(
     n = weight.shape[0]
     dense = _row_major(x) and _row_major(out)
     backend, tactic = _select(_GEMM_TABLE.get((n, k)), m)
-    fgs_tactic = _FGS_SPLITK_TACTICS.get((n, k))
-    if backend == "fi_splitk" and tactic[2] == 1 and fgs_tactic is not None and m <= fgs_tactic[0]:
-        tactic = fgs_tactic[1]
+    if backend == "fi_splitk" and tactic[2] == 1:
+        fgs_tactic = next(
+            (t for max_m, t in _FGS_SPLITK_TACTICS.get((n, k), ()) if m <= max_m), None
+        )
+        if fgs_tactic is not None:
+            tactic = fgs_tactic
+            _debug(f"linear N={n} K={k}", m, f"fgs split-K tactic {fgs_tactic}")
     direct_store = ""
     if produce:
-        direct_store = "pzo" if out_edge in _element_checked_edges() else _direct_producer()
+        direct_store = "pzo" if out_edge in _element_checked_edges() else _direct_producer(n)
         if direct_store == "auto":
-            direct_store = "group8" if (n, k, m) in _DIRECT_GROUP8 else "splitk"
+            direct_store = _DIRECT_AUTO_STORE.get(n, "group8")
+        if direct_store == "chunk" and backend == "fi_direct":
+            block_size, outputs_per_block, rows_per_block = tactic
+            if rows_per_block != 1 or (8 // outputs_per_block) % max(1, 512 // block_size):
+                direct_store = "group8"
     if (
         backend == "fi_direct"
         and (_fgs_direct_mode() == "1" or (_fgs_direct_mode() == "consumer" and not produce))
@@ -345,7 +465,7 @@ def _fgs_linear(
         and out.data_ptr() % 32 == 0
         and (not produce or (n % 8 == 0 and direct_store != "splitk"))
     ):
-        _fgs_direct(x, weight, out, tactic, consume, direct_store)
+        _fgs_direct(x, weight, out, tactic, consume, direct_store, in_edge)
         return
     # The decode o_proj consumer; prefill rows take the table's GEMM below.
     if consume and not produce and dense and n == 7168 and k == 12288 and m <= 2 * _FI_MAX_M:
@@ -354,7 +474,21 @@ def _fgs_linear(
     if backend == "rubin" or not dense:
         if backend != "rubin":
             tactic = _FGS_SMALL_TACTIC
-        _fgs_rubin(x.unsqueeze(0), weight.unsqueeze(0), out.unsqueeze(0), tactic, consume, produce)
+        n_order = None
+        if produce and backend == "rubin" and (n, k) == _QKVG:
+            h1 = _qkvg_order(m)
+            if h1 > 0:
+                n_order = (_QKVG_HEADS, h1)
+            _debug(f"linear N={n} K={k}", m, f"fgs rubin qkvg tile order h1={h1}")
+        _fgs_rubin(
+            x.unsqueeze(0),
+            weight.unsqueeze(0),
+            out.unsqueeze(0),
+            tactic,
+            consume,
+            produce,
+            n_order=n_order,
+        )
         return
     exact = backend == "vsplitk"
     for r in range(0, m, _FI_MAX_M):
@@ -410,6 +544,7 @@ def linear(
             in_lease is not None,
             out_lease is not None,
             None if out_lease is None or _fgs_direct_mode() == "0" else out_lease.workspace.name,
+            None if in_lease is None or _fgs_direct_mode() == "0" else in_lease.workspace.name,
         )
         _debug(
             f"linear N={n} K={k}",

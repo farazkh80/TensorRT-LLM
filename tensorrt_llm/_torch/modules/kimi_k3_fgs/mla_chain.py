@@ -19,8 +19,13 @@ reader of the split-KV workspace and plan that every MLA layer shares. :func:`ru
 append, the first writer of this step's cache rows; split_kv and the reduction, which read the page table, plan and
 sentinels, follow on the main stream. The chain covers decode batches of ``TLLM_K3_FGS_MLA_MIN_ROWS`` to
 ``TLLM_K3_FGS_MLA_MAX_ROWS`` rows; any edge without a slot leaves the whole layer on the stock path.
+
+The chain's reduction reduces several head rows per CTA from 8 decode rows up (``TLLM_K3_FGS_MLA_RED_ROWS``, default
+``auto``): fewer CTAs let W_UV, its PDL dependent, launch sooner; the output is bit-identical. With
+``TLLM_K3_FGS_DEBUG=1`` the path log names the rows per CTA (and the skip-empty split clusters when on) per row count.
 """
 
+import functools
 import math
 import os
 from typing import Dict, NamedTuple, Optional
@@ -57,9 +62,29 @@ _EDGES = (
     (ATTN_O, 1),
 )
 
-# At 1 row Step 0 runs g_proj / o_proj as direct GEMMs, which the chain's split-K builds do not match bit-exactly.
-MIN_ROWS = int(os.environ.get("TLLM_K3_FGS_MLA_MIN_ROWS", "2"))
+# At 1 row the table's g_proj / o_proj are direct GEMMs; the chain runs their direct FGS builds
+# (``kimi_k3_cute_gemm``), which match the stock path bit for bit.
+MIN_ROWS = int(os.environ.get("TLLM_K3_FGS_MLA_MIN_ROWS", "1"))
 MAX_ROWS = int(os.environ.get("TLLM_K3_FGS_MLA_MAX_ROWS", "32"))
+# Split-KV clusters without K tiles exit at entry (``KimiK3MlaDecodeFgs(fgs_skip_empty=True)``).
+SKIP_EMPTY_SPLITS = os.environ.get("TLLM_K3_FGS_MLA_SKIP_EMPTY", "0") == "1"
+# Split-KV reduction: head rows per CTA (1, 2, 4, or ``auto``: 1 below 8 decode rows, 2 below 16, else 4) and the
+# launch's preferred smem carveout in percent (unset: the driver's default for its 1 KB per CTA).
+RED_ROWS = os.environ.get("TLLM_K3_FGS_MLA_RED_ROWS", "auto")
+RED_CARVEOUT = int(os.environ.get("TLLM_K3_FGS_MLA_RED_CARVEOUT", "-1"))
+
+
+def _red_rows(batch: int) -> int:
+    if RED_ROWS == "auto":
+        return 1 if batch < 8 else 2 if batch < 16 else 4
+    return int(RED_ROWS)
+
+
+# In-kernel sentinel re-arm (comma list): ``kv_c`` = the latent append re-arms compressed_kv after reading it (its last
+# reader); ``gated`` = the output gate arms the slot of the edge's next use in the step. The framework fill still
+# runs for these slots (redundant); TLLM_K3_FGS_MLA_REARM_DELAY_NS delays the re-arm stores (hazard tests).
+REARM = frozenset(filter(None, os.environ.get("TLLM_K3_FGS_MLA_REARM", "").split(",")))
+REARM_DELAY_NS = int(os.environ.get("TLLM_K3_FGS_MLA_REARM_DELAY_NS", "0"))
 # Split-plan buffer capacity (requests); the stock planner serves up to 1024.
 _PLAN_CAPACITY = 1024
 
@@ -281,11 +306,25 @@ def _kernels():
         mla_rmsnorm,
     )
 
-    return _Kernels(
-        mla_rmsnorm.mla_rmsnorm,
-        mla_latent_append.mla_latent_append,
-        mla_output_gate.mla_output_gate,
-    )
+    latent_append = mla_latent_append.mla_latent_append
+    gate = mla_output_gate.mla_output_gate
+    if "kv_c" in REARM:
+        latent_append = functools.partial(
+            latent_append, fgs_rearm_ckv=True, fgs_rearm_delay_ns=REARM_DELAY_NS
+        )
+    if "gated" in REARM:
+        gate = functools.partial(_gate_arming_next_use, gate)
+    return _Kernels(mla_rmsnorm.mla_rmsnorm, latent_append, gate)
+
+
+def _gate_arming_next_use(gate, o, g, out=None, **kwargs):
+    lease = edges.lease_containing(out)
+    ws = None if lease is None else lease.workspace
+    arm = None
+    if ws is not None and lease.slot + 1 < ws.num_slots:
+        # The slot the next acquire of this edge in the step hands out (the cursor walks the slots in order).
+        arm = ws._lease_tensor(lease.slot + 1, lease.tensor.shape[0])
+    return gate(o, g, out=out, fgs_arm=arm, fgs_arm_delay_ns=REARM_DELAY_NS, **kwargs)
 
 
 class _Kernels(NamedTuple):
@@ -429,7 +468,19 @@ class _Decode:
         split_ws = self.split_ws if self.use_workspace else None
         plan = self.plan if self.use_workspace else None
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-        key = (self.page_size, heads, self.use_workspace, plan is not None, fused_q.device)
+        red_rows = _red_rows(batch) if plan is not None else 1
+        if plan is not None:
+            edges.debug("mla.reduction", batch, f"{red_rows} head rows per CTA")
+        if SKIP_EMPTY_SPLITS:
+            edges.debug("mla.split_kv", batch, "split clusters without K tiles exit at entry")
+        key = (
+            self.page_size,
+            heads,
+            self.use_workspace,
+            plan is not None,
+            red_rows,
+            fused_q.device,
+        )
         fn = self._compiled.get(key)
         if fn is None:
             import tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops as ops
@@ -440,7 +491,9 @@ class _Decode:
                 cutlass.Float32, cutlass.Float32, (128, 128), (128, 256), clusters, self.page_size, 0.0, False,
                 True, var_split, num_heads=heads, seq_len_q=1,
                 reducer_max_splits=ops.MLA_DECODE_MAX_SPLITS if var_split else 32,
-                fgs_consumer=True, fgs_producer=True, fgs_reduction=True,
+                fgs_consumer=True, fgs_producer=True, fgs_reduction=True, fgs_skip_empty=SKIP_EMPTY_SPLITS,
+                fgs_red_rows=red_rows,
+                fgs_red_carveout=RED_CARVEOUT if RED_CARVEOUT >= 0 else None,
             )  # fmt: skip
 
             def ct(t, leading, align=16):
