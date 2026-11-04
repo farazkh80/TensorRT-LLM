@@ -28,7 +28,9 @@ completed when the norm starts.
 
 ``TLLM_K3_FGS_KDA_CORE`` (off by default; :func:`core_kwargs`) runs the decode KdaDecodeT1 producer of ``CORE`` as one
 resident wave that leaves an o_proj CTA room on every SM (``persistent``) and / or lets the chained core wait for the
-output gate only in its epilogue (``ogate=1``).
+output gate only in its epilogue (``ogate=1``). ``TLLM_K3_FGS_KDA_REARM=core_o`` (off by default) makes that producer
+arm the ``CORE`` slot of the next KDA layer in the same step itself (``TLLM_K3_FGS_KDA_REARM_DELAY_NS`` delays its
+arming stores, for hazard tests).
 """
 
 import atexit
@@ -278,15 +280,41 @@ def _o_proj_split(rows: int) -> int:
     return next((t[1][2] for t in tactics if rows <= t[0]), 3)
 
 
-def core_kwargs(rows: int, heads: int = 96) -> Dict[str, object]:
+REARM_ENV = "TLLM_K3_FGS_KDA_REARM"
+
+
+def _rearm_core() -> bool:
+    value = os.environ.get(REARM_ENV, "").strip()
+    if value not in ("", "0", "core_o"):
+        raise ValueError(f"{REARM_ENV}={value!r}; valid: core_o")
+    return value == "core_o"
+
+
+def _arm_kwargs(lease, rows: int, heads: int) -> Dict[str, object]:
+    """The next use's region of ``lease``'s ``CORE`` slot (STEP slots are used in cursor order, one per KDA layer);
+    none for the step's last use, whose successor is the next step's first slot (framework fill). Safe because a
+    launch without PDL (the MoE's plain kernels) orders this core's completion before the next KDA layer's core."""
+    ws = lease.workspace
+    if lease.slot + 1 >= ws.num_slots:
+        return {}
+    return dict(
+        fgs_arm=ws._lease_tensor(lease.slot + 1, rows).view(rows, heads, -1),
+        fgs_arm_delay_ns=int(os.environ.get(f"{REARM_ENV}_DELAY_NS", "0")),
+    )
+
+
+def core_kwargs(rows: int, heads: int = 96, lease=None) -> Dict[str, object]:
     """Extra ``kda_decode_t1`` kwargs of the decode core when it produces a ``CORE`` slot (empty unless
     ``TLLM_K3_FGS_KDA_CORE`` covers ``rows``): a persistent grid of ``cps`` CTAs per SM that leaves one o_proj CTA
     room on each SM, publishing all rows of one head of each of o_proj's split-K slices per group; the heads qkvg
-    publishes first, first; the late output-gate wait (applies only to the consumer build)."""
+    publishes first, first; the late output-gate wait (applies only to the consumer build). With ``lease`` (the
+    core's ``CORE`` lease) and ``TLLM_K3_FGS_KDA_REARM=core_o``, the core also arms the next use's slot."""
+    kwargs: Dict[str, object] = {}
+    if lease is not None and _rearm_core():
+        kwargs.update(_arm_kwargs(lease, rows, heads))
     knob = _core_knob()
     if knob is None or not knob["rows"][0] <= rows <= knob["rows"][1]:
-        return {}
-    kwargs: Dict[str, object] = {}
+        return kwargs
     persistent = knob["persistent"]
     split = knob.get("split") or (_o_proj_split(rows) if persistent else 1)
     first = knob["first"]
@@ -315,7 +343,8 @@ def core_kwargs(rows: int, heads: int = 96) -> Dict[str, object]:
         kwargs["fgs_late_gate"] = True
     if rows not in _core_logged:
         _core_logged.add(rows)
-        logger.info(f"{CORE_ENV} rows={rows}: {kwargs}")
+        shown = {k: "<tensor>" if isinstance(v, torch.Tensor) else v for k, v in kwargs.items()}
+        logger.info(f"{CORE_ENV} rows={rows}: {shown}")
     return kwargs
 
 
