@@ -50,6 +50,11 @@ because the W_UV TMA ``report_valid`` load checks only element 0 of a chunk.
 
 ``pdl_early``: kernels without their FGS consumer flag are launched with PDL, trigger on entry and wait on entry.
 
+``fgs_skip_empty`` (split-KV kernel, non-persistent grid): a cluster whose (request, split) has no K tile exits right
+after the PDL trigger (and wait), before barrier init, TMEM allocation and the cluster sync. The grid is sized for the
+runner's split_kv and the per-request plan usually uses fewer splits; an empty cluster still holds two SMs (1 CTA /
+SM) while it runs, and the dependents launch only once every split CTA has started.
+
 Framework contract (sentinel = -0.0; bf16 0x8000, fp32 0x80000000):
   * fused_q (all 576 columns of the step's rows) holds the sentinel before W_UK / latent append write it.
   * The current cache rows of every MLA layer hold the sentinel before the latent append writes them
@@ -324,6 +329,7 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         fgs_stats: bool = False,
         spin_limit: int = 0,
         launch: tuple = ("split", "reduction"),
+        fgs_skip_empty: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -335,15 +341,18 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         self.fgs_stats = fgs_stats
         self.spin_limit = spin_limit
         self.fgs_launch = frozenset(launch)
-        self._fgs_split = fgs_consumer or fgs_producer or pdl_early
+        self.fgs_skip_empty = fgs_skip_empty
+        self._fgs_split = fgs_consumer or fgs_producer or pdl_early or fgs_skip_empty
         self._fgs_red = fgs_reduction or pdl_early
         if self._fgs_split or self._fgs_red:
             if self.is_var_q or self.emit_softmax_stats:
                 raise ValueError(
                     "FGS MLA decode supports fixed-Q decode without softmax stats only"
                 )
-            if self.is_persistent and fgs_consumer:
-                raise ValueError("FGS MLA decode consumer supports the non-persistent grid only")
+            if self.is_persistent and (fgs_consumer or fgs_skip_empty):
+                raise ValueError(
+                    "FGS MLA decode consumer / fgs_skip_empty support the non-persistent grid only"
+                )
         if fgs_partials not in ("lse", "all"):
             raise ValueError(f"fgs_partials must be 'lse' or 'all', got {fgs_partials!r}")
         if fgs_consumer and getattr(pipeline, "PipelineTmaUmmaRetry", None) is None:
@@ -535,7 +544,72 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         cute.arch.griddepcontrol_launch_dependents()
         if cutlass.const_expr(not self.fgs_consumer):
             cute.arch.griddepcontrol_wait()
+        args = (
+            tiled_mma_qk, tiled_mma_pv, tma_atom_q_latent, mQL, tma_atom_q_rope, mQR, tma_atom_c_latent, mCL,
+            tma_atom_c_rope, mKR, tma_atom_c_latent_transpose, mCLT, mPT, mO, mLSE, mAccO, mAccLSE, split_kv,
+            cache_seqs, kv_bounds, cum_seq_lens_q, block_split_kvs, softmax_scale_log2, output_scale,
+            q_latent_smem_layout_staged, q_rope_smem_layout_staged, kc_smem_layout_staged, p_smem_layout_staged,
+            vc_smem_layout_staged, kc_smem_layout_for_tma, vc_smem_layout_for_tma, cta_layout_vmnk,
+            tile_sched_params, SharedStorage, mCLraw, mStats,
+        )  # fmt: skip
+        if cutlass.const_expr(self.fgs_skip_empty):
+            # Both CTAs of a cluster share (request, split), so they leave together before any cluster-scope
+            # barrier, TMEM allocation or DSMEM traffic.
+            tile_sched = create_mla_static_tile_scheduler(
+                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+            )
+            k_tile_count = self.get_k_tile_count(
+                split_kv,
+                cache_seqs,
+                cum_seq_lens_q,
+                block_split_kvs,
+                tile_sched.initial_work_tile_info().tile_idx,
+            )[1]
+            if k_tile_count > 0:
+                self._fgs_split_kv_body(*args)
+        else:
+            self._fgs_split_kv_body(*args)
 
+    @cute.jit
+    def _fgs_split_kv_body(
+        self,
+        tiled_mma_qk: cute.TiledMma,
+        tiled_mma_pv: cute.TiledMma,
+        tma_atom_q_latent: Optional[cute.CopyAtom],
+        mQL: cute.Tensor,
+        tma_atom_q_rope: Optional[cute.CopyAtom],
+        mQR: cute.Tensor,
+        tma_atom_c_latent: Optional[cute.CopyAtom],
+        mCL: cute.Tensor,
+        tma_atom_c_rope: Optional[cute.CopyAtom],
+        mKR: cute.Tensor,
+        tma_atom_c_latent_transpose: Optional[cute.CopyAtom],
+        mCLT: cute.Tensor,
+        mPT: cute.Tensor,
+        mO: Optional[cute.Tensor],
+        mLSE: cute.Tensor,
+        mAccO: Optional[cute.Tensor],
+        mAccLSE: Optional[cute.Tensor],
+        split_kv: cutlass.Int32,
+        cache_seqs: cute.Tensor,
+        kv_bounds: Optional[cute.Tensor],
+        cum_seq_lens_q: Optional[cute.Tensor],
+        block_split_kvs: cute.Tensor,
+        softmax_scale_log2: cutlass.Float32,
+        output_scale: cutlass.Float32,
+        q_latent_smem_layout_staged: cute.ComposedLayout,
+        q_rope_smem_layout_staged: cute.ComposedLayout,
+        kc_smem_layout_staged: cute.ComposedLayout,
+        p_smem_layout_staged: cute.ComposedLayout,
+        vc_smem_layout_staged: cute.ComposedLayout,
+        kc_smem_layout_for_tma: cute.ComposedLayout,
+        vc_smem_layout_for_tma: cute.ComposedLayout,
+        cta_layout_vmnk: cute.Layout,
+        tile_sched_params: MLAStaticTileSchedulerParams,
+        SharedStorage: cutlass.Constexpr,
+        mCLraw: cute.Tensor,
+        mStats: Optional[cute.Tensor],
+    ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()

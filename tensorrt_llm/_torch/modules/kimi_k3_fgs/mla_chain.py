@@ -60,6 +60,8 @@ _EDGES = (
 # At 1 row Step 0 runs g_proj / o_proj as direct GEMMs, which the chain's split-K builds do not match bit-exactly.
 MIN_ROWS = int(os.environ.get("TLLM_K3_FGS_MLA_MIN_ROWS", "2"))
 MAX_ROWS = int(os.environ.get("TLLM_K3_FGS_MLA_MAX_ROWS", "32"))
+# Split-KV clusters without K tiles exit at entry (``KimiK3MlaDecodeFgs(fgs_skip_empty=True)``).
+SKIP_EMPTY_SPLITS = os.environ.get("TLLM_K3_FGS_MLA_SKIP_EMPTY", "0") == "1"
 # Split-plan buffer capacity (requests); the stock planner serves up to 1024.
 _PLAN_CAPACITY = 1024
 
@@ -440,7 +442,7 @@ class _Decode:
                 cutlass.Float32, cutlass.Float32, (128, 128), (128, 256), clusters, self.page_size, 0.0, False,
                 True, var_split, num_heads=heads, seq_len_q=1,
                 reducer_max_splits=ops.MLA_DECODE_MAX_SPLITS if var_split else 32,
-                fgs_consumer=True, fgs_producer=True, fgs_reduction=True,
+                fgs_consumer=True, fgs_producer=True, fgs_reduction=True, fgs_skip_empty=SKIP_EMPTY_SPLITS,
             )  # fmt: skip
 
             def ct(t, leading, align=16):
