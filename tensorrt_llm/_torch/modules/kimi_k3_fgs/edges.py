@@ -44,10 +44,10 @@ from ....logger import logger
 
 ENV = "TLLM_K3_FGS"
 MODES = ("off", "early", "lamport", "chain", "chain_after")
-# The chain modes pay from 8 rows; from 4 rows down the decode projections include direct GEMMs, whose fine-grained-sync
-# builds cost more than the chain saves.
+# The chain modes pay from 8 to 64 rows; from 4 rows down the decode projections include direct GEMMs, whose
+# fine-grained-sync builds cost more than the chain saves.
 MIN_ROWS = int(os.environ.get("TLLM_K3_FGS_MIN_ROWS", "8"))
-MAX_ROWS = int(os.environ.get("TLLM_K3_FGS_MAX_ROWS", "16"))
+MAX_ROWS = int(os.environ.get("TLLM_K3_FGS_MAX_ROWS", "64"))
 # A ``lamport`` edge outside a chain pays only at 16 rows: below, the report_valid consumer is slower than the
 # early-trigger path with a waiting consumer; above, the o_proj consumer runs 32-row split-K tiles, slower than the
 # table's GEMM at 64 rows.
@@ -65,8 +65,9 @@ def _parse_drops(value: str) -> Dict[str, Tuple[int, int]]:
 
 
 # Pruned edges (``name`` or ``name:low-high`` rows, comma separated): acquire refuses them, so the producer writes its
-# own buffer and the consumer runs its default build.
-DROPPED = _parse_drops(os.environ.get("TLLM_K3_FGS_DROP_EDGES", ""))
+# own buffer and the consumer runs its default build. By default the KDA o_proj -> pre-MoE mix edge stops at 32 rows:
+# above, the KDA chain with that edge is slower than the stock layer.
+DROPPED = _parse_drops(os.environ.get("TLLM_K3_FGS_DROP_EDGES", "kda.attn_o:33-64"))
 
 # Edge name -> (row width, layers that declared it).
 _declared: Dict[str, Tuple[int, Set[int]]] = {}
