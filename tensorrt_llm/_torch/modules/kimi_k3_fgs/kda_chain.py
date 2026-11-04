@@ -26,11 +26,11 @@ The pre-attention mix (pipe kernel, no producer mode) and BT16 prep (no consumer
 gated norm reads the gate columns of the p_qkvg slot unchecked: chain_dv2 is a plain launch, so the qkvg GEMM has
 completed when the norm starts.
 
-``TLLM_K3_FGS_KDA_CORE`` (off by default; :func:`core_kwargs`) runs the decode KdaDecodeT1 producer of ``CORE`` as one
-resident wave that leaves an o_proj CTA room on every SM (``persistent``) and / or lets the chained core wait for the
-output gate only in its epilogue (``ogate=1``). ``TLLM_K3_FGS_KDA_REARM=core_o`` (off by default) makes that producer
-arm the ``CORE`` slot of the next KDA layer in the same step itself (``TLLM_K3_FGS_KDA_REARM_DELAY_NS`` delays its
-arming stores, for hazard tests).
+``TLLM_K3_FGS_KDA_CORE`` (:func:`core_kwargs`; chain default ``CORE_DEFAULT``, ``off`` disables) runs the decode
+KdaDecodeT1 producer of ``CORE`` as one resident wave (``persistent``), with the chained core waiting for the output
+gate only in its epilogue (``ogate=1``) and taking first the heads qkvg publishes first (``first=n``).
+``TLLM_K3_FGS_KDA_REARM=core_o`` (off by default) makes that producer arm the ``CORE`` slot of the next KDA layer in
+the same step itself (``TLLM_K3_FGS_KDA_REARM_DELAY_NS`` delays its arming stores, for hazard tests).
 """
 
 import atexit
@@ -207,9 +207,21 @@ _SM_REGS = 65536
 _CORE_THREADS = 256
 
 
-@functools.lru_cache(maxsize=None)
+# The chain's decode core at 9..16 rows (persistent rows default), paired with the FGS qkvg order of 70 heads.
+CORE_DEFAULT = "persistent,cps=4,ogate=1,first=70"
+
+
 def _core_knob() -> Optional[Dict[str, object]]:
-    """``TLLM_K3_FGS_KDA_CORE``: empty / ``0`` off; else comma separated items, ``persistent`` and / or
+    """The parsed ``TLLM_K3_FGS_KDA_CORE``, or ``CORE_DEFAULT`` in the chain modes when it is unset."""
+    value = os.environ.get(CORE_ENV)
+    if value is None:
+        value = CORE_DEFAULT if edges.chain() else "off"
+    return _parse_core(value.strip())
+
+
+@functools.lru_cache(maxsize=None)
+def _parse_core(value: str) -> Optional[Dict[str, object]]:
+    """``TLLM_K3_FGS_KDA_CORE``: ``off`` / ``0`` / empty disables; else comma separated items, ``persistent`` and / or
     ``key=value`` (e.g. ``persistent,cps=2``, ``ogate=1``, ``persistent,ogate=1``):
 
       ogate=0|1    the consumer core validates the output gate in its epilogue (0)
@@ -229,8 +241,7 @@ def _core_knob() -> Optional[Dict[str, object]]:
       regs=r       register cap per thread (0: none); default the smallest above 64 (the 4-CTA bound) that keeps a
                    (cps+1)-th core CTA off the SM, so the free slot is left to o_proj
     """
-    value = os.environ.get(CORE_ENV, "").strip()
-    if value in ("", "0"):
+    if value in ("", "0", "off"):
         return None
     knob: Dict[str, object] = {"persistent": False}
     for item in (v.strip() for v in value.split(",")):
@@ -345,10 +356,12 @@ def core_kwargs(rows: int, heads: int = 96, lease=None) -> Dict[str, object]:
         )
     if knob["ogate"]:
         kwargs["fgs_late_gate"] = True
-    if rows not in _core_logged:
-        _core_logged.add(rows)
+    key = (os.environ.get(CORE_ENV), rows)
+    if key not in _core_logged:
+        _core_logged.add(key)
         shown = {k: "<tensor>" if isinstance(v, torch.Tensor) else v for k, v in kwargs.items()}
-        logger.info(f"{CORE_ENV} rows={rows}: {shown}")
+        logger.info(f"{CORE_ENV}={os.environ.get(CORE_ENV, CORE_DEFAULT)!r} rows={rows}: {shown}")
+        edges.debug("kda.core_knob", rows, str(shown))
     return kwargs
 
 
