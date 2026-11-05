@@ -15,8 +15,8 @@ up-projection. Stock runs the FlashInfer CuTe RMSNorm, a cuBLASLt split-K GEMM +
   of the row; ``bf16(x * rstd * w)``.
 * :func:`up_proj` runs the vendored FlashInfer split-K GEMM (cluster-local fp32 reduction, deterministic) with the
   add fused into its epilogue after the bf16 rounding, so the add is bitwise the ATen add of the rounded GEMM output.
-  The GEMM itself differs from cuBLAS in its K-reduction order. Rows beyond 64 run the in-tree Rubin GEMM and a
-  separate :func:`add`.
+  The GEMM itself differs from cuBLAS in its K-reduction order. Rows beyond 32 keep the stock cuBLAS GEMM and ATen
+  add, which measured faster there than two 32-row split-K launches.
 """
 
 from __future__ import annotations
@@ -35,8 +35,7 @@ LATENT = 3584
 HIDDEN = 7168
 _VEC = 8
 _THREADS_PER_ROW = 64
-_SPLITK_MAX_M = 32
-_SPLITK_ROWS = 64
+_SPLITK_ROWS = 32
 
 
 def _pdl() -> bool:
@@ -257,15 +256,24 @@ def add(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor, chunks: int = 7) ->
     return out
 
 
+# Measured on SM107 (CUDA-graph replay, ready input): (max M, (mma_m, mma_n, split_k, ab_stages)).
+_UP_TACTICS = (
+    (1, (128, 8, 2, 6)),
+    (8, (64, 8, 1, 11)),
+    (16, (64, 16, 1, 10)),
+    (32, (64, 32, 1, 9)),
+)
+
+
 def up_tactic(m: int):
-    """Split-K tactic of the latent up-projection at M rows per launch (``TLLM_K3_LATENT_UP_TACTIC=m,n,split,stages``
+    """Split-K tactic of the latent up-projection at M rows (``TLLM_K3_LATENT_UP_TACTIC=m,n,split,stages``
     overrides)."""
-    from ..splitk_gemm_fgs import SplitKTactic, default_tactic
+    from ..splitk_gemm_fgs import SplitKTactic
 
     override = os.environ.get("TLLM_K3_LATENT_UP_TACTIC")
     if override:
         return SplitKTactic(*(int(v) for v in override.split(",")))
-    return default_tactic(m, HIDDEN, LATENT)
+    return SplitKTactic(*next(t for max_m, t in _UP_TACTICS if m <= max_m))
 
 
 def up_proj(
@@ -276,27 +284,23 @@ def up_proj(
     if m == 0:
         return out
     if m > _SPLITK_ROWS:
-        from .. import kimi_k3_cute_gemm
-
         if addend is None:
-            return kimi_k3_cute_gemm.linear(x, weight, out)
-        return add(kimi_k3_cute_gemm.linear(x, weight), addend, out)
+            return torch.matmul(x, weight.t(), out=out)
+        return torch.add(torch.matmul(x, weight.t()), addend, out=out)
     from ..splitk_gemm_fgs import run_splitk_dense_fgs
 
-    for r in range(0, m, _SPLITK_MAX_M):
-        rows = min(_SPLITK_MAX_M, m - r)
-        run_splitk_dense_fgs(
-            x[r : r + rows],
-            weight.t(),
-            None if addend is None else addend[r : r + rows],
-            out[r : r + rows],
-            _pdl(),
-            up_tactic(rows),
-            report_valid=False,
-            retry_warp=False,
-            pdl_wait_activation=True,
-            addend=addend is not None,
-        )
+    run_splitk_dense_fgs(
+        x,
+        weight.t(),
+        addend,
+        out,
+        _pdl(),
+        up_tactic(m),
+        report_valid=False,
+        retry_warp=False,
+        pdl_wait_activation=True,
+        addend=addend is not None,
+    )
     return out
 
 
