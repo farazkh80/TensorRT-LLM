@@ -59,10 +59,17 @@ FGS_MAX_ROWS = int(os.environ.get("TLLM_K3_MOE_FGS_MAX_ROWS", "64"))
 TAIL_FGS_MAX_ROWS = 32
 # Hazard tests only: the CuTe combine and routing delay their FGS-published stores by this many ns.
 _HAZARD_DELAY_NS = int(os.environ.get("TLLM_K3_MOE_HAZARD_DELAY_NS", "0"))
+MAX_ROWS_ENV = "TLLM_K3_MOE_MAX_ROWS"
 
 
 def enabled() -> bool:
     return os.environ.get(ENV, "") == "cute"
+
+
+def within_max_rows(tokens_per_rank: int) -> bool:
+    """Whether a forward with this many tokens on its fullest rank runs the CuTe path (expert path, all-to-all and
+    tail); larger forwards, such as context steps, keep the stock kernels and never grow the workspace."""
+    return tokens_per_rank <= int(os.environ.get(MAX_ROWS_ENV, "128"))
 
 
 def tail_enabled() -> bool:
@@ -479,6 +486,7 @@ class _Layer:
             return (
                 kwargs.get("eplb_local_stats") is None
                 and kwargs.get("active_rank_mask") is None
+                and within_max_rows(runtime_max)
                 and comm.use_cft_for_dispatch(runtime_max)
                 and comm.use_cft_for_combine(runtime_max)
             )
@@ -577,6 +585,8 @@ def install(routed_experts) -> bool:
       routing) keep the stock runner.
     - ``TLLM_K3_COMM=cute``: dispatch / combine through ``moe.comm.CuteA2A``.
     - ``TLLM_K3_MOE_FGS=<edges>|all``: the M2 edges; each needs both of its kernel sides and the stages it connects.
+
+    Forwards with more than ``TLLM_K3_MOE_MAX_ROWS`` (default 128) tokens on the fullest rank keep the stock path.
     """
     edges = fgs_edges()
     moe_on, comm_on, tail_on = enabled(), os.environ.get(COMM_ENV, "") == "cute", tail_enabled()
@@ -611,15 +621,21 @@ def install(routed_experts) -> bool:
         return True
     stock_run_moe = backend.run_moe
     checked = []
+    ep = getattr(comm, "ep_size", 1)
 
     def run_moe(ctx, *, workspace=None):
         plan = ctx.comm_plan
         out = None if plan is None else plan.moe_output
+        if ctx.all_rank_num_tokens:
+            tokens_per_rank = max(ctx.all_rank_num_tokens)
+        else:
+            tokens_per_rank = ctx.x.shape[0] // ep
         if (
             out is None
             or not ctx.do_finalize
             or ctx.token_selected_experts is None
             or ctx.x_sf is None
+            or not within_max_rows(tokens_per_rank)
         ):
             layer.abandon()
             return stock_run_moe(ctx, workspace=workspace)
@@ -645,6 +661,9 @@ def run_tail(y: torch.Tensor, norm, up_proj, shared: torch.Tensor) -> torch.Tens
     combined = getattr(_pending_tail, "lease", None)
     _pending_tail.lease = None
     m = y.shape[0]
+    if not within_max_rows(m):
+        # Stock norm module; above 32 rows latent.up_proj is the stock GEMM and add.
+        return latent.up_proj(norm(y), up_proj.weight, torch.empty_like(shared), shared)
     norm_lease = None
     if "norm_up" in fgs_edges() and m:
         norm_lease = k3_edges.acquire(LATENT_NORM, m, window=(1, TAIL_FGS_MAX_ROWS))
