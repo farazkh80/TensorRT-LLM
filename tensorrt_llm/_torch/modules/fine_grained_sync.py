@@ -171,6 +171,7 @@ _SENTINELS: Dict[torch.dtype, Tuple[torch.dtype, int, int]] = {
     torch.bfloat16: (torch.int16, -0x8000, -0x7FFF8000),
     torch.float16: (torch.int16, -0x8000, -0x7FFF8000),
     torch.float32: (torch.int32, -0x80000000, -0x80000000),
+    torch.int32: (torch.int32, 0, 0),
 }
 
 
@@ -466,12 +467,16 @@ class EdgeWorkspaces:
             return existing
         if torch.cuda.is_current_stream_capturing() or self.in_scope:
             raise RuntimeError(f"register edge {name} before capture and outside a scope")
+        backend = ResetBackend(backend or self.backend)
+        if dtype == torch.int32 and backend is ResetBackend.TEMPLATE:
+            # Templates are keyed by lane dtype, and int32 is also the float32 lane (another sentinel).
+            backend = ResetBackend.AUTO
         ws = EdgeWorkspace(
             name,
             shape,
             dtype,
             slots,
-            ResetBackend(backend or self.backend),
+            backend,
             self.reset_ctas if reset_ctas is None else reset_ctas,
             self.device,
             self.max_streams_per_slot,
