@@ -48,6 +48,8 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import make_ptr
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from .sync import wait_at_least
+
 HIDDEN = 3584
 INTER = 3072
 TOP_K = 16
@@ -55,6 +57,8 @@ SF_VEC = 32
 W_ROWS = 2 * INTER
 M_TILE = 128
 NUM_M_TILES = W_ROWS // M_TILE
+# fc1_done words per token tile: one per 256-channel K stage of FC2, complete at 4 (64-channel weight tiles).
+DONE_PER_TILE = INTER // 256
 SMEM_ARCH = "sm_107"
 # Above this the L1 carveout drops to a few KB and the cp.async row gather slows down sharply.
 SMEM_BUDGET = 227 * 1024
@@ -209,6 +213,22 @@ def _tmem_load_16x256b(addrs, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _red_add_gpu(addr, val, *, loc=None, ip=None):
+    """Relaxed GPU-scope ``red.add`` on a global int32 word; ordering comes from a preceding fence."""
+    llvm.inline_asm(
+        None,
+        [cutlass.Int64(addr).ir_value(loc=loc, ip=ip), cutlass.Int32(val).ir_value(loc=loc, ip=ip)],
+        "red.relaxed.gpu.global.add.s32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def _tcgen05_fence(kind: str, *, loc=None, ip=None):
     """``tcgen05.fence::before_thread_sync`` / ``after_thread_sync`` around the TMEM accumulator handoff."""
     llvm.inline_asm(
@@ -297,9 +317,12 @@ class Fc1Kernel:
         gate_cap: float,
         linear_cap: float,
         use_pdl: bool,
+        wait_plan: bool = False,
+        signal_done: bool = False,
         max_ab_stages: int = 16,
         num_acc_stages: int = 2,
         num_tile_stages: int = 6,
+        num_stored_stages: int = 4,
     ):
         if n_tile not in (8, 16, 32):
             raise ValueError(f"n_tile must be 8, 16 or 32, got {n_tile}")
@@ -310,9 +333,12 @@ class Fc1Kernel:
         self.gate_cap = float(gate_cap)
         self.linear_cap = float(linear_cap)
         self.use_pdl = use_pdl
+        self.wait_plan = wait_plan
+        self.signal_done = signal_done
         self.max_ab_stages = max_ab_stages
         self.num_acc_stage = num_acc_stages
         self.num_tile_stage = num_tile_stages
+        self.num_stored_stage = num_stored_stages
         self.sf_vec_size = SF_VEC
         self.acc_dtype = cutlass.Float32
         self.cta_group = tcgen05.CtaGroup.ONE
@@ -323,7 +349,9 @@ class Fc1Kernel:
         self.mma_warp_id = 4
         self.tma_warp_id = 5
         self.sched_warp_id = 6
-        self.gather_warp_id = 7
+        # With signal_done, warp 7 publishes fc1_done so the epilogue never waits on a GPU-scope release.
+        self.signal_warp_id = 7
+        self.gather_warp_id = 8 if signal_done else 7
         self.threads_per_warp = 32
         self.threads_per_cta = 32 * (self.gather_warp_id + self.num_gather_warps)
         self.num_epilog_threads = 32 * len(self.epilog_warp_id)
@@ -445,6 +473,8 @@ class Fc1Kernel:
         t2e_ptr: cute.Pointer,
         t2l_ptr: cute.Pointer,
         ntiles_ptr: cute.Pointer,
+        plan_ready_ptr: cute.Pointer,
+        fc1_done_ptr: cute.Pointer,
         num_experts: cutlass.Int32,
         num_rows: cutlass.Int32,
         num_permuted: cutlass.Int32,
@@ -477,6 +507,10 @@ class Fc1Kernel:
         t2e = cute.make_tensor(t2e_ptr, cute.make_layout((num_tiles_cap,)))
         t2l = cute.make_tensor(t2l_ptr, cute.make_layout((num_tiles_cap,)))
         ntiles = cute.make_tensor(ntiles_ptr, cute.make_layout((1,)))
+        plan_ready = cute.make_tensor(plan_ready_ptr, cute.make_layout((1,)))
+        fc1_done = cute.make_tensor(
+            fc1_done_ptr, cute.make_layout((num_tiles_cap * DONE_PER_TILE,))
+        )
 
         tiled_mma = self._make_tiled_mma(self.mma_inst_shape_mn)
         tiled_mma_sfb = self._make_tiled_mma(self.mma_inst_shape_mn_sfb)
@@ -514,6 +548,7 @@ class Fc1Kernel:
             b_mbar: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
             acc_mbar: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
             info_mbar: cute.struct.MemRange[cutlass.Int64, self.num_tile_stage * 2]
+            stored_mbar: cute.struct.MemRange[cutlass.Int64, self.num_stored_stage * 2]
             tmem_holding_buf: cutlass.Int32
             sA: cute.struct.Align[
                 cute.struct.MemRange[
@@ -557,6 +592,8 @@ class Fc1Kernel:
             t2e,
             t2l,
             ntiles,
+            plan_ready,
+            fc1_done,
             num_ctas,
             self.cluster_layout_vmnk,
             self.a_smem_layout_staged,
@@ -603,6 +640,8 @@ class Fc1Kernel:
         mT2e: cute.Tensor,
         mT2l: cute.Tensor,
         mNumTiles: cute.Tensor,
+        mPlanReady: cute.Tensor,
+        mFc1Done: cute.Tensor,
         num_ctas: cutlass.Int32,
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -653,6 +692,19 @@ class Fc1Kernel:
                 pipeline.Agent.Thread, self.num_info_consumers
             ),
         )
+        # Epilogue -> signal warp: an item's act / act_sf stores are done (mbarrier arrive / wait order them at CTA
+        # scope; the signal warp's release then publishes them at GPU scope).
+        if cutlass.const_expr(self.signal_done):
+            stored_pipeline = pipeline.PipelineAsync.create(
+                barrier_storage=storage.stored_mbar.data_ptr(),
+                num_stages=self.num_stored_stage,
+                producer_group=pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread, self.num_epilog_threads
+                ),
+                consumer_group=pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread, self.threads_per_warp
+                ),
+            )
 
         tmem = utils.TmemAllocator(
             storage.tmem_holding_buf.ptr,
@@ -702,8 +754,9 @@ class Fc1Kernel:
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
         tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.num_acc_stage))
 
-        # Every read of a predecessor's output and every global write comes after this wait.
-        if cutlass.const_expr(self.use_pdl):
+        # Every read of a predecessor's output and every global write comes after this wait; with wait_plan the
+        # predecessor (routing) publishes the plan through plan_ready instead, and only the scheduler reads it.
+        if cutlass.const_expr(self.use_pdl and not self.wait_plan):
             cute.arch.griddepcontrol_wait()
         self.cta_sync_barrier.arrive_and_wait()
 
@@ -715,6 +768,11 @@ class Fc1Kernel:
         # and the source row of each of the n_mma token rows (-1 at or past the row limit). The row limit is the
         # tile_idx_to_mn_limit of the item's last tile, clipped to that tile's end.
         if warp_idx == self.sched_warp_id:
+            if cutlass.const_expr(self.wait_plan):
+                wait_at_least(mPlanReady.iterator.toint(), cutlass.Int32(1))
+            # The dependent (FC2) may start once the plan it also reads is complete.
+            if cutlass.const_expr(self.use_pdl and (self.wait_plan or self.signal_done)):
+                cute.arch.griddepcontrol_launch_dependents()
             info_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_tile_stage
             )
@@ -1067,6 +1125,9 @@ class Fc1Kernel:
             info_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_tile_stage
             )
+            stored_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.num_stored_stage
+            )
             info = cute.make_rmem_tensor((5,), cutlass.Int32)
             acc = cute.make_rmem_tensor((8 * n_chunk,), cutlass.Float32)
             act = cute.make_rmem_tensor((4 * n_chunk,), cutlass.Float32)
@@ -1171,6 +1232,10 @@ class Fc1Kernel:
                                 if (quad & 1) == 0:
                                     mActSf[(prow, m_tile * 2 + sf_group)] = cutlass.Uint8(sf_byte)
                 parity = parity ^ 1
+                if cutlass.const_expr(self.signal_done):
+                    stored_pipeline.producer_acquire(stored_state)
+                    stored_pipeline.producer_commit(stored_state)
+                    stored_state.advance()
 
                 info_pipeline.consumer_wait(info_state)
                 for i in cutlass.range_constexpr(5):
@@ -1178,9 +1243,43 @@ class Fc1Kernel:
                 info_pipeline.consumer_release(info_state)
                 info_state.advance()
 
+            if cutlass.const_expr(self.signal_done):
+                stored_pipeline.producer_tail(stored_state)
             tmem.relinquish_alloc_permit()
             self.epilog_sync_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
+
+        # Signal warp: after all stores of (token tile t, weight tile j), fc1_done[t * 12 + j // 4] += 1 with release
+        # semantics, for both tiles of a pair. The GPU-scope fence slows the whole SM, so a pair shares one.
+        if cutlass.const_expr(self.signal_done):
+            if warp_idx == self.signal_warp_id:
+                stored_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.num_stored_stage
+                )
+                info_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.num_tile_stage
+                )
+                info = cute.make_rmem_tensor((5,), cutlass.Int32)
+                info_pipeline.consumer_wait(info_state)
+                for i in cutlass.range_constexpr(5):
+                    info[i] = sInfo[(i, info_state.index)]
+                info_pipeline.consumer_release(info_state)
+                info_state.advance()
+                while info[4] == 1:
+                    stored_pipeline.consumer_wait(stored_state)
+                    if tidx % self.threads_per_warp == 0:
+                        done = mFc1Done.iterator + info[1] * DONE_PER_TILE + info[0] // 4
+                        cute.arch.fence_acq_rel_gpu()
+                        _red_add_gpu(done.toint(), cutlass.Int32(1))
+                        if info[3] > (info[1] + 1) * n_tile:
+                            _red_add_gpu((done + DONE_PER_TILE).toint(), cutlass.Int32(1))
+                    stored_pipeline.consumer_release(stored_state)
+                    stored_state.advance()
+                    info_pipeline.consumer_wait(info_state)
+                    for i in cutlass.range_constexpr(5):
+                        info[i] = sInfo[(i, info_state.index)]
+                    info_pipeline.consumer_release(info_state)
+                    info_state.advance()
 
         if cutlass.const_expr(self.use_pdl):
             cute.arch.griddepcontrol_launch_dependents()
@@ -1199,7 +1298,7 @@ def _gmem_ptr(dtype, tensor: torch.Tensor, align: int):
     return make_ptr(dtype, tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
 
 
-def _launch_args(x, x_sf, weights, plan, act, act_sf):
+def _launch_args(x, x_sf, weights, plan, act, act_sf, plan_ready, fc1_done):
     num_experts = weights.w3_w1_weight.shape[0]
     num_tiles_cap = plan.tile_idx_to_expert_idx.shape[0]
     num_ctas = min(_num_sms(x.device.index), num_tiles_cap * NUM_M_TILES)
@@ -1214,6 +1313,10 @@ def _launch_args(x, x_sf, weights, plan, act, act_sf):
         _gmem_ptr(cutlass.Int32, plan.tile_idx_to_expert_idx, 4),
         _gmem_ptr(cutlass.Int32, plan.tile_idx_to_mn_limit, 4),
         _gmem_ptr(cutlass.Int32, plan.num_non_exiting_tiles, 4),
+        _gmem_ptr(
+            cutlass.Int32, plan.num_non_exiting_tiles if plan_ready is None else plan_ready, 4
+        ),
+        _gmem_ptr(cutlass.Int32, plan.num_non_exiting_tiles if fc1_done is None else fc1_done, 4),
         cutlass.Int32(num_experts),
         cutlass.Int32(x.shape[0]),
         cutlass.Int32(act.shape[0]),
@@ -1267,13 +1370,32 @@ def _check(x, x_sf, weights, plan, act, act_sf):
         raise ValueError("plan tiles exceed the permuted rows")
 
 
-def run(x, x_sf, weights, plan, act, act_sf):
+def _check_word(name, t, words):
+    if t is not None and (t.dtype != torch.int32 or not t.is_contiguous() or t.numel() < words):
+        raise ValueError(f"{name} must be a contiguous int32 tensor of at least {words} words")
+
+
+def run(x, x_sf, weights, plan, act, act_sf, *, plan_ready=None, fc1_done=None):
     """FC1 of the moe_chain contract: act[p], act_sf[p] = MXFP8(SiTU-GLU(x[p2e[p] // 16] @ W31[e]^T)) for every
     valid permuted row p of expert e; rows past each tile's mn_limit are left untouched. Launches one kernel on the
-    current stream; no allocation, no host synchronization."""
+    current stream; no allocation, no host synchronization.
+
+    ``plan_ready`` (int32 word, zero-armed, raised to >= 1 by routing after its plan stores) makes FC1 the M2b
+    consumer: the plan is read only after the word is acquired. ``fc1_done`` (int32 [T * 12], zero-armed) makes it
+    the M2a producer: after the stores of weight tile j of token tile t, fc1_done[t * 12 + j // 4] is incremented
+    with release semantics, so each 256-channel K stage of a tile reaches 4. Both are owned by the caller."""
     _check(x, x_sf, weights, plan, act, act_sf)
-    key = (plan.tile_n, weights.gate_cap, weights.linear_cap, _use_pdl())
-    args = _launch_args(x, x_sf, weights, plan, act, act_sf)
+    _check_word("plan_ready", plan_ready, 1)
+    _check_word("fc1_done", fc1_done, plan.tile_idx_to_expert_idx.shape[0] * DONE_PER_TILE)
+    key = (
+        plan.tile_n,
+        weights.gate_cap,
+        weights.linear_cap,
+        _use_pdl(),
+        plan_ready is not None,
+        fc1_done is not None,
+    )
+    args = _launch_args(x, x_sf, weights, plan, act, act_sf, plan_ready, fc1_done)
     stream = cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
     compiled = _compiled.get(key)
     if compiled is None:
