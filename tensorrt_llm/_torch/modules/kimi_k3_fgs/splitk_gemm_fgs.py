@@ -30,6 +30,9 @@ Compile-time producer roles (the output is a report_valid consumer's input):
 - ``pzo``: the output is narrowed with ``cvt.rn.pzo`` (-0.0 stored as +0.0).
 - ``early_trigger``: ``griddepcontrol.launch_dependents`` at kernel entry
   instead of after the weight loads.
+- ``addend``: the bias operand is a full ``[M, N]`` tensor added after the
+  output rounding, ``out = round(f32(round(A @ B)) + f32(addend))``, the
+  result of a rounded GEMM followed by a separate elementwise add.
 - ``store16``: the TMEM fragment gives each thread 2 B per output element, so a
   16 B output chunk would be written by several threads. The owner instead
   stages its tile in shared memory (the A stage buffers, idle after the last
@@ -402,7 +405,10 @@ class SplitKFgsGemmKernel:
         pzo: bool = False,
         early_trigger: bool = False,
         store16: bool = False,
+        addend: bool = False,
     ) -> None:
+        if addend and not has_bias:
+            raise ValueError("addend is passed as the bias operand")
         if report_valid and not retry_warp:
             raise ValueError("report_valid needs retry_warp to re-issue invalid stages")
         if timeline and not retry_warp:
@@ -424,6 +430,7 @@ class SplitKFgsGemmKernel:
         self.pzo = pzo
         self.early_trigger = early_trigger and use_pdl
         self.store16 = store16
+        self.addend = addend
         # Per-CTA re-issue budget after which an invalid stage is released with
         # its sentinel data (counted in retry_count[1]), so a never-published
         # stage cannot hang the kernel. Diagnostic builds only; 0 retries forever.
@@ -1058,7 +1065,9 @@ class SplitKFgsGemmKernel:
                         )
 
         if split_rank == OWNER_RANK:
-            if cutlass.const_expr(self.has_bias):
+            if cutlass.const_expr(self.addend):
+                rAcc.store(rAcc.load().to(c_dtype).to(self.acc_dtype) + rBiasAcc.load())
+            elif cutlass.const_expr(self.has_bias):
                 rAcc.store(rAcc.load() + rBiasAcc.load())
 
             if cutlass.const_expr(self.pzo):
@@ -1178,6 +1187,7 @@ def _make_compile_repr_tensors(
     a_leading: int,
     b_leading: int,
     c_leading: int,
+    addend: bool = False,
 ):
     m, n, k, batch = 64, 8, _CTA_K, 1
     tensors = tuple(
@@ -1196,6 +1206,14 @@ def _make_compile_repr_tensors(
     )
     if not has_bias:
         return (*tensors, None, retry)
+    if addend:
+        return (
+            *tensors,
+            _from_dlpack_dynamic(
+                _torch.empty((batch, m, n), dtype=dtype, device="cuda").transpose(-2, -1), 1
+            ),
+            retry,
+        )
     return (
         *tensors,
         _from_dlpack_dynamic(
@@ -1209,7 +1227,7 @@ def _make_compile_repr_tensors(
     )
 
 
-def _to_cute_swap(a, b, out, bias):
+def _to_cute_swap(a, b, out, bias, addend=False):
     tensors = (
         b.unsqueeze(0).transpose(-2, -1),
         a.unsqueeze(0).transpose(-2, -1),
@@ -1221,9 +1239,11 @@ def _to_cute_swap(a, b, out, bias):
             _from_dlpack_dynamic(tensor, leading_dim)
             for tensor, leading_dim in zip(tensors, leading_dims, strict=True)
         ),
-        _from_dlpack_dynamic(bias.as_strided(size=tensors[2].shape, stride=(0, 1, 0)), 1, 2)
-        if bias is not None
-        else None,
+        None
+        if bias is None
+        else _from_dlpack_dynamic(bias.unsqueeze(0).transpose(-2, -1), 1)
+        if addend
+        else _from_dlpack_dynamic(bias.as_strided(size=tensors[2].shape, stride=(0, 1, 0)), 1, 2),
         leading_dims,
     )
 
@@ -1246,12 +1266,15 @@ def _get_compiled_splitk_kernel(
     pzo: bool = False,
     early_trigger: bool = False,
     store16: bool = False,
+    addend: bool = False,
 ):
     if dtype not in _SUPPORTED_TORCH_DTYPES:
         raise ValueError(f"split-K dense GEMM supports {_SUPPORTED_TORCH_DTYPES}; got {dtype}")
 
     with _torch.cuda.device(device_index):
-        compile_tensors = _make_compile_repr_tensors(dtype, has_bias, timeline, *leading_dims)
+        compile_tensors = _make_compile_repr_tensors(
+            dtype, has_bias, timeline, *leading_dims, addend=addend
+        )
         kernel = SplitKFgsGemmKernel(
             tactic=tactic,
             use_pdl=use_pdl,
@@ -1266,6 +1289,7 @@ def _get_compiled_splitk_kernel(
             pzo=pzo,
             early_trigger=early_trigger,
             store16=store16,
+            addend=addend,
         )
         stream = _cuda.CUstream(_torch.cuda.current_stream().cuda_stream)
         if has_bias:
@@ -1275,7 +1299,7 @@ def _get_compiled_splitk_kernel(
         )
 
 
-def _validate_runtime_tensors(a, b, bias, out) -> tuple[int, int, int]:
+def _validate_runtime_tensors(a, b, bias, out, addend=False) -> tuple[int, int, int]:
     tensors = (a, b, out) + ((bias,) if bias is not None else ())
     if any(not isinstance(tensor, _torch.Tensor) for tensor in tensors):
         raise ValueError("a, b, out, and bias must be torch tensors")
@@ -1296,7 +1320,10 @@ def _validate_runtime_tensors(a, b, bias, out) -> tuple[int, int, int]:
     n = b.shape[1]
     if out.shape != (m, n):
         raise ValueError(f"out must have shape {(m, n)}, got {tuple(out.shape)}")
-    if bias is not None and (bias.ndim != 1 or bias.shape[0] != n or not bias.is_contiguous()):
+    if addend:
+        if bias is None or bias.shape != (m, n) or bias.stride(-1) != 1 or bias.data_ptr() % 32:
+            raise ValueError(f"addend must be a row-major, 32-byte aligned [{m}, {n}] tensor")
+    elif bias is not None and (bias.ndim != 1 or bias.shape[0] != n or not bias.is_contiguous()):
         raise ValueError(
             f"bias must be contiguous with shape {(n,)}, "
             f"got shape {tuple(bias.shape)} and stride {bias.stride()}"
@@ -1336,6 +1363,7 @@ def run_splitk_dense_fgs(
     pzo: bool = False,
     early_trigger: bool = False,
     store16: bool = False,
+    addend: bool = False,
 ):
     """Run ``A[M,K] @ B[K,N]`` with the ``mm_bf16`` layouts; ``a`` is the FGS-checked operand.
 
@@ -1346,9 +1374,10 @@ def run_splitk_dense_fgs(
     an SM with a concurrently running producer. ``timeline`` (diagnostic) also
     stores per-CTA load stamps; the counter then needs ``timeline_slots``
     elements. ``pzo``, ``early_trigger`` and ``store16`` are the producer roles
-    (module docstring).
+    (module docstring). ``addend`` takes ``bias`` as a ``[M, N]`` tensor added
+    after the output rounding.
     """
-    m, n, k = _validate_runtime_tensors(a, b, bias, out)
+    m, n, k = _validate_runtime_tensors(a, b, bias, out, addend)
     validate_tactic(tactic, m, n, k)
     if store16 and (out.stride(-1) != 1 or n % 8):
         raise ValueError("store16 needs a row-major output with N % 8 == 0")
@@ -1364,7 +1393,7 @@ def run_splitk_dense_fgs(
         raise ValueError(f"retry_counter must be int32[{slots}] on {a.device}")
     has_bias = bias is not None
     with _torch.cuda.device(a.device):
-        tensors = _to_cute_swap(a, b, out, bias)
+        tensors = _to_cute_swap(a, b, out, bias, addend)
         compiled = _get_compiled_splitk_kernel(
             device_index=a.get_device(),
             dtype=a.dtype,
@@ -1382,6 +1411,7 @@ def run_splitk_dense_fgs(
             pzo=pzo,
             early_trigger=early_trigger,
             store16=store16,
+            addend=addend,
         )
         compiled(
             *(tensors[:4] if has_bias else tensors[:3]),
