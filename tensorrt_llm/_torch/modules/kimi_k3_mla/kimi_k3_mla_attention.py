@@ -272,13 +272,16 @@ class KimiK3MLAAttention(MLA):
                         lease = k3_fgs_edges.acquire(
                             "mla.gated", rows, window=k3_fgs_edges.lamport_window()
                         )
-                        # The producer build stores into a separate buffer, never in place.
-                        out = (
-                            torch.empty_like(attn_output)
-                            if lease is None
-                            else lease.tensor.view(attn_output.shape)
-                        )
-                        return mla_output_gate(attn_output, gate, out=out, fgs_producer=True)
+                        # In the chain modes the producer build's early trigger only pays with the edge's slot;
+                        # without it o_proj starts early and finishes later.
+                        if lease is not None or not k3_fgs_edges.chain():
+                            # The producer build stores into a separate buffer, never in place.
+                            out = (
+                                torch.empty_like(attn_output)
+                                if lease is None
+                                else lease.tensor.view(attn_output.shape)
+                            )
+                            return mla_output_gate(attn_output, gate, out=out, fgs_producer=True)
                     return mla_output_gate(attn_output, gate)
             return attn_output * gate.sigmoid()
         return attn_output

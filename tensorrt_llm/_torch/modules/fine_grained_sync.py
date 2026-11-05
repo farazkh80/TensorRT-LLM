@@ -382,8 +382,9 @@ class EdgeWorkspace:
 class EdgeWorkspaces:
     """Owns edge workspaces, their reset stream and the scope that brackets a forward.
 
-    Not thread-safe; use one instance per thread (the stream manager is
-    thread-local).
+    Not thread-safe: callers must not use one instance from two threads at
+    the same time (the Kimi K3 edges share one per device across executor
+    threads that run forwards one after another).
     """
 
     def __init__(
