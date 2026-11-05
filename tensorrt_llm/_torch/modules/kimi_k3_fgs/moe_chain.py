@@ -56,7 +56,7 @@ FC1_K_STAGES = INTER // 256
 # Rows per rank the expert-path edges serve; the tail edges stop where the split-K up-projection consumer does.
 FGS_MAX_ROWS = int(os.environ.get("TLLM_K3_MOE_FGS_MAX_ROWS", "64"))
 TAIL_FGS_MAX_ROWS = 32
-# Hazard tests only: the CuTe combine delays its output stores by this many ns on the FGS path.
+# Hazard tests only: the CuTe combine and routing delay their FGS-published stores by this many ns.
 _HAZARD_DELAY_NS = int(os.environ.get("TLLM_K3_MOE_HAZARD_DELAY_NS", "0"))
 
 
@@ -406,6 +406,8 @@ class _Layer:
             kw["routing"]["source"] = call.source
         if call.on("route_fc1"):
             kw["routing"]["ready"] = call.slab("route_fc1")
+            if _HAZARD_DELAY_NS:
+                kw["routing"]["hazard_delay_ns"] = _HAZARD_DELAY_NS
             kw["fc1"]["plan_ready"] = call.slab("route_fc1")
         if call.on("fc1_fc2"):
             kw["fc1"]["fc1_done"] = kw["fc2"]["fc1_done"] = call.slab("fc1_fc2")
