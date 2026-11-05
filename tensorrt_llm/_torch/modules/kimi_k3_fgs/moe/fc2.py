@@ -11,8 +11,8 @@ conversion. Padding rows of ``y`` are not written.
 
 Swap-AB block-scaled grouped GEMM:
 
-    acc[128 weight rows, tile_n tokens] = W2[e][128-row tile, :]          (A: MXFP4, TMA)
-                                        x act[tile_n permuted rows, :]^T  (B: MXFP8, cp.async)
+    acc[128 weight rows, n tokens] = W2[e][128-row tile, :]     (A: MXFP4, TMA)
+                                   x act[n permuted rows, :]^T  (B: MXFP8, cp.async)
 
 ``tcgen05.mma kind::mxf8f6f4`` with the SM107 MMA-K of 64; the FP4 weights stay packed in shared memory. The
 TRTLLM-Gen weight buffers are read in place: ``w2_weight`` rows are shuffled in 32-row blocks (stored row 32b + j
@@ -20,9 +20,10 @@ holds output channel 32b + 4 (j % 8) + j // 8) and ``w2_weight_scale`` is alread
 layout the MMA consumes. ``act_sf`` is linear UE8M0 [P, 96]; the loader warp drops each row's four bytes per
 128-wide K block into the scale-factor atom.
 
-Work unit = (token tile t, 128-row weight tile m), t-major over ``num_non_exiting_tiles`` x 28 units, dealt
-round-robin to a persistent grid. Each output element comes from one CTA's fixed-order K loop, so the result is
-deterministic and independent of the grid size and of the order of rows within an expert.
+Work unit = (group g, 128-row weight tile m), u = 28 g + m. A group is up to ``group`` consecutive token tiles of
+one expert (n = group x tile_n MMA columns), so their weights are read once; the loader warp builds the group table
+from the routing plan at kernel start. Units are dealt round-robin to a persistent grid in equal rounds. Each output
+element comes from one CTA's fixed-order K loop, so the result is deterministic and independent of the grid size.
 
 Warp roles: 0-3 epilogue (thread = TMEM lane = stored weight row), 4 MMA, 5 weight TMA, 6 activation cp.async.
 """
@@ -32,6 +33,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import os
+from typing import Optional
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -59,8 +61,13 @@ K_STAGE = 256
 MMA_K = 64
 M_TILES = HIDDEN // TILE_M
 K_TILES = INTER // K_STAGE
-SMEM_CAPACITY = 334848
+# Above this much dynamic smem the remaining L1 starves the cp.async activation loads (measured on SM107).
+SMEM_BUDGET = 232448
 TILE_NS = (8, 16, 32)
+# Diagnostic timeline (TLLM_K3_MOE_FC2_TIMELINE=1), %globaltimer_lo per CTA: [0] entry, [1] first weight load
+# issued, [2 + i] unit i stored (first 29 units), [31] number of units.
+TIMELINE_FIELDS = 32
+SCAN_BATCHES = 4
 
 
 def _pow2_at_least(n: int, lo: int) -> int:
@@ -80,17 +87,35 @@ def _tcgen05_fence_before_thread_sync():
 
 class Fc2Kernel:
     def __init__(
-        self, tile_n: int, num_local: int, num_stages: int, use_pdl: bool, paired_store: bool = True
+        self,
+        tile_n: int,
+        num_local: int,
+        num_stages: int,
+        use_pdl: bool,
+        paired_store: bool = True,
+        group: int = 2,
+        group_cap: int = 1024,
+        timeline: bool = False,
     ):
         if tile_n not in TILE_NS:
             raise ValueError(f"tile_n must be one of {TILE_NS}, got {tile_n}")
+        if group < 1 or group * tile_n > 128:
+            raise ValueError(f"group * tile_n must be in [tile_n, 128], got {group} x {tile_n}")
+        if num_local > 128:
+            raise ValueError(
+                f"at most 128 local experts (7-bit group entry field), got {num_local}"
+            )
         self.tile_n = tile_n
         self.num_local = num_local
         self.num_ab_stage = num_stages
         self.num_acc_stage = 2
         self.use_pdl = use_pdl
         self.paired_store = paired_store
-        self.mma_tiler = (TILE_M, tile_n, K_STAGE)
+        self.group = group
+        self.n_max = group * tile_n
+        self.group_cap = group_cap
+        self.timeline = timeline
+        self.mma_tiler = (TILE_M, self.n_max, K_STAGE)
         self.cta_group = tcgen05.CtaGroup.ONE
         self.a_dtype = cutlass.Float4E2M1FN
         self.b_dtype = cutlass.Float8E4M3FN
@@ -103,20 +128,40 @@ class Fc2Kernel:
         self.threads_per_cta = 32 * 7
         self.epilog_sync_barrier = pipeline.NamedBarrier(barrier_id=1, num_threads=32 * 4)
         self.tmem_alloc_barrier = pipeline.NamedBarrier(barrier_id=2, num_threads=32 * 5)
-        self.b_bytes_per_stage = tile_n * K_STAGE
+        self.b_bytes_per_stage = self.n_max * K_STAGE
         self.sf_atom_bytes = 512
-        self.num_acc_tmem_cols = tile_n * self.num_acc_stage
+        self.num_acc_tmem_cols = self.n_max * self.num_acc_stage
 
     @staticmethod
-    def stage_bytes(tile_n: int) -> int:
+    def stage_bytes(n_max: int) -> int:
         # Packed FP4 A + FP8 B + one 512 B scale-factor atom per 128 K for each of SFA and SFB (SFB rows round up
         # to the 128-row atom).
-        return TILE_M * K_STAGE // 2 + tile_n * K_STAGE + 2 * (K_STAGE // 128) * 512
+        return TILE_M * K_STAGE // 2 + n_max * K_STAGE + 2 * (K_STAGE // 128) * 512
 
     @staticmethod
-    def max_stages(tile_n: int, ctas_per_sm: int = 1) -> int:
-        reserve = 8 * 1024
-        return min((SMEM_CAPACITY // ctas_per_sm - reserve) // Fc2Kernel.stage_bytes(tile_n), 16)
+    def max_stages(n_max: int, group_cap: int, smem: int = SMEM_BUDGET) -> int:
+        reserve = 6 * 1024 + 4 * (group_cap + 1)
+        return min((smem - reserve) // Fc2Kernel.stage_bytes(n_max), 16)
+
+    def _collect_groups(self, t, expert, prev, limit, num_t, n_groups, sGroup, lane):
+        """One warp-wide step of the group scan over 32 tiles: returns the running group count.
+
+        Group leaders are an expert's first tile and every tile with a multiple of ``group`` tiles left in its
+        expert, so groups never span experts. Entry: first tile | valid rows << 16 | expert << 24; non-leader lanes
+        write the spare last slot.
+        """
+        tile_n, group = self.tile_n, self.group
+        first = (t == 0) | (prev != expert)
+        remaining = (limit - t * tile_n + (tile_n - 1)) // tile_n
+        leader = (t < num_t) & (first | (remaining % group == 0))
+        size = cutlass.select_(first, (remaining - 1) % group + 1, cutlass.Int32(group))
+        rows = cutlass.min(limit - t * tile_n, size * tile_n)
+        ballot = cute.arch.vote_ballot_sync(leader)
+        g = n_groups + cute.arch.popc(ballot & ((cutlass.Int32(1) << lane) - 1))
+        sGroup[cutlass.select_(leader, g, cutlass.Int32(self.group_cap))] = (
+            t | (rows << 16) | (expert << 24)
+        )
+        return n_groups + cute.arch.popc(ballot)
 
     def _tmem_cols(self, sf_tmem_layout) -> int:
         # TMEM addresses are (lane << 16) | column: the low 16 bits of the 32-bit cosize are the columns.
@@ -155,6 +200,7 @@ class Fc2Kernel:
         tile_expert_ptr: cute.Pointer,
         tile_limit_ptr: cute.Pointer,
         num_tiles_ptr: cute.Pointer,
+        stamps_ptr: Optional[cute.Pointer],
         num_rows: cutlass.Int32,
         num_tile_slots: cutlass.Int32,
         grid_size: cutlass.Int32,
@@ -175,6 +221,9 @@ class Fc2Kernel:
         tile_expert = cute.make_tensor(tile_expert_ptr, cute.make_layout((num_tile_slots,)))
         tile_limit = cute.make_tensor(tile_limit_ptr, cute.make_layout((num_tile_slots,)))
         num_tiles = cute.make_tensor(num_tiles_ptr, cute.make_layout((1,)))
+        stamps = None
+        if cutlass.const_expr(self.timeline):
+            stamps = cute.make_tensor(stamps_ptr, cute.make_layout((grid_size * TIMELINE_FIELDS,)))
 
         tiled_mma = sm107_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
@@ -184,7 +233,7 @@ class Fc2Kernel:
             self.sf_dtype,
             SF_VEC,
             self.cta_group,
-            (TILE_M, self.tile_n, MMA_K),
+            (TILE_M, self.n_max, MMA_K),
         )
         a_smem_staged = sm100_utils.make_smem_layout_a(
             tiled_mma, self.mma_tiler, self.a_dtype, self.num_ab_stage
@@ -240,6 +289,8 @@ class Fc2Kernel:
             acc_mbar: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
             tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
+            num_groups: cute.struct.MemRange[cutlass.Int32, 1]
+            groups: cute.struct.MemRange[cutlass.Int32, self.group_cap + 1]
             sA: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, a_bytes], 1024]
             sB: cute.struct.Align[
                 cute.struct.MemRange[self.b_dtype, cute.cosize(b_smem_staged.outer)], 1024
@@ -265,6 +316,7 @@ class Fc2Kernel:
             tile_expert,
             tile_limit,
             num_tiles,
+            stamps,
             cluster_layout_vmnk,
             a_smem_staged,
             b_smem_staged,
@@ -293,6 +345,7 @@ class Fc2Kernel:
         tile_expert: cute.Tensor,
         tile_limit: cute.Tensor,
         num_tiles: cute.Tensor,
+        stamps: Optional[cute.Tensor],
         cluster_layout_vmnk: cute.Layout,
         a_smem_staged: cute.ComposedLayout,
         b_smem_staged: cute.ComposedLayout,
@@ -300,10 +353,14 @@ class Fc2Kernel:
         sfb_smem_staged: cute.Layout,
     ):
         tile_n = self.tile_n
+        n_max = self.n_max
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         grid_x, _, _ = cute.arch.grid_dim()
+        if cutlass.const_expr(self.timeline):
+            if tidx == 0:
+                stamps[bidx * TIMELINE_FIELDS] = cute.arch.globaltimer_lo()
 
         if warp_idx == self.tma_warp_id:
             cpasync.prefetch_descriptor(tma_atom_a)
@@ -360,6 +417,8 @@ class Fc2Kernel:
         sB = storage.sB.get_tensor(b_smem_staged.outer, swizzle=b_smem_staged.inner)
         sSFA = storage.sSFA.get_tensor(sfa_smem_staged)
         sSFB = storage.sSFB.get_tensor(sfb_smem_staged)
+        sNumGroups = storage.num_groups.get_tensor(cute.make_layout((1,)))
+        sGroup = storage.groups.get_tensor(cute.make_layout((self.group_cap + 1,)))
 
         # (bM, bK, nM, nK, L)
         gA_mkl = cute.local_tile(
@@ -394,22 +453,67 @@ class Fc2Kernel:
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
         tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.num_acc_stage))
 
-        pipeline.pipeline_init_wait(cluster_shape_mn=(1, 1))
-
         if cutlass.const_expr(self.use_pdl):
             cute.arch.griddepcontrol_wait()
-        num_units = num_tiles[0] * M_TILES
+        if warp_idx == self.load_warp_id:
+            lane = tidx % 32
+            last_slot = tile_expert.shape[0] - 1
+            # The first SCAN_BATCHES x 32 tiles are read together with num_tiles: one round trip in the common case.
+            batch = []
+            for b in cutlass.range_constexpr(SCAN_BATCHES):
+                t_safe = cutlass.min(b * 32 + lane, last_slot)
+                batch.append(
+                    (
+                        tile_expert[t_safe],
+                        tile_expert[cutlass.max(t_safe - 1, 0)],
+                        tile_limit[t_safe],
+                    )
+                )
+            num_t = num_tiles[0]
+            n_groups = cutlass.Int32(0)
+            for b in cutlass.range_constexpr(SCAN_BATCHES):
+                expert, prev, limit = batch[b]
+                n_groups = self._collect_groups(
+                    b * 32 + lane, expert, prev, limit, num_t, n_groups, sGroup, lane
+                )
+            for base in cutlass.range(SCAN_BATCHES * 32, num_t, 32, unroll=1):
+                t_safe = cutlass.min(base + lane, last_slot)
+                n_groups = self._collect_groups(
+                    base + lane,
+                    tile_expert[t_safe],
+                    tile_expert[t_safe - 1],
+                    tile_limit[t_safe],
+                    num_t,
+                    n_groups,
+                    sGroup,
+                    lane,
+                )
+            if lane == 0:
+                sNumGroups[0] = n_groups
+        pipeline.pipeline_init_wait(cluster_shape_mn=(1, 1))
+        # Equal rounds: the fewest CTAs that keep the round count, so no CTA finishes a unit behind the rest.
+        num_units = sNumGroups[0] * M_TILES
+        rounds = (num_units + grid_x - 1) // grid_x
+        used_ctas = (num_units + cutlass.max(rounds, 1) - 1) // cutlass.max(rounds, 1)
+        num_mine = cutlass.max(num_units - bidx + used_ctas - 1, cutlass.Int32(0)) // cutlass.max(
+            used_ctas, 1
+        )
+        num_mine = cutlass.select_(bidx < used_ctas, num_mine, cutlass.Int32(0))
 
         if warp_idx == self.tma_warp_id:
             ab_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_ab_stage
             )
-            for unit in cutlass.range(bidx, num_units, grid_x, unroll=1):
-                tile = unit // M_TILES
-                m_tile = unit - tile * M_TILES
-                expert = tile_expert[tile]
+            for i in cutlass.range(num_mine, unroll=1):
+                unit = bidx + i * used_ctas
+                m_tile = unit % M_TILES
+                expert = sGroup[unit // M_TILES] >> 24
                 tAgA_unit = tAgA[(None, m_tile, None, expert)]
                 tAgSFA_unit = tAgSFA[(None, m_tile, None, expert)]
+                if cutlass.const_expr(self.timeline):
+                    if i == 0:
+                        if tidx % 32 == 0:
+                            stamps[bidx * TIMELINE_FIELDS + 1] = cute.arch.globaltimer_lo()
                 for k_tile in cutlass.range(K_TILES, unroll=1):
                     ab_pipeline.producer_acquire(ab_state)
                     tma_bar = ab_pipeline.producer_get_barrier(ab_state)
@@ -428,12 +532,14 @@ class Fc2Kernel:
                     ab_state.advance()
             ab_pipeline.producer_tail(ab_state)
 
-        # Predicated-off cp.async copies zero-fill their destination: rows past the expert's end reach the MMA as 0.
+        # Predicated-off cp.async copies zero-fill their destination: padding rows of the group reach the MMA as 0.
+        # Rows past the group are not loaded; their accumulator columns are never stored.
         if warp_idx == self.load_warp_id:
             lane = tidx % 32
             chunk = lane % 8
             row_in_pass = lane // 8
-            n_pass = tile_n // 4
+            n_pass = n_max // 4
+            n_sf = max(1, n_max // 32)
             n_katom = K_STAGE // 128
             b_copy = cute.make_copy_atom(
                 cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
@@ -444,56 +550,66 @@ class Fc2Kernel:
             pred = cute.make_rmem_tensor(cute.make_layout((1,)), cutlass.Boolean)
             row_src = cute.make_rmem_tensor((n_pass,), cutlass.Int32)
             row_ok = cute.make_rmem_tensor((n_pass,), cutlass.Boolean)
+            sf_src = cute.make_rmem_tensor((n_sf,), cutlass.Int32)
+            sf_ok = cute.make_rmem_tensor((n_sf,), cutlass.Boolean)
             load_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_ab_stage
             )
-            for unit in cutlass.range(bidx, num_units, grid_x, unroll=1):
-                tile = unit // M_TILES
-                row_base = tile * tile_n
-                mn_limit = tile_limit[tile]
-                for i in cutlass.range_constexpr(n_pass):
-                    row = row_base + i * 4 + row_in_pass
-                    ok = row < mn_limit
-                    row_ok[i] = ok
-                    row_src[i] = row * cutlass.Int32(ok)
-                sf_row = row_base + lane
-                sf_ok = (lane < tile_n) & (sf_row < mn_limit)
-                sf_src = sf_row * cutlass.Int32(sf_ok)
+            for i in cutlass.range(num_mine, unroll=1):
+                entry = sGroup[(bidx + i * used_ctas) // M_TILES]
+                row_base = (entry & 0xFFFF) * tile_n
+                valid_rows = (entry >> 16) & 0xFF
+                group_rows = (valid_rows + tile_n - 1) // tile_n * tile_n
+                row_end = row_base + valid_rows
+                for p in cutlass.range_constexpr(n_pass):
+                    row = row_base + p * 4 + row_in_pass
+                    ok = row < row_end
+                    row_ok[p] = ok
+                    row_src[p] = row * cutlass.Int32(ok)
+                for q in cutlass.range_constexpr(n_sf):
+                    sf_row = row_base + q * 32 + lane
+                    ok = (q * 32 + lane < n_max) & (sf_row < row_end)
+                    sf_ok[q] = ok
+                    sf_src[q] = sf_row * cutlass.Int32(ok)
                 for k_tile in cutlass.range(K_TILES, unroll=1):
                     load_pipeline.producer_acquire(load_state)
                     sB_stage = sB.iterator + load_state.index * self.b_bytes_per_stage
                     sSFB_stage = sSFB.iterator + load_state.index * (n_katom * self.sf_atom_bytes)
                     for kt in cutlass.range_constexpr(n_katom):
                         k0 = k_tile * K_STAGE + kt * 128
-                        for i in cutlass.range_constexpr(n_pass):
-                            row = i * 4 + row_in_pass
-                            src = cute.make_tensor(
-                                act.iterator
-                                + cute.assume(row_src[i] * INTER + k0 + chunk * 16, divby=16),
-                                cute.make_layout((16,)),
+                        for p in cutlass.range_constexpr(n_pass):
+                            if p * 4 < group_rows:
+                                row = p * 4 + row_in_pass
+                                src = cute.make_tensor(
+                                    act.iterator
+                                    + cute.assume(row_src[p] * INTER + k0 + chunk * 16, divby=16),
+                                    cute.make_layout((16,)),
+                                )
+                                # sB.iterator applies the 128B swizzle to this logical (K atom, row, chunk) offset.
+                                dst = cute.make_tensor(
+                                    sB_stage + (kt * n_max * 128 + row * 128 + chunk * 16),
+                                    cute.make_layout((16,)),
+                                )
+                                pred[0] = row_ok[p]
+                                cute.copy_atom_call(b_copy, src, dst, pred=pred)
+                        # Scale-factor atom (128 rows x 4 K blocks, 512 B): row r at byte 16 (r % 32) + 4 (r / 32).
+                        for q in cutlass.range_constexpr(n_sf):
+                            sf_g = cute.make_tensor(
+                                act_sf.iterator
+                                + cute.assume(
+                                    sf_src[q] * (INTER // SF_VEC)
+                                    + k_tile * (K_STAGE // SF_VEC)
+                                    + kt * 4,
+                                    divby=4,
+                                ),
+                                cute.make_layout((4,)),
                             )
-                            # sB.iterator applies the 128B swizzle to this logical (K atom, row, chunk) offset.
-                            dst = cute.make_tensor(
-                                sB_stage + (kt * tile_n * 128 + row * 128 + chunk * 16),
-                                cute.make_layout((16,)),
+                            sf_s = cute.make_tensor(
+                                sSFB_stage + (kt * self.sf_atom_bytes + lane * 16 + q * 4),
+                                cute.make_layout((4,)),
                             )
-                            pred[0] = row_ok[i]
-                            cute.copy_atom_call(b_copy, src, dst, pred=pred)
-                        # Scale-factor atom (128 rows x 4 K blocks, 512 B): row r < 32 at byte 16 r.
-                        sf_g = cute.make_tensor(
-                            act_sf.iterator
-                            + cute.assume(
-                                sf_src * (INTER // SF_VEC) + k_tile * (K_STAGE // SF_VEC) + kt * 4,
-                                divby=4,
-                            ),
-                            cute.make_layout((4,)),
-                        )
-                        sf_s = cute.make_tensor(
-                            sSFB_stage + (kt * self.sf_atom_bytes + lane * 16),
-                            cute.make_layout((4,)),
-                        )
-                        pred[0] = sf_ok
-                        cute.copy_atom_call(sf_copy, sf_g, sf_s, pred=pred)
+                            pred[0] = sf_ok[q]
+                            cute.copy_atom_call(sf_copy, sf_g, sf_s, pred=pred)
                     load_pipeline.producer_commit(load_state)
                     load_state.advance()
             load_pipeline.producer_tail(load_state)
@@ -532,7 +648,7 @@ class Fc2Kernel:
             acc_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_acc_stage
             )
-            for unit in cutlass.range(bidx, num_units, grid_x, unroll=1):
+            for _ in cutlass.range(num_mine, unroll=1):
                 acc_pipeline.producer_acquire(acc_state)
                 _tcgen05_fence_after_thread_sync()
                 tCtAcc = tCtAcc_base[(None, None, None, acc_state.index)]
@@ -565,7 +681,7 @@ class Fc2Kernel:
             tmem.wait_for_alloc()
             acc_tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             tCtAcc_base = cute.make_tensor(acc_tmem_ptr, tCtAcc_fake.layout)
-            epi_tile = (TILE_M, tile_n)
+            epi_tile = (TILE_M, n_max)
             copy_atom_t2r = sm100_utils.get_tmem_load_op(
                 self.mma_tiler,
                 utils.LayoutEnum.ROW_MAJOR,
@@ -581,7 +697,7 @@ class Fc2Kernel:
             # (T2R, T2R_M, T2R_N, nM, nN, STAGE)
             tTR_tAcc = thr_copy_t2r.partition_S(tAcc_epi)
             gC_fake = cute.make_tensor(
-                y.iterator, cute.make_layout((TILE_M, tile_n), stride=(tile_n, 1))
+                y.iterator, cute.make_layout((TILE_M, n_max), stride=(n_max, 1))
             )
             tTR_gC = thr_copy_t2r.partition_D(cute.flat_divide(gC_fake, epi_tile))
             tTR_rAcc = cute.make_rmem_tensor(tTR_gC[(None, None, None, 0, 0)].shape, self.acc_dtype)
@@ -597,12 +713,12 @@ class Fc2Kernel:
             acc_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_acc_stage
             )
-            for unit in cutlass.range(bidx, num_units, grid_x, unroll=1):
-                tile = unit // M_TILES
-                m_tile = unit - tile * M_TILES
-                row_base = tile * tile_n
-                mn_limit = tile_limit[tile]
-                channel = m_tile * TILE_M + channel_in_tile
+            for i in cutlass.range(num_mine, unroll=1):
+                unit = bidx + i * used_ctas
+                entry = sGroup[unit // M_TILES]
+                row_base = (entry & 0xFFFF) * tile_n
+                row_end = row_base + ((entry >> 16) & 0xFF)
+                channel = unit % M_TILES * TILE_M + channel_in_tile
                 acc_pipeline.consumer_wait(acc_state)
                 _tcgen05_fence_after_thread_sync()
                 cute.copy(
@@ -618,12 +734,12 @@ class Fc2Kernel:
                 if cutlass.const_expr(self.paired_store):
                     is_odd = odd_channel == 1
                     pair_channel = channel - odd_channel
-                    for c in cutlass.range_constexpr(0, tile_n, 2):
+                    for c in cutlass.range_constexpr(0, n_max, 2):
                         recv = cute.arch.shuffle_sync_bfly(
                             cutlass.select_(is_odd, acc[c], acc[c + 1]), offset=8
                         )
                         row = row_base + c + odd_channel
-                        if row < mn_limit:
+                        if row < row_end:
                             pair[0] = cutlass.select_(is_odd, recv, acc[c]).to(cutlass.BFloat16)
                             pair[1] = cutlass.select_(is_odd, acc[c + 1], recv).to(cutlass.BFloat16)
                             dst = cute.make_tensor(
@@ -632,10 +748,17 @@ class Fc2Kernel:
                             )
                             cute.copy(store_pair, pair, dst)
                 else:
-                    for c in cutlass.range_constexpr(tile_n):
-                        if row_base + c < mn_limit:
+                    for c in cutlass.range_constexpr(n_max):
+                        if row_base + c < row_end:
                             y[(row_base + c, channel)] = acc[c].to(cutlass.BFloat16)
+                if cutlass.const_expr(self.timeline):
+                    if tidx == 0:
+                        if i < TIMELINE_FIELDS - 3:
+                            stamps[bidx * TIMELINE_FIELDS + 2 + i] = cute.arch.globaltimer_lo()
 
+            if cutlass.const_expr(self.timeline):
+                if tidx == 0:
+                    stamps[bidx * TIMELINE_FIELDS + TIMELINE_FIELDS - 1] = num_mine
             tmem.relinquish_alloc_permit()
             self.epilog_sync_barrier.arrive_and_wait()
             tmem.free(acc_tmem_ptr)
@@ -648,13 +771,8 @@ def _sm_count(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
-def _ctas_per_sm() -> int:
-    return int(os.environ.get("TLLM_K3_MOE_FC2_CTAS_PER_SM", "1"))
-
-
-def _num_stages(tile_n: int) -> int:
-    override = os.environ.get("TLLM_K3_MOE_FC2_STAGES")
-    return int(override) if override else Fc2Kernel.max_stages(tile_n, _ctas_per_sm())
+def _env_int(name: str, default: int) -> int:
+    return int(os.environ.get(f"TLLM_K3_MOE_FC2_{name}", default))
 
 
 def _ptr(dtype, tensor: torch.Tensor, align: int):
@@ -662,8 +780,19 @@ def _ptr(dtype, tensor: torch.Tensor, align: int):
 
 
 @functools.cache
-def _compiled(tile_n: int, num_local: int, num_stages: int, use_pdl: bool, paired_store: bool):
-    kernel = Fc2Kernel(tile_n, num_local, num_stages, use_pdl, paired_store)
+def _compiled(
+    tile_n: int,
+    num_local: int,
+    num_stages: int,
+    use_pdl: bool,
+    paired_store: bool,
+    group: int,
+    group_cap: int,
+    timeline: bool,
+):
+    kernel = Fc2Kernel(
+        tile_n, num_local, num_stages, use_pdl, paired_store, group, group_cap, timeline
+    )
     fake = cute.AddressSpace.gmem
     args = (
         make_ptr(cutlass.Float4E2M1FN, 1 << 20, fake, assumed_align=32),
@@ -674,12 +803,27 @@ def _compiled(tile_n: int, num_local: int, num_stages: int, use_pdl: bool, paire
         make_ptr(cutlass.Int32, 1 << 20, fake, assumed_align=4),
         make_ptr(cutlass.Int32, 1 << 20, fake, assumed_align=4),
         make_ptr(cutlass.Int32, 1 << 20, fake, assumed_align=4),
+        make_ptr(cutlass.Int32, 1 << 20, fake, assumed_align=4) if timeline else None,
         cutlass.Int32(tile_n),
         cutlass.Int32(1),
         cutlass.Int32(1),
         cuda.CUstream(0),
     )
     return cute.compile(kernel, *args)
+
+
+_timeline_buffers: dict = {}
+
+
+def timeline_buffer(device: torch.device) -> torch.Tensor:
+    """Per-CTA stamps, int32 [CTA, TIMELINE_FIELDS], of the last TLLM_K3_MOE_FC2_TIMELINE=1 launch on ``device``."""
+    device = torch.device("cuda", torch.device(device).index or torch.cuda.current_device())
+    if device not in _timeline_buffers:
+        grid = 4 * _sm_count(device.index)
+        _timeline_buffers[device] = torch.zeros(
+            grid, TIMELINE_FIELDS, dtype=torch.int32, device=device
+        )
+    return _timeline_buffers[device]
 
 
 def run(act: torch.Tensor, act_sf: torch.Tensor, weights, plan, y: torch.Tensor) -> None:
@@ -702,11 +846,27 @@ def run(act: torch.Tensor, act_sf: torch.Tensor, weights, plan, y: torch.Tensor)
     )
     assert w2_sf.shape == (num_local, HIDDEN, INTER // SF_VEC) and w2_sf.is_contiguous()
     tile_slots = plan.tile_idx_to_expert_idx.numel()
+    assert tile_slots < 1 << 16
     device = act.device
-    use_pdl = os.environ.get("TLLM_K3_MOE_FC2_PDL", "0") == "1"
-    paired_store = os.environ.get("TLLM_K3_MOE_FC2_PAIRED_STORE", "1") == "1"
-    compiled = _compiled(tile_n, num_local, _num_stages(tile_n), use_pdl, paired_store)
-    grid = max(1, min(_ctas_per_sm() * _sm_count(device.index), tile_slots * M_TILES))
+    ctas_per_sm = _env_int("CTAS_PER_SM", 1)
+    group = _env_int("GROUP", 2)
+    timeline = _env_int("TIMELINE", 0) == 1
+    grid = max(1, min(ctas_per_sm * _sm_count(device.index), tile_slots * M_TILES))
+    # Groups never outnumber the tile capacity: one shared-memory entry each.
+    group_cap = _pow2_at_least(tile_slots, 64)
+    stages = _env_int(
+        "STAGES", Fc2Kernel.max_stages(group * tile_n, group_cap, SMEM_BUDGET // ctas_per_sm)
+    )
+    compiled = _compiled(
+        tile_n,
+        num_local,
+        stages,
+        _env_int("PDL", 0) == 1,
+        _env_int("PAIRED_STORE", 1) == 1,
+        group,
+        group_cap,
+        timeline,
+    )
     compiled(
         _ptr(cutlass.Float4E2M1FN, w2, 32),
         _ptr(cutlass.Float8E8M0FNU, w2_sf, 16),
@@ -716,6 +876,7 @@ def run(act: torch.Tensor, act_sf: torch.Tensor, weights, plan, y: torch.Tensor)
         _ptr(cutlass.Int32, plan.tile_idx_to_expert_idx, 4),
         _ptr(cutlass.Int32, plan.tile_idx_to_mn_limit, 4),
         _ptr(cutlass.Int32, plan.num_non_exiting_tiles, 4),
+        _ptr(cutlass.Int32, timeline_buffer(device), 4) if timeline else None,
         cutlass.Int32(rows),
         cutlass.Int32(tile_slots),
         cutlass.Int32(grid),
