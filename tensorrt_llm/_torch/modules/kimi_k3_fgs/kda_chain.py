@@ -211,18 +211,24 @@ _CORE_THREADS = 256
 CORE_DEFAULT = "persistent,cps=4,ogate=1,first=70"
 
 
-def _core_knob() -> Optional[Dict[str, object]]:
-    """The parsed ``TLLM_K3_FGS_KDA_CORE``, or ``CORE_DEFAULT`` in the chain modes when it is unset."""
+def _core_knob(rows: int) -> Optional[Dict[str, object]]:
+    """The first ``;``-separated spec of ``TLLM_K3_FGS_KDA_CORE`` (``CORE_DEFAULT`` in the chain modes when it is
+    unset) whose rows cover ``rows``, parsed."""
     value = os.environ.get(CORE_ENV)
     if value is None:
         value = CORE_DEFAULT if edges.chain() else "off"
-    return _parse_core(value.strip())
+    for spec in value.split(";"):
+        knob = _parse_core(spec.strip())
+        if knob is not None and knob["rows"][0] <= rows <= knob["rows"][1]:
+            return knob
+    return None
 
 
 @functools.lru_cache(maxsize=None)
 def _parse_core(value: str) -> Optional[Dict[str, object]]:
-    """``TLLM_K3_FGS_KDA_CORE``: ``off`` / ``0`` / empty disables; else comma separated items, ``persistent`` and / or
-    ``key=value`` (e.g. ``persistent,cps=2``, ``ogate=1``, ``persistent,ogate=1``):
+    """One spec of ``TLLM_K3_FGS_KDA_CORE`` (specs are ``;``-separated, each for its own rows): ``off`` / ``0`` / empty
+    disables; else comma separated items, ``persistent`` and / or ``key=value`` (e.g. ``persistent,cps=2``,
+    ``ogate=1``, ``persistent,ogate=1``):
 
       ogate=0|1    the consumer core validates the output gate in its epilogue (0)
       rows=lo:hi   decode rows it applies to (persistent: 9:16, since one 4-CTA/SM wave holds the core at <= 8 rows
@@ -327,8 +333,8 @@ def core_kwargs(rows: int, heads: int = 96, lease=None) -> Dict[str, object]:
     kwargs: Dict[str, object] = {}
     if lease is not None and _rearm_core():
         kwargs.update(_arm_kwargs(lease, rows, heads))
-    knob = _core_knob()
-    if knob is None or not knob["rows"][0] <= rows <= knob["rows"][1]:
+    knob = _core_knob(rows)
+    if knob is None:
         return kwargs
     persistent = knob["persistent"]
     split = knob.get("split") or (_o_proj_split(rows, heads) if persistent else 1)
