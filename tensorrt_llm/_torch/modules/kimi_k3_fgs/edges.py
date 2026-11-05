@@ -65,9 +65,9 @@ def _parse_drops(value: str) -> Dict[str, Tuple[int, int]]:
 
 
 # Pruned edges (``name`` or ``name:low-high`` rows, comma separated): acquire refuses them, so the producer writes its
-# own buffer and the consumer runs its default build. By default the KDA o_proj -> pre-MoE mix edge stops at 32 rows:
-# above, the KDA chain with that edge is slower than the stock layer.
-DROPPED = _parse_drops(os.environ.get("TLLM_K3_FGS_DROP_EDGES", "kda.attn_o:33-64"))
+# own buffer and the consumer runs its default build. By default the KDA o_proj -> pre-MoE mix edge stops at 16 rows:
+# above, the KDA chain is faster without it.
+DROPPED = _parse_drops(os.environ.get("TLLM_K3_FGS_DROP_EDGES", "kda.attn_o:17-64"))
 
 # Edge name -> (row width, layers that declared it).
 _declared: Dict[str, Tuple[int, Set[int]]] = {}
@@ -75,6 +75,8 @@ _declared: Dict[str, Tuple[int, Set[int]]] = {}
 _rows: Dict[str, int] = {}
 # Edge name -> (min, max) rows its declaring modules acquire it for.
 _windows: Dict[str, Tuple[int, int]] = {}
+# Counter edge name -> int32 words per slot (int32 slabs armed to zero instead of bf16 slots).
+_counter_words: Dict[str, int] = {}
 _local = threading.local()
 # TLLM_K3_FGS_DEBUG=1: ``debug`` logs which path each kernel took, once per (site, rows, path).
 DEBUG = os.environ.get("TLLM_K3_FGS_DEBUG", "0") == "1"
@@ -145,6 +147,24 @@ def declare(
         )
 
 
+def declare_counters(
+    name: str,
+    words: int,
+    layer_idx: int,
+    max_rows: Optional[int] = None,
+    min_rows: Optional[int] = None,
+) -> None:
+    """Declare an int32 counter slab of ``words`` words used once per step by ``layer_idx``.
+
+    Slots are armed to zero and re-armed like the bf16 edges (``TLLM_FGS_RESET_POLICY``). Producers add to the words
+    after their stores, consumers wait for an expected count; the slab is not a GEMM operand. ``words`` is the most
+    any forward uses: ``acquire_counters`` truncates to the words of the current forward.
+    """
+    if slots():
+        _counter_words[name] = max(words, _counter_words.get(name, 0))
+        declare(name, 1, layer_idx, max_rows=max_rows, min_rows=min_rows)
+
+
 def _state():
     if not hasattr(_local, "workspaces"):
         from ..fine_grained_sync import EdgeWorkspaces
@@ -186,6 +206,9 @@ def model_scope(
         for name in missing:
             width = _declared[name][0]
             num_slots = len(users[name]) if per_step else 2
+            if name in _counter_words:
+                workspaces.workspace(name, (_counter_words[name], 1), torch.int32, slots=num_slots)
+                continue
             workspaces.workspace(
                 name, (_rows.get(name, MAX_ROWS), width), torch.bfloat16, slots=num_slots
             )
@@ -256,6 +279,29 @@ def acquire(name: str, rows: int, readers: int = 1, window: Optional[Tuple[int, 
     if name not in workspaces:
         return _refuse(f"edge {name} not registered")
     lease = workspaces.acquire(name, rows=rows)
+    live[lease.tensor.data_ptr()] = lease
+    _local.readers[lease.tensor.data_ptr()] = readers
+    return lease
+
+
+def acquire_counters(name: str, rows: int, words: int, readers: int = 1, window=None):
+    """The next zero-armed counter slot of ``name`` truncated to ``words`` int32 words (``lease.tensor`` is
+    [words, 1]), or None (same refusals as ``acquire`` except the GEMM ones)."""
+    low, high = (MIN_ROWS, MAX_ROWS) if window is None else window
+    if not slots():
+        return _refuse(f"{ENV}={mode()} has no slots")
+    if not low <= rows <= high:
+        return _refuse(f"{rows} rows outside [{low}, {high}]")
+    if name in DROPPED and DROPPED[name][0] <= rows <= DROPPED[name][1]:
+        return _refuse(f"edge {name} pruned at {rows} rows (TLLM_K3_FGS_DROP_EDGES)")
+    if not hasattr(_local, "live"):
+        return _refuse(f"no model_scope opened in thread {threading.current_thread().name}")
+    workspaces, live = _state()
+    if not workspaces.in_scope:
+        return _refuse("outside a model_scope")
+    if name not in workspaces or name not in _counter_words:
+        return _refuse(f"counter edge {name} not registered")
+    lease = workspaces.acquire(name, rows=words)
     live[lease.tensor.data_ptr()] = lease
     _local.readers[lease.tensor.data_ptr()] = readers
     return lease
