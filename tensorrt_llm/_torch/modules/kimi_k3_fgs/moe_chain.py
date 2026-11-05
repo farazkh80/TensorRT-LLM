@@ -37,6 +37,7 @@ COMM_ENV = "TLLM_K3_COMM"
 HIDDEN = 3584
 INTER = 3072
 TOP_K = 16
+NUM_EXPERTS = 896
 SF_VEC = 32
 STAGES = ("routing", "fc1", "fc2", "finalize")
 FGS_ENV = "TLLM_K3_MOE_FGS"
@@ -68,17 +69,24 @@ def tail_enabled() -> bool:
     return os.environ.get(TAIL_ENV, "") == "cute"
 
 
-def _bucket_rows(rows: int) -> int:
+def _tile_bounds(num_experts: int) -> tuple:
+    # The tile follows the mean rows per expert, R * TOP_K / num_experts: R <= 512 / 1024 at 896 experts.
+    return 512 * num_experts // NUM_EXPERTS, 1024 * num_experts // NUM_EXPERTS
+
+
+def _bucket_rows(rows: int, num_experts: int = NUM_EXPERTS) -> int:
     """The largest R that ``tile_n_for`` maps to the same tile_n as ``rows``."""
-    return 512 if rows <= 512 else 1024 if rows <= 1024 else rows
+    r8, r16 = _tile_bounds(num_experts)
+    return r8 if rows <= r8 else r16 if rows <= r16 else rows
 
 
-def tile_n_for(rows: int) -> int:
-    """Token rows per FC tile (the N of the swap-AB MMA) for R received rows."""
+def tile_n_for(rows: int, num_experts: int = NUM_EXPERTS) -> int:
+    """Token rows per FC tile (the N of the swap-AB MMA) for R received rows routed over ``num_experts``."""
     override = os.environ.get("TLLM_K3_MOE_TILE_N")
     if override:
         return int(override)
-    return 8 if rows <= 512 else 16 if rows <= 1024 else 32
+    r8, r16 = _tile_bounds(num_experts)
+    return 8 if rows <= r8 else 16 if rows <= r16 else 32
 
 
 @dataclass(frozen=True)
@@ -321,8 +329,8 @@ def _counter_words(edge: str, tiles: int, ep: int) -> int:
     return {"route_fc1": 1, "fc1_fc2": tiles * FC1_K_STAGES, "fc2_fin": tiles, "fin_push": ep}[edge]
 
 
-def _max_tiles(rows: int, num_local: int) -> int:
-    tile_n = tile_n_for(rows)
+def _max_tiles(rows: int, num_local: int, num_experts: int) -> int:
+    tile_n = tile_n_for(rows, num_experts)
     return max_permuted(rows, num_local, tile_n) // tile_n
 
 
@@ -336,7 +344,7 @@ class _Call:
         counters = layer.edges & set(_COUNTERS)
         if counters and 1 <= rows <= FGS_MAX_ROWS:
             r = layer.ep * rows
-            ws = workspace(layer.device, r, layer.num_local, tile_n_for(r))
+            ws = layer.workspace(r)
             tiles = ws.plan.tile_idx_to_expert_idx.numel()
             for edge in counters:
                 words = _counter_words(edge, tiles, layer.ep)
@@ -380,12 +388,15 @@ class _Layer:
         self.edges = edges
         self.a2a = a2a
         self.num_local = int(self.backend.expert_size_per_partition)
+        self.num_experts = int(self.backend.num_slots)
         self.ep = a2a.ep if a2a is not None else 1
         self.call: Optional[_Call] = None
         layer_idx = getattr(routed_experts, "layer_idx", None)
         # A workspace serves every R of its tile_n bucket, so a plan can be as large as the bucket's largest R.
         tiles = max(
-            _max_tiles(_bucket_rows(self.ep * rows), self.num_local)
+            _max_tiles(
+                _bucket_rows(self.ep * rows, self.num_experts), self.num_local, self.num_experts
+            )
             for rows in range(1, FGS_MAX_ROWS + 1)
         )
         self.words = {edge: _counter_words(edge, tiles, self.ep) for edge in edges & set(_COUNTERS)}
@@ -400,6 +411,9 @@ class _Layer:
     @property
     def device(self) -> torch.device:
         return self.backend.w3_w1_weight.device
+
+    def workspace(self, rows: int) -> Workspace:
+        return workspace(self.device, rows, self.num_local, tile_n_for(rows, self.num_experts))
 
     def stage_kwargs(self, call: Optional[_Call], max_tokens: int) -> Dict[str, dict]:
         kw = {"routing": {"enable_pdl": _pdl()}, "fc1": {}, "fc2": {}, "finalize": {}}
@@ -438,6 +452,7 @@ class _Layer:
             topk_w,
             ExpertWeights.from_backend(self.backend),
             out,
+            ws=self.workspace(ctx.x.shape[0]),
             stage_kwargs=self.stage_kwargs(call, max_tokens),
         )
         if call is not None:
