@@ -1387,7 +1387,7 @@ def run(x, x_sf, weights, plan, act, act_sf, *, plan_ready=None, fc1_done=None, 
     valid permuted row p of expert e; rows past each tile's mn_limit are left untouched. Launches one kernel on the
     current stream; no allocation, no host synchronization.
 
-    ``plan_ready`` (int32 word, zero-armed, raised to >= 1 by routing after its plan stores) makes FC1 the M2b
+    ``plan_ready`` (int32 word, zero-armed, raised to >= 1 by routing after its plan stores) makes FC1 the routing
     consumer: the plan is read only after the word is acquired. ``fc1_done`` (int32 [T * 12], zero-armed) makes it
     the FC1 -> FC2 producer: after the stores of weight tile j of token tile t < ``EARLY_TILES``,
     fc1_done[t * 12 + j // 4] is incremented with release semantics, so each 256-channel K stage of such a tile

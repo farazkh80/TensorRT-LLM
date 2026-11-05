@@ -270,7 +270,7 @@ def _pdl() -> bool:
 
 
 def fgs_edges() -> frozenset:
-    """The M2 edges ``TLLM_K3_MOE_FGS`` turns on (comma list of ``EDGES``, or ``all``)."""
+    """The FGS edges ``TLLM_K3_MOE_FGS`` turns on (comma list of ``EDGES``, or ``all``)."""
     value = os.environ.get(FGS_ENV, "")
     names = set(EDGES) if value == "all" else {v for v in value.split(",") if v}
     unknown = names - set(EDGES)
@@ -288,7 +288,7 @@ def _accepts(fn: Callable, *names: str) -> bool:
 
 def _missing_sides(edges: frozenset, moe_on: bool, comm_on: bool, tail_on: bool) -> List[str]:
     """Every requested edge needs both its kernel sides and the stages it connects; an edge that cannot run is an
-    error rather than a silent M1 arm."""
+    error rather than a silent run without it."""
     from .moe import comm, finalize, latent, routing
 
     def stage_run(name):
@@ -354,7 +354,7 @@ def _counter_words(edge: str, tiles: int, ep: int, rows: int = FGS_MAX_ROWS) -> 
 
 
 # Default row windows (tokens per rank) of the counter edges; TLLM_K3_MOE_FGS_ROWS=edge:low-high,... overrides them.
-# On the DEP4 layer subset the per-row push pays up to 32 rows (above, the push waits on rows that finish together),
+# The per-row push pays up to 32 rows (above, the push waits on rows that finish together),
 # and the FC2 -> finalize counters cost more than they hide at a few rows.
 _EDGE_ROWS = {"fin_push": (1, 32), "fc2_fin": (9, 32)}
 
@@ -424,7 +424,7 @@ class _Call:
 
 
 class _Layer:
-    """The expert-path state of one MoE layer: its backend, its CuteA2A (``TLLM_K3_COMM=cute``), its M2 edges and the
+    """The expert-path state of one MoE layer: its backend, its CuteA2A (``TLLM_K3_COMM=cute``), its FGS edges and the
     forward in flight between dispatch, run_moe and combine."""
 
     def __init__(self, routed_experts, edges: frozenset, a2a):
@@ -521,7 +521,7 @@ class _Layer:
                 self.call = call
 
     def abandon(self) -> None:
-        """The stock runner takes this forward: its producers never run, so the edges fall back to M1 (released
+        """The stock runner takes this forward: its producers never run, so its edges stay off (released
         unwritten; the step reset re-arms them)."""
         call, self.call = self.call, None
         if call is not None:
@@ -633,7 +633,7 @@ def install(routed_experts) -> bool:
       :func:`run_expert_path`; calls the path cannot take (no combine payload buffer, unfinalized output, internal
       routing) keep the stock runner.
     - ``TLLM_K3_COMM=cute``: dispatch / combine through ``moe.comm.CuteA2A``.
-    - ``TLLM_K3_MOE_FGS=<edges>|all``: the M2 edges; each needs both of its kernel sides and the stages it connects.
+    - ``TLLM_K3_MOE_FGS=<edges>|all``: the FGS edges; each needs both of its kernel sides and the stages it connects.
 
     Forwards with more than ``TLLM_K3_MOE_MAX_ROWS`` (default 128) tokens on the fullest rank keep the stock path.
     """

@@ -46,10 +46,10 @@ def _pdl() -> bool:
 class RMSNormKernel:
     """One row per ``_THREADS_PER_ROW`` threads; ``rows_per_cta`` rows per CTA (FlashInfer uses 2 at H = 3584).
 
-    ``fgs_consumer`` (M2d-1): reads x while its producer runs, without ``griddepcontrol.wait``; each thread re-reads
+    ``fgs_consumer``: reads x while its producer runs, without ``griddepcontrol.wait``; each thread re-reads
     its 16 B chunks of the row until none starts with the bf16 -0.0 sentinel (the producer stores whole chunks and
-    never -0.0), falling back to waiting for the producer grid after ``fgs_max_spins`` rounds. ``fgs_producer``
-    (M2d-2): dependents launch at entry and the output never holds -0.0, so it can feed a sentinel consumer.
+    never -0.0), falling back to waiting for the producer grid after ``fgs_max_spins`` rounds. ``fgs_producer``:
+    dependents launch at entry and the output never holds -0.0, so it can feed a sentinel consumer.
     ``fgs_check=False`` (negative-control builds only) reads the consumer's input once without waiting.
     """
 
@@ -407,7 +407,7 @@ def up_proj(
 ) -> torch.Tensor:
     """``out = bf16(x @ weight^T)`` (+ ``addend`` after the rounding); x [M, 3584], weight [7168, 3584].
 
-    ``fgs_consumer`` (M2d-2, M <= 32): x is a sentinel slot written by a running ``rmsnorm(fgs_producer=True)``; the
+    ``fgs_consumer`` (M <= 32): x is a sentinel slot written by a running ``rmsnorm(fgs_producer=True)``; the
     split-K report_valid build re-loads activation stages that still hold -0.0.
     """
     m = x.shape[0]
