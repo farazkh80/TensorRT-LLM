@@ -234,7 +234,7 @@ def run_expert_path(
 
 
 def _pdl() -> bool:
-    return os.environ.get("TRTLLM_ENABLE_PDL", "0") == "1"
+    return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
 
 def fgs_edges() -> frozenset:
