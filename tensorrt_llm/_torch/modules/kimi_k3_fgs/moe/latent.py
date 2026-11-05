@@ -25,10 +25,9 @@ import functools
 import os
 from typing import Optional
 
-import torch
-
 import cutlass
 import cutlass.cute as cute
+import torch
 from cutlass import BFloat16, Float32, Int32
 
 from ...kimi_k3_attn_res.attn_res_mix_cute import _lamport_wait, _ld_relaxed_v4, _pzo_b32
@@ -154,7 +153,11 @@ class RMSNormKernel:
 
         tXpX = cute.make_rmem_tensor(
             cute.make_layout(
-                (cute.size(tXcX, mode=[0, 1]), cute.size(tXcX, mode=[1]), cute.size(tXcX, mode=[2])),
+                (
+                    cute.size(tXcX, mode=[0, 1]),
+                    cute.size(tXcX, mode=[1]),
+                    cute.size(tXcX, mode=[2]),
+                ),
                 stride=(cute.size(tXcX, mode=[2]), 0, 1),
             ),
             cutlass.Boolean,

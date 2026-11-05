@@ -17,10 +17,9 @@ import functools
 import os
 from typing import Optional
 
-import torch
-
 import cutlass
 import cutlass.cute as cute
+import torch
 from cutlass import BFloat16, Float32, Int32
 
 from ..moe_chain import HIDDEN, TOP_K
@@ -134,7 +133,20 @@ class FinalizeKernel:
                 cute.arch.griddepcontrol_launch_dependents()
 
     @cute.jit
-    def _row(self, gY, gW, gE, gO, mFc2, mFin, tile_n: Int32, max_tokens: Int32, row: Int32, col: Int32, tidx: Int32):
+    def _row(
+        self,
+        gY,
+        gW,
+        gE,
+        gO,
+        mFc2,
+        mFin,
+        tile_n: Int32,
+        max_tokens: Int32,
+        row: Int32,
+        col: Int32,
+        tidx: Int32,
+    ):
         e = cute.make_rmem_tensor(gE[(None, (row, 0))].shape, Int32)
         e.store(gE[(None, (row, 0))].load())
         w = cute.make_rmem_tensor(gW[(None, (row, 0))].shape, BFloat16)
@@ -145,9 +157,7 @@ class FinalizeKernel:
             p = e[k]
             if p >= 0:
                 if cutlass.const_expr(self.wait_fc2):
-                    wait_at_least(
-                        (mFc2.iterator + p // tile_n).toint(), Int32(self.fc2_expected)
-                    )
+                    wait_at_least((mFc2.iterator + p // tile_n).toint(), Int32(self.fc2_expected))
                 acc.store(acc.load() + gY[(None, (p, col))].load().to(Float32) * Float32(w[k]))
         gO[(None, (row, col))].store(acc.load().to(BFloat16))
 
@@ -223,7 +233,14 @@ def run(
         raise ValueError("finalize: fin_done needs max_tokens and one word per source block")
     chunks = chunks or default_chunks(rows)
     wait_fc2, signal = fc2_done is not None, fin_done is not None
-    fn = _compiled(HIDDEN, chunks, _pdl() or wait_fc2 or signal, wait_fc2, fc2_expected if wait_fc2 else 0, signal)
+    fn = _compiled(
+        HIDDEN,
+        chunks,
+        _pdl() or wait_fc2 or signal,
+        wait_fc2,
+        fc2_expected if wait_fc2 else 0,
+        signal,
+    )
     words = plan.num_non_exiting_tiles
     fn(
         y,
