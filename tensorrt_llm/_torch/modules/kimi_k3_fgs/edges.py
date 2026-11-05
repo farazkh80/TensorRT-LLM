@@ -65,9 +65,9 @@ def _parse_drops(value: str) -> Dict[str, Tuple[int, int]]:
 
 
 # Pruned edges (``name`` or ``name:low-high`` rows, comma separated): acquire refuses them, so the producer writes its
-# own buffer and the consumer runs its default build. By default the KDA o_proj -> pre-MoE mix edge stops at 32 rows:
-# above, the KDA chain with that edge is slower than the stock layer.
-DROPPED = _parse_drops(os.environ.get("TLLM_K3_FGS_DROP_EDGES", "kda.attn_o:33-64"))
+# own buffer and the consumer runs its default build. By default the KDA o_proj -> pre-MoE mix edge stops at 16 rows:
+# above, the KDA chain is faster without it.
+DROPPED = _parse_drops(os.environ.get("TLLM_K3_FGS_DROP_EDGES", "kda.attn_o:17-64"))
 
 # Edge name -> (row width, layers that declared it).
 _declared: Dict[str, Tuple[int, Set[int]]] = {}
