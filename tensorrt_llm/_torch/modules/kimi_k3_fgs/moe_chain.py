@@ -378,6 +378,7 @@ class _Call:
                 )
                 if lease is not None:
                     self.leases[edge] = lease
+                    k3_edges.debug(f"moe.{edge}", rows, f"on, {words} words")
         if "comb_norm" in layer.edges and local_rows:
             lease = k3_edges.acquire(COMBINED, local_rows, window=(1, TAIL_FGS_MAX_ROWS))
             if lease is not None:
@@ -637,7 +638,8 @@ def install(routed_experts) -> bool:
         )
         edges = edges - _COMM_EDGES
     layer = _Layer(routed_experts, edges, a2a)
-    if a2a is not None and edges & _COMM_EDGES:
+    # The forward's edge leases are taken at the CuTe dispatch, so it is wrapped for any edge, not only the comm ones.
+    if a2a is not None and edges:
         layer.install_comm(comm)
     if not moe_on:
         return True
