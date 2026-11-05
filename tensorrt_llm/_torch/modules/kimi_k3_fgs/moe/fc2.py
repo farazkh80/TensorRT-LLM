@@ -181,25 +181,39 @@ class Fc2Kernel:
         reserve = 6 * 1024 + 4 * (group_cap + 1)
         return min((smem - reserve) // Fc2Kernel.stage_bytes(n_max), 16)
 
-    def _collect_groups(self, t, expert, prev, limit, num_t, n_groups, sGroup, lane):
-        """One warp-wide step of the group scan over 32 tiles: returns the running group count.
+    def _collect_groups(
+        self, t, expert, prev, nxt, limit, num_t, seg_carry, n_groups, sGroup, lane
+    ):
+        """One warp-wide step of the group scan over 32 tiles: returns (group count, last expert start so far).
 
-        Group leaders are an expert's first tile and every tile with a multiple of ``group`` tiles left in its
-        expert, so groups never span experts. Entry: first tile | valid rows << 16 | expert << 24; non-leader lanes
-        write the spare last slot.
+        Groups pair an expert's tiles from its first tile, so they never span experts. The last tile of each group
+        writes the entry: first tile | valid rows << 16 | expert << 24 (other lanes write the spare last slot). A
+        tile's valid rows are its mn_limit clipped to the tile, so the plan may give either the per-tile limit or
+        the expert's end.
         """
         tile_n, group = self.tile_n, self.group
-        first = (t == 0) | (prev != expert)
-        remaining = (limit - t * tile_n + (tile_n - 1)) // tile_n
-        leader = (t < num_t) & (first | (remaining % group == 0))
-        size = cutlass.select_(first, (remaining - 1) % group + 1, cutlass.Int32(group))
-        rows = cutlass.min(limit - t * tile_n, size * tile_n)
-        ballot = cute.arch.vote_ballot_sync(leader)
-        g = n_groups + cute.arch.popc(ballot & ((cutlass.Int32(1) << lane) - 1))
-        sGroup[cutlass.select_(leader, g, cutlass.Int32(self.group_cap))] = (
-            t | (rows << 16) | (expert << 24)
+        valid = t < num_t
+        starts = cute.arch.vote_ballot_sync(valid & ((t == 0) | (prev != expert)))
+        base = t - lane
+        # The expert's first tile: the last start at or below this lane, else the one carried from earlier batches.
+        at_or_below = starts & ((cutlass.Int32(2) << lane) - 1)
+        seg_start = cutlass.select_(
+            at_or_below != 0,
+            base + cutlass.Int32(cute.arch.bfind(cutlass.Uint32(at_or_below))),
+            seg_carry,
         )
-        return n_groups + cute.arch.popc(ballot)
+        pos = (t - seg_start) % group
+        closes = valid & ((pos == group - 1) | (t + 1 >= num_t) | (nxt != expert))
+        rows = pos * tile_n + cutlass.min(limit - t * tile_n, tile_n)
+        ballot = cute.arch.vote_ballot_sync(closes)
+        g = n_groups + cute.arch.popc(ballot & ((cutlass.Int32(1) << lane) - 1))
+        sGroup[cutlass.select_(closes, g, cutlass.Int32(self.group_cap))] = (
+            (t - pos) | (rows << 16) | (expert << 24)
+        )
+        seg_carry = cutlass.select_(
+            starts != 0, base + cutlass.Int32(cute.arch.bfind(cutlass.Uint32(starts))), seg_carry
+        )
+        return n_groups + cute.arch.popc(ballot), seg_carry
 
     @cute.jit
     def _fc1_missing(self, fc1_done, first_tile, n_tiles, lane):
@@ -573,24 +587,37 @@ class Fc2Kernel:
                     (
                         tile_expert[t_safe],
                         tile_expert[cutlass.max(t_safe - 1, 0)],
+                        tile_expert[cutlass.min(t_safe + 1, last_slot)],
                         tile_limit[t_safe],
                     )
                 )
             num_t = num_tiles[0]
             n_groups = cutlass.Int32(0)
+            seg_carry = cutlass.Int32(0)
             for b in cutlass.range_constexpr(SCAN_BATCHES):
-                expert, prev, limit = batch[b]
-                n_groups = self._collect_groups(
-                    b * 32 + lane, expert, prev, limit, num_t, n_groups, sGroup, lane
+                expert, prev, nxt, limit = batch[b]
+                n_groups, seg_carry = self._collect_groups(
+                    b * 32 + lane,
+                    expert,
+                    prev,
+                    nxt,
+                    limit,
+                    num_t,
+                    seg_carry,
+                    n_groups,
+                    sGroup,
+                    lane,
                 )
             for base in cutlass.range(SCAN_BATCHES * 32, num_t, 32, unroll=1):
                 t_safe = cutlass.min(base + lane, last_slot)
-                n_groups = self._collect_groups(
+                n_groups, seg_carry = self._collect_groups(
                     base + lane,
                     tile_expert[t_safe],
                     tile_expert[t_safe - 1],
+                    tile_expert[cutlass.min(t_safe + 1, last_slot)],
                     tile_limit[t_safe],
                     num_t,
+                    seg_carry,
                     n_groups,
                     sGroup,
                     lane,

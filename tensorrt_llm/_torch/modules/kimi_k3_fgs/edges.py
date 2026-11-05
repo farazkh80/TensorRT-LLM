@@ -78,6 +78,10 @@ _windows: Dict[str, Tuple[int, int]] = {}
 # Counter edge name -> int32 words per slot (int32 slabs armed to zero instead of bf16 slots).
 _counter_words: Dict[str, int] = {}
 _local = threading.local()
+# One slot set per device: the executor runs forwards from several threads (memory profiling, warm-up, the step
+# loop), never concurrently, and a set per thread would keep a full copy of every edge's slots for each of them.
+_device_workspaces: Dict[int, object] = {}
+_device_workspaces_lock = threading.Lock()
 # TLLM_K3_FGS_DEBUG=1: ``debug`` logs which path each kernel took, once per (site, rows, path).
 DEBUG = os.environ.get("TLLM_K3_FGS_DEBUG", "0") == "1"
 _debug_seen: Set[Tuple[str, int, str]] = set()
@@ -165,15 +169,25 @@ def declare_counters(
         declare(name, 1, layer_idx, max_rows=max_rows, min_rows=min_rows)
 
 
-def _state():
-    if not hasattr(_local, "workspaces"):
-        from ..fine_grained_sync import EdgeWorkspaces
+def _workspaces():
+    device = torch.cuda.current_device()
+    workspaces = _device_workspaces.get(device)
+    if workspaces is None:
+        with _device_workspaces_lock:
+            workspaces = _device_workspaces.get(device)
+            if workspaces is None:
+                from ..fine_grained_sync import EdgeWorkspaces
 
-        _local.workspaces = EdgeWorkspaces.from_env()
+                workspaces = _device_workspaces[device] = EdgeWorkspaces.from_env()
+    return workspaces
+
+
+def _state():
+    if not hasattr(_local, "live"):
         _local.live = {}
         _local.readers = {}
         _local.step = {}
-    return _local.workspaces, _local.live
+    return _workspaces(), _local.live
 
 
 @contextmanager
@@ -241,7 +255,7 @@ def model_scope(
 
 
 def reset_stream() -> torch.cuda.Stream:
-    """The reset stream of this thread's edge workspaces."""
+    """The reset stream of this device's edge workspaces."""
     return _state()[0].reset_stream
 
 
@@ -265,7 +279,7 @@ def acquire(name: str, rows: int, readers: int = 1, window: Optional[Tuple[int, 
         return _refuse(f"{rows} rows outside [{low}, {high}]")
     if name in DROPPED and DROPPED[name][0] <= rows <= DROPPED[name][1]:
         return _refuse(f"edge {name} pruned at {rows} rows (TLLM_K3_FGS_DROP_EDGES)")
-    if not hasattr(_local, "workspaces"):
+    if not hasattr(_local, "live"):
         return _refuse(f"no model_scope opened in thread {threading.current_thread().name}")
     from .. import kimi_k3_cute_gemm
 
@@ -348,4 +362,7 @@ def consumed(lease) -> None:
 
 
 def ledger() -> Optional[list]:
-    return _local.workspaces.ledger() if hasattr(_local, "workspaces") else None
+    workspaces = (
+        _device_workspaces.get(torch.cuda.current_device()) if torch.cuda.is_available() else None
+    )
+    return workspaces.ledger() if workspaces is not None else None

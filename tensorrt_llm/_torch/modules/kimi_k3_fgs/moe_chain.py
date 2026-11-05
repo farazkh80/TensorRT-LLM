@@ -60,10 +60,21 @@ TAIL_FGS_MAX_ROWS = 32
 # Hazard tests only: the FGS producers (routing, FC1, FC2, finalize, combine) delay some published stores by this
 # many ns.
 _HAZARD_DELAY_NS = int(os.environ.get("TLLM_K3_MOE_HAZARD_DELAY_NS", "0"))
+MAX_ROWS_ENV = "TLLM_K3_MOE_MAX_ROWS"
 
 
 def enabled() -> bool:
     return os.environ.get(ENV, "") == "cute"
+
+
+def _max_tokens_per_rank() -> int:
+    return int(os.environ.get(MAX_ROWS_ENV, "128"))
+
+
+def within_max_rows(tokens_per_rank: int) -> bool:
+    """Whether a forward with this many tokens on its fullest rank runs the CuTe path (expert path, all-to-all and
+    tail); larger forwards, such as context steps, keep the stock kernels and never grow the workspace."""
+    return tokens_per_rank <= _max_tokens_per_rank()
 
 
 def tail_enabled() -> bool:
@@ -75,10 +86,12 @@ def _tile_bounds(num_experts: int) -> tuple:
     return 512 * num_experts // NUM_EXPERTS, 1024 * num_experts // NUM_EXPERTS
 
 
-def _bucket_rows(rows: int, num_experts: int = NUM_EXPERTS) -> int:
-    """The largest R that ``tile_n_for`` maps to the same tile_n as ``rows``."""
+def _bucket_rows(rows: int, num_experts: int, max_rows: int) -> int:
+    """The largest R up to ``max_rows`` that ``tile_n_for`` maps to the same tile_n as ``rows``."""
+    if os.environ.get("TLLM_K3_MOE_TILE_N"):
+        return max(rows, max_rows)
     r8, r16 = _tile_bounds(num_experts)
-    return r8 if rows <= r8 else r16 if rows <= r16 else rows
+    return max(rows, min(r8 if rows <= r8 else r16 if rows <= r16 else max_rows, max_rows))
 
 
 def tile_n_for(rows: int, num_experts: int = NUM_EXPERTS) -> int:
@@ -188,7 +201,12 @@ class Workspace:
 _workspaces: Dict[tuple, Workspace] = {}
 
 
-def workspace(device: torch.device, rows: int, num_local: int, tile_n: int) -> Workspace:
+def workspace(
+    device: torch.device, rows: int, num_local: int, tile_n: int, alloc_rows: int = 0
+) -> Workspace:
+    """The workspace serving ``rows``; a new one is sized for ``max(rows, alloc_rows)`` rows. A reallocation frees the
+    buffers that CUDA graphs captured earlier still use, so callers size the first allocation for the largest R they
+    can request with this tile_n."""
     key = (device, num_local, tile_n)
     ws = _workspaces.get(key)
     if ws is None or ws.max_rows < rows:
@@ -197,7 +215,7 @@ def workspace(device: torch.device, rows: int, num_local: int, tile_n: int) -> W
                 f"{ENV}=cute: no workspace for {rows} rows (tile_n {tile_n}) before graph capture; "
                 "run the batch eagerly first"
             )
-        ws = _workspaces[key] = Workspace(device, rows, num_local, tile_n)
+        ws = _workspaces[key] = Workspace(device, max(rows, alloc_rows), num_local, tile_n)
     return ws
 
 
@@ -248,7 +266,7 @@ def run_expert_path(
 
 
 def _pdl() -> bool:
-    return os.environ.get("TRTLLM_ENABLE_PDL", "0") == "1"
+    return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
 
 def fgs_edges() -> frozenset:
@@ -385,6 +403,7 @@ class _Call:
                 )
                 if lease is not None:
                     self.leases[edge] = lease
+                    k3_edges.debug(f"moe.{edge}", rows, f"on, {words} words")
         if "comb_norm" in layer.edges and local_rows:
             lease = k3_edges.acquire(COMBINED, local_rows, window=(1, TAIL_FGS_MAX_ROWS))
             if lease is not None:
@@ -415,13 +434,17 @@ class _Layer:
         self.num_local = int(self.backend.expert_size_per_partition)
         self.num_experts = int(self.backend.num_slots)
         self.ep = a2a.ep if a2a is not None else 1
+        # Received rows R are ep * tokens on the fullest rank, at most the cap on the CuTe path.
+        comm_ep = getattr(getattr(routed_experts, "comm", None), "ep_size", 1)
+        self.max_rows = comm_ep * _max_tokens_per_rank()
         self.call: Optional[_Call] = None
-        self.device = self.backend.w3_w1_weight.device
         layer_idx = getattr(routed_experts, "layer_idx", None)
         # A workspace serves every R of its tile_n bucket, so a plan can be as large as the bucket's largest R.
         tiles = max(
             _max_tiles(
-                _bucket_rows(self.ep * rows, self.num_experts), self.num_local, self.num_experts
+                _bucket_rows(self.ep * rows, self.num_experts, self.max_rows),
+                self.num_local,
+                self.num_experts,
             )
             for rows in range(1, FGS_MAX_ROWS + 1)
         )
@@ -434,8 +457,18 @@ class _Layer:
             if edge in edges:
                 k3_edges.declare(name, HIDDEN, layer_idx, max_rows=TAIL_FGS_MAX_ROWS, min_rows=1)
 
+    @property
+    def device(self) -> torch.device:
+        return self.backend.w3_w1_weight.device
+
     def workspace(self, rows: int) -> Workspace:
-        return workspace(self.device, rows, self.num_local, tile_n_for(rows, self.num_experts))
+        return workspace(
+            self.device,
+            rows,
+            self.num_local,
+            tile_n_for(rows, self.num_experts),
+            _bucket_rows(rows, self.num_experts, self.max_rows),
+        )
 
     def stage_kwargs(self, call: Optional[_Call]) -> Dict[str, dict]:
         kw = {"routing": {"enable_pdl": _pdl()}, "fc1": {}, "fc2": {}, "finalize": {}}
@@ -505,6 +538,7 @@ class _Layer:
             return (
                 kwargs.get("eplb_local_stats") is None
                 and kwargs.get("active_rank_mask") is None
+                and within_max_rows(runtime_max)
                 and comm.use_cft_for_dispatch(runtime_max)
                 and comm.use_cft_for_combine(runtime_max)
             )
@@ -573,6 +607,25 @@ def finalize_chunks(rows: int) -> int:
 _pending_tail = threading.local()
 
 
+def _check_weights(backend) -> None:
+    """The in-place weight layout the stage kernels read; checked at the first call because the backend creates its
+    weights after the model is constructed."""
+    w31, w31_s = backend.w3_w1_weight, backend.w3_w1_weight_scale
+    w2, w2_s = backend.w2_weight, backend.w2_weight_scale
+    expected = (
+        (w31, torch.uint8, (2 * INTER, HIDDEN // 2)),
+        (w31_s, torch.uint8, (2 * INTER, HIDDEN // SF_VEC)),
+        (w2, torch.uint8, (HIDDEN, INTER // 2)),
+        (w2_s, torch.uint8, (HIDDEN, INTER // SF_VEC)),
+    )
+    for t, dtype, shape in expected:
+        if t.dtype != dtype or tuple(t.shape[1:]) != shape:
+            raise ValueError(
+                f"{ENV}=cute needs the TRTLLM-Gen MXFP4 x MXFP8 expert buffers [E, {shape[0]}, {shape[1]}] "
+                f"{dtype}; got {tuple(t.shape)} {t.dtype} on {type(backend).__name__}"
+            )
+
+
 def install(routed_experts) -> bool:
     """Opt-in switches on one MoE layer, each default off:
 
@@ -581,6 +634,8 @@ def install(routed_experts) -> bool:
       routing) keep the stock runner.
     - ``TLLM_K3_COMM=cute``: dispatch / combine through ``moe.comm.CuteA2A``.
     - ``TLLM_K3_MOE_FGS=<edges>|all``: the FGS edges; each needs both of its kernel sides and the stages it connects.
+
+    Forwards with more than ``TLLM_K3_MOE_MAX_ROWS`` (default 128) tokens on the fullest rank keep the stock path.
     """
     edges = fgs_edges()
     moe_on, comm_on, tail_on = enabled(), os.environ.get(COMM_ENV, "") == "cute", tail_enabled()
@@ -594,42 +649,49 @@ def install(routed_experts) -> bool:
     if edges and not k3_edges.slots():
         raise ValueError(f"{FGS_ENV} needs edge slots ({k3_edges.ENV}=chain|chain_after|lamport)")
     backend = routed_experts.backend
-    w31 = getattr(backend, "w3_w1_weight", None)
-    w31_s = getattr(backend, "w3_w1_weight_scale", None)
-    if moe_on and (
-        w31 is None
-        or w31.dtype != torch.uint8
-        or tuple(w31.shape[1:]) != (2 * INTER, HIDDEN // 2)
-        or tuple(w31_s.shape[1:]) != (2 * INTER, HIDDEN // SF_VEC)
-        or not hasattr(backend.activation, "gate_softcap")
-    ):
-        raise ValueError(
-            f"{ENV}=cute needs the TRTLLM-Gen MXFP4 x MXFP8 SiTU experts, got {type(backend).__name__}"
-        )
+    if moe_on and not hasattr(getattr(backend, "activation", None), "gate_softcap"):
+        raise ValueError(f"{ENV}=cute needs the SiTU experts, got {type(backend).__name__}")
     comm = getattr(routed_experts, "comm", None)
-    a2a = k3_comm.install(comm) if comm_on and comm is not None else None
+    # Only an NVLinkOneSided strategy with counted writes has the CFT workspace CuteA2A runs on; other strategies
+    # (e.g. the allgather / reduce-scatter of a prefill model) keep their stock comm and the layer drops its comm edges.
+    cft = comm is not None and getattr(comm, "can_use_cft_counted_writes", False)
+    a2a = k3_comm.install(comm) if comm_on and cft else None
     if a2a is None and edges & _COMM_EDGES:
-        raise ValueError(
-            f"{FGS_ENV}: {sorted(edges & _COMM_EDGES)} need the CuTe all-to-all (attention DP)"
+        k3_edges.debug(
+            "moe.install",
+            0,
+            f"{type(comm).__name__}: no CuTe all-to-all, {sorted(edges & _COMM_EDGES)} off",
         )
+        edges = edges - _COMM_EDGES
     layer = _Layer(routed_experts, edges, a2a)
-    if a2a is not None and edges & _COMM_EDGES:
+    # The forward's edge leases are taken at the CuTe dispatch, so it is wrapped for any edge, not only the comm ones.
+    if a2a is not None and edges:
         layer.install_comm(comm)
     if not moe_on:
         return True
     stock_run_moe = backend.run_moe
+    checked = []
+    ep = getattr(comm, "ep_size", 1)
 
     def run_moe(ctx, *, workspace=None):
         plan = ctx.comm_plan
         out = None if plan is None else plan.moe_output
+        if ctx.all_rank_num_tokens:
+            tokens_per_rank = max(ctx.all_rank_num_tokens)
+        else:
+            tokens_per_rank = ctx.x.shape[0] // ep
         if (
             out is None
             or not ctx.do_finalize
             or ctx.token_selected_experts is None
             or ctx.x_sf is None
+            or not within_max_rows(tokens_per_rank)
         ):
             layer.abandon()
             return stock_run_moe(ctx, workspace=workspace)
+        if not checked:
+            _check_weights(backend)
+            checked.append(True)
         if ctx.x_ready_event is not None:
             ctx.x_ready_event.wait()
         layer.run_moe(ctx, out)
@@ -649,6 +711,9 @@ def run_tail(y: torch.Tensor, norm, up_proj, shared: torch.Tensor) -> torch.Tens
     combined = getattr(_pending_tail, "lease", None)
     _pending_tail.lease = None
     m = y.shape[0]
+    if not within_max_rows(m):
+        # Stock norm module; above 32 rows latent.up_proj is the stock GEMM and add.
+        return latent.up_proj(norm(y), up_proj.weight, torch.empty_like(shared), shared)
     norm_lease = None
     if "norm_up" in fgs_edges() and m:
         norm_lease = k3_edges.acquire(LATENT_NORM, m, window=(1, TAIL_FGS_MAX_ROWS))

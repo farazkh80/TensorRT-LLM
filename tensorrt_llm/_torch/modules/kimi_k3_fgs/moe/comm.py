@@ -1497,10 +1497,13 @@ class CuteA2A:
 
 def install(comm) -> Optional[CuteA2A]:
     """With ``TLLM_K3_COMM=cute``, route ``comm.dispatch`` / ``comm.combine`` of a CFT ``NVLinkOneSided`` through
-    :class:`CuteA2A` for the batches stock runs with CFT and without EPLB statistics or rank masks; other calls keep
-    the stock path. Strategy kwargs the scheduler passes to every strategy are ignored, as stock does."""
+    :class:`CuteA2A` for the batches stock runs with CFT, with at most ``TLLM_K3_MOE_MAX_ROWS`` tokens per rank and
+    without EPLB statistics or rank masks; other calls keep the stock path. Strategy kwargs the scheduler passes to
+    every strategy are ignored, as stock does."""
     if not enabled():
         return None
+    from ..moe_chain import within_max_rows
+
     cute_a2a = CuteA2A(comm)
     stock_dispatch, stock_combine = comm.dispatch, comm.combine
 
@@ -1519,6 +1522,7 @@ def install(comm) -> Optional[CuteA2A]:
         runtime_max = max(all_rank_num_tokens)
         if (
             plain(kwargs)
+            and within_max_rows(runtime_max)
             and comm.use_cft_for_dispatch(runtime_max)
             and comm.use_cft_for_combine(runtime_max)
         ):
@@ -1543,6 +1547,7 @@ def install(comm) -> Optional[CuteA2A]:
         runtime_max = comm._dispatch_state.get("runtime_max_tokens_per_rank") or 0
         if (
             plain(kwargs)
+            and within_max_rows(runtime_max)
             and comm.use_cft_for_combine(runtime_max)
             and final_hidden_states.dtype == torch.bfloat16
         ):

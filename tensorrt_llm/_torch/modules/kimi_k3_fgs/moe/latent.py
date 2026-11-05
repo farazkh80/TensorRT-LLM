@@ -25,10 +25,9 @@ import functools
 import os
 from typing import Optional
 
-import torch
-
 import cutlass
 import cutlass.cute as cute
+import torch
 from cutlass import BFloat16, Float32, Int32
 
 from ...kimi_k3_attn_res.attn_res_mix_cute import _lamport_wait, _ld_relaxed_v4, _pzo_b32
@@ -154,7 +153,11 @@ class RMSNormKernel:
 
         tXpX = cute.make_rmem_tensor(
             cute.make_layout(
-                (cute.size(tXcX, mode=[0, 1]), cute.size(tXcX, mode=[1]), cute.size(tXcX, mode=[2])),
+                (
+                    cute.size(tXcX, mode=[0, 1]),
+                    cute.size(tXcX, mode=[1]),
+                    cute.size(tXcX, mode=[2]),
+                ),
                 stride=(cute.size(tXcX, mode=[2]), 0, 1),
             ),
             cutlass.Boolean,
@@ -168,8 +171,8 @@ class RMSNormKernel:
         if cutlass.const_expr(self.fgs_consumer):
             cute.copy(copy_x, tWgW, tWrW, pred=tXpX)
             if cutlass.const_expr(self.fgs_check):
-                self._wait_published(tXgX, row_in_bounds, mCnt)
-            if row_in_bounds:
+                self._wait_published(tXgX, tXrX, row_in_bounds, mCnt)
+            elif row_in_bounds:
                 cute.copy(copy_x, tXgX, tXrX, pred=tXpX)
         else:
             if row_in_bounds:
@@ -205,15 +208,18 @@ class RMSNormKernel:
             cute.arch.griddepcontrol_launch_dependents()
 
     @cute.jit
-    def _wait_published(self, tXgX: cute.Tensor, row_in_bounds, mCnt: cute.Tensor):
-        """Wait until none of this thread's 16 B chunks of ``tXgX`` holds the sentinel. The polls are L1-bypassing
-        relaxed loads, so the plain loads that follow cannot hit a stale L1 line."""
+    def _wait_published(
+        self, tXgX: cute.Tensor, tXrX: cute.Tensor, row_in_bounds, mCnt: cute.Tensor
+    ):
+        """Wait until none of this thread's 16 B chunks of ``tXgX`` holds the sentinel, and take x from the polled
+        values. A plain re-load is unsafe: another thread's load of the same 128 B line may have filled L1 while this
+        thread's chunk still held the sentinel."""
         words, addrs = [], []
         for b in cutlass.range_constexpr(self.blocks):
             w = cute.make_rmem_tensor((_VEC // 2,), Int32)
             for i in cutlass.range_constexpr(_VEC // 2):
                 w[i] = Int32(0)
-            addr = tXgX[None, 0, b].iterator.toint()
+            addr = tXgX[(None, b), 0, 0].iterator.toint()
             if row_in_bounds:
                 vals = _ld_relaxed_v4(addr)
                 for i in cutlass.range_constexpr(_VEC // 2):
@@ -221,6 +227,10 @@ class RMSNormKernel:
             words.append(w)
             addrs.append(addr)
         _lamport_wait(words, addrs, mCnt, self.fgs_max_spins)
+        x_words = cute.recast_tensor(tXrX, Int32)
+        for b in cutlass.range_constexpr(self.blocks):
+            for i in cutlass.range_constexpr(_VEC // 2):
+                x_words[(i, b), 0, 0] = words[b][i]
 
 
 class AddKernel:
