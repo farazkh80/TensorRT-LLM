@@ -66,10 +66,14 @@ def enabled() -> bool:
     return os.environ.get(ENV, "") == "cute"
 
 
+def _max_tokens_per_rank() -> int:
+    return int(os.environ.get(MAX_ROWS_ENV, "128"))
+
+
 def within_max_rows(tokens_per_rank: int) -> bool:
     """Whether a forward with this many tokens on its fullest rank runs the CuTe path (expert path, all-to-all and
     tail); larger forwards, such as context steps, keep the stock kernels and never grow the workspace."""
-    return tokens_per_rank <= int(os.environ.get(MAX_ROWS_ENV, "128"))
+    return tokens_per_rank <= _max_tokens_per_rank()
 
 
 def tail_enabled() -> bool:
@@ -81,10 +85,12 @@ def _tile_bounds(num_experts: int) -> tuple:
     return 512 * num_experts // NUM_EXPERTS, 1024 * num_experts // NUM_EXPERTS
 
 
-def _bucket_rows(rows: int, num_experts: int = NUM_EXPERTS) -> int:
-    """The largest R that ``tile_n_for`` maps to the same tile_n as ``rows``."""
+def _bucket_rows(rows: int, num_experts: int, max_rows: int) -> int:
+    """The largest R up to ``max_rows`` that ``tile_n_for`` maps to the same tile_n as ``rows``."""
+    if os.environ.get("TLLM_K3_MOE_TILE_N"):
+        return max(rows, max_rows)
     r8, r16 = _tile_bounds(num_experts)
-    return r8 if rows <= r8 else r16 if rows <= r16 else rows
+    return max(rows, min(r8 if rows <= r8 else r16 if rows <= r16 else max_rows, max_rows))
 
 
 def tile_n_for(rows: int, num_experts: int = NUM_EXPERTS) -> int:
@@ -194,7 +200,12 @@ class Workspace:
 _workspaces: Dict[tuple, Workspace] = {}
 
 
-def workspace(device: torch.device, rows: int, num_local: int, tile_n: int) -> Workspace:
+def workspace(
+    device: torch.device, rows: int, num_local: int, tile_n: int, alloc_rows: int = 0
+) -> Workspace:
+    """The workspace serving ``rows``; a new one is sized for ``max(rows, alloc_rows)`` rows. A reallocation frees the
+    buffers that CUDA graphs captured earlier still use, so callers size the first allocation for the largest R they
+    can request with this tile_n."""
     key = (device, num_local, tile_n)
     ws = _workspaces.get(key)
     if ws is None or ws.max_rows < rows:
@@ -203,7 +214,7 @@ def workspace(device: torch.device, rows: int, num_local: int, tile_n: int) -> W
                 f"{ENV}=cute: no workspace for {rows} rows (tile_n {tile_n}) before graph capture; "
                 "run the batch eagerly first"
             )
-        ws = _workspaces[key] = Workspace(device, rows, num_local, tile_n)
+        ws = _workspaces[key] = Workspace(device, max(rows, alloc_rows), num_local, tile_n)
     return ws
 
 
@@ -397,12 +408,17 @@ class _Layer:
         self.num_local = int(self.backend.expert_size_per_partition)
         self.num_experts = int(self.backend.num_slots)
         self.ep = a2a.ep if a2a is not None else 1
+        # Received rows R are ep * tokens on the fullest rank, at most the cap on the CuTe path.
+        comm_ep = getattr(getattr(routed_experts, "comm", None), "ep_size", 1)
+        self.max_rows = comm_ep * _max_tokens_per_rank()
         self.call: Optional[_Call] = None
         layer_idx = getattr(routed_experts, "layer_idx", None)
         # A workspace serves every R of its tile_n bucket, so a plan can be as large as the bucket's largest R.
         tiles = max(
             _max_tiles(
-                _bucket_rows(self.ep * rows, self.num_experts), self.num_local, self.num_experts
+                _bucket_rows(self.ep * rows, self.num_experts, self.max_rows),
+                self.num_local,
+                self.num_experts,
             )
             for rows in range(1, FGS_MAX_ROWS + 1)
         )
@@ -420,7 +436,13 @@ class _Layer:
         return self.backend.w3_w1_weight.device
 
     def workspace(self, rows: int) -> Workspace:
-        return workspace(self.device, rows, self.num_local, tile_n_for(rows, self.num_experts))
+        return workspace(
+            self.device,
+            rows,
+            self.num_local,
+            tile_n_for(rows, self.num_experts),
+            _bucket_rows(rows, self.num_experts, self.max_rows),
+        )
 
     def stage_kwargs(self, call: Optional[_Call], max_tokens: int) -> Dict[str, dict]:
         kw = {"routing": {"enable_pdl": _pdl()}, "fc1": {}, "fc2": {}, "finalize": {}}
