@@ -31,6 +31,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import BFloat16, Float32, Int32
 
+from ...kimi_k3_attn_res.attn_res_mix_cute import _lamport_wait, _ld_relaxed_v4, _pzo_b32
+
 LATENT = 3584
 HIDDEN = 7168
 _VEC = 8
@@ -43,10 +45,27 @@ def _pdl() -> bool:
 
 
 class RMSNormKernel:
-    """One row per ``_THREADS_PER_ROW`` threads; ``rows_per_cta`` rows per CTA (FlashInfer uses 2 at H = 3584)."""
+    """One row per ``_THREADS_PER_ROW`` threads; ``rows_per_cta`` rows per CTA (FlashInfer uses 2 at H = 3584).
 
-    def __init__(self, hidden: int, rows_per_cta: int, enable_pdl: bool):
+    ``fgs_consumer`` (M2d-1): reads x while its producer runs, without ``griddepcontrol.wait``; each thread re-reads
+    its 16 B chunks of the row until none starts with the bf16 -0.0 sentinel (the producer stores whole chunks and
+    never -0.0), falling back to waiting for the producer grid after ``fgs_max_spins`` rounds. ``fgs_producer``
+    (M2d-2): dependents launch at entry and the output never holds -0.0, so it can feed a sentinel consumer.
+    ``fgs_check=False`` (negative-control builds only) reads the consumer's input once without waiting.
+    """
+
+    def __init__(
+        self,
+        hidden: int,
+        rows_per_cta: int,
+        enable_pdl: bool,
+        fgs_consumer: bool = False,
+        fgs_producer: bool = False,
+        fgs_max_spins: int = 1 << 16,
+        fgs_check: bool = True,
+    ):
         assert hidden % _VEC == 0
+        assert not (fgs_consumer or fgs_producer) or enable_pdl, "the FGS builds launch with PDL"
         self.H = hidden
         self.rows = rows_per_cta
         self.threads = _THREADS_PER_ROW * rows_per_cta
@@ -54,15 +73,28 @@ class RMSNormKernel:
         self.blocks = (hidden // _VEC + _THREADS_PER_ROW - 1) // _THREADS_PER_ROW
         self.cols_per_tile = _VEC * self.blocks * _THREADS_PER_ROW
         self.enable_pdl = enable_pdl
+        self.fgs_consumer = fgs_consumer
+        self.fgs_producer = fgs_producer
+        self.fgs_max_spins = fgs_max_spins
+        self.fgs_check = fgs_check
 
     @cute.jit
-    def __call__(self, mX: cute.Tensor, mW: cute.Tensor, mY: cute.Tensor, M: Int32, eps: Float32, stream):
+    def __call__(
+        self,
+        mX: cute.Tensor,
+        mW: cute.Tensor,
+        mY: cute.Tensor,
+        M: Int32,
+        eps: Float32,
+        mCnt: cute.Tensor,
+        stream,
+    ):
         tv_layout = cute.make_layout(
             ((_THREADS_PER_ROW, self.rows), (_VEC, self.blocks)),
             stride=((_VEC * self.rows, 1), (self.rows, self.rows * _VEC * _THREADS_PER_ROW)),
         )
         tiler_mn = (self.rows, self.cols_per_tile)
-        self.kernel(mX, mW, mY, M, eps, tv_layout, tiler_mn).launch(
+        self.kernel(mX, mW, mY, M, eps, mCnt, tv_layout, tiler_mn).launch(
             grid=[cute.ceil_div(M, self.rows), 1, 1],
             block=[self.threads, 1, 1],
             smem=self.rows * self.warps_per_row * 4,
@@ -78,12 +110,15 @@ class RMSNormKernel:
         mY: cute.Tensor,
         M: Int32,
         eps: Float32,
+        mCnt: cute.Tensor,
         tv_layout: cute.Layout,
         tiler_mn: cute.Shape,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
-        if cutlass.const_expr(self.enable_pdl):
+        if cutlass.const_expr(self.fgs_producer):
+            cute.arch.griddepcontrol_launch_dependents()
+        if cutlass.const_expr(self.enable_pdl and not self.fgs_consumer):
             cute.arch.griddepcontrol_wait()
 
         smem = cutlass.utils.SmemAllocator()
@@ -130,9 +165,16 @@ class RMSNormKernel:
         row_in_bounds = tXcX[(0, 0), 0, 0][0] < M
 
         tXrX.store(cute.zeros_like(tXrX, dtype=mX.element_type))
-        if row_in_bounds:
-            cute.copy(copy_x, tXgX, tXrX, pred=tXpX)
-        cute.copy(copy_x, tWgW, tWrW, pred=tXpX)
+        if cutlass.const_expr(self.fgs_consumer):
+            cute.copy(copy_x, tWgW, tWrW, pred=tXpX)
+            if cutlass.const_expr(self.fgs_check):
+                self._wait_published(tXgX, row_in_bounds, mCnt)
+            if row_in_bounds:
+                cute.copy(copy_x, tXgX, tXrX, pred=tXpX)
+        else:
+            if row_in_bounds:
+                cute.copy(copy_x, tXgX, tXrX, pred=tXpX)
+            cute.copy(copy_x, tWgW, tWrW, pred=tXpX)
 
         x = tXrX.load().to(Float32)
         local = (x * x).reduce(cute.ReductionOp.ADD, init_val=Float32(0.0), reduction_profile=0)
@@ -151,10 +193,34 @@ class RMSNormKernel:
         w = tWrW.load().to(Float32)
         y = x * rstd * (w + Float32(0.0))
         tXrO.store(y.to(mY.element_type))
+        if cutlass.const_expr(self.fgs_producer):
+            words = cute.recast_tensor(tXrO, Int32)
+            for i in cutlass.range_constexpr(cute.size(words)):
+                words[i] = _pzo_b32(words[i])
         if row_in_bounds:
             cute.copy(copy_y, tXrO, tXgO, pred=tXpX)
-        if cutlass.const_expr(self.enable_pdl):
+        if cutlass.const_expr(self.enable_pdl and not self.fgs_producer):
+            if cutlass.const_expr(self.fgs_consumer):
+                cute.arch.griddepcontrol_wait()
             cute.arch.griddepcontrol_launch_dependents()
+
+    @cute.jit
+    def _wait_published(self, tXgX: cute.Tensor, row_in_bounds, mCnt: cute.Tensor):
+        """Wait until none of this thread's 16 B chunks of ``tXgX`` holds the sentinel. The polls are L1-bypassing
+        relaxed loads, so the plain loads that follow cannot hit a stale L1 line."""
+        words, addrs = [], []
+        for b in cutlass.range_constexpr(self.blocks):
+            w = cute.make_rmem_tensor((_VEC // 2,), Int32)
+            for i in cutlass.range_constexpr(_VEC // 2):
+                w[i] = Int32(0)
+            addr = tXgX[None, 0, b].iterator.toint()
+            if row_in_bounds:
+                vals = _ld_relaxed_v4(addr)
+                for i in cutlass.range_constexpr(_VEC // 2):
+                    w[i] = vals[i]
+            words.append(w)
+            addrs.append(addr)
+        _lamport_wait(words, addrs, mCnt, self.fgs_max_spins)
 
 
 class AddKernel:
@@ -201,15 +267,26 @@ def _fake(dtype, cols):
 
 
 @functools.lru_cache(maxsize=None)
-def _compiled_norm(hidden: int, rows_per_cta: int, enable_pdl: bool):
+def _compiled_norm(
+    hidden: int,
+    rows_per_cta: int,
+    enable_pdl: bool,
+    fgs_consumer: bool = False,
+    fgs_producer: bool = False,
+    fgs_max_spins: int = 1 << 16,
+    fgs_check: bool = True,
+):
     weight = cute.runtime.make_fake_compact_tensor(BFloat16, (hidden,), assumed_align=16)
     return cute.compile(
-        RMSNormKernel(hidden, rows_per_cta, enable_pdl),
+        RMSNormKernel(
+            hidden, rows_per_cta, enable_pdl, fgs_consumer, fgs_producer, fgs_max_spins, fgs_check
+        ),
         _fake(BFloat16, hidden),
         weight,
         _fake(BFloat16, hidden),
         Int32(1),
         Float32(1e-6),
+        cute.runtime.make_fake_compact_tensor(Int32, (4,), assumed_align=16),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
@@ -239,14 +316,48 @@ def default_norm_rows(m: int) -> int:
 
 
 def rmsnorm(
-    x: torch.Tensor, weight: torch.Tensor, eps: float, out: torch.Tensor, rows_per_cta: int = 0
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    out: torch.Tensor,
+    rows_per_cta: int = 0,
+    *,
+    fgs_consumer: bool = False,
+    fgs_producer: bool = False,
+    fgs_counters: Optional[torch.Tensor] = None,
+    fgs_max_spins: int = 1 << 16,
+    fgs_check: bool = True,
 ) -> torch.Tensor:
-    """FlashInfer-identical RMSNorm of x [M, H] bf16 into ``out``."""
+    """FlashInfer-identical RMSNorm of x [M, H] bf16 into ``out``.
+
+    ``fgs_consumer``: x is a sentinel slot written by a running producer (counters: ``make_fgs_counters``);
+    ``fgs_producer``: ``out`` feeds a sentinel consumer (see :class:`RMSNormKernel`).
+    """
     _check(x, weight, out)
     m, h = x.shape
+    if fgs_consumer and (fgs_counters is None or fgs_counters.numel() != 4):
+        raise ValueError("rmsnorm: fgs_consumer needs int32[4] fgs_counters")
     if m:
-        _compiled_norm(h, rows_per_cta or default_norm_rows(m), _pdl())(x, weight, out, m, eps)
+        fn = _compiled_norm(
+            h,
+            rows_per_cta or default_norm_rows(m),
+            _pdl() or fgs_consumer or fgs_producer,
+            fgs_consumer,
+            fgs_producer,
+            fgs_max_spins if fgs_consumer else 1 << 16,
+            fgs_check or not fgs_consumer,
+        )
+        fn(x, weight, out, m, eps, fgs_counters if fgs_consumer else _scratch_counters(x.device))
     return out
+
+
+_SCRATCH: dict = {}
+
+
+def _scratch_counters(device: torch.device) -> torch.Tensor:
+    if device not in _SCRATCH:
+        _SCRATCH[device] = torch.zeros(4, dtype=torch.int32, device=device)
+    return _SCRATCH[device]
 
 
 def add(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor, chunks: int = 7) -> torch.Tensor:
@@ -277,12 +388,23 @@ def up_tactic(m: int):
 
 
 def up_proj(
-    x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor, addend: Optional[torch.Tensor] = None
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    addend: Optional[torch.Tensor] = None,
+    *,
+    fgs_consumer: bool = False,
 ) -> torch.Tensor:
-    """``out = bf16(x @ weight^T)`` (+ ``addend`` after the rounding); x [M, 3584], weight [7168, 3584]."""
+    """``out = bf16(x @ weight^T)`` (+ ``addend`` after the rounding); x [M, 3584], weight [7168, 3584].
+
+    ``fgs_consumer`` (M2d-2, M <= 32): x is a sentinel slot written by a running ``rmsnorm(fgs_producer=True)``; the
+    split-K report_valid build re-loads activation stages that still hold -0.0.
+    """
     m = x.shape[0]
     if m == 0:
         return out
+    if fgs_consumer and m > _SPLITK_ROWS:
+        raise ValueError(f"up_proj: the FGS consumer serves at most {_SPLITK_ROWS} rows")
     if m > _SPLITK_ROWS:
         if addend is None:
             return torch.matmul(x, weight.t(), out=out)
@@ -296,9 +418,9 @@ def up_proj(
         out,
         _pdl(),
         up_tactic(m),
-        report_valid=False,
-        retry_warp=False,
-        pdl_wait_activation=True,
+        report_valid=fgs_consumer,
+        retry_warp=fgs_consumer,
+        pdl_wait_activation=not fgs_consumer,
         addend=addend is not None,
     )
     return out
