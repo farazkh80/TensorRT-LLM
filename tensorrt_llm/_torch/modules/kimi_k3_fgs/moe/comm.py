@@ -32,7 +32,7 @@ from __future__ import annotations
 import ctypes
 import functools
 import os
-from typing import List, Optional, Tuple
+from typing import List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -363,6 +363,37 @@ if _CUTE_AVAILABLE:
         _asm(None, [], "fence.proxy.generic::fabric.alias.acquire.sys;", "", loc, ip)
 
     @dsl_user_op
+    def _fence_proxy_async_global(*, loc=None, ip=None) -> None:
+        _asm(None, [], "fence.proxy.async.global;", "", loc, ip)
+
+    @dsl_user_op
+    def _ld_acquire_b32(addr, *, loc=None, ip=None) -> Int32:
+        return Int32(
+            _asm(
+                T.i32(),
+                [_v(addr, Int64, loc, ip)],
+                "ld.acquire.gpu.global.b32 $0, [$1];",
+                "=r,l",
+                loc,
+                ip,
+            )
+        )
+
+    @dsl_user_op
+    def _pzo_b32(w, *, loc=None, ip=None) -> Int32:
+        """Each bf16 -0.0 half of ``w`` becomes +0.0 (x + +0 is x for every other value under RN)."""
+        return Int32(
+            _asm(
+                T.i32(),
+                [_v(w, Int32, loc, ip)],
+                "{\n.reg .b32 z;\nmov.b32 z, 0;\nadd.rn.bf16x2 $0, $1, z;\n}",
+                "=r,r",
+                loc,
+                ip,
+            )
+        )
+
+    @dsl_user_op
     def _bf16x2_to_f32(w, *, loc=None, ip=None):
         res = _asm(
             llvm.StructType.get_literal([T.f32(), T.f32()]),
@@ -410,6 +441,19 @@ if _CUTE_AVAILABLE:
     def _spin_eq(addr: Int64, expected: Int32, timeout_ns: Int64):
         start = _globaltimer()
         while _ld_sys_b32(addr) != expected:
+            if _globaltimer() - start > timeout_ns:
+                _trap()
+
+    @cute.jit
+    def _sleep_ns(ns: int):
+        start = _globaltimer()
+        while _globaltimer() - start < Int64(ns):
+            pass
+
+    @cute.jit
+    def _spin_ge_acquire(addr: Int64, target: Int32, timeout_ns: Int64):
+        start = _globaltimer()
+        while _ld_acquire_b32(addr) < target:
             if _globaltimer() - start > timeout_ns:
                 _trap()
 
@@ -492,6 +536,8 @@ if _CUTE_AVAILABLE:
             ids_payload: int,
             lay: Tuple,
             pdl: bool,
+            fgs: bool,
+            delay_ns: int = 0,
         ):
             assert (
                 ep <= 32 and top_k <= 32 and top_k % 4 == 0 and len(payload_bytes) <= _MAX_PAYLOADS
@@ -502,6 +548,8 @@ if _CUTE_AVAILABLE:
             self.total = sum(payload_bytes)
             self.ids_payload = ids_payload
             self.lay, self.pdl = dict(lay), pdl
+            self.fgs = fgs
+            self.delay_ns = delay_ns
 
         @cute.jit
         def __call__(
@@ -699,6 +747,8 @@ if _CUTE_AVAILABLE:
                             peer_ws + L["recv_counters"] + (parity * EP + rank) * 4, s_cnt[lane]
                         )
 
+            if cutlass.const_expr(self.delay_ns > 0):
+                _sleep_ns(self.delay_ns)
             if n_local > 0:
                 nsend = s_nsend[0]
                 has_self = Int32(0)
@@ -772,18 +822,21 @@ if _CUTE_AVAILABLE:
                     if lane < EP:
                         peer_ws = ws_base + Int64(lane) * ws_stride
                         _st_sys_b32(peer_ws + L["dispatch_flags"] + rank * 4, flag)
-                        if lane != rank:
-                            cnt = _ld_b32(my_ws + L["recv_counters"] + (parity * EP + lane) * 4)
-                            expected = Int64(cnt) * self.total
-                            if expected > 0:
-                                base_addr = my_ws + L["dispatch_baseline"] + lane * 8
-                                target = _ld_b64(base_addr) + expected
-                                _spin_ge64(
-                                    my_ws + L["dispatch_counters"] + Int64(lane) * _COUNTER_STRIDE,
-                                    target,
-                                    timeout_ns,
-                                )
-                                _st_b64(base_addr, target)
+                        if cutlass.const_expr(not self.fgs):
+                            if lane != rank:
+                                cnt = _ld_b32(my_ws + L["recv_counters"] + (parity * EP + lane) * 4)
+                                expected = Int64(cnt) * self.total
+                                if expected > 0:
+                                    base_addr = my_ws + L["dispatch_baseline"] + lane * 8
+                                    target = _ld_b64(base_addr) + expected
+                                    _spin_ge64(
+                                        my_ws
+                                        + L["dispatch_counters"]
+                                        + Int64(lane) * _COUNTER_STRIDE,
+                                        target,
+                                        timeout_ns,
+                                    )
+                                    _st_b64(base_addr, target)
 
     class _PrepareCombine:
         def __init__(self, ep: int, nbytes: int, lay: Tuple, pdl: bool):
@@ -828,8 +881,8 @@ if _CUTE_AVAILABLE:
                     _st_v4(d + v * 16, w[0], w[1], w[2], w[3])
 
     class _Push:
-        def __init__(self, ep: int, nbytes: int, lay: Tuple, pdl: bool):
-            self.ep, self.nbytes, self.lay, self.pdl = ep, nbytes, dict(lay), pdl
+        def __init__(self, ep: int, nbytes: int, lay: Tuple, pdl: bool, fgs: bool):
+            self.ep, self.nbytes, self.lay, self.pdl, self.fgs = ep, nbytes, dict(lay), pdl, fgs
 
         @cute.jit
         def __call__(
@@ -843,10 +896,23 @@ if _CUTE_AVAILABLE:
             static_max: Int32,
             le_base: Int32,
             blocks_per_rank: Int32,
+            fin_done: Int64,
+            fin_expected: Int32,
+            timeout_ns: Int64,
             stream,
         ):
             self.kernel(
-                mY, ws_base, ws_stride, src_stride, rank, max_tokens, static_max, le_base
+                mY,
+                ws_base,
+                ws_stride,
+                src_stride,
+                rank,
+                max_tokens,
+                static_max,
+                le_base,
+                fin_done,
+                fin_expected,
+                timeout_ns,
             ).launch(
                 grid=[self.ep, blocks_per_rank, 1],
                 block=[_PUSH_WARPS * 32, 1, 1],
@@ -866,6 +932,9 @@ if _CUTE_AVAILABLE:
             max_tokens: Int32,
             static_max: Int32,
             le_base: Int32,
+            fin_done: Int64,
+            fin_expected: Int32,
+            timeout_ns: Int64,
         ):
             L = self.lay
             src = mY.iterator.toint()
@@ -880,9 +949,19 @@ if _CUTE_AVAILABLE:
             )
             my_ws = ws_base + Int64(rank) * ws_stride
 
-            cute.arch.griddepcontrol_wait()
-            cute.arch.griddepcontrol_launch_dependents()
-            flag = _ld_b32(my_ws + L["flag"])
+            if cutlass.const_expr(self.fgs):
+                # Rows of source block s are final once fin_done[s] counts all their finalize units; the round
+                # flag still holds the dispatch value (the reduce advances it).
+                cute.arch.griddepcontrol_launch_dependents()
+                if tidx == 0:
+                    _spin_ge_acquire(fin_done + source * 4, fin_expected, timeout_ns)
+                    _fence_proxy_async_global()
+                cute.arch.sync_threads()
+                flag = _ld_b32(my_ws + L["flag"]) + 1
+            else:
+                cute.arch.griddepcontrol_wait()
+                cute.arch.griddepcontrol_launch_dependents()
+                flag = _ld_b32(my_ws + L["flag"])
             if by == 0:
                 if tidx == 0:
                     _st_sys_b32(
@@ -924,15 +1003,42 @@ if _CUTE_AVAILABLE:
                                     bar_put,
                                 )
                                 _fabric_submit_wait()
+            if cutlass.const_expr(self.fgs):
+                if source == rank:
+                    parity = ((flag - 1) >> 1) & 1
+                    n = _ld_b32(my_ws + L["recv_counters"] + (parity * self.ep + rank) * 4)
+                    for t in cutlass.range(by, n, nby, unroll=1):
+                        g = Int64(rank) * max_tokens + t
+                        for v in cutlass.range(tidx, self.nbytes // 16, _PUSH_WARPS * 32, unroll=1):
+                            w = _ld_v4(src + g * src_stride + v * 16)
+                            _st_v4(
+                                my_ws + L["combine_recv"] + g * self.nbytes + v * 16,
+                                w[0],
+                                w[1],
+                                w[2],
+                                w[3],
+                            )
 
     class _Reduce:
         """out[t] = sum over the k contributions of token t, in the stock order: two sources add directly; more
         sources add in groups of eight as ((a0 + a1) + (a2 + a3)) + ((a4 + a5) + (a6 + a7)), absent ones as +0, and
         the groups add pairwise; fp32, one round to bf16."""
 
-        def __init__(self, ep: int, top_k: int, hidden: int, lay: Tuple, pdl: bool):
+        def __init__(
+            self,
+            ep: int,
+            top_k: int,
+            hidden: int,
+            lay: Tuple,
+            pdl: bool,
+            fgs: bool,
+            pzo: bool,
+            delay_ns: int = 0,
+        ):
             assert top_k <= 32 and (hidden * 2) % 16 == 0
             self.ep, self.top_k, self.hidden, self.lay, self.pdl = ep, top_k, hidden, dict(lay), pdl
+            self.fgs, self.pzo = fgs, pzo
+            self.delay_ns = delay_ns
 
         @cute.jit
         def __call__(
@@ -1014,7 +1120,11 @@ if _CUTE_AVAILABLE:
                             inbox + (Int64(tr) * max_tokens + di) * nbytes
                         )
                 cute.arch.sync_threads()
+                # Threads load slots warp 0 waited for: each fences after the barrier.
+                _fence_fabric_acquire()
 
+                if cutlass.const_expr(self.delay_ns > 0):
+                    _sleep_ns(self.delay_ns)
                 count = s_n[0]
                 dst = out + Int64(tok) * nbytes
                 ns = (K + 7) // 8 * 8
@@ -1040,16 +1150,23 @@ if _CUTE_AVAILABLE:
                         if cutlass.const_expr(ns >= 32):
                             if count > 16:
                                 res[j] = (g[0] + g[1]) + (g[2] + g[3])
-                    _st_v4(
-                        dst + v * 16,
-                        *[_f32x2_to_bf16x2(res[2 * q], res[2 * q + 1]) for q in range(4)],
-                    )
+                    words = [_f32x2_to_bf16x2(res[2 * q], res[2 * q + 1]) for q in range(4)]
+                    if cutlass.const_expr(self.pzo):
+                        words = [_pzo_b32(w) for w in words]
+                    _st_v4(dst + v * 16, *words)
 
             if tok == 0:
                 if warp == 0:
                     flag = _ld_b32(my_ws + L["flag"])
+                    if cutlass.const_expr(self.fgs):
+                        # No combine prepare ran: this kernel advances the round flag to the combine value.
+                        flag = flag + 1
                     if lane < self.ep:
                         _spin_eq(my_ws + L["combine_flags"] + lane * 4, flag, timeout_ns)
+                    if cutlass.const_expr(self.fgs):
+                        cute.arch.sync_warp()
+                        if lane == 0:
+                            _st_b32(my_ws + L["flag"], flag)
 
     def _fake(dtype):
         return cute.runtime.make_fake_compact_tensor(dtype, (cute.sym_int(),), assumed_align=16)
@@ -1098,6 +1215,9 @@ if _CUTE_AVAILABLE:
                 i32,
                 i32,
                 Int32(1),
+                i64,
+                i32,
+                i64,
                 stream,
                 options=opt,
             )
@@ -1118,6 +1238,18 @@ if _CUTE_AVAILABLE:
         raise ValueError(kind)
 
 
+class RoutingSource(NamedTuple):
+    """Receive side of a dispatch whose data wait is left to the routing kernel: this rank's workspace address and
+    layout, the EP shape, the rows per source block and the payload bytes per token."""
+
+    my_ws: int
+    lay: "_Layout"
+    ep: int
+    rank: int
+    max_tokens: int
+    bytes_per_token: int
+
+
 def _align(x: int, a: int) -> int:
     return (x + a - 1) // a * a
 
@@ -1131,6 +1263,17 @@ class CuteA2A:
     ``combine(final_hidden_states)`` takes the bf16 expert output ``[ep * runtime_max_tokens, hidden]`` (also the
     in-workspace view from ``get_combine_payload_tensor_in_workspace``) and returns ``[local_tokens, hidden]``.
     Both keep the stock communicator's dispatch state, so its own dispatch / combine can take either phase.
+
+    Fine-grained-sync modes (opt-in per call; counter words are int32, zero-armed by the caller each step):
+    ``dispatch(..., defer_data_wait=True)`` does not wait for the peers' data: the grid ends once the local copies,
+    the counts, the sanitize and the flags are done. The data wait then belongs to the routing kernel
+    (``routing.run(..., source=a2a.routing_source())``), which waits per source block and advances the per-source
+    byte-counter baselines; it must run in every such round.
+    ``combine(..., fin_done=c, fin_expected=x)`` skips the combine prepare and the push waits per source block s
+    until ``c[s] >= x`` (the finalize units of rows [s * max, (s + 1) * max)) instead of waiting for the finalize
+    grid; the reduce advances the round flag. ``combine(..., out=slot)`` writes the result into ``slot`` (bf16
+    [local_tokens, hidden]) with -0.0 stored as +0.0, for a sentinel-armed edge slot. ``hazard_delay_ns`` delays the
+    dispatch data issue / the combine output stores, for the hazard tests only.
     """
 
     def __init__(self, comm, le_base: Optional[int] = None):
@@ -1150,6 +1293,7 @@ class CuteA2A:
         self.ep, self.rank = comm.ep_size, comm.ep_rank
         self.lay = _Layout(comm)
         self.le_base = find_le_base(self.ep) if le_base is None else le_base
+        self._source: Optional[RoutingSource] = None
 
     @property
     def workspace(self) -> torch.Tensor:
@@ -1167,6 +1311,8 @@ class CuteA2A:
         token_final_scales,
         all_rank_num_tokens: List[int],
         use_dp_padding=None,
+        defer_data_wait: bool = False,
+        hazard_delay_ns: int = 0,
         **kwargs,
     ):
         comm = self.comm
@@ -1199,8 +1345,18 @@ class CuteA2A:
         pdl = _pdl()
         ws_base, ws_stride, my_ws = self._ws()
         _compile("prepare_dispatch", self.ep, lay, pdl)(self.workspace[self.rank])
+        fgs = defer_data_wait
         fn = _compile(
-            "dispatch", self.ep, top_k, comm.num_experts, tuple(nbytes), ids_payload, lay, pdl
+            "dispatch",
+            self.ep,
+            top_k,
+            comm.num_experts,
+            tuple(nbytes),
+            ids_payload,
+            lay,
+            pdl,
+            fgs,
+            hazard_delay_ns,
         )
         srcs = [p.data_ptr() for p in payloads] + [0] * (_MAX_PAYLOADS - len(payloads))
         rcvs = offsets + [0] * (_MAX_PAYLOADS - len(offsets))
@@ -1215,6 +1371,11 @@ class CuteA2A:
             self.le_base,
             *rcvs,
             _TIMEOUT_NS,
+        )
+        self._source = (
+            RoutingSource(my_ws, self.lay, self.ep, self.rank, runtime_max, sum(nbytes))
+            if fgs
+            else None
         )
         comm._dispatch_state.update(
             phase="dispatched",
@@ -1238,7 +1399,21 @@ class CuteA2A:
             views.append(None)
         return tuple(views)
 
-    def combine(self, final_hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
+    def routing_source(self) -> "RoutingSource":
+        """The receive side of the last ``defer_data_wait`` dispatch, for ``routing.run(source=...)``."""
+        if self._source is None:
+            raise RuntimeError("routing_source() needs a dispatch with defer_data_wait=True")
+        return self._source
+
+    def combine(
+        self,
+        final_hidden_states: torch.Tensor,
+        fin_done: Optional[torch.Tensor] = None,
+        fin_expected: int = 0,
+        out: Optional[torch.Tensor] = None,
+        hazard_delay_ns: int = 0,
+        **kwargs,
+    ) -> torch.Tensor:
         comm = self.comm
         st = comm._dispatch_state
         if st.get("phase") != "dispatched":
@@ -1254,12 +1429,23 @@ class CuteA2A:
         lay = self.lay.key()
         pdl = _pdl()
         ws_base, ws_stride, my_ws = self._ws()
-        out = torch.empty(n, hidden, dtype=torch.bfloat16, device=y.device)
-        _compile("prepare_combine", self.ep, nbytes, lay, pdl)(
-            y.view(-1), my_ws, nbytes, self.rank, runtime_max
-        )
+        pzo = out is not None
+        if out is None:
+            out = torch.empty(n, hidden, dtype=torch.bfloat16, device=y.device)
+        elif (
+            out.shape[0] < n
+            or out.shape[-1] != hidden
+            or out.dtype != torch.bfloat16
+            or not out.is_contiguous()
+        ):
+            raise ValueError(f"combine out must be contiguous bf16 [>= {n}, {hidden}]")
+        fgs = fin_done is not None
+        if not fgs:
+            _compile("prepare_combine", self.ep, nbytes, lay, pdl)(
+                y.view(-1), my_ws, nbytes, self.rank, runtime_max
+            )
         blocks = min(32, max(1, (runtime_max + 2 * _PUSH_WARPS - 1) // (2 * _PUSH_WARPS)))
-        _compile("push", self.ep, nbytes, lay, pdl)(
+        _compile("push", self.ep, nbytes, lay, pdl, fgs)(
             y.view(-1),
             ws_base,
             ws_stride,
@@ -1269,8 +1455,11 @@ class CuteA2A:
             self.lay.max_tokens,
             self.le_base,
             blocks,
+            fin_done.data_ptr() if fgs else 0,
+            fin_expected,
+            _TIMEOUT_NS,
         )
-        _compile("reduce", self.ep, comm.top_k, hidden, lay, pdl)(
+        _compile("reduce", self.ep, comm.top_k, hidden, lay, pdl, fgs, pzo, hazard_delay_ns)(
             out.view(-1),
             ws_base,
             ws_stride,
