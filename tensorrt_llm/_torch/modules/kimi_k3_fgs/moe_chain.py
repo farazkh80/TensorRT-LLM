@@ -578,11 +578,17 @@ def install(routed_experts) -> bool:
     if moe_on and not hasattr(getattr(backend, "activation", None), "gate_softcap"):
         raise ValueError(f"{ENV}=cute needs the SiTU experts, got {type(backend).__name__}")
     comm = getattr(routed_experts, "comm", None)
-    a2a = k3_comm.install(comm) if comm_on and comm is not None else None
+    # Only an NVLinkOneSided strategy with counted writes has the CFT workspace CuteA2A runs on; other strategies
+    # (e.g. the allgather / reduce-scatter of a prefill model) keep their stock comm and the layer drops its comm edges.
+    cft = comm is not None and getattr(comm, "can_use_cft_counted_writes", False)
+    a2a = k3_comm.install(comm) if comm_on and cft else None
     if a2a is None and edges & _COMM_EDGES:
-        raise ValueError(
-            f"{FGS_ENV}: {sorted(edges & _COMM_EDGES)} need the CuTe all-to-all (attention DP)"
+        k3_edges.debug(
+            "moe.install",
+            0,
+            f"{type(comm).__name__}: no CuTe all-to-all, {sorted(edges & _COMM_EDGES)} off",
         )
+        edges = edges - _COMM_EDGES
     layer = _Layer(routed_experts, edges, a2a)
     if a2a is not None and edges & _COMM_EDGES:
         layer.install_comm(comm)
