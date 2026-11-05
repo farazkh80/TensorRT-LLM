@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Kimi K3 decode MoE expert path in CuTe DSL (``TLLM_K3_MOE=cute``): routing -> FC1 -> FC2 -> finalize.
+"""Kimi K3 decode MoE expert path in CuTe DSL (``TLLM_K3_MOE=cute``): routing -> FC1 -> FC2 -> finalize, and the
+post-combine latent tail (``TLLM_K3_MOE_TAIL=cute``).
 
 It replaces only the TRTLLM-Gen runner call inside the routed experts' ``run_moe``; quantize, dispatch and combine
 stay stock. Per call, on one rank, with R = ep_size * max_tokens_per_rank received rows:
@@ -26,6 +27,7 @@ from typing import Callable, Dict, Optional
 import torch
 
 ENV = "TLLM_K3_MOE"
+TAIL_ENV = "TLLM_K3_MOE_TAIL"
 HIDDEN = 3584
 INTER = 3072
 TOP_K = 16
@@ -35,6 +37,10 @@ STAGES = ("routing", "fc1", "fc2", "finalize")
 
 def enabled() -> bool:
     return os.environ.get(ENV, "") == "cute"
+
+
+def tail_enabled() -> bool:
+    return os.environ.get(TAIL_ENV, "") == "cute"
 
 
 def tile_n_for(rows: int) -> int:
@@ -245,3 +251,16 @@ def install(routed_experts) -> bool:
 
     backend.run_moe = run_moe
     return True
+
+
+def run_tail(y: torch.Tensor, norm, up_proj, shared: torch.Tensor) -> torch.Tensor:
+    """Post-combine latent tail (``TLLM_K3_MOE_TAIL=cute``): ``up_proj(norm(y)) + shared`` with the routed + shared
+    add fused into the up-projection epilogue. ``y`` is the combine output [M, 3584]; it runs after the shared-expert
+    join because ``shared`` is read in that epilogue."""
+    from .moe import latent
+
+    norm_out = torch.empty_like(y)
+    out = torch.empty_like(shared)
+    return latent.run(
+        y, norm.weight, float(norm.variance_epsilon), up_proj.weight, shared, out, norm_out
+    )
