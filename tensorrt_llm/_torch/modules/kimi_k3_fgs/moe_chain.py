@@ -382,7 +382,6 @@ class _Layer:
         self.num_local = int(self.backend.expert_size_per_partition)
         self.ep = a2a.ep if a2a is not None else 1
         self.call: Optional[_Call] = None
-        self.device = self.backend.w3_w1_weight.device
         layer_idx = getattr(routed_experts, "layer_idx", None)
         # A workspace serves every R of its tile_n bucket, so a plan can be as large as the bucket's largest R.
         tiles = max(
@@ -397,6 +396,10 @@ class _Layer:
         for edge, name in (("comb_norm", COMBINED), ("norm_up", LATENT_NORM)):
             if edge in edges:
                 k3_edges.declare(name, HIDDEN, layer_idx, max_rows=TAIL_FGS_MAX_ROWS, min_rows=1)
+
+    @property
+    def device(self) -> torch.device:
+        return self.backend.w3_w1_weight.device
 
     def stage_kwargs(self, call: Optional[_Call], max_tokens: int) -> Dict[str, dict]:
         kw = {"routing": {"enable_pdl": _pdl()}, "fc1": {}, "fc2": {}, "finalize": {}}
@@ -532,6 +535,25 @@ def finalize_chunks(rows: int) -> int:
 _pending_tail = threading.local()
 
 
+def _check_weights(backend) -> None:
+    """The in-place weight layout the stage kernels read; checked at the first call because the backend creates its
+    weights after the model is constructed."""
+    w31, w31_s = backend.w3_w1_weight, backend.w3_w1_weight_scale
+    w2, w2_s = backend.w2_weight, backend.w2_weight_scale
+    expected = (
+        (w31, torch.uint8, (2 * INTER, HIDDEN // 2)),
+        (w31_s, torch.uint8, (2 * INTER, HIDDEN // SF_VEC)),
+        (w2, torch.uint8, (HIDDEN, INTER // 2)),
+        (w2_s, torch.uint8, (HIDDEN, INTER // SF_VEC)),
+    )
+    for t, dtype, shape in expected:
+        if t.dtype != dtype or tuple(t.shape[1:]) != shape:
+            raise ValueError(
+                f"{ENV}=cute needs the TRTLLM-Gen MXFP4 x MXFP8 expert buffers [E, {shape[0]}, {shape[1]}] "
+                f"{dtype}; got {tuple(t.shape)} {t.dtype} on {type(backend).__name__}"
+            )
+
+
 def install(routed_experts) -> bool:
     """Opt-in switches on one MoE layer, each default off:
 
@@ -553,18 +575,8 @@ def install(routed_experts) -> bool:
     if edges and not k3_edges.slots():
         raise ValueError(f"{FGS_ENV} needs edge slots ({k3_edges.ENV}=chain|chain_after|lamport)")
     backend = routed_experts.backend
-    w31 = getattr(backend, "w3_w1_weight", None)
-    w31_s = getattr(backend, "w3_w1_weight_scale", None)
-    if moe_on and (
-        w31 is None
-        or w31.dtype != torch.uint8
-        or tuple(w31.shape[1:]) != (2 * INTER, HIDDEN // 2)
-        or tuple(w31_s.shape[1:]) != (2 * INTER, HIDDEN // SF_VEC)
-        or not hasattr(backend.activation, "gate_softcap")
-    ):
-        raise ValueError(
-            f"{ENV}=cute needs the TRTLLM-Gen MXFP4 x MXFP8 SiTU experts, got {type(backend).__name__}"
-        )
+    if moe_on and not hasattr(getattr(backend, "activation", None), "gate_softcap"):
+        raise ValueError(f"{ENV}=cute needs the SiTU experts, got {type(backend).__name__}")
     comm = getattr(routed_experts, "comm", None)
     a2a = k3_comm.install(comm) if comm_on and comm is not None else None
     if a2a is None and edges & _COMM_EDGES:
@@ -577,6 +589,7 @@ def install(routed_experts) -> bool:
     if not moe_on:
         return True
     stock_run_moe = backend.run_moe
+    checked = []
 
     def run_moe(ctx, *, workspace=None):
         plan = ctx.comm_plan
@@ -589,6 +602,9 @@ def install(routed_experts) -> bool:
         ):
             layer.abandon()
             return stock_run_moe(ctx, workspace=workspace)
+        if not checked:
+            _check_weights(backend)
+            checked.append(True)
         if ctx.x_ready_event is not None:
             ctx.x_ready_event.wait()
         layer.run_moe(ctx, out)
