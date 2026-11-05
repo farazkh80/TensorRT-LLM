@@ -30,10 +30,12 @@ Warp roles: 0-3 epilogue (thread = TMEM lane = stored weight row), 4 MMA, 5 weig
 Fine-grained sync with the neighbouring stages (int32 counter slabs, zero-armed by the caller, T = tile slots):
 - ``fc1_done[T * 12]``: before K stage k of token tile t the activation loader waits until ``fc1_done[t * 12 + k] >= 4``
   (FC1's four 64-column units of that stage). A gate warp (7) polls the counters ahead of the loader and hands it one
-  smem token per stage; the weight TMA does not wait.
+  smem token per stage; the weight TMA does not wait. FC1 counts only the first ``EARLY_TILES`` token tiles, so a unit
+  with a later tile waits for the FC1 grid (``griddepcontrol.wait`` in the gate warp) instead.
 - ``fc2_done[T]``: after a unit's ``y`` stores, a release add of 1 per token tile of the unit, so tile t is complete at
   28. The epilogue hands each unit to a signal warp (7 or 8) through an mbarrier; that warp issues one gpu-scope fence
-  per unit and relaxed adds, keeping the fence off the epilogue.
+  per unit and relaxed adds, keeping the fence off the epilogue. Dependents launch when each CTA starts its last unit,
+  so the consumer is resident for the end of the GEMM only.
 """
 
 from __future__ import annotations
@@ -56,6 +58,8 @@ from cutlass._mlir.dialects import llvm, nvvm
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.runtime import make_ptr
 from cutlass.cutlass_dsl import dsl_user_op
+
+from .sync import EARLY_TILES, spin_ns
 
 try:
     from cutlass.memory import TmemAllocator
@@ -124,6 +128,7 @@ class Fc2Kernel:
         timeline: bool = False,
         wait_fc1: bool = False,
         signal_fc2: bool = False,
+        delay_ns: int = 0,
     ):
         if tile_n not in TILE_NS:
             raise ValueError(f"tile_n must be one of {TILE_NS}, got {tile_n}")
@@ -145,6 +150,7 @@ class Fc2Kernel:
         self.timeline = timeline
         self.wait_fc1 = wait_fc1
         self.signal_fc2 = signal_fc2
+        self.delay_ns = delay_ns if signal_fc2 else 0
         self.mma_tiler = (TILE_M, self.n_max, K_STAGE)
         self.cta_group = tcgen05.CtaGroup.ONE
         self.a_dtype = cutlass.Float4E2M1FN
@@ -619,7 +625,8 @@ class Fc2Kernel:
             if lane == 0:
                 sNumGroups[0] = n_groups
         pipeline.pipeline_init_wait(cluster_shape_mn=(1, 1))
-        cute.arch.griddepcontrol_launch_dependents()
+        if cutlass.const_expr(not self.signal_fc2):
+            cute.arch.griddepcontrol_launch_dependents()
         # Equal rounds: the fewest CTAs that keep the round count, so no CTA finishes a unit behind the rest.
         num_units = sNumGroups[0] * M_TILES
         rounds = (num_units + grid_x - 1) // grid_x
@@ -643,6 +650,10 @@ class Fc2Kernel:
                     if i == 0:
                         if tidx % 32 == 0:
                             stamps[bidx * TIMELINE_FIELDS + 1] = cute.arch.globaltimer_lo()
+                if cutlass.const_expr(self.delay_ns > 0):
+                    # The last unit's y lands after the consumer has been released.
+                    if (i == num_mine - 1) & (bidx < M_TILES):
+                        spin_ns(cutlass.Int64(self.delay_ns))
                 for k_tile in cutlass.range(K_TILES, unroll=1):
                     ab_pipeline.producer_acquire(ab_state)
                     tma_bar = ab_pipeline.producer_get_barrier(ab_state)
@@ -764,7 +775,12 @@ class Fc2Kernel:
                     entry = sGroup[(bidx + i * used_ctas) // M_TILES]
                     first_tile = entry & 0xFFFF
                     n_tiles = (((entry >> 16) & 0xFF) + tile_n - 1) // tile_n
-                    missing = self._fc1_missing(fc1_done, first_tile, n_tiles, lane)
+                    missing = cutlass.Int32(0)
+                    if first_tile + n_tiles <= EARLY_TILES:
+                        missing = self._fc1_missing(fc1_done, first_tile, n_tiles, lane)
+                    else:
+                        # FC1 publishes no counters for these tiles: wait for its grid.
+                        cute.arch.griddepcontrol_wait()
                     for k_tile in cutlass.range(K_TILES, unroll=1):
                         if missing > 0:
                             self._wait_fc1_stage(fc1_done, first_tile, n_tiles, k_tile)
@@ -826,8 +842,12 @@ class Fc2Kernel:
             acc_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_acc_stage
             )
-            for _ in cutlass.range(num_mine, unroll=1):
+            for i in cutlass.range(num_mine, unroll=1):
                 acc_pipeline.producer_acquire(acc_state)
+                if cutlass.const_expr(self.signal_fc2):
+                    # The fc2_done consumer becomes resident for this CTA's last unit, not for the whole GEMM.
+                    if i == num_mine - 1:
+                        cute.arch.griddepcontrol_launch_dependents()
                 _tcgen05_fence_after_thread_sync()
                 tCtAcc = tCtAcc_base[(None, None, None, acc_state.index)]
                 for k_tile in cutlass.range(K_TILES, unroll=1):
@@ -980,6 +1000,7 @@ def _compiled(
     timeline: bool,
     wait_fc1: bool = False,
     signal_fc2: bool = False,
+    delay_ns: int = 0,
 ):
     kernel = Fc2Kernel(
         tile_n,
@@ -992,6 +1013,7 @@ def _compiled(
         timeline,
         wait_fc1,
         signal_fc2,
+        delay_ns,
     )
     fake = cute.AddressSpace.gmem
     args = (
@@ -1036,12 +1058,14 @@ def run(
     y: torch.Tensor,
     fc1_done: Optional[torch.Tensor] = None,
     fc2_done: Optional[torch.Tensor] = None,
+    hazard_delay_ns: int = 0,
 ) -> None:
     """``y[p] = bf16(dequant(act[p]) @ dequant(W2[e]).T)`` for every valid permuted row (moe_chain FC2 stage).
 
     ``fc1_done`` (int32 [T * 12]) and ``fc2_done`` (int32 [T]), T = ``plan.tile_idx_to_expert_idx.numel()``, are the
     counter slabs of the FC1 -> FC2 and FC2 -> finalize edges (module docstring). With ``fc1_done`` the kernel is
-    launched with PDL and does not wait for FC1's grid before streaming weights.
+    launched with PDL and does not wait for FC1's grid before streaming weights. ``hazard_delay_ns`` delays the last
+    unit of the first 28 CTAs in the ``fc2_done`` build (hazard tests only).
     """
     tile_n = plan.tile_n
     rows = act.shape[0]
@@ -1087,6 +1111,7 @@ def run(
         timeline,
         fc1_done is not None,
         fc2_done is not None,
+        hazard_delay_ns if fc2_done is not None else 0,
     )
     compiled(
         _ptr(cutlass.Float4E2M1FN, w2, 32),

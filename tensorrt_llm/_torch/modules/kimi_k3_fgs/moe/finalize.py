@@ -20,10 +20,10 @@ from typing import Optional
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import BFloat16, Float32, Int32
+from cutlass import BFloat16, Float32, Int32, Int64
 
 from ..moe_chain import HIDDEN, TOP_K
-from .sync import release_add, wait_at_least
+from .sync import release_add, spin_ns, wait_at_least_short
 
 _VEC = 8
 
@@ -41,13 +41,12 @@ def default_chunks(rows: int) -> int:
 
 
 class FinalizeKernel:
-    """``wait_fc2`` (M2c-1 consumer): no ``griddepcontrol.wait`` before the reads; each thread waits for
-    ``fc2_done[p // tile_n] >= fc2_expected`` before reading row p of ``y`` and the kernel waits for the producer grid
-    only at its end, so its completion still implies FC2's. ``signal`` (M2c-2 producer): dependents launch at entry,
-    and after a row chunk is stored one thread adds 1 to ``fin_done[row // max_tokens]`` (release); a source block of
-    ``max_tokens`` rows is complete at ``max_tokens * chunks``. The grid is then persistent over rows (``grid_rows``
-    CTAs per chunk, rows strided), so every CTA is resident once the dependents launch and early source blocks
-    complete first."""
+    """``wait_fc2`` (fc2_done consumer): no ``griddepcontrol.wait`` before the reads. One lane per k waits for
+    ``fc2_done[p // tile_n] >= fc2_expected`` and a CTA barrier orders every thread's ``y`` loads after those
+    acquires; the kernel waits for the producer grid only at its end, so its completion still implies FC2's.
+    ``signal`` (fin_done producer): dependents launch at entry, and after a row chunk is stored one thread adds 1 to
+    ``fin_done[row]`` (release), so a row is final at ``chunks``. Every CTA has started once the dependents launch,
+    so a dependent spinning on fin_done never waits for a CTA that is not resident."""
 
     def __init__(
         self,
@@ -57,6 +56,7 @@ class FinalizeKernel:
         wait_fc2: bool = False,
         fc2_expected: int = 0,
         signal: bool = False,
+        delay_ns: int = 0,
     ):
         vecs = hidden // _VEC
         assert hidden % _VEC == 0 and vecs % chunks == 0, (hidden, chunks)
@@ -68,6 +68,7 @@ class FinalizeKernel:
         self.wait_fc2 = wait_fc2
         self.fc2_expected = fc2_expected
         self.signal = signal
+        self.delay_ns = delay_ns
 
     @cute.jit
     def __call__(
@@ -79,8 +80,7 @@ class FinalizeKernel:
         mFc2: cute.Tensor,
         mFin: cute.Tensor,
         tile_n: Int32,
-        max_tokens: Int32,
-        grid_rows: Int32,
+        rows: Int32,
         stream,
     ):
         self.kernel(
@@ -91,9 +91,8 @@ class FinalizeKernel:
             mFc2,
             mFin,
             tile_n,
-            max_tokens,
         ).launch(
-            grid=[grid_rows, self.chunks, 1],
+            grid=[rows, self.chunks, 1],
             block=[self.threads, 1, 1],
             stream=stream,
             use_pdl=self.enable_pdl,
@@ -109,10 +108,9 @@ class FinalizeKernel:
         mFc2: cute.Tensor,
         mFin: cute.Tensor,
         tile_n: Int32,
-        max_tokens: Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, chunk, _ = cute.arch.block_idx()
+        row, chunk, _ = cute.arch.block_idx()
         col = chunk * self.threads + tidx
         if cutlass.const_expr(self.signal):
             cute.arch.griddepcontrol_launch_dependents()
@@ -121,50 +119,37 @@ class FinalizeKernel:
             if cutlass.const_expr(not self.signal):
                 cute.arch.griddepcontrol_launch_dependents()
 
-        if cutlass.const_expr(self.signal):
-            gdim, _, _ = cute.arch.grid_dim()
-            for row in cutlass.range(bidx, gO.shape[1][0], gdim, unroll=1):
-                self._row(gY, gW, gE, gO, mFc2, mFin, tile_n, max_tokens, row, col, tidx)
-        else:
-            self._row(gY, gW, gE, gO, mFc2, mFin, tile_n, max_tokens, bidx, col, tidx)
-        if cutlass.const_expr(self.wait_fc2):
-            cute.arch.griddepcontrol_wait()
-            if cutlass.const_expr(not self.signal):
-                cute.arch.griddepcontrol_launch_dependents()
-
-    @cute.jit
-    def _row(
-        self,
-        gY,
-        gW,
-        gE,
-        gO,
-        mFc2,
-        mFin,
-        tile_n: Int32,
-        max_tokens: Int32,
-        row: Int32,
-        col: Int32,
-        tidx: Int32,
-    ):
         e = cute.make_rmem_tensor(gE[(None, (row, 0))].shape, Int32)
         e.store(gE[(None, (row, 0))].load())
         w = cute.make_rmem_tensor(gW[(None, (row, 0))].shape, BFloat16)
         w.store(gW[(None, (row, 0))].load())
+        if cutlass.const_expr(self.wait_fc2):
+            if tidx < TOP_K:
+                p_lane = gE[((0, tidx), (row, 0))]
+                if p_lane >= 0:
+                    wait_at_least_short(
+                        (mFc2.iterator + p_lane // tile_n).toint(), Int32(self.fc2_expected)
+                    )
+            cute.arch.barrier()
         acc = cute.make_rmem_tensor(gO[(None, (row, col))].shape, Float32)
         acc.fill(0.0)
         for k in cutlass.range_constexpr(TOP_K):
             p = e[k]
             if p >= 0:
-                if cutlass.const_expr(self.wait_fc2):
-                    wait_at_least((mFc2.iterator + p // tile_n).toint(), Int32(self.fc2_expected))
                 acc.store(acc.load() + gY[(None, (p, col))].load().to(Float32) * Float32(w[k]))
+        if cutlass.const_expr(self.delay_ns > 0):
+            if row % 3 == 0:
+                spin_ns(Int64(self.delay_ns))
         gO[(None, (row, col))].store(acc.load().to(BFloat16))
 
         if cutlass.const_expr(self.signal):
             cute.arch.barrier()
             if tidx == 0:
-                release_add((mFin.iterator + row // max_tokens).toint(), Int32(1))
+                release_add((mFin.iterator + row).toint(), Int32(1))
+        if cutlass.const_expr(self.wait_fc2):
+            cute.arch.griddepcontrol_wait()
+            if cutlass.const_expr(not self.signal):
+                cute.arch.griddepcontrol_launch_dependents()
 
 
 @functools.lru_cache(maxsize=None)
@@ -175,8 +160,9 @@ def _compiled(
     wait_fc2: bool = False,
     fc2_expected: int = 0,
     signal: bool = False,
+    delay_ns: int = 0,
 ):
-    kernel = FinalizeKernel(hidden, chunks, enable_pdl, wait_fc2, fc2_expected, signal)
+    kernel = FinalizeKernel(hidden, chunks, enable_pdl, wait_fc2, fc2_expected, signal, delay_ns)
 
     def fake(dtype, cols):
         return cute.runtime.make_fake_compact_tensor(
@@ -197,7 +183,6 @@ def _compiled(
         fake_words(),
         Int32(1),
         Int32(1),
-        Int32(1),
         stream,
         options="--enable-tvm-ffi",
     )
@@ -213,12 +198,13 @@ def run(
     fc2_done: Optional[torch.Tensor] = None,
     fc2_expected: int = 28,
     fin_done: Optional[torch.Tensor] = None,
-    max_tokens: int = 0,
+    hazard_delay_ns: int = 0,
 ) -> None:
     """``moe_chain`` finalize stage: y bf16 [P, 3584] (permuted rows), topk_w bf16 [R, 16], out bf16 [R, 3584].
 
-    ``fc2_done`` (int32, one word per tile_n-row tile) makes it the M2c-1 consumer; ``fin_done`` (int32, one word per
-    source block of ``max_tokens`` rows) the M2c-2 producer. Both are zero-armed counter slabs owned by the caller.
+    ``fc2_done`` (int32, one word per tile_n-row tile) makes it the FC2 -> finalize consumer; ``fin_done`` (int32,
+    one word per row of ``out``) the finalize -> combine producer. Both are zero-armed counter slabs owned by the
+    caller. ``hazard_delay_ns`` delays the stores of every third row of the producer build (hazard tests only).
     """
     rows = out.shape[0]
     if rows == 0:
@@ -229,8 +215,8 @@ def run(
             raise ValueError("finalize: operands must be contiguous and 16-byte aligned")
     if y.shape[1] != HIDDEN or out.shape[1] != HIDDEN or topk_w.shape != (rows, TOP_K):
         raise ValueError(f"finalize: bad shapes y {tuple(y.shape)} topk_w {tuple(topk_w.shape)}")
-    if fin_done is not None and (max_tokens <= 0 or fin_done.numel() * max_tokens < rows):
-        raise ValueError("finalize: fin_done needs max_tokens and one word per source block")
+    if fin_done is not None and fin_done.numel() < rows:
+        raise ValueError("finalize: fin_done needs one word per row")
     chunks = chunks or default_chunks(rows)
     wait_fc2, signal = fc2_done is not None, fin_done is not None
     fn = _compiled(
@@ -240,6 +226,7 @@ def run(
         wait_fc2,
         fc2_expected if wait_fc2 else 0,
         signal,
+        hazard_delay_ns if signal else 0,
     )
     words = plan.num_non_exiting_tiles
     fn(
@@ -250,16 +237,5 @@ def run(
         (fc2_done if wait_fc2 else words).view(-1),
         (fin_done if signal else words).view(-1),
         plan.tile_n,
-        max(max_tokens, 1),
-        min(rows, _persistent_rows(out.device)) if signal else rows,
+        rows,
     )
-
-
-@functools.lru_cache(maxsize=None)
-def _persistent_rows(device: torch.device) -> int:
-    """Rows in flight of the persistent producer grid: one CTA of each chunk per SM, which runs as fast as larger
-    grids and leaves room on every SM for the CTAs of the dependent push."""
-    override = os.environ.get("TLLM_K3_MOE_FIN_GRID_ROWS")
-    if override:
-        return int(override)
-    return torch.cuda.get_device_properties(device).multi_processor_count

@@ -64,3 +64,32 @@ def wait_at_least(addr: cutlass.Int64, expected: Int32):
         nanosleep(delay)
         delay = cutlass.min(delay * 2, Int32(512))
         seen = ld_acquire(addr)
+
+
+@cute.jit
+def wait_at_least_short(addr: cutlass.Int64, expected: Int32):
+    """``wait_at_least`` with the backoff capped at 128 ns, for a wait on the critical path."""
+    delay = Int32(32)
+    seen = ld_acquire(addr)
+    while seen < expected:
+        nanosleep(delay)
+        delay = cutlass.min(delay * 2, Int32(128))
+        seen = ld_acquire(addr)
+
+
+@dsl_user_op
+def globaltimer(*, loc=None, ip=None) -> cutlass.Int64:
+    return cutlass.Int64(_asm(T.i64(), [], "mov.u64 $0, %globaltimer;", "=l", loc, ip))
+
+
+@cute.jit
+def spin_ns(ns: cutlass.Int64):
+    """Busy-wait ``ns`` nanoseconds (hazard tests only)."""
+    start = globaltimer()
+    while globaltimer() - start < ns:
+        nanosleep(Int32(1000))
+
+
+# The FC1 -> FC2 counters cover the first EARLY_TILES token tiles only. The FC2 CTAs that start in FC1's tail take
+# those tiles first; FC2 units of later tiles wait for the FC1 grid instead, which saves FC1 a fence per item.
+EARLY_TILES = 8

@@ -450,12 +450,20 @@ if _CUTE_AVAILABLE:
         while _globaltimer() - start < Int64(ns):
             pass
 
+    @dsl_user_op
+    def _nanosleep(ns, *, loc=None, ip=None) -> None:
+        _asm(None, [_v(ns, Int32, loc, ip)], "nanosleep.u32 $0;", "r", loc, ip)
+
     @cute.jit
     def _spin_ge_acquire(addr: Int64, target: Int32, timeout_ns: Int64):
+        """Acquire polling with a 32..256 ns sleep between polls: one waiter per push warp."""
         start = _globaltimer()
+        delay = Int32(32)
         while _ld_acquire_b32(addr) < target:
             if _globaltimer() - start > timeout_ns:
                 _trap()
+            _nanosleep(delay)
+            delay = cutlass.min(delay * 2, Int32(256))
 
     @cute.jit
     def _spin_ge64(addr: Int64, target: Int64, timeout_ns: Int64):
@@ -950,13 +958,9 @@ if _CUTE_AVAILABLE:
             my_ws = ws_base + Int64(rank) * ws_stride
 
             if cutlass.const_expr(self.fgs):
-                # Rows of source block s are final once fin_done[s] counts all their finalize units; the round
-                # flag still holds the dispatch value (the reduce advances it).
+                # Row t of source block s is final once fin_done[s * max_tokens + t] counts its finalize units; the
+                # round flag still holds the dispatch value (the reduce advances it).
                 cute.arch.griddepcontrol_launch_dependents()
-                if tidx == 0:
-                    _spin_ge_acquire(fin_done + source * 4, fin_expected, timeout_ns)
-                    _fence_proxy_async_global()
-                cute.arch.sync_threads()
                 flag = _ld_b32(my_ws + L["flag"]) + 1
             else:
                 cute.arch.griddepcontrol_wait()
@@ -983,6 +987,13 @@ if _CUTE_AVAILABLE:
                             for t in cutlass.range(
                                 by * _PUSH_WARPS + warp, n, nby * _PUSH_WARPS, unroll=1
                             ):
+                                if cutlass.const_expr(self.fgs):
+                                    _spin_ge_acquire(
+                                        fin_done + (Int64(source) * max_tokens + t) * 4,
+                                        fin_expected,
+                                        timeout_ns,
+                                    )
+                                    _fence_proxy_async_global()
                                 _bulk_g2s(
                                     stage,
                                     src + (Int64(source) * max_tokens + t) * src_stride,
@@ -1004,20 +1015,8 @@ if _CUTE_AVAILABLE:
                                 )
                                 _fabric_submit_wait()
             if cutlass.const_expr(self.fgs):
-                if source == rank:
-                    parity = ((flag - 1) >> 1) & 1
-                    n = _ld_b32(my_ws + L["recv_counters"] + (parity * self.ep + rank) * 4)
-                    for t in cutlass.range(by, n, nby, unroll=1):
-                        g = Int64(rank) * max_tokens + t
-                        for v in cutlass.range(tidx, self.nbytes // 16, _PUSH_WARPS * 32, unroll=1):
-                            w = _ld_v4(src + g * src_stride + v * 16)
-                            _st_v4(
-                                my_ws + L["combine_recv"] + g * self.nbytes + v * 16,
-                                w[0],
-                                w[1],
-                                w[2],
-                                w[3],
-                            )
+                # Completion of this grid still implies the finalize's (and, through it, the expert path's).
+                cute.arch.griddepcontrol_wait()
 
     class _Reduce:
         """out[t] = sum over the k contributions of token t, in the stock order: two sources add directly; more
@@ -1051,10 +1050,19 @@ if _CUTE_AVAILABLE:
             max_tokens: Int32,
             static_max: Int32,
             timeout_ns: Int64,
+            own_base: Int64,
             stream,
         ):
             self.kernel(
-                mOut, ws_base, ws_stride, rank, n_local, max_tokens, static_max, timeout_ns
+                mOut,
+                ws_base,
+                ws_stride,
+                rank,
+                n_local,
+                max_tokens,
+                static_max,
+                timeout_ns,
+                own_base,
             ).launch(
                 grid=[cutlass.max(n_local, Int32(1)), 1, 1],
                 block=[_THREADS, 1, 1],
@@ -1074,6 +1082,7 @@ if _CUTE_AVAILABLE:
             max_tokens: Int32,
             static_max: Int32,
             timeout_ns: Int64,
+            own_base: Int64,
         ):
             L = self.lay
             out = mOut.iterator.toint()
@@ -1116,9 +1125,12 @@ if _CUTE_AVAILABLE:
                     if lane == 0:
                         s_n[0] = cute.arch.popc(valid)
                     if di >= 0:
-                        s_src[cute.arch.popc(valid & ((Int32(1) << lane) - 1))] = (
-                            inbox + (Int64(tr) * max_tokens + di) * nbytes
-                        )
+                        row_src = inbox + (Int64(tr) * max_tokens + di) * nbytes
+                        if cutlass.const_expr(self.fgs):
+                            # The push copies no own rows: they are read from the payload itself.
+                            if tr == rank:
+                                row_src = own_base + (Int64(rank) * max_tokens + di) * nbytes
+                        s_src[cute.arch.popc(valid & ((Int32(1) << lane) - 1))] = row_src
                 cute.arch.sync_threads()
                 # Threads load slots warp 0 waited for: each fences after the barrier.
                 _fence_fabric_acquire()
@@ -1232,6 +1244,7 @@ if _CUTE_AVAILABLE:
                 i32,
                 i32,
                 i64,
+                i64,
                 stream,
                 options=opt,
             )
@@ -1269,9 +1282,10 @@ class CuteA2A:
     the counts, the sanitize and the flags are done. The data wait then belongs to the routing kernel
     (``routing.run(..., source=a2a.routing_source())``), which waits per source block and advances the per-source
     byte-counter baselines; it must run in every such round.
-    ``combine(..., fin_done=c, fin_expected=x)`` skips the combine prepare and the push waits per source block s
-    until ``c[s] >= x`` (the finalize units of rows [s * max, (s + 1) * max)) instead of waiting for the finalize
-    grid; the reduce advances the round flag. ``combine(..., out=slot)`` writes the result into ``slot`` (bf16
+    ``combine(..., fin_done=c, fin_expected=x)`` skips the combine prepare: the push and the reduce launch with PDL,
+    each push warp sends one row as soon as its word ``c[s * max + t] >= x`` (the finalize units of row t of source
+    block s), the reduce reads this rank's own rows from the payload instead of a copy, and it advances the round
+    flag. ``combine(..., out=slot)`` writes the result into ``slot`` (bf16
     [local_tokens, hidden]) with -0.0 stored as +0.0, for a sentinel-armed edge slot. ``hazard_delay_ns`` delays the
     dispatch data issue / the combine output stores, for the hazard tests only.
     """
@@ -1444,8 +1458,15 @@ class CuteA2A:
             _compile("prepare_combine", self.ep, nbytes, lay, pdl)(
                 y.view(-1), my_ws, nbytes, self.rank, runtime_max
             )
-        blocks = min(32, max(1, (runtime_max + 2 * _PUSH_WARPS - 1) // (2 * _PUSH_WARPS)))
-        _compile("push", self.ep, nbytes, lay, pdl, fgs)(
+        # FGS: one row per push warp, so each row goes out as soon as its finalize units are counted.
+        rows_per_warp = 1 if fgs else 2
+        blocks = min(
+            32,
+            max(
+                1, (runtime_max + rows_per_warp * _PUSH_WARPS - 1) // (rows_per_warp * _PUSH_WARPS)
+            ),
+        )
+        _compile("push", self.ep, nbytes, lay, pdl or fgs, fgs)(
             y.view(-1),
             ws_base,
             ws_stride,
@@ -1459,7 +1480,7 @@ class CuteA2A:
             fin_expected,
             _TIMEOUT_NS,
         )
-        _compile("reduce", self.ep, comm.top_k, hidden, lay, pdl, fgs, pzo, hazard_delay_ns)(
+        _compile("reduce", self.ep, comm.top_k, hidden, lay, pdl or fgs, fgs, pzo, hazard_delay_ns)(
             out.view(-1),
             ws_base,
             ws_stride,
@@ -1468,6 +1489,7 @@ class CuteA2A:
             runtime_max,
             self.lay.max_tokens,
             _TIMEOUT_NS,
+            y.data_ptr() if fgs else 0,
         )
         comm.reset_state()
         return out

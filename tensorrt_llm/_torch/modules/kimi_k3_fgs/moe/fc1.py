@@ -48,7 +48,7 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import make_ptr
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from .sync import wait_at_least
+from .sync import EARLY_TILES, spin_ns, wait_at_least
 
 HIDDEN = 3584
 INTER = 3072
@@ -323,6 +323,7 @@ class Fc1Kernel:
         num_acc_stages: int = 2,
         num_tile_stages: int = 6,
         num_stored_stages: int = 4,
+        delay_ns: int = 0,
     ):
         if n_tile not in (8, 16, 32):
             raise ValueError(f"n_tile must be 8, 16 or 32, got {n_tile}")
@@ -335,6 +336,7 @@ class Fc1Kernel:
         self.use_pdl = use_pdl
         self.wait_plan = wait_plan
         self.signal_done = signal_done
+        self.delay_ns = delay_ns if signal_done else 0
         self.max_ab_stages = max_ab_stages
         self.num_acc_stage = num_acc_stages
         self.num_tile_stage = num_tile_stages
@@ -1153,6 +1155,10 @@ class Fc1Kernel:
             inv_linear_cap = cutlass.Float32(1.0 / self.linear_cap)
             parity = cutlass.Int32(0)
 
+            if cutlass.const_expr(self.delay_ns > 0):
+                # CTA c starts with item c: the first NUM_M_TILES CTAs hold token tile 0.
+                if bidx < NUM_M_TILES:
+                    spin_ns(cutlass.Int64(self.delay_ns))
             while info[4] == 1:
                 m_tile = info[0]
                 row_base = info[1] * n_tile
@@ -1250,7 +1256,8 @@ class Fc1Kernel:
             tmem.free(tmem_ptr)
 
         # Signal warp: after all stores of (token tile t, weight tile j), fc1_done[t * 12 + j // 4] += 1 with release
-        # semantics, for both tiles of a pair. The GPU-scope fence slows the whole SM, so a pair shares one.
+        # semantics, for both tiles of a pair and for t < EARLY_TILES only. The GPU-scope fence slows the whole SM,
+        # so a pair shares one.
         if cutlass.const_expr(self.signal_done):
             if warp_idx == self.signal_warp_id:
                 stored_state = pipeline.make_pipeline_state(
@@ -1267,7 +1274,7 @@ class Fc1Kernel:
                 info_state.advance()
                 while info[4] == 1:
                     stored_pipeline.consumer_wait(stored_state)
-                    if tidx % self.threads_per_warp == 0:
+                    if (tidx % self.threads_per_warp == 0) & (info[1] < EARLY_TILES):
                         done = mFc1Done.iterator + info[1] * DONE_PER_TILE + info[0] // 4
                         cute.arch.fence_acq_rel_gpu()
                         _red_add_gpu(done.toint(), cutlass.Int32(1))
@@ -1375,15 +1382,17 @@ def _check_word(name, t, words):
         raise ValueError(f"{name} must be a contiguous int32 tensor of at least {words} words")
 
 
-def run(x, x_sf, weights, plan, act, act_sf, *, plan_ready=None, fc1_done=None):
+def run(x, x_sf, weights, plan, act, act_sf, *, plan_ready=None, fc1_done=None, hazard_delay_ns=0):
     """FC1 of the moe_chain contract: act[p], act_sf[p] = MXFP8(SiTU-GLU(x[p2e[p] // 16] @ W31[e]^T)) for every
     valid permuted row p of expert e; rows past each tile's mn_limit are left untouched. Launches one kernel on the
     current stream; no allocation, no host synchronization.
 
     ``plan_ready`` (int32 word, zero-armed, raised to >= 1 by routing after its plan stores) makes FC1 the M2b
     consumer: the plan is read only after the word is acquired. ``fc1_done`` (int32 [T * 12], zero-armed) makes it
-    the M2a producer: after the stores of weight tile j of token tile t, fc1_done[t * 12 + j // 4] is incremented
-    with release semantics, so each 256-channel K stage of a tile reaches 4. Both are owned by the caller."""
+    the FC1 -> FC2 producer: after the stores of weight tile j of token tile t < ``EARLY_TILES``,
+    fc1_done[t * 12 + j // 4] is incremented with release semantics, so each 256-channel K stage of such a tile
+    reaches 4 (later tiles are covered by the grid dependency). Both are owned by the caller. ``hazard_delay_ns``
+    delays the stores of token tile 0 in the ``fc1_done`` build (hazard tests only)."""
     _check(x, x_sf, weights, plan, act, act_sf)
     _check_word("plan_ready", plan_ready, 1)
     _check_word("fc1_done", fc1_done, plan.tile_idx_to_expert_idx.shape[0] * DONE_PER_TILE)
@@ -1394,10 +1403,12 @@ def run(x, x_sf, weights, plan, act, act_sf, *, plan_ready=None, fc1_done=None):
         _use_pdl(),
         plan_ready is not None,
         fc1_done is not None,
+        hazard_delay_ns if fc1_done is not None else 0,
     )
     args = _launch_args(x, x_sf, weights, plan, act, act_sf, plan_ready, fc1_done)
     stream = cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
     compiled = _compiled.get(key)
     if compiled is None:
-        compiled = _compiled[key] = cute.compile(Fc1Kernel(*key), *args, stream)
+        kernel = Fc1Kernel(*key[:6], delay_ns=key[6])
+        compiled = _compiled[key] = cute.compile(kernel, *args, stream)
     compiled(*args, stream)

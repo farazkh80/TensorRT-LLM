@@ -57,7 +57,8 @@ FC1_K_STAGES = INTER // 256
 # Rows per rank the expert-path edges serve; the tail edges stop where the split-K up-projection consumer does.
 FGS_MAX_ROWS = int(os.environ.get("TLLM_K3_MOE_FGS_MAX_ROWS", "64"))
 TAIL_FGS_MAX_ROWS = 32
-# Hazard tests only: the CuTe combine and routing delay their FGS-published stores by this many ns.
+# Hazard tests only: the FGS producers (routing, FC1, FC2, finalize, combine) delay some published stores by this
+# many ns.
 _HAZARD_DELAY_NS = int(os.environ.get("TLLM_K3_MOE_HAZARD_DELAY_NS", "0"))
 MAX_ROWS_ENV = "TLLM_K3_MOE_MAX_ROWS"
 
@@ -341,10 +342,30 @@ def _missing_sides(edges: frozenset, moe_on: bool, comm_on: bool, tail_on: bool)
     return [f"{edge}: {what}" for edge in sorted(edges) for ok, what in need[edge] if not ok]
 
 
-def _counter_words(edge: str, tiles: int, ep: int) -> int:
+def _counter_words(edge: str, tiles: int, ep: int, rows: int = FGS_MAX_ROWS) -> int:
     """int32 words of ``edge``'s counter slab for a plan of ``tiles`` token tiles (the kernels size their checks by the
-    workspace's plan, which can exceed the current forward's)."""
-    return {"route_fc1": 1, "fc1_fc2": tiles * FC1_K_STAGES, "fc2_fin": tiles, "fin_push": ep}[edge]
+    workspace's plan, which can exceed the current forward's) and ``rows`` tokens per source rank."""
+    return {
+        "route_fc1": 1,
+        "fc1_fc2": tiles * FC1_K_STAGES,
+        "fc2_fin": tiles,
+        "fin_push": ep * rows,
+    }[edge]
+
+
+# Default row windows (tokens per rank) of the counter edges; TLLM_K3_MOE_FGS_ROWS=edge:low-high,... overrides them.
+# On the DEP4 layer subset the per-row push pays up to 32 rows (above, the push waits on rows that finish together),
+# and the FC2 -> finalize counters cost more than they hide at a few rows.
+_EDGE_ROWS = {"fin_push": (1, 32), "fc2_fin": (9, 32)}
+
+
+def _edge_rows(edge: str) -> tuple:
+    windows = dict(_EDGE_ROWS)
+    for item in filter(None, os.environ.get("TLLM_K3_MOE_FGS_ROWS", "").split(",")):
+        name, _, span = item.partition(":")
+        low, _, high = span.partition("-")
+        windows[name] = (int(low), int(high or low))
+    return windows.get(edge, (1, FGS_MAX_ROWS))
 
 
 def _max_tiles(rows: int, num_local: int, num_experts: int) -> int:
@@ -365,7 +386,11 @@ class _Call:
             ws = layer.workspace(r)
             tiles = ws.plan.tile_idx_to_expert_idx.numel()
             for edge in counters:
-                words = _counter_words(edge, tiles, layer.ep)
+                low, high = _edge_rows(edge)
+                if not low <= rows <= high:
+                    k3_edges.debug(f"moe.{edge}", rows, f"off: outside its rows {low}..{high}")
+                    continue
+                words = _counter_words(edge, tiles, layer.ep, rows)
                 if words > layer.words[edge]:
                     k3_edges.debug(
                         f"moe.{edge}",
@@ -445,7 +470,7 @@ class _Layer:
             _bucket_rows(rows, self.num_experts, self.max_rows),
         )
 
-    def stage_kwargs(self, call: Optional[_Call], max_tokens: int) -> Dict[str, dict]:
+    def stage_kwargs(self, call: Optional[_Call]) -> Dict[str, dict]:
         kw = {"routing": {"enable_pdl": _pdl()}, "fc1": {}, "fc2": {}, "finalize": {}}
         if call is None:
             return kw
@@ -458,12 +483,17 @@ class _Layer:
             kw["fc1"]["plan_ready"] = call.slab("route_fc1")
         if call.on("fc1_fc2"):
             kw["fc1"]["fc1_done"] = kw["fc2"]["fc1_done"] = call.slab("fc1_fc2")
+            if _HAZARD_DELAY_NS:
+                kw["fc1"]["hazard_delay_ns"] = _HAZARD_DELAY_NS
         if call.on("fc2_fin"):
             kw["fc2"]["fc2_done"] = kw["finalize"]["fc2_done"] = call.slab("fc2_fin")
             kw["finalize"]["fc2_expected"] = HIDDEN // 128
+            if _HAZARD_DELAY_NS:
+                kw["fc2"]["hazard_delay_ns"] = _HAZARD_DELAY_NS
         if call.on("fin_push"):
             kw["finalize"]["fin_done"] = call.slab("fin_push")
-            kw["finalize"]["max_tokens"] = max_tokens
+            if _HAZARD_DELAY_NS:
+                kw["finalize"]["hazard_delay_ns"] = _HAZARD_DELAY_NS
         return kw
 
     def run_moe(self, ctx, out: torch.Tensor) -> None:
@@ -474,7 +504,6 @@ class _Layer:
         topk_w = ctx.token_final_scales
         if topk_w.dtype != torch.bfloat16:
             topk_w = topk_w.to(torch.bfloat16)
-        max_tokens = ctx.x.shape[0] // self.ep
         run_expert_path(
             ctx.x,
             ctx.x_sf.view(torch.uint8),
@@ -483,7 +512,7 @@ class _Layer:
             ExpertWeights.from_backend(self.backend),
             out,
             ws=self.workspace(ctx.x.shape[0]),
-            stage_kwargs=self.stage_kwargs(call, max_tokens),
+            stage_kwargs=self.stage_kwargs(call),
         )
         if call is not None:
             for edge in ("route_fc1", "fc1_fc2", "fc2_fin"):
@@ -556,10 +585,7 @@ class _Layer:
             fin_kw = {}
             if call.on("fin_push"):
                 rows = final_hidden_states.numel() // HIDDEN
-                fin_kw = {
-                    "fin_done": call.slab("fin_push"),
-                    "fin_expected": call.rows * finalize_chunks(rows),
-                }
+                fin_kw = {"fin_done": call.slab("fin_push"), "fin_expected": finalize_chunks(rows)}
             out = call.leases["comb_norm"].tensor if call.on("comb_norm") else None
             if _HAZARD_DELAY_NS:
                 fin_kw["hazard_delay_ns"] = _HAZARD_DELAY_NS
