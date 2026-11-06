@@ -121,9 +121,13 @@ from ..distributed import (
 )
 from ..distributed.symm_mem_allgather import SymmetricMemoryAllGather
 from ..model_config import ModelConfig
-from ..modules.fine_grained_sync import get_stream_manager, maybe_stage
+from ..modules.fine_grained_sync import active_stream_manager, get_stream_manager, maybe_stage
 from ..modules.gated_mlp import GatedMLP
 from ..modules.kimi_k3_fgs import edges as k3_fgs_edges
+from ..modules.kimi_k3_fgs import kda_chain as k3_kda_chain
+from ..modules.kimi_k3_fgs import mla_chain as k3_mla_chain
+from ..modules.kimi_k3_fgs import moe_chain as k3_moe_chain
+from ..modules.kimi_k3_fgs import moe_streams as k3_moe_streams
 from ..modules.kimi_kda import KimiKDALinearAttention
 from ..modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
 from ..modules.linear import (
@@ -465,8 +469,8 @@ KIMI_K3_CUTE_NORM_FOLD_ENV = "TLLM_K3_CUTE_NORM_FOLD"
 """With ``TLLM_K3_CUTE_NORM=1``, set to ``1`` to fold each layer's closing ``prefix + MoE output`` add into the next
 layer's attention-residual kernel, which also writes a snapshot layer's prefix straight into the bank. The MoE output
 is untouched and the fused add is the same bf16 rounding of the fp32 sum, so results match the unfolded CuTe path
-bitwise. Layers that cannot fold (FGS stages, DSpark capture, token-sliced helix layers, no snapshot yet) add first,
-as stock does. Without ``TLLM_K3_CUTE_NORM=1`` it has no effect.
+bitwise. Layers that cannot fold (FGS stages, DSpark capture, no snapshot yet) add first, as stock does.
+Without ``TLLM_K3_CUTE_NORM=1`` it has no effect.
 """
 
 _CUTE_NORM_FOLD_ENABLED = (
@@ -535,6 +539,8 @@ def _cute_attn_res(
     output_norm: Optional[nn.Module] = None,
     addend: Optional[torch.Tensor] = None,
     updated: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    **fgs_kwargs,
 ):
     M, H = prefix_sum.shape
     N = int(block_residual.shape[0]) + 1
@@ -560,6 +566,8 @@ def _cute_attn_res(
         float(norm.eps),
         addend=addend,
         updated=updated,
+        out=out,
+        **fgs_kwargs,
         **kwargs,
     )
 
@@ -1508,6 +1516,7 @@ class KimiK3MoERuntime(nn.Module):
         self.experts_per_rank = len(local_expert_ids)
         self.expert_lo = local_expert_ids[0]
         self.expert_hi = self.expert_lo + self.experts_per_rank
+        k3_moe_chain.install(self.routed_experts)
 
         shared_intermediate = cfg.moe_intermediate_size * cfg.num_shared_experts
         attention_dp = model_config.mapping.enable_attention_dp
@@ -1856,30 +1865,68 @@ class KimiK3MoERuntime(nn.Module):
         """``hidden_states``: ``[num_tokens, hidden_size]`` bf16."""
         identity = hidden_states
         projected_input = None
+        k3_tail = k3_moe_chain.tail_enabled() and not self._reduce_routed_output
         early_routed_in = None
-        if self._can_fuse_router_down(hidden_states):
-            router_logits, projected_input = torch.ops.trtllm.dsv3_router_latent_gemm_op(
-                hidden_states, self.gate.weight, self.routed_expert_down_proj.weight
-            )
-        else:
-            if (
-                self.latent_down_stream is not None
-                and do_multi_stream()
-                and not torch.compiler.is_compiling()
-            ):
-                # Forked ahead of the router GEMM: the latent chain needs only
-                # hidden_states.
-                self.moe_latent_fork_event.record()
-                with torch.cuda.stream(self.latent_down_stream):
-                    self.moe_latent_fork_event.wait()
+        fgs = active_stream_manager()
+        k3_entry = k3_moe_chain.entry(self, hidden_states, all_rank_num_tokens)
+        rows = hidden_states.shape[0]
+        fuse_router_down = self._can_fuse_router_down(hidden_states)
+        branches = (
+            fgs is None
+            and k3_entry is None
+            and not fuse_router_down
+            and k3_moe_streams.branches_enabled()
+            and getattr(self.routed_experts, "comm", None) is not None
+            and do_multi_stream()
+            and not torch.compiler.is_compiling()
+            # The DP zero-row padding and the multi-chunk path read the latent activations before quantize.
+            and all_rank_num_tokens is not None
+            and min(all_rank_num_tokens) > 0
+            and self.routed_experts.calculate_num_chunks(all_rank_num_tokens) == 1
+        )
+        with maybe_stage(fgs, "moe.router"):
+            if k3_entry is not None:
+                projected_input, router_logits = k3_entry
+            elif fuse_router_down:
+                router_logits, projected_input = torch.ops.trtllm.dsv3_router_latent_gemm_op(
+                    hidden_states, self.gate.weight, self.routed_expert_down_proj.weight
+                )
+            elif branches:
+                if not hasattr(self, "_k3_branch_fork"):
+                    self._k3_branch_fork = torch.cuda.Event()
+                    self._k3_latent_ready = torch.cuda.Event()
+                    self._k3_routed_done = torch.cuda.Event()
+                router_stream, latent_stream = k3_moe_streams.branch_streams(hidden_states.device)
+                self._k3_branch_fork.record()
+                with torch.cuda.stream(latent_stream):
+                    self._k3_branch_fork.wait()
                     early_routed_in = self._routed_projection(
                         hidden_states, self.routed_expert_down_proj
                     )
-                    self.moe_latent_ready_event.record()
-                # No record_stream (under graph capture it holds every layer's
-                # blocks until capture ends): both tensors are read on main only
-                # after the join, and later work on this stream forks from main.
-            router_logits = self.gate.compute_logits(hidden_states)
+                    self._k3_latent_ready.record()
+                k3_moe_streams.arm_latent_join(self.routed_experts, self._k3_latent_ready, rows)
+                with torch.cuda.stream(router_stream):
+                    self._k3_branch_fork.wait()
+                    router_logits = self.gate.compute_logits(hidden_states)
+            else:
+                if (
+                    self.latent_down_stream is not None
+                    and do_multi_stream()
+                    and not torch.compiler.is_compiling()
+                ):
+                    # Forked ahead of the router GEMM: the latent chain needs only
+                    # hidden_states.
+                    self.moe_latent_fork_event.record()
+                    with torch.cuda.stream(self.latent_down_stream):
+                        self.moe_latent_fork_event.wait()
+                        early_routed_in = self._routed_projection(
+                            hidden_states, self.routed_expert_down_proj
+                        )
+                        self.moe_latent_ready_event.record()
+                    # No record_stream (under graph capture it holds every layer's
+                    # blocks until capture ends): both tensors are read on main only
+                    # after the join, and later work on this stream forks from main.
+                router_logits = self.gate.compute_logits(hidden_states)
         moe_all_reduce = self.routed_experts.all_reduce if self._reduce_routed_output else None
         overlap_shared_allreduce = (
             self._defer_shared_allreduce
@@ -1899,43 +1946,103 @@ class KimiK3MoERuntime(nn.Module):
             # replaced the projection module, call it directly: its weight is
             # an e4m3 buffer the bf16 dsv3 op must not read, and its forward
             # is already a single fused GEMM (fp8_swap_ab_gemm).
-            moe_kwargs = {}
-            if projected_input is not None:
-                routed_in = projected_input
-            elif early_routed_in is not None:
-                routed_in = early_routed_in
-                # ConfigurableMoE joins the event before its first read of x.
-                moe_kwargs = {"input_ready_event": self.moe_latent_ready_event}
-            else:
-                routed_in = self._routed_projection(hidden_states, self.routed_expert_down_proj)
-            y = self.routed_experts(
-                routed_in,
-                router_logits,
-                all_rank_num_tokens=all_rank_num_tokens,
-                **moe_kwargs,
-            )
-            if overlap_shared_allreduce:
-                self.moe_routed_event.record()
-            if self._reduce_routed_output:
-                return y
-            # Communication-backed paths return a complete routed result.
-            y = self.routed_expert_norm(y)
-            return self._routed_projection(y, self.routed_expert_up_proj)
+            with maybe_stage(fgs, "moe.routed", after=("moe.router",)):
+                moe_kwargs = {}
+                if projected_input is not None:
+                    routed_in = projected_input
+                elif early_routed_in is not None:
+                    routed_in = early_routed_in
+                    if not branches:
+                        # ConfigurableMoE joins the event before its first read of x.
+                        moe_kwargs = {"input_ready_event": self.moe_latent_ready_event}
+                else:
+                    routed_in = self._routed_projection(hidden_states, self.routed_expert_down_proj)
+                y = self.routed_experts(
+                    routed_in,
+                    router_logits,
+                    all_rank_num_tokens=all_rank_num_tokens,
+                    **moe_kwargs,
+                )
+                if overlap_shared_allreduce:
+                    self.moe_routed_event.record()
+                if self._reduce_routed_output:
+                    return y
+                # Communication-backed paths return a complete routed result.
+                if k3_tail:
+                    return y
+                y = self.routed_expert_norm(y)
+                return self._routed_projection(y, self.routed_expert_up_proj)
+
+        gate = os.environ.get("TLLM_K3_SHARED_AT")
+        comm = getattr(self.routed_experts, "comm", None)
+        max_tokens = int(os.environ.get("TLLM_K3_SHARED_AT_MAX_TOKENS", "0"))
+        if max_tokens and hidden_states.shape[0] > max_tokens:
+            gate = None
+        gate = gate if gate and comm is not None and do_multi_stream() else None
+        if gate not in (None, "dispatch_start", "dispatch_end"):
+            raise ValueError(f"TLLM_K3_SHARED_AT={gate!r}; valid: dispatch_start, dispatch_end")
+        if gate:
+            if not hasattr(self, "_shared_gate_event"):
+                self._shared_gate_event = torch.cuda.Event()
+            # Per instance: the CuTe all-to-all installs its dispatch on the instance, which a class patch misses.
+            if not getattr(comm, "_k3_gate_patched", False):
+                orig_dispatch = comm.dispatch
+
+                def gated_dispatch(*a, _comm=comm, _orig=orig_dispatch, **k):
+                    ev = getattr(_comm, "_k3_gate", None)
+                    if ev is not None:
+                        k3_fgs_edges.debug(
+                            "moe.shared_at", ev[2], f"{ev[1]} on {type(_comm).__name__}"
+                        )
+                    if ev is not None and ev[1] == "dispatch_start":
+                        ev[0].record()
+                    out = _orig(*a, **k)
+                    if ev is not None and ev[1] == "dispatch_end":
+                        ev[0].record()
+                    return out
+
+                comm.dispatch = gated_dispatch
+                comm._k3_gate_patched = True
+            comm._k3_gate = (self._shared_gate_event, gate, hidden_states.shape[0])
+            shared_down_at = k3_moe_streams.shared_down_at()
+            if shared_down_at:
+                if not hasattr(self, "_k3_shared_down_event"):
+                    self._k3_shared_down_event = torch.cuda.Event()
+                k3_moe_streams.arm_shared_down(
+                    comm,
+                    self.shared_experts.down_proj,
+                    self._k3_shared_down_event,
+                    rows,
+                    shared_down_at,
+                )
+
+        def _routed_on_branch():
+            with torch.cuda.stream(router_stream):
+                out = _routed_output()
+                k3_moe_streams.finish_latent_join(self.routed_experts, self._k3_latent_ready)
+                self._k3_routed_done.record()
+            self._k3_routed_done.wait()
+            return out
 
         def _shared_output():
-            shared_out = self.shared_experts(
-                identity,
-                final_all_reduce_params=(
-                    AllReduceParams(enable_allreduce=False)
-                    if self._defer_shared_allreduce
-                    else None
-                ),
-            )
-            if overlap_shared_allreduce:
-                # Wait for all routed chunks, but overlap the norm/up tail.
-                self.moe_routed_event.wait()
-                shared_out = self.shared_experts.down_proj.all_reduce(shared_out)
-            return shared_out
+            if gate:
+                self._shared_gate_event.wait()
+            with maybe_stage(fgs, "moe.shared"):
+                shared_out = k3_moe_chain.run_shared(self, identity)
+                if shared_out is None:
+                    shared_out = self.shared_experts(
+                        identity,
+                        final_all_reduce_params=(
+                            AllReduceParams(enable_allreduce=False)
+                            if self._defer_shared_allreduce
+                            else None
+                        ),
+                    )
+                if overlap_shared_allreduce:
+                    # Wait for all routed chunks, but overlap the norm/up tail.
+                    self.moe_routed_event.wait()
+                    shared_out = self.shared_experts.down_proj.all_reduce(shared_out)
+                return shared_out
 
         # Shared experts depend only on the block input, so overlap their GEMMs
         # with the routed dispatch/expert/combine chain. Multi-stream engages
@@ -1946,30 +2053,39 @@ class KimiK3MoERuntime(nn.Module):
         # precedes the routed all-reduce: concurrent collectives on different
         # streams can corrupt SYMM_MEM all-reduce state.
         routed_out, shared_out = maybe_execute_in_parallel(
-            _routed_output,
+            _routed_on_branch if branches else _routed_output,
             _shared_output,
             self.moe_main_event,
             self.moe_shared_event,
             self.shared_expert_stream,
             disable_on_compile=True,
         )
-        if self._defer_shared_allreduce and not overlap_shared_allreduce:
-            shared_out = self.shared_experts.down_proj.all_reduce(shared_out)
-        if self._reduce_routed_output:
-            # RMSNorm folded into the routed all-reduce (RMS_NORM fusion): the
-            # MNNVL kernel normalizes straight out of the lamport buffer, so
-            # the reduced row never round-trips through HBM for a norm kernel.
-            # Strategies without the fusion fall back inside AllReduce.
-            routed_latent = moe_all_reduce(
-                routed_out,
-                all_reduce_params=AllReduceParams(
-                    fusion_op=AllReduceFusionOp.RMS_NORM,
-                    norm_weight=self.routed_expert_norm.weight,
-                    eps=float(self.routed_expert_norm.variance_epsilon),
-                ),
-            )
-            routed_out = self._routed_projection(routed_latent, self.routed_expert_up_proj)
-        return routed_out + shared_out
+        # Every reader of a mix_out slot (router, latent down, shared expert) is launched and joined here.
+        k3_moe_chain.mix_done(identity)
+        if fgs is not None:
+            fgs.keep(router_logits, projected_input, early_routed_in, routed_out, shared_out)
+        with maybe_stage(fgs, "moe.combine", after=("moe.routed", "moe.shared")):
+            if self._defer_shared_allreduce and not overlap_shared_allreduce:
+                shared_out = self.shared_experts.down_proj.all_reduce(shared_out)
+            if self._reduce_routed_output:
+                # RMSNorm folded into the routed all-reduce (RMS_NORM fusion): the
+                # MNNVL kernel normalizes straight out of the lamport buffer, so
+                # the reduced row never round-trips through HBM for a norm kernel.
+                # Strategies without the fusion fall back inside AllReduce.
+                routed_latent = moe_all_reduce(
+                    routed_out,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.RMS_NORM,
+                        norm_weight=self.routed_expert_norm.weight,
+                        eps=float(self.routed_expert_norm.variance_epsilon),
+                    ),
+                )
+                routed_out = self._routed_projection(routed_latent, self.routed_expert_up_proj)
+            if k3_tail:
+                return k3_moe_chain.run_tail(
+                    routed_out, self.routed_expert_norm, self.routed_expert_up_proj, shared_out
+                )
+            return routed_out + shared_out
 
 
 def resolve_attention_quant_config(
@@ -2194,15 +2310,54 @@ class KimiMLARuntime(nn.Module):
             mapping_with_cp=mapping_with_cp,
         )
 
+    def k3_chain_begin(self, rows: int, attn_metadata: AttentionMetadata):
+        """TLLM_K3_FGS=chain: arm this decode step's MLA chain (``k3_mla_chain.begin``) and return the x_norm
+        slot lease the pre-attention mix writes, or None to keep the stock path."""
+        self._k3_chain = None
+        mla, meta = self.mixer, attn_metadata
+        if (
+            self._o_allreduce is not None
+            or is_in_breakable_cuda_graph()
+            or meta.num_generations != rows
+            or meta.kv_lens_cuda_runtime.shape[0] != rows
+            or mla.mapping.has_cp_helix()
+            or not mla._k3_latent_append_active(meta, rows)
+        ):
+            return None
+        weights = k3_mla_chain.weights_of(mla)
+        if weights is None:
+            return None
+        pool_idx = int(meta.host_kv_cache_pool_mapping[mla.mqa.get_local_layer_idx(meta), 0])
+        self._k3_chain = k3_mla_chain.begin(
+            mla,
+            meta.kv_cache_manager.get_buffers(mla.mqa.layer_idx),
+            meta.kv_cache_block_offsets[pool_idx, :rows, 0, :],
+            meta.kv_lens_cuda_runtime[:rows].to(torch.int32),
+            int(meta.max_num_requests),
+            weights,
+        )
+        return None if self._k3_chain is None else self._k3_chain.leases[k3_mla_chain.X_NORM]
+
     def forward(
         self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
     ) -> torch.Tensor:
+        chain = self.__dict__.pop("_k3_chain", None)
+        k3_fgs_edges.debug(
+            "mla.attention", hidden_states.shape[0], "chain" if chain is not None else "default"
+        )
+        if chain is not None:
+            return k3_mla_chain.run(chain)
+        fgs = active_stream_manager()
         # MLA.forward takes position_ids first; K3 is NoPE, so pass None.
-        out = self.mixer(None, hidden_states, attn_metadata)
+        with maybe_stage(fgs, "mla.dec"):
+            out = self.mixer(None, hidden_states, attn_metadata)
         if self._o_allreduce is not None:
+            if fgs is not None:
+                fgs.keep(out)
             # Head-sharded TP: sum the row-sharded o_proj partials across
             # the head-shard group.
-            out = self._o_allreduce(out)
+            with maybe_stage(fgs, "mla.dec_allreduce", after=("mla.dec",)):
+                out = self._o_allreduce(out)
         return out
 
 
@@ -2347,6 +2502,12 @@ class KimiLinearDecoderLayer(nn.Module):
         ``[K_max, M, H]`` layout. Returns the running prefix sum and the
         number of valid bank rows.
 
+        ``residual_addend`` is the previous layer's deferred MoE output: the
+        incoming prefix sum is ``hidden_states + residual_addend``. With
+        ``defer_residual_add`` this layer returns ``(prefix_sum, num_snapshots,
+        moe_output)`` and leaves the closing add to the next consumer (or
+        returns ``None`` as the addend when it had to add itself).
+
         ``capture`` is ``(spec_metadata, layer_id)`` and taps the DSpark aux
         stream for the layer BEFORE this one: the aggregated stream for layer j
         is by definition what its next consumer sees, so the mixture computed
@@ -2356,12 +2517,6 @@ class KimiLinearDecoderLayer(nn.Module):
 
         On a ``token_sliced`` layer M is this rank's chunk of the batch and
         ``helix_a2a`` moves rows between that chunk and the full batch.
-
-        ``residual_addend`` is the previous layer's deferred MoE output: the
-        incoming prefix sum is ``hidden_states + residual_addend``. With
-        ``defer_residual_add`` this layer returns ``(prefix_sum, num_snapshots,
-        moe_output)`` and leaves the closing add to the next consumer (or
-        returns ``None`` as the addend when it had to add itself).
         """
         sliced = helix_a2a if self.token_sliced else None
         num_tokens = attn_metadata.num_tokens if sliced is not None else None
@@ -2373,14 +2528,13 @@ class KimiLinearDecoderLayer(nn.Module):
         def _full_rows(t: torch.Tensor) -> torch.Tensor:
             return t if sliced is None else sliced.all_gather(t, num_tokens)
 
-        prefix_sum = hidden_states
-        valid_block_residual = block_residual[:num_snapshots]
-
-        # Fine-grained sync for the pre-norm -> KDA edge: decode-only KDA layers
-        # open the region here so the KDA stages nest in "layer.attention".
-        fgs = get_stream_manager() if self.is_kda and sliced is None and capture is None else None
+        fgs = get_stream_manager()
         if fgs is not None and (
-            fgs.active or attn_metadata.num_contexts != 0 or is_in_breakable_cuda_graph()
+            fgs.active
+            or attn_metadata.num_contexts > 0
+            or is_in_breakable_cuda_graph()
+            or sliced is not None
+            or (os.environ.get("TLLM_FGS_KDA_ONLY") == "1" and not self.is_kda)
         ):
             fgs = None
         fold_in = (
@@ -2390,12 +2544,46 @@ class KimiLinearDecoderLayer(nn.Module):
             and fgs is None
             and capture is None
             and num_snapshots > 0
-            and _cute_attn_res_applicable(hidden_states, valid_block_residual, residual_addend)
+            and _cute_attn_res_applicable(
+                hidden_states, block_residual[:num_snapshots], residual_addend
+            )
         )
         if residual_addend is not None and not fold_in:
             hidden_states = hidden_states + residual_addend
-            prefix_sum = hidden_states
         with fgs.region() if fgs is not None else nullcontext():
+            prefix_sum = hidden_states
+            valid_block_residual = block_residual[:num_snapshots]
+            # TLLM_K3_FGS=chain: the pre-attention mix publishes x_norm into a slot the attention chain consumes
+            # (both KDA GEMMs, or the MLA fused-A and g_proj GEMMs).
+            x_norm_lease = None
+            if (
+                fgs is None
+                and sliced is None
+                and capture is None
+                and attn_metadata.num_contexts == 0
+                and num_snapshots > 0
+                and _CUTE_NORM_ENABLED
+                and k3_fgs_edges.chain()
+                and (not self.is_kda or self.linear_attn.k3_chain_ready())
+                and _cute_attn_res_applicable(
+                    prefix_sum, valid_block_residual, residual_addend if fold_in else None
+                )
+            ):
+                if self.is_kda:
+                    x_norm_lease = k3_kda_chain.acquire(
+                        k3_kda_chain.X_NORM, prefix_sum.shape[0], readers=2
+                    )
+                else:
+                    x_norm_lease = self.self_attn.k3_chain_begin(prefix_sum.shape[0], attn_metadata)
+            k3_fgs_edges.debug(
+                f"{'kda' if self.is_kda else 'mla'}.pre_mix",
+                prefix_sum.shape[0],
+                "chain producer" if x_norm_lease is not None else "default",
+            )
+            x_norm_fgs = (
+                {} if x_norm_lease is None else dict(out=x_norm_lease.tensor, fgs_producer=True)
+            )
+
             with maybe_stage(fgs, "layer.pre_norm"):
                 if capture is not None:
                     # The mixture tap needs the PRE-norm value, which the fused
@@ -2428,6 +2616,16 @@ class KimiLinearDecoderLayer(nn.Module):
                         self.input_layernorm,
                         addend=residual_addend,
                         updated=snapshot_slot,
+                        **x_norm_fgs,
+                    )
+                elif x_norm_lease is not None:
+                    hidden_states = _cute_attn_res(
+                        prefix_sum,
+                        valid_block_residual,
+                        self.self_attention_res_proj,
+                        self.self_attention_res_norm,
+                        self.input_layernorm,
+                        **x_norm_fgs,
                     )
                 elif num_snapshots > 0:
                     hidden_states = _apply_attn_res_and_rmsnorm(
@@ -2440,58 +2638,180 @@ class KimiLinearDecoderLayer(nn.Module):
                     )
                 else:
                     hidden_states = self.input_layernorm(hidden_states)
+
+                if self.layer_idx % self.attn_res_block_size == 0:
+                    if not fold_in:
+                        block_residual[num_snapshots].copy_(prefix_sum)
+                    num_snapshots += 1
+                    valid_block_residual = block_residual[:num_snapshots]
+                    prefix_sum = None
             if fgs is not None:
                 fgs.keep(hidden_states)
-
-            if self.layer_idx % self.attn_res_block_size == 0:
-                if not fold_in:
-                    block_residual[num_snapshots].copy_(prefix_sum)
-                num_snapshots += 1
-                valid_block_residual = block_residual[:num_snapshots]
-                prefix_sum = None
-
+            # The attention and MoE modules stage their own kernels inside these
+            # stages; see StreamManager for nested stages.
             # Attention is head-TP over every row: KDA rows are gathered in and its
             # row-sharded o_proj partials reduce-scattered back out here; helix MLA
             # does both itself (_helix_cp_allgather_input / _helix_cp_output_projection).
-            if self.is_kda:
-                with maybe_stage(fgs, "layer.attention", after=("layer.pre_norm",)):
+            with maybe_stage(fgs, "layer.attention", after=("layer.pre_norm",)):
+                if self.is_kda:
                     hidden_states = self.linear_attn(_full_rows(hidden_states), attn_metadata)
-                if sliced is not None:
-                    hidden_states = sliced.reduce_scatter(hidden_states, num_tokens)
-            else:
-                hidden_states = self.self_attn(hidden_states, attn_metadata)
+                    if sliced is not None:
+                        hidden_states = sliced.reduce_scatter(hidden_states, num_tokens)
+                else:
+                    hidden_states = self.self_attn(hidden_states, attn_metadata)
+            if fgs is not None:
+                fgs.keep(hidden_states)
 
-        if prefix_sum is None:
-            prefix_sum = hidden_states
-            hidden_states = _apply_attn_res_and_rmsnorm(
-                prefix_sum,
-                valid_block_residual,
-                self.mlp_res_proj,
-                self.mlp_res_norm,
-                self.post_attention_layernorm,
-            )
-        else:
-            prefix_sum, hidden_states = _apply_attn_res_add_and_rmsnorm(
-                prefix_sum,
-                hidden_states,
-                valid_block_residual,
-                self.mlp_res_proj,
-                self.mlp_res_norm,
-                self.post_attention_layernorm,
-            )
-        if self.is_moe:
-            hidden_states = self.block_sparse_moe(
-                hidden_states,
-                sliced.all_rank_num_tokens(num_tokens)
-                if sliced is not None
-                else getattr(attn_metadata, "all_rank_num_tokens", None),
-            )
-        else:
-            hidden_states = self.mlp(hidden_states)
+            # pre_norm wrote the block_residual snapshot that post_norm reads.
+            with maybe_stage(fgs, "layer.post_norm", after=("layer.attention", "layer.pre_norm")):
+                # TLLM_K3_FGS=chain: the attention output is an o_proj slot; this mix consumes it and releases it.
+                attn_o_lease = (
+                    k3_fgs_edges.lease_containing(hidden_states) if k3_fgs_edges.chain() else None
+                )
+                chain_mix = (
+                    attn_o_lease is not None
+                    and _CUTE_NORM_ENABLED
+                    and _cute_attn_res_applicable(
+                        hidden_states if prefix_sum is None else prefix_sum,
+                        valid_block_residual,
+                        None if prefix_sum is None else hidden_states,
+                    )
+                )
+                # TLLM_K3_MOE_FGS mix_*: the mix writes the MoE input into a -0-armed slot as an FGS producer.
+                mix_lease = (
+                    k3_moe_chain.mix_out(self.block_sparse_moe, hidden_states.shape[0])
+                    if self.is_moe
+                    and _CUTE_NORM_ENABLED
+                    and (attn_o_lease is None or chain_mix)
+                    and _cute_attn_res_applicable(
+                        hidden_states if prefix_sum is None else prefix_sum,
+                        valid_block_residual,
+                        None if prefix_sum is None else hidden_states,
+                    )
+                    else None
+                )
+                mix_out_kw = (
+                    {} if mix_lease is None else dict(out=mix_lease.tensor, fgs_producer=True)
+                )
+                k3_fgs_edges.debug(
+                    f"{'kda' if self.is_kda else 'mla'}.post_mix",
+                    hidden_states.shape[0],
+                    "chain consumer"
+                    if chain_mix
+                    else "default"
+                    if attn_o_lease is None
+                    else "default on a slot",
+                )
+                if chain_mix:
+                    mix_fgs = dict(
+                        fgs_consumer=True,
+                        fgs_counters=k3_kda_chain.mix_counters(self, hidden_states.device),
+                    )
+                    owner = k3_kda_chain.mix_owner(self, self.layer_idx, hidden_states.shape[0])
+                    if mix_lease is not None:
+                        mix_fgs["fgs_producer"] = True
+                    if prefix_sum is None:
+                        attn_out = hidden_states
+                        hidden_states = _cute_attn_res(
+                            attn_out,
+                            valid_block_residual,
+                            self.mlp_res_proj,
+                            self.mlp_res_norm,
+                            self.post_attention_layernorm,
+                            out=k3_kda_chain.buffer(owner, "mix_out", attn_out)
+                            if mix_lease is None
+                            else mix_lease.tensor,
+                            **mix_fgs,
+                        )
+                        # The residual add reads the attention output after the slot is re-armed.
+                        prefix_sum = k3_kda_chain.buffer(owner, "attn_out", attn_out).copy_(
+                            attn_out
+                        )
+                    else:
+                        prefix_sum, hidden_states = _cute_attn_res(
+                            prefix_sum,
+                            valid_block_residual,
+                            self.mlp_res_proj,
+                            self.mlp_res_norm,
+                            self.post_attention_layernorm,
+                            addend=hidden_states,
+                            updated=k3_kda_chain.buffer(owner, "mix_updated", prefix_sum),
+                            out=k3_kda_chain.buffer(owner, "mix_out", prefix_sum)
+                            if mix_lease is None
+                            else mix_lease.tensor,
+                            **mix_fgs,
+                        )
+                elif mix_lease is not None:
+                    if prefix_sum is None:
+                        prefix_sum = hidden_states
+                        hidden_states = _cute_attn_res(
+                            prefix_sum,
+                            valid_block_residual,
+                            self.mlp_res_proj,
+                            self.mlp_res_norm,
+                            self.post_attention_layernorm,
+                            **mix_out_kw,
+                        )
+                    else:
+                        prefix_sum, hidden_states = _cute_attn_res(
+                            prefix_sum,
+                            valid_block_residual,
+                            self.mlp_res_proj,
+                            self.mlp_res_norm,
+                            self.post_attention_layernorm,
+                            addend=hidden_states,
+                            **mix_out_kw,
+                        )
+                elif prefix_sum is None:
+                    prefix_sum = (
+                        hidden_states
+                        if attn_o_lease is None
+                        else k3_kda_chain.buffer(
+                            k3_kda_chain.mix_owner(self, self.layer_idx, hidden_states.shape[0]),
+                            "attn_out",
+                            hidden_states,
+                        ).copy_(hidden_states)
+                    )
+                    hidden_states = _apply_attn_res_and_rmsnorm(
+                        prefix_sum,
+                        valid_block_residual,
+                        self.mlp_res_proj,
+                        self.mlp_res_norm,
+                        self.post_attention_layernorm,
+                    )
+                else:
+                    prefix_sum, hidden_states = _apply_attn_res_add_and_rmsnorm(
+                        prefix_sum,
+                        hidden_states,
+                        valid_block_residual,
+                        self.mlp_res_proj,
+                        self.mlp_res_norm,
+                        self.post_attention_layernorm,
+                    )
+                if attn_o_lease is not None:
+                    k3_fgs_edges.consumed(attn_o_lease)
+            if fgs is not None:
+                fgs.keep(prefix_sum, hidden_states)
+            with maybe_stage(fgs, "layer.moe", after=("layer.post_norm",)):
+                if self.is_moe:
+                    hidden_states = self.block_sparse_moe(
+                        hidden_states,
+                        sliced.all_rank_num_tokens(num_tokens)
+                        if sliced is not None
+                        else getattr(attn_metadata, "all_rank_num_tokens", None),
+                    )
+                else:
+                    hidden_states = self.mlp(hidden_states)
+            if fgs is not None:
+                fgs.keep(hidden_states)
 
-        if defer_residual_add and sliced is None:
-            return prefix_sum, num_snapshots, hidden_states
-        prefix_sum = prefix_sum + hidden_states
+            # prefix_sum is the attention output on snapshot layers.
+            if defer_residual_add and fgs is None:
+                return prefix_sum, num_snapshots, hidden_states
+            with maybe_stage(
+                fgs, "layer.residual", after=("layer.moe", "layer.post_norm", "layer.attention")
+            ):
+                prefix_sum = prefix_sum + hidden_states
         if defer_residual_add:
             return prefix_sum, num_snapshots, None
         return prefix_sum, num_snapshots

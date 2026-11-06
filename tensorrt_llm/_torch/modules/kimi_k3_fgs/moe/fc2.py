@@ -27,6 +27,10 @@ element comes from one CTA's fixed-order K loop, so the result is deterministic 
 
 Warp roles: 0-3 epilogue (thread = TMEM lane = stored weight row), 4 MMA, 5 weight TMA, 6 activation cp.async.
 
+Fused finalize (``run_v2``): the epilogue writes ``out[r] = bf16(0 + w * y)`` straight into the combine payload for a
+row r with one local pair (with a per-unit ``fc2_push`` the signal warp then adds 1 to ``fin_done[r]``); the pairs of a
+row with several go to ``y``, and the finalize kernel launched behind FC2 sums them and zeroes rows without a pair.
+
 Fine-grained sync with the neighbouring stages (int32 counter slabs, zero-armed by the caller, T = tile slots):
 - ``fc1_done[T * 12]``: before K stage k of token tile t the activation loader waits until ``fc1_done[t * 12 + k] >= 4``
   (FC1's four 64-column units of that stage). A gate warp (7) polls the counters ahead of the loader and hands it one
@@ -59,7 +63,16 @@ from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.runtime import make_ptr
 from cutlass.cutlass_dsl import dsl_user_op
 
-from .sync import EARLY_TILES, spin_ns
+from . import finalize
+from .sync import (
+    EARLY_TILES,
+    bits_to_f32,
+    fgs_diag,
+    ld_cg_b32,
+    ld_cg_v4,
+    spin_ns,
+    wait_at_least_short,
+)
 
 try:
     from cutlass.memory import TmemAllocator
@@ -83,6 +96,10 @@ TIMELINE_FIELDS = 32
 SCAN_BATCHES = 4
 FC1_UNITS_PER_K_STAGE = K_STAGE // 64
 SIGNAL_STAGES = 4
+TOP_K = 16
+# Fused finalize: per-row metadata of a unit in shared memory (received row, routing weight bits, local pairs of the
+# row), double-buffered by unit.
+META_FIELDS = 3
 
 
 def _pow2_at_least(n: int, lo: int) -> int:
@@ -129,6 +146,9 @@ class Fc2Kernel:
         wait_fc1: bool = False,
         signal_fc2: bool = False,
         delay_ns: int = 0,
+        wait_plan: bool = False,
+        fused_fin: bool = False,
+        push: bool = False,
     ):
         if tile_n not in TILE_NS:
             raise ValueError(f"tile_n must be one of {TILE_NS}, got {tile_n}")
@@ -151,6 +171,9 @@ class Fc2Kernel:
         self.wait_fc1 = wait_fc1
         self.signal_fc2 = signal_fc2
         self.delay_ns = delay_ns if signal_fc2 else 0
+        self.wait_plan = wait_plan
+        self.fused_fin = fused_fin
+        self.push = push and fused_fin
         self.mma_tiler = (TILE_M, self.n_max, K_STAGE)
         self.cta_group = tcgen05.CtaGroup.ONE
         self.a_dtype = cutlass.Float4E2M1FN
@@ -163,7 +186,9 @@ class Fc2Kernel:
         self.load_warp_id = 6
         self.gate_warp_id = 7
         self.signal_warp_id = 7 + int(wait_fc1)
-        self.threads_per_cta = 32 * (7 + int(wait_fc1) + int(signal_fc2))
+        # With fc2_push the fused finalize hands each unit's finished rows to the signal warp, which publishes them.
+        self.has_signal_warp = signal_fc2 or (fused_fin and push)
+        self.threads_per_cta = 32 * (7 + int(wait_fc1) + int(self.has_signal_warp))
         self.epilog_sync_barrier = pipeline.NamedBarrier(barrier_id=1, num_threads=32 * 4)
         self.tmem_alloc_barrier = pipeline.NamedBarrier(barrier_id=2, num_threads=32 * 5)
         self.b_bytes_per_stage = self.n_max * K_STAGE
@@ -290,9 +315,17 @@ class Fc2Kernel:
         stamps_ptr: Optional[cute.Pointer],
         fc1_done_ptr: Optional[cute.Pointer],
         fc2_done_ptr: Optional[cute.Pointer],
+        plan_pub_ptr: Optional[cute.Pointer],
+        out_ptr: Optional[cute.Pointer],
+        topk_w_ptr: Optional[cute.Pointer],
+        p2e_ptr: Optional[cute.Pointer],
+        e2p_ptr: Optional[cute.Pointer],
+        fin_done_ptr: Optional[cute.Pointer],
         num_rows: cutlass.Int32,
         num_tile_slots: cutlass.Int32,
         grid_size: cutlass.Int32,
+        plan_pub_expected: cutlass.Int32,
+        out_rows: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         mA = cute.make_tensor(
@@ -319,6 +352,19 @@ class Fc2Kernel:
         fc2_done = None
         if cutlass.const_expr(self.signal_fc2):
             fc2_done = cute.make_tensor(fc2_done_ptr, cute.make_layout((num_tile_slots,)))
+        plan_pub = None
+        if cutlass.const_expr(self.wait_plan):
+            plan_pub = cute.make_tensor(plan_pub_ptr, cute.make_layout((1,)))
+        f_out = f_w = f_p2e = f_e2p = f_fin_done = None
+        if cutlass.const_expr(self.fused_fin):
+            f_out = cute.make_tensor(
+                out_ptr, cute.make_ordered_layout((out_rows, HIDDEN), order=(1, 0))
+            )
+            f_w = cute.make_tensor(topk_w_ptr, cute.make_layout((out_rows * TOP_K,)))
+            f_p2e = cute.make_tensor(p2e_ptr, cute.make_layout((num_rows,)))
+            f_e2p = cute.make_tensor(e2p_ptr, cute.make_layout((out_rows * TOP_K,)))
+        if cutlass.const_expr(self.push):
+            f_fin_done = cute.make_tensor(fin_done_ptr, cute.make_layout((out_rows,)))
 
         tiled_mma = sm107_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
@@ -384,12 +430,18 @@ class Fc2Kernel:
             acc_mbar: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
             gate_mbar: cute.struct.MemRange[cutlass.Int64, K_TILES * 2 if self.wait_fc1 else 1]
             signal_mbar: cute.struct.MemRange[
-                cutlass.Int64, SIGNAL_STAGES * 2 if self.signal_fc2 else 1
+                cutlass.Int64, SIGNAL_STAGES * 2 if self.has_signal_warp else 1
             ]
             tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
             num_groups: cute.struct.MemRange[cutlass.Int32, 1]
             groups: cute.struct.MemRange[cutlass.Int32, self.group_cap + 1]
+            meta: cute.struct.MemRange[
+                cutlass.Int32, META_FIELDS * self.n_max * 2 if self.fused_fin else 1
+            ]
+            sig_rows: cute.struct.MemRange[
+                cutlass.Int32, SIGNAL_STAGES * self.n_max if self.fused_fin else 1
+            ]
             sA: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, a_bytes], 1024]
             sB: cute.struct.Align[
                 cute.struct.MemRange[self.b_dtype, cute.cosize(b_smem_staged.outer)], 1024
@@ -418,6 +470,14 @@ class Fc2Kernel:
             stamps,
             fc1_done,
             fc2_done,
+            plan_pub,
+            plan_pub_expected,
+            f_out,
+            f_w,
+            f_p2e,
+            f_e2p,
+            f_fin_done,
+            out_rows,
             cluster_layout_vmnk,
             a_smem_staged,
             b_smem_staged,
@@ -431,6 +491,40 @@ class Fc2Kernel:
             min_blocks_per_mp=1,
             use_pdl=self.use_pdl,
         )
+
+    @cute.jit
+    def _row_meta(self, tidx, row_base, row_end, buf, sMeta, mTopkW, mP2e, mE2p):
+        """Thread t < n_max: received row, routing weight and local-pair count of the unit's row t (row -1 past
+        the group)."""
+        if tidx < self.n_max:
+            p = row_base + tidx
+            r = cutlass.Int32(-1)
+            w_bits = cutlass.Int32(0)
+            pairs = cutlass.Int32(0)
+            if p < row_end:
+                expanded = ld_cg_b32(mP2e.iterator.toint() + cutlass.Int64(p) * 4)
+                r = expanded // TOP_K
+                word = ld_cg_b32(mTopkW.iterator.toint() + cutlass.Int64(expanded // 2) * 4)
+                w_bits = ((word >> ((expanded & 1) * 16)) & 0xFFFF) << 16
+                for q in cutlass.range_constexpr(TOP_K // 4):
+                    e = ld_cg_v4(mE2p.iterator.toint() + (cutlass.Int64(r) * TOP_K + 4 * q) * 4)
+                    for j in cutlass.range_constexpr(4):
+                        pairs = pairs + cutlass.select_(
+                            e[j] >= 0, cutlass.Int32(1), cutlass.Int32(0)
+                        )
+            sMeta[(0, tidx, buf)] = r
+            sMeta[(1, tidx, buf)] = w_bits
+            sMeta[(2, tidx, buf)] = pairs
+
+    @cute.jit
+    def _publish_rows(self, sSigRows, slot, mFinDone):
+        """Signal warp, one lane, per unit: one GPU-scope fence, then each row of the unit with one local pair adds 1
+        to ``fin_done[row]``."""
+        cute.arch.fence_acq_rel_gpu()
+        for t in cutlass.range(self.n_max, unroll=1):
+            row = sSigRows[(t, slot)]
+            if row >= 0:
+                _red_add_relaxed_gpu(mFinDone.iterator + row, cutlass.Int32(1))
 
     @cute.kernel
     def kernel(
@@ -449,6 +543,14 @@ class Fc2Kernel:
         stamps: Optional[cute.Tensor],
         fc1_done: Optional[cute.Tensor],
         fc2_done: Optional[cute.Tensor],
+        plan_pub: Optional[cute.Tensor],
+        plan_pub_expected: cutlass.Int32,
+        mOut: Optional[cute.Tensor],
+        mTopkW: Optional[cute.Tensor],
+        mP2e: Optional[cute.Tensor],
+        mE2p: Optional[cute.Tensor],
+        mFinDone: Optional[cute.Tensor],
+        out_rows: cutlass.Int32,
         cluster_layout_vmnk: cute.Layout,
         a_smem_staged: cute.ComposedLayout,
         b_smem_staged: cute.ComposedLayout,
@@ -513,7 +615,7 @@ class Fc2Kernel:
                 consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
                 defer_sync=True,
             )
-        if cutlass.const_expr(self.signal_fc2):
+        if cutlass.const_expr(self.has_signal_warp):
             signal_pipeline = pipeline.PipelineAsync.create(
                 barrier_storage=storage.signal_mbar.data_ptr(),
                 num_stages=SIGNAL_STAGES,
@@ -577,6 +679,9 @@ class Fc2Kernel:
         if cutlass.const_expr(self.use_pdl and not self.wait_fc1):
             cute.arch.griddepcontrol_wait()
         if warp_idx == self.load_warp_id:
+            # A plan written by FC1 itself (routed FC1) is complete once every FC1 CTA has added to plan_pub.
+            if cutlass.const_expr(self.wait_plan):
+                wait_at_least_short(plan_pub.iterator.toint(), plan_pub_expected)
             lane = tidx % 32
             last_slot = tile_expert.shape[0] - 1
             # The first SCAN_BATCHES x 32 tiles are read together with num_tiles: one round trip in the common case.
@@ -807,6 +912,20 @@ class Fc2Kernel:
                         )
                         signal_pipeline.consumer_release(signal_state)
                         signal_state.advance()
+        if cutlass.const_expr(self.push):
+            if warp_idx == self.signal_warp_id:
+                if tidx % 32 == 0:
+                    sSigRows = storage.sig_rows.get_tensor(
+                        cute.make_layout((n_max, SIGNAL_STAGES), stride=(1, n_max))
+                    )
+                    signal_state = pipeline.make_pipeline_state(
+                        pipeline.PipelineUserType.Consumer, SIGNAL_STAGES
+                    )
+                    for i in cutlass.range(num_mine, unroll=1):
+                        signal_pipeline.consumer_wait(signal_state)
+                        self._publish_rows(sSigRows, signal_state.index, mFinDone)
+                        signal_pipeline.consumer_release(signal_state)
+                        signal_state.advance()
 
         if warp_idx == self.mma_warp_id:
             tmem.wait_for_alloc()
@@ -915,12 +1034,29 @@ class Fc2Kernel:
                 signal_state = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer, SIGNAL_STAGES
                 )
+            if cutlass.const_expr(self.push):
+                signal_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, SIGNAL_STAGES
+                )
+                sSigRows = storage.sig_rows.get_tensor(
+                    cute.make_layout((n_max, SIGNAL_STAGES), stride=(1, n_max))
+                )
+            if cutlass.const_expr(self.fused_fin):
+                sMeta = storage.meta.get_tensor(
+                    cute.make_layout(
+                        (META_FIELDS, n_max, 2), stride=(1, META_FIELDS, META_FIELDS * n_max)
+                    )
+                )
             for i in cutlass.range(num_mine, unroll=1):
                 unit = bidx + i * used_ctas
                 entry = sGroup[unit // M_TILES]
                 row_base = (entry & 0xFFFF) * tile_n
                 row_end = row_base + ((entry >> 16) & 0xFF)
                 channel = unit % M_TILES * TILE_M + channel_in_tile
+                if cutlass.const_expr(self.fused_fin):
+                    buf = i % 2
+                    self._row_meta(tidx, row_base, row_end, buf, sMeta, mTopkW, mP2e, mE2p)
+                    self.epilog_sync_barrier.arrive_and_wait()
                 acc_pipeline.consumer_wait(acc_state)
                 _tcgen05_fence_after_thread_sync()
                 cute.copy(
@@ -933,7 +1069,54 @@ class Fc2Kernel:
                 _tcgen05_fence_before_thread_sync()
                 acc_pipeline.consumer_release(acc_state)
                 acc_state.advance()
-                if cutlass.const_expr(self.paired_store):
+                if cutlass.const_expr(self.fused_fin):
+                    is_odd = odd_channel == 1
+                    pair_channel = channel - odd_channel
+                    for c in cutlass.range_constexpr(0, n_max, 2):
+                        recv = cute.arch.shuffle_sync_bfly(
+                            cutlass.select_(is_odd, acc[c], acc[c + 1]), offset=8
+                        )
+                        row = row_base + c + odd_channel
+                        if row < row_end:
+                            v0 = cutlass.select_(is_odd, recv, acc[c]).to(cutlass.BFloat16)
+                            v1 = cutlass.select_(is_odd, acc[c + 1], recv).to(cutlass.BFloat16)
+                            at = c + odd_channel
+                            if sMeta[(2, at, buf)] == 1:
+                                # One local pair: the finalize sum is 0 + w * y, rounded once.
+                                w = bits_to_f32(sMeta[(1, at, buf)])
+                                pair[0] = (cutlass.Float32(0.0) + v0.to(cutlass.Float32) * w).to(
+                                    cutlass.BFloat16
+                                )
+                                pair[1] = (cutlass.Float32(0.0) + v1.to(cutlass.Float32) * w).to(
+                                    cutlass.BFloat16
+                                )
+                                dst = cute.make_tensor(
+                                    mOut.iterator
+                                    + cute.assume(
+                                        sMeta[(0, at, buf)] * HIDDEN + pair_channel, divby=2
+                                    ),
+                                    cute.make_layout((2,)),
+                                )
+                                cute.copy(store_pair, pair, dst)
+                            else:
+                                pair[0] = v0
+                                pair[1] = v1
+                                dst = cute.make_tensor(
+                                    y.iterator + cute.assume(row * HIDDEN + pair_channel, divby=2),
+                                    cute.make_layout((2,)),
+                                )
+                                cute.copy(store_pair, pair, dst)
+                    if cutlass.const_expr(self.push):
+                        # Each thread's mbarrier arrive releases its own stores to the signal warp (CTA scope).
+                        signal_pipeline.producer_acquire(signal_state)
+                        if tidx < n_max:
+                            row = cutlass.Int32(-1)
+                            if (row_base + tidx < row_end) & (sMeta[(2, tidx, buf)] == 1):
+                                row = sMeta[(0, tidx, buf)]
+                            sSigRows[(tidx, signal_state.index)] = row
+                        signal_pipeline.producer_commit(signal_state)
+                        signal_state.advance()
+                elif cutlass.const_expr(self.paired_store):
                     is_odd = odd_channel == 1
                     pair_channel = channel - odd_channel
                     for c in cutlass.range_constexpr(0, n_max, 2):
@@ -1001,6 +1184,9 @@ def _compiled(
     wait_fc1: bool = False,
     signal_fc2: bool = False,
     delay_ns: int = 0,
+    wait_plan: bool = False,
+    fused_fin: bool = False,
+    push: bool = False,
 ):
     kernel = Fc2Kernel(
         tile_n,
@@ -1014,6 +1200,9 @@ def _compiled(
         wait_fc1,
         signal_fc2,
         delay_ns,
+        wait_plan,
+        fused_fin,
+        push,
     )
     fake = cute.AddressSpace.gmem
     args = (
@@ -1028,7 +1217,15 @@ def _compiled(
         make_ptr(cutlass.Int32, 1 << 20, fake, assumed_align=4) if timeline else None,
         make_ptr(cutlass.Int32, 1 << 20, fake, assumed_align=4) if wait_fc1 else None,
         make_ptr(cutlass.Int32, 1 << 20, fake, assumed_align=4) if signal_fc2 else None,
+        make_ptr(cutlass.Int32, 1 << 20, fake, assumed_align=4) if wait_plan else None,
+        make_ptr(cutlass.BFloat16, 1 << 20, fake, assumed_align=16) if fused_fin else None,
+        make_ptr(cutlass.BFloat16, 1 << 20, fake, assumed_align=4) if fused_fin else None,
+        make_ptr(cutlass.Int32, 1 << 20, fake, assumed_align=4) if fused_fin else None,
+        make_ptr(cutlass.Int32, 1 << 20, fake, assumed_align=16) if fused_fin else None,
+        make_ptr(cutlass.Int32, 1 << 20, fake, assumed_align=4) if push else None,
         cutlass.Int32(tile_n),
+        cutlass.Int32(1),
+        cutlass.Int32(1),
         cutlass.Int32(1),
         cutlass.Int32(1),
         cuda.CUstream(0),
@@ -1059,13 +1256,18 @@ def run(
     fc1_done: Optional[torch.Tensor] = None,
     fc2_done: Optional[torch.Tensor] = None,
     hazard_delay_ns: int = 0,
+    plan_pub: Optional[torch.Tensor] = None,
+    plan_pub_expected: int = 0,
+    fin: Optional[tuple] = None,
 ) -> None:
     """``y[p] = bf16(dequant(act[p]) @ dequant(W2[e]).T)`` for every valid permuted row (moe_chain FC2 stage).
 
     ``fc1_done`` (int32 [T * 12]) and ``fc2_done`` (int32 [T]), T = ``plan.tile_idx_to_expert_idx.numel()``, are the
     counter slabs of the FC1 -> FC2 and FC2 -> finalize edges (module docstring). With ``fc1_done`` the kernel is
     launched with PDL and does not wait for FC1's grid before streaming weights. ``hazard_delay_ns`` delays the last
-    unit of the first 28 CTAs in the ``fc2_done`` build (hazard tests only).
+    unit of the first 28 CTAs in the ``fc2_done`` build (hazard tests only). ``plan_pub`` (int32 word): the plan is
+    written by the routed FC1 this kernel may overlap; it is read once the word reaches ``plan_pub_expected``
+    (``fc1.num_ctas_for``).
     """
     tile_n = plan.tile_n
     rows = act.shape[0]
@@ -1097,14 +1299,28 @@ def run(
     grid = max(1, min(ctas_per_sm * _sm_count(device.index), tile_slots * M_TILES))
     # Groups never outnumber the tile capacity: one shared-memory entry each.
     group_cap = _pow2_at_least(tile_slots, 64)
-    stages = _env_int(
-        "STAGES", Fc2Kernel.max_stages(group * tile_n, group_cap, SMEM_BUDGET // ctas_per_sm)
+    smem = SMEM_BUDGET // ctas_per_sm - (
+        4 * META_FIELDS * 2 * group * tile_n if fin is not None else 0
     )
+    stages = _env_int("STAGES", Fc2Kernel.max_stages(group * tile_n, group_cap, smem))
+    fin_ptrs = (None,) * 5
+    out_rows = 0
+    if fin is not None:
+        out, topk_w, fin_done = fin
+        out_rows = out.shape[0]
+        fin_ptrs = (
+            (cutlass.BFloat16, out, 16),
+            (cutlass.BFloat16, topk_w, 4),
+            (cutlass.Int32, plan.permuted_idx_to_expanded_idx, 4),
+            (cutlass.Int32, plan.expanded_idx_to_permuted_idx, 16),
+            (cutlass.Int32, fin_done, 4) if fin_done is not None else None,
+        )
     compiled = _compiled(
         tile_n,
         num_local,
         stages,
-        _env_int("PDL", 0) == 1 or fc1_done is not None,
+        (_env_int("PDL", 0) == 1 or fc1_done is not None)
+        and not (fc1_done is not None and fgs_diag("fc1_fc2") == "ready"),
         _env_int("PAIRED_STORE", 1) == 1,
         group,
         group_cap,
@@ -1112,6 +1328,9 @@ def run(
         fc1_done is not None,
         fc2_done is not None,
         hazard_delay_ns if fc2_done is not None else 0,
+        plan_pub is not None,
+        fin is not None,
+        fin is not None and fin[2] is not None,
     )
     compiled(
         _ptr(cutlass.Float4E2M1FN, w2, 32),
@@ -1125,8 +1344,77 @@ def run(
         _ptr(cutlass.Int32, timeline_buffer(device), 4) if timeline else None,
         _ptr(cutlass.Int32, fc1_done, 4) if fc1_done is not None else None,
         _ptr(cutlass.Int32, fc2_done, 4) if fc2_done is not None else None,
+        _ptr(cutlass.Int32, plan_pub, 4) if plan_pub is not None else None,
+        *(_ptr(*f) if f is not None else None for f in fin_ptrs),
         cutlass.Int32(rows),
         cutlass.Int32(tile_slots),
         cutlass.Int32(grid),
+        cutlass.Int32(plan_pub_expected),
+        cutlass.Int32(out_rows),
         cuda.CUstream(torch.cuda.current_stream(device).cuda_stream),
+    )
+
+
+FGS_WAITS = {"run_v2": ("fc1_fc2", "fc1_plan")}
+PUSH_ENV = "TLLM_K3_MOE_FC2_PUSH"
+FGS_PUBLISHES = {"run_v2": ("fc2_push",)}
+
+
+def run_v2(act, act_sf, weights_e, plan, topk_w, out, *, fgs=None, enable_pdl=True, y=None):
+    """``TLLM_K3_MOE_FIN=fc2`` entry (moe_chain contract): FC2 with the finalize fused into its epilogue.
+
+    ``out[r] = bf16(sum over k in order, fp32, of topk_w[r, k] * y[e2p[r * 16 + k]])`` for every received row r (zero
+    without a local pair), bit-identical to ``fc2.run`` + ``finalize.run``. ``out`` [R, 3584] bf16 is the combine
+    payload; ``topk_w`` [R, 16] bf16. A row with one local pair is written straight from the accumulator; the
+    pairs of a row with several are staged in ``y`` (the workspace's FC2 output) and summed, and rows without a
+    pair zeroed, by the finalize kernel launched behind FC2, which skips the rows FC2 wrote. Which rows those are
+    follows from the plan on the device, so one graph serves any routing. ``fgs.waits["fc1_fc2"]`` /
+    ``["fc1_plan"]``: as ``fc2.run``'s ``fc1_done`` / ``plan_pub``. ``fgs.publishes["fc2_push"]``: int32 [R] words,
+    zero-armed; each row reaches 28. By default the finalize kernel publishes every row once the FC2 grid is complete:
+    FC2's per-unit publish needs a GPU-scope fence per unit, which slows the whole SM. With
+    ``TLLM_K3_MOE_FC2_PUSH=unit`` FC2 adds 1 per weight tile to the rows it wrote, so they are final before FC2 ends."""
+    waits = fgs.waits if fgs is not None else {}
+    pubs = fgs.publishes if fgs is not None else {}
+    rows = out.shape[0]
+    if (
+        out.dtype != torch.bfloat16
+        or tuple(out.shape) != (rows, HIDDEN)
+        or not out.is_contiguous()
+        or out.data_ptr() % 16
+        or topk_w.dtype != torch.bfloat16
+        or tuple(topk_w.shape) != (rows, TOP_K)
+        or not topk_w.is_contiguous()
+    ):
+        raise ValueError(
+            f"fc2.run_v2: out must be contiguous bf16 [R, {HIDDEN}], topk_w bf16 [R, {TOP_K}]"
+        )
+    if y is None:
+        raise ValueError(
+            "fc2.run_v2: y (the workspace FC2 output) stages rows with several local pairs"
+        )
+    push = pubs.get("fc2_push")
+    unit_push = push is not None and os.environ.get(PUSH_ENV) == "unit"
+    done = waits.get("fc1_fc2")
+    pub = waits.get("fc1_plan")
+    run(
+        act,
+        act_sf,
+        weights_e,
+        plan,
+        y,
+        fc1_done=None if done is None else done.tensor,
+        plan_pub=None if pub is None else pub.tensor,
+        plan_pub_expected=0 if pub is None else pub.expected,
+        fin=(out, topk_w, push.tensor if unit_push else None),
+    )
+    finalize.run(
+        y,
+        topk_w,
+        plan,
+        out,
+        fin_done=None if push is None else push.tensor,
+        fin_per_row=M_TILES,
+        skip_single=True,
+        signal_skipped=not unit_push,
+        hazard_delay_ns=0 if push is None else push.hazard_delay_ns,
     )
