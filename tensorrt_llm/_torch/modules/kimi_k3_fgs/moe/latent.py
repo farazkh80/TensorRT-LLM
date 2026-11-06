@@ -31,12 +31,15 @@ import torch
 from cutlass import BFloat16, Float32, Int32
 
 from ...kimi_k3_attn_res.attn_res_mix_cute import _lamport_wait, _ld_relaxed_v4, _pzo_b32
+from .sync import fgs_diag
 
 LATENT = 3584
+FGS_WAITS = {"up_proj": ("rn_up",)}
 HIDDEN = 7168
 _VEC = 8
 _THREADS_PER_ROW = 64
 _SPLITK_ROWS = 32
+FGS_UP_MAX_ROWS = _SPLITK_ROWS
 
 
 def _pdl() -> bool:
@@ -348,14 +351,15 @@ def rmsnorm(
     if fgs_consumer and (fgs_counters is None or fgs_counters.numel() != 4):
         raise ValueError("rmsnorm: fgs_consumer needs int32[4] fgs_counters")
     if m:
+        diag = fgs_diag("comb_norm") if fgs_consumer else ""
         fn = _compiled_norm(
             h,
             rows_per_cta or default_norm_rows(m),
             _pdl() or fgs_consumer or fgs_producer,
             fgs_consumer,
             fgs_producer,
-            fgs_max_spins if fgs_consumer else 1 << 16,
-            fgs_check or not fgs_consumer,
+            (0 if diag == "ready" else fgs_max_spins) if fgs_consumer else 1 << 16,
+            (fgs_check and diag != "oracle") or not fgs_consumer,
         )
         fn(x, weight, out, m, eps, fgs_counters if fgs_consumer else _scratch_counters(x.device))
     return out
@@ -386,6 +390,10 @@ _UP_TACTICS = (
 )
 
 
+def _up_split3() -> bool:
+    return os.environ.get("TLLM_K3_MOE_UP") == "split3"
+
+
 def up_tactic(m: int):
     """Split-K tactic of the latent up-projection at M rows (``TLLM_K3_LATENT_UP_TACTIC=m,n,split,stages``
     overrides)."""
@@ -404,34 +412,53 @@ def up_proj(
     addend: Optional[torch.Tensor] = None,
     *,
     fgs_consumer: bool = False,
+    fused_tail: bool = False,
+    ready: Optional[torch.Tensor] = None,
+    tactic=None,
+    split3: Optional[bool] = None,
 ) -> torch.Tensor:
     """``out = bf16(x @ weight^T)`` (+ ``addend`` after the rounding); x [M, 3584], weight [7168, 3584].
 
     ``fgs_consumer`` (M <= 32): x is a sentinel slot written by a running ``rmsnorm(fgs_producer=True)``; the
     split-K report_valid build re-loads activation stages that still hold -0.0.
+
+    ``fused_tail`` (M <= 32): the build that follows ``tail.reduce_norm``; it loads its weight stages at launch
+    and, with ``ready`` (the reduce_norm's per-row words), waits per row instead of on the grid dependency (the
+    same binary either way). ``split3`` (default: ``TLLM_K3_MOE_UP=split3``) adds an L2 prefetch of the weight
+    tiles beyond the stage ring at launch and, up to 8 rows, splits K over 3-CTA clusters (168 CTAs, more weights
+    resident before the rows are ready; a different fp32 K association than the default tactic).
     """
     m = x.shape[0]
     if m == 0:
         return out
-    if fgs_consumer and m > _SPLITK_ROWS:
+    fused_tail = fused_tail or ready is not None
+    if (fgs_consumer or fused_tail) and m > _SPLITK_ROWS:
         raise ValueError(f"up_proj: the FGS consumer serves at most {_SPLITK_ROWS} rows")
     if m > _SPLITK_ROWS:
         if addend is None:
             return torch.matmul(x, weight.t(), out=out)
         return torch.add(torch.matmul(x, weight.t()), addend, out=out)
-    from ..splitk_gemm_fgs import run_splitk_dense_fgs
+    from ..splitk_gemm_fgs import SplitKTactic, run_splitk_dense_fgs
 
+    split3 = fused_tail and (_up_split3() if split3 is None else split3)
+    if split3 and tactic is None and m <= 8 and not os.environ.get("TLLM_K3_LATENT_UP_TACTIC"):
+        tactic = SplitKTactic(128, 8, 3, 6)
+    diag = fgs_diag("norm_up") if fgs_consumer else ""
+    poll = fgs_consumer and diag != "oracle"
     run_splitk_dense_fgs(
         x,
         weight.t(),
         addend,
         out,
         _pdl(),
-        up_tactic(m),
-        report_valid=fgs_consumer,
-        retry_warp=fgs_consumer,
-        pdl_wait_activation=not fgs_consumer,
+        tactic or up_tactic(m),
+        report_valid=poll,
+        retry_warp=poll,
+        pdl_wait_activation=not fgs_consumer or diag == "ready",
         addend=addend is not None,
+        ready=ready,
+        ready_wait=fused_tail,
+        l2_prefetch=split3,
     )
     return out
 
