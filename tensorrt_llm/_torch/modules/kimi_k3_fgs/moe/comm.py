@@ -2306,6 +2306,11 @@ class CuteA2A:
     def workspace(self) -> torch.Tensor:
         return self.comm.workspace
 
+    def _ws_head(self) -> torch.Tensor:
+        # The prepare kernel reads only the row's base pointer; a whole row sized for a serving max_num_tokens can
+        # exceed 2 GiB, which fails the launcher's int32 shape check.
+        return self.workspace[self.rank, :_CACHELINE]
+
     def _ws(self) -> Tuple[int, int, int]:
         ws = self.workspace
         return ws.data_ptr(), ws.stride(0), ws.data_ptr() + self.rank * ws.stride(0)
@@ -2315,7 +2320,7 @@ class CuteA2A:
         stream; a consumer of ``recv_source()`` must be ordered after it. ``hazard_delay_ns`` (tests only) delays its
         stores past its dependents' launch."""
         _compile("prepare_dispatch", self.ep, self.lay.key(), _pdl(), hazard_delay_ns)(
-            self.workspace[self.rank]
+            self._ws_head()
         )
         self._prepared = True
 
@@ -2375,7 +2380,7 @@ class CuteA2A:
         pdl = _pdl()
         ws_base, ws_stride, my_ws = self._ws()
         if not prepared:
-            _compile("prepare_dispatch", self.ep, lay, pdl)(self.workspace[self.rank])
+            _compile("prepare_dispatch", self.ep, lay, pdl)(self._ws_head())
         mode = _DISPATCH_WAIT
         if defer_data_wait:
             mode = _DISPATCH_DEFER
