@@ -64,6 +64,9 @@ _EDGES = (
 
 # At 1 row the table's g_proj / o_proj are direct GEMMs; the chain runs their direct FGS builds
 # (``kimi_k3_cute_gemm``), which match the stock path bit for bit.
+# Up to this many rows g_proj launches after the reduction instead of right after the fused q_a | kv_a GEMM: at 1 row
+# it is a multi-wave direct GEMM whose waves would hold back every later launch of the attention path.
+LATE_GPROJ_ROWS = int(os.environ.get("TLLM_K3_FGS_MLA_LATE_GPROJ_ROWS", "1"))
 MIN_ROWS = int(os.environ.get("TLLM_K3_FGS_MLA_MIN_ROWS", "1"))
 MAX_ROWS = int(os.environ.get("TLLM_K3_FGS_MLA_MAX_ROWS", "32"))
 # Split-KV clusters without K tiles exit at entry (``KimiK3MlaDecodeFgs(fgs_skip_empty=True)``).
@@ -248,7 +251,9 @@ def run(chain: Chain) -> torch.Tensor:
     qkv_a = chain.slot(QKV_A)
     kimi_k3_cute_gemm.linear(x, w.fused_a, qkv_a)
     g = chain.slot(GATE)
-    kimi_k3_cute_gemm.linear(x, w.g_proj, g)
+    late_gproj = rows <= LATE_GPROJ_ROWS
+    if not late_gproj:
+        kimi_k3_cute_gemm.linear(x, w.g_proj, g)
 
     q_a_n = chain.slot(Q_A_NORM)
     k.rmsnorm(qkv_a[:, :q_lora], w.q_a_norm, q_a_n, w.q_a_eps, fgs_consumer=True, fgs_producer=True)
@@ -289,6 +294,8 @@ def run(chain: Chain) -> torch.Tensor:
     latent = chain.slot(ATTN_LATENT)
     d.run(fused_q, latent)
     edges.consumed(leases[FUSED_Q])
+    if late_gproj:
+        kimi_k3_cute_gemm.linear(x, w.g_proj, g)
     attn_out = chain.slot(ATTN_OUT)
     kimi_k3_cute_gemm.bmm(
         latent.view(rows, heads, kv_lora).transpose(0, 1),
