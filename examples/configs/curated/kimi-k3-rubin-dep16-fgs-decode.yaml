@@ -35,10 +35,11 @@ fine_grained_sync_config:
     # resident beside a multi-wave o_proj and stretches it.
     mla.chain: [[1, 64]]
     mla.attn_o: [[1, 16]]
-    # Lamport combine inbox at every decode batch, with the data-only push below.
+    # Lamport combine inbox up to 128 rows, with the data-only push below.
     moe.recv_norm: [[1, 128]]
-    # FC1 -> FC2 and the latent mix up to 64 rows; at 128 neither pays.
-    moe.fc1_fc2: [[1, 64]]
+    # FC1 -> FC2 up to 128 rows.
+    moe.fc1_fc2: [[1, 128]]
+    # Pre-MoE mix -> latent down up to 64 rows: above that the mix runs a kernel without an FGS producer build.
     moe.mix_latent: [[1, 64]]
   kernel_switches:
     TLLM_K3_MOE: cute
