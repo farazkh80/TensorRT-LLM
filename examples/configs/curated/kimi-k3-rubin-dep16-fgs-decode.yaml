@@ -1,0 +1,56 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Kimi K3 on Rubin, DEP16 decode with fine-grained sync (FGS) edges chosen per decode batch (rows per rank).
+# Needs TRTLLM_ENABLE_PDL=1, CUDA_MODULE_LOADING=EAGER (a lazy module load while a consumer spins can hang) and the
+# CuTe K3 build (TLLM_K3_CUTE_GEMM=1 TLLM_K3_CUTE_KDA=all TLLM_K3_CUTE_NORM=1 TLLM_K3_CUTE_NORM_FOLD=1
+# TLLM_K3_CUTE_MLA=1, CuTe DSL >= 4.9). TLLM_K3_FGS_* / TLLM_K3_MOE_FGS* variables override the edges of their family.
+tensor_parallel_size: 16
+moe_expert_parallel_size: 16
+enable_attention_dp: true
+enable_chunked_prefill: true
+trust_remote_code: true
+stream_interval: 10
+cuda_graph_config:
+  max_batch_size: 64
+  enable_padding: true
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.6
+moe_config:
+  use_low_precision_moe_combine: true
+fine_grained_sync_config:
+  mode: chain_after
+  reset_policy: step
+  edges:
+    # KDA decode chain from 8 rows: below 8 its direct-GEMM builds cost more than the chain saves. Above 64 rows the
+    # bfa projection runs a 2-CTA A-multicast tile, which has no FGS consumer build.
+    kda.x_norm: [[8, 64]]
+    kda.qkvg: [[8, 64]]
+    kda.bfa: [[8, 64]]
+    kda.g: [[8, 64]]
+    kda.core_o: [[8, 64]]
+    # No kda.attn_o: o_proj is a single wave, so the early-launched mix beside it only stretches it.
+    # MLA chain up to 32 rows; at 64 it does not pay.
+    mla.chain: [[1, 32]]
+    # Lamport combine inbox at every decode batch, with the data-only push below.
+    moe.recv_norm: [[1, 128]]
+    # FC1 -> FC2 and the latent mix up to 64 rows; at 128 neither pays.
+    moe.fc1_fc2: [[1, 64]]
+    moe.mix_latent: [[1, 64]]
+  kernel_switches:
+    TLLM_K3_MOE: cute
+    TLLM_K3_COMM: cute
+    TLLM_K3_MOE_ROUTER: cute
+    TLLM_K3_MOE_LATENT_DOWN: cute
+    TLLM_K3_SHARED_AT: dispatch_start
+    TLLM_K3_MOE_SHARED: cute
+    TLLM_K3_SHARED_DOWN_AT: combine_start
+    TLLM_K3_MOE_TAIL: fused
+    TLLM_K3_MOE_UP: split3
+    TLLM_K3_MOE_FIN: fc2
+    TLLM_K3_MOE_ENTRY: auto
+    # The polling inbox consumer does not wait on the push's completion; 4 push blocks per source rank leave SMs to
+    # the shared-expert down that runs beside it.
+    TLLM_K3_COMM_INBOX_DATA_ONLY: "1"
+    TLLM_K3_COMM_INBOX_BLOCKS: "4"
