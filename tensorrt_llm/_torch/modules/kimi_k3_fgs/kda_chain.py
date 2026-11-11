@@ -90,7 +90,7 @@ def prefill_edges() -> Tuple[str, ...]:
 
 def declare(layer_idx: int, hidden: int, bfa_width: int, proj_size: int, qkvg_width: int) -> None:
     """Declare the chain edges of one KDA layer (``CORE`` is declared with the ``lamport`` edges)."""
-    if not edges.chain():
+    if not edges.chain() or edges.MIN_ROWS > edges.MAX_ROWS:
         return
     for name, width in (
         (X_NORM, hidden),

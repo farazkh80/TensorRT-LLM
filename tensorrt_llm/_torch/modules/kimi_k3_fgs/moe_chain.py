@@ -32,6 +32,7 @@ import torch
 from ..multi_stream_utils import do_multi_stream
 from . import edges as k3_edges
 from . import moe_streams
+from . import recipe as k3_recipe
 
 ENV = "TLLM_K3_MOE"
 TAIL_ENV = "TLLM_K3_MOE_TAIL"
@@ -648,6 +649,9 @@ def fgs_edges() -> frozenset:
     """The FGS edges ``TLLM_K3_MOE_FGS`` turns on: a comma list of ``EDGES`` and ``V2_EDGES``, or ``all`` (the
     unfused-path edges whose kernels the active switches keep, plus the fused-kernel edges moe_chain runs whose
     switches are on)."""
+    recipe_edges = k3_recipe.moe_edge_names()
+    if recipe_edges is not None:
+        return recipe_edges
     value = os.environ.get(FGS_ENV, "")
     if value == "all":
         names = {
@@ -739,9 +743,10 @@ def _missing_sides(edges: frozenset, moe_on: bool, comm_on: bool, tail_on: bool)
     ]
 
 
-def _counter_words(edge: str, tiles: int, ep: int, rows: int = FGS_MAX_ROWS) -> int:
+def _counter_words(edge: str, tiles: int, ep: int, rows: Optional[int] = None) -> int:
     """int32 words of ``edge``'s counter slab for a plan of ``tiles`` token tiles (the kernels size their checks by the
     workspace's plan, which can exceed the current forward's) and ``rows`` tokens per source rank."""
+    rows = FGS_MAX_ROWS if rows is None else rows
     return {
         "route_fc1": 1,
         "fc1_fc2": tiles * FC1_K_STAGES,
@@ -758,7 +763,19 @@ _EDGE_ROWS = {"fin_push": (1, 32), "fc2_fin": (9, 32)}
 _EDGE_ROWS.update({edge: spec.rows for edge, spec in V2_EDGES.items()})
 
 
+def configure_windows(windows: Mapping[str, Tuple[int, int]]) -> None:
+    """Size the counter slabs and the mix slot for the recipe's MoE edge spans (``recipe.install``)."""
+    global FGS_MAX_ROWS, MIX_MAX_ROWS
+    for edge, (_, high) in windows.items():
+        if edge in _COUNTERS:
+            FGS_MAX_ROWS = max(FGS_MAX_ROWS, high)
+        elif edge in _MIX_EDGES:
+            MIX_MAX_ROWS = max(MIX_MAX_ROWS, high)
+
+
 def _edge_rows(edge: str) -> tuple:
+    if k3_recipe.owns("moe"):
+        return k3_recipe.span((f"moe.{edge}",)) or (1, 0)
     windows = dict(_EDGE_ROWS)
     for item in filter(None, os.environ.get("TLLM_K3_MOE_FGS_ROWS", "").split(",")):
         name, _, span = item.partition(":")
@@ -786,7 +803,7 @@ class _Call:
             tiles = ws.plan.tile_idx_to_expert_idx.numel()
             for edge in counters:
                 low, high = _edge_rows(edge)
-                if not low <= rows <= high:
+                if not (low <= rows <= high and k3_recipe.moe_on(edge, rows)):
                     k3_edges.debug(f"moe.{edge}", rows, f"off: outside its rows {low}..{high}")
                     continue
                 words = _counter_words(edge, tiles, layer.ep, rows)
@@ -808,18 +825,28 @@ class _Call:
                         rows,
                         f"on, {words} words" + (f", diag={diag}" if diag else ""),
                     )
-        if "comb_norm" in layer.edges and local_rows:
+        if "comb_norm" in layer.edges and local_rows and k3_recipe.moe_on("comb_norm", local_rows):
             lease = k3_edges.acquire(COMBINED, local_rows, window=(1, TAIL_FGS_MAX_ROWS))
             if lease is not None:
                 self.leases["comb_norm"] = lease
-        if "disp_route" in layer.edges and k3_edges.slots() and 1 <= rows <= FGS_MAX_ROWS:
+        if (
+            "disp_route" in layer.edges
+            and k3_edges.slots()
+            and 1 <= rows <= FGS_MAX_ROWS
+            and k3_recipe.moe_on("disp_route", rows)
+        ):
             self.leases["disp_route"] = None
         if not fc1_v2_on(rows):
             if "recv_fc1" in layer.edges and switched(FC1_ENV, "v2"):
                 k3_edges.debug("moe.recv_fc1", rows, f"off: above {FC1_MAX_ROWS_ENV}, unfused FC1")
             return
         low, high = _edge_rows("recv_fc1")
-        if "recv_fc1" in layer.edges and layer.send and low <= rows <= high:
+        if (
+            "recv_fc1" in layer.edges
+            and layer.send
+            and low <= rows <= high
+            and k3_recipe.moe_on("recv_fc1", rows)
+        ):
             self.leases["recv_fc1"] = None
         if layer.fc1_plan and "fc1_fc2" in self.leases:
             lease = k3_edges.acquire_counters(FC1_PLAN, rows, 1, window=(1, FGS_MAX_ROWS))
@@ -1189,7 +1216,11 @@ class _Layer:
 
         local_rows = self.a2a.comm._dispatch_state["local_num_tokens"]
         ready_lease = None
-        if "rn_up" in self.edges and 1 <= local_rows <= TAIL_FGS_MAX_ROWS:
+        if (
+            "rn_up" in self.edges
+            and 1 <= local_rows <= TAIL_FGS_MAX_ROWS
+            and k3_recipe.moe_on("rn_up", local_rows)
+        ):
             ready_lease = k3_edges.acquire_counters(
                 RN_READY, local_rows, local_rows, window=_edge_rows("rn_up")
             )
@@ -1199,7 +1230,9 @@ class _Layer:
         fin_kw = _push_wait(call, final_hidden_states.numel() // HIDDEN)
         norm = self.tail_norm
         inbox_kw = {}
-        if self.inbox:
+        # The inbox changes what peers push, so the recipe decides it on the rank-consistent row count.
+        inbox = self.inbox and k3_recipe.moe_on("recv_norm", call.rows)
+        if inbox:
             poll = "recv_norm" in self.edges and fgs_diag("recv_norm") != "ready"
             inbox_kw = {"inbox": "lamport", "lamport_wait": "poll" if poll else "done"}
             k3_edges.debug(
@@ -1223,7 +1256,7 @@ class _Layer:
             "moe.combine_norm",
             local_rows,
             f"fused reduce + norm, wire={'e4m3' if self.a2a.lpc else 'bf16'}, "
-            f"{'Lamport inbox' if self.inbox else 'counted writes'}, pdl={int(_pdl())}",
+            f"{'Lamport inbox' if inbox else 'counted writes'}, pdl={int(_pdl())}",
         )
         _pending_tail.fused = (out.data_ptr(), ready_lease)
         return out
@@ -1735,8 +1768,8 @@ def _router_sync(layer: _Layer, hidden_states: torch.Tensor) -> Optional[StageSy
     mix = _mix_sync(layer, "mix_router", hidden_states)
     waits = dict(mix.waits) if mix is not None else {}
     publishes = {}
-    if "router_send" in layer.edges:
-        m = hidden_states.shape[0]
+    m = hidden_states.shape[0]
+    if "router_send" in layer.edges and k3_recipe.moe_on("router_send", m):
         lease = k3_edges.acquire_counters(ROUTE_READY, m, m, window=_edge_rows("router_send"))
         if lease is not None:
             publishes["router_send"] = EdgeSync(
@@ -1755,7 +1788,7 @@ def _router_sync(layer: _Layer, hidden_states: torch.Tensor) -> Optional[StageSy
 def _latent_send(layer: _Layer, m: int, sync: Optional[StageSync]) -> Optional[StageSync]:
     """``latent_send`` (producer side): the fused latent down adds to ``moe.latent_ready[t]`` after token t's q and
     sf rows; the send dispatch reads them once the word reaches ``latent_down.ready_target``."""
-    if "latent_send" not in layer.edges:
+    if "latent_send" not in layer.edges or not k3_recipe.moe_on("latent_send", m):
         return sync
     lease = k3_edges.acquire_counters(LATENT_READY, m, m, window=_edge_rows("latent_send"))
     if lease is None:
@@ -1776,7 +1809,11 @@ def _latent_send(layer: _Layer, m: int, sync: Optional[StageSync]) -> Optional[S
 def _mix_sync(layer: _Layer, edge: str, hidden_states: torch.Tensor) -> Optional[StageSync]:
     """The ``mix_router`` / ``mix_latent`` consumer side: the MoE input itself, when it lives in the ``mix_out``
     slot and the edge is on."""
-    if edge not in layer.edges or k3_edges.lease_containing(hidden_states) is None:
+    if (
+        edge not in layer.edges
+        or not k3_recipe.moe_on(edge, hidden_states.shape[0])
+        or k3_edges.lease_containing(hidden_states) is None
+    ):
         return None
     sync = EdgeSync(
         edge,
@@ -1793,7 +1830,7 @@ def mix_out(runtime, rows: int):
     for its plain buffer. The mix stores it as an FGS producer (no -0, dependents launched at entry); the slot is
     released once the MoE block has joined its streams (``mix_done``), which re-arms it on the reset stream."""
     layer = getattr(getattr(runtime, "routed_experts", None), "_k3_moe_layer", None)
-    if layer is None or not layer.edges & _MIX_EDGES:
+    if layer is None or not any(k3_recipe.moe_on(e, rows) for e in layer.edges & _MIX_EDGES):
         return None
     lease = k3_edges.acquire(MIX_X, rows, window=(1, MIX_MAX_ROWS))
     k3_edges.debug(MIX_X, rows, "slot" if lease is not None else f"off: {k3_edges.last_refusal()}")

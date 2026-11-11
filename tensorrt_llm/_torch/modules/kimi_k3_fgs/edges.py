@@ -41,6 +41,7 @@ from typing import Dict, Iterable, Iterator, Optional, Set, Tuple
 import torch
 
 from ....logger import logger
+from . import recipe
 
 ENV = "TLLM_K3_FGS"
 MODES = ("off", "early", "lamport", "chain", "chain_after")
@@ -87,6 +88,14 @@ DEBUG = os.environ.get("TLLM_K3_FGS_DEBUG", "0") == "1"
 _debug_seen: Set[Tuple[str, int, str]] = set()
 # Why the last acquire returned None (process-wide, so a missing scope in another thread shows too).
 _refusal = [""]
+
+
+def configure_window(window: Optional[Tuple[int, int]]) -> None:
+    """Set the decode KDA chain's row window to the recipe's kda.* span (None: the chain never runs); the recipe's
+    per-edge windows replace the drop list."""
+    global MIN_ROWS, MAX_ROWS, DROPPED
+    MIN_ROWS, MAX_ROWS = window if window is not None else (1 << 30, MAX_ROWS)
+    DROPPED = {}
 
 
 def mode() -> str:
@@ -279,6 +288,8 @@ def acquire(name: str, rows: int, readers: int = 1, window: Optional[Tuple[int, 
         return _refuse(f"{rows} rows outside [{low}, {high}]")
     if name in DROPPED and DROPPED[name][0] <= rows <= DROPPED[name][1]:
         return _refuse(f"edge {name} pruned at {rows} rows (TLLM_K3_FGS_DROP_EDGES)")
+    if not recipe.slot_allowed(name, rows):
+        return _refuse(f"edge {name} off at {rows} rows (fine_grained_sync_config)")
     if not hasattr(_local, "live"):
         return _refuse(f"no model_scope opened in thread {threading.current_thread().name}")
     from .. import kimi_k3_cute_gemm
@@ -308,6 +319,8 @@ def acquire_counters(name: str, rows: int, words: int, readers: int = 1, window=
         return _refuse(f"{rows} rows outside [{low}, {high}]")
     if name in DROPPED and DROPPED[name][0] <= rows <= DROPPED[name][1]:
         return _refuse(f"edge {name} pruned at {rows} rows (TLLM_K3_FGS_DROP_EDGES)")
+    if not recipe.slot_allowed(name, rows):
+        return _refuse(f"edge {name} off at {rows} rows (fine_grained_sync_config)")
     if not hasattr(_local, "live"):
         return _refuse(f"no model_scope opened in thread {threading.current_thread().name}")
     workspaces, live = _state()

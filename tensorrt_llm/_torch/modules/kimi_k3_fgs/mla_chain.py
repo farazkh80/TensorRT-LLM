@@ -28,12 +28,12 @@ The chain's reduction reduces several head rows per CTA from 8 decode rows up (`
 import functools
 import math
 import os
-from typing import Dict, NamedTuple, Optional
+from typing import Dict, NamedTuple, Optional, Tuple
 
 import torch
 
 from .. import kimi_k3_cute_gemm
-from . import edges
+from . import edges, recipe
 
 X_NORM = "mla.x_norm"
 QKV_A = "mla.qkv_a"
@@ -103,6 +103,12 @@ class Weights(NamedTuple):
     softmax_scale: float
 
 
+def configure_window(window: Optional[Tuple[int, int]]) -> None:
+    """Set the chain's row window to the recipe's mla.chain span (None: the chain never runs)."""
+    global MIN_ROWS, MAX_ROWS
+    MIN_ROWS, MAX_ROWS = window if window is not None else (1 << 30, 0)
+
+
 def declare(
     layer_idx: int,
     hidden: int,
@@ -114,7 +120,7 @@ def declare(
     v_dim: int,
 ) -> None:
     """Declare the chain edges of one MLA layer."""
-    if not edges.chain():
+    if not edges.chain() or MIN_ROWS > MAX_ROWS:
         return
     widths = {
         X_NORM: hidden,
@@ -205,7 +211,7 @@ def begin(
     if not edges.chain():
         return None
     rows = page_rows.shape[0]
-    if not MIN_ROWS <= rows <= MAX_ROWS:
+    if not MIN_ROWS <= rows <= MAX_ROWS or not recipe.slot_allowed(X_NORM, rows):
         return None
     decode = _Decode.build(owner, kv_pool, page_rows, kv_lens, max_requests, weights)
     if decode is None:

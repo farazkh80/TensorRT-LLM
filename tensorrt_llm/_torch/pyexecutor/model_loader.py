@@ -2068,6 +2068,7 @@ class ModelLoader:
             disable_finalize_fusion,
             use_low_precision_moe_combine=self.llm_args.moe_config.
             use_low_precision_moe_combine,
+            fine_grained_sync_config=self.llm_args.fine_grained_sync_config,
             nvfp4_gemm_allowed_backends=self.llm_args.nvfp4_gemm_config.
             allowed_backends,
             use_cute_dsl_blockscaling_mm=self.llm_args.

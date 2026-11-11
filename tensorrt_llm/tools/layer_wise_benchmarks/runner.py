@@ -12,6 +12,7 @@ from enum import IntEnum
 from typing import Literal, Optional
 
 import torch
+import yaml
 
 import tensorrt_llm._torch.model_config
 import tensorrt_llm._torch.pyexecutor.config_utils
@@ -50,9 +51,25 @@ from tensorrt_llm._torch.pyexecutor.model_loader import (
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.utils import get_model_extra_attrs, model_extra_attrs
 from tensorrt_llm._utils import local_mpi_size, mpi_rank, mpi_world_size, torch_dtype_to_binding
-from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, KvCacheConfig, MoeConfig, TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import (
+    DecodingBaseConfig,
+    FineGrainedSyncConfig,
+    KvCacheConfig,
+    MoeConfig,
+    TorchLlmArgs,
+)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+
+
+def _fine_grained_sync_args() -> dict:
+    """``fine_grained_sync_config`` from the ``--config`` style YAML named by ``LWB_FGS_CONFIG``, if set."""
+    path = os.environ.get("LWB_FGS_CONFIG")
+    if not path:
+        return {}
+    with open(path) as f:
+        config = yaml.safe_load(f)["fine_grained_sync_config"]
+    return {"fine_grained_sync_config": FineGrainedSyncConfig(**config)}
 
 
 class BalanceMethod(IntEnum):
@@ -436,6 +453,7 @@ class Runner:
             # `model_config.spec_config`; this keeps `llm_args` consistent with it.
             **({"speculative_config": spec_config} if spec_config is not None else {}),
             **{} if use_cuda_graph else {"cuda_graph_config": None},
+            **_fine_grained_sync_args(),
             moe_config=MoeConfig(
                 backend=moe_backend,
                 max_num_tokens=moe_max_num_tokens,

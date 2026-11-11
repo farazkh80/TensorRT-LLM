@@ -128,6 +128,7 @@ from ..modules.kimi_k3_fgs import kda_chain as k3_kda_chain
 from ..modules.kimi_k3_fgs import mla_chain as k3_mla_chain
 from ..modules.kimi_k3_fgs import moe_chain as k3_moe_chain
 from ..modules.kimi_k3_fgs import moe_streams as k3_moe_streams
+from ..modules.kimi_k3_fgs import recipe as k3_fgs_recipe
 from ..modules.kimi_kda import KimiKDALinearAttention
 from ..modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
 from ..modules.linear import (
@@ -2855,6 +2856,8 @@ class KimiLinearModel(DecoderModel):
         }
 
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size, dtype=dtype)
+        # Layers declare their fine-grained-sync edges at construction.
+        k3_fgs_recipe.install(model_config.fine_grained_sync_config)
         self.layers = nn.ModuleList(
             [
                 KimiLinearDecoderLayer(model_config, cfg, layer_idx, self.aux_stream_dict)
