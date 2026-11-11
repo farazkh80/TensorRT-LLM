@@ -67,6 +67,8 @@ _DISPATCH_WAIT, _DISPATCH_DEFER, _DISPATCH_SEND_ONLY = 0, 1, 2
 # Lamport combine side buffer (one symmetric MNNVL allocation): push-completion words done[src][by] (u32), the
 # per-source active-expert masks, then two inboxes selected by the round parity.
 _SIDE_BLOCKS = 32
+INBOX_BLOCKS_ENV = "TLLM_K3_COMM_INBOX_BLOCKS"
+INBOX_DATA_ONLY_ENV = "TLLM_K3_COMM_INBOX_DATA_ONLY"
 _SIDE_DONE = 0
 _SIDE_MASK = 4096
 _SIDE_INBOX = 8192
@@ -1627,11 +1629,15 @@ if _CUTE_AVAILABLE:
             inbox_bytes: int,
             delay_ns: int = 0,
             bulk: bool = False,
+            data_only: bool = False,
         ):
             assert hidden % 512 == 0
             # bulk: a warp stages the converted row in shared memory and one lane bulk-stores it to the peer;
             # otherwise every lane stores its 16-B chunks from registers.
             self.bulk = bulk
+            # data_only: for a consumer that polls the inbox chunks, a CTA exits once its reads of the payload are
+            # done; it neither waits for its remote stores to land nor publishes the push-completion words.
+            self.data_only = data_only
             self.ep, self.hidden, self.lpc, self.lay, self.pdl = ep, hidden, lpc, dict(lay), pdl
             self.fin, self.adv_base = fin, adv_base
             self.rows, self.inbox_bytes = rows, inbox_bytes
@@ -1791,12 +1797,16 @@ if _CUTE_AVAILABLE:
                             _bulk_commit()
             if cutlass.const_expr(self.bulk):
                 if lane == 0:
-                    _bulk_commit_wait()
-                    _fence_proxy_async_global()
+                    if cutlass.const_expr(self.data_only):
+                        _bulk_wait_read()
+                    else:
+                        _bulk_commit_wait()
+                        _fence_proxy_async_global()
             cute.arch.sync_threads()
-            if tidx == 0:
-                _fence_acq_rel_sys()
-                _st_sys_b32(dst_side + _SIDE_DONE + (rank * _SIDE_BLOCKS + by) * 4, value)
+            if cutlass.const_expr(not self.data_only):
+                if tidx == 0:
+                    _fence_acq_rel_sys()
+                    _st_sys_b32(dst_side + _SIDE_DONE + (rank * _SIDE_BLOCKS + by) * 4, value)
             if source == rank:
                 if by == 0:
                     if cutlass.const_expr(self.fin):
@@ -2608,7 +2618,12 @@ class CuteA2A:
         return out
 
     def _lamport_blocks(self, runtime_max: int) -> int:
-        return min(_SIDE_BLOCKS, max(1, (runtime_max + _PUSH_WARPS - 1) // _PUSH_WARPS))
+        # TLLM_K3_COMM_INBOX_BLOCKS caps the push blocks per source rank: each warp then pushes more rows, and the
+        # push leaves SMs to the shared-expert down launched beside it. Every rank must use the same value.
+        cap = int(os.environ.get(INBOX_BLOCKS_ENV, str(_SIDE_BLOCKS)))
+        if not 1 <= cap <= _SIDE_BLOCKS:
+            raise ValueError(f"{INBOX_BLOCKS_ENV}={cap}; valid: 1..{_SIDE_BLOCKS}")
+        return min(cap, max(1, (runtime_max + _PUSH_WARPS - 1) // _PUSH_WARPS))
 
     def lamport_inbox(self) -> LamportInbox:
         """The consumer view of this rank's Lamport inbox for the current round."""
@@ -2633,6 +2648,7 @@ class CuteA2A:
         hazard_delay_ns: int = 0,
         hazard_skip_base: bool = False,
         bulk: bool = True,
+        data_only: bool = False,
     ) -> LamportInbox:
         """Push each received row back to its source rank's inbox: a warp per row loads the bf16 expert output
         (after ``fin_done[s * max + t] >= fin_expected`` when given, else after the producer grid), casts it to the
@@ -2662,6 +2678,7 @@ class CuteA2A:
             self.inbox_bytes,
             hazard_delay_ns,
             bulk,
+            data_only,
         )(
             y.view(-1),
             ws_base,

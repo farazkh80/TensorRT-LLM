@@ -29,6 +29,7 @@ entry with or without it.
 from __future__ import annotations
 
 import functools
+import os
 from typing import Optional
 
 import cutlass
@@ -632,7 +633,9 @@ def combine_norm(
         hazard_delay_ns=hazard_delay_ns,
     )
     if inbox == "lamport":
-        box = a2a.combine_push(y, fin_done=fin_done, fin_expected=fin_expected)
+        # The poll consumer accepts each chunk only once it is written, so it does not need the push's completion.
+        data_only = lamport_wait == "poll" and os.environ.get(_comm.INBOX_DATA_ONLY_ENV, "0") == "1"
+        box = a2a.combine_push(y, fin_done=fin_done, fin_expected=fin_expected, data_only=data_only)
         return reduce_norm(
             out, norm_weight, eps, pdl=True, lamport=lamport_wait, inbox=box, **common
         )
