@@ -488,6 +488,27 @@
       "path": "encoder_max_num_tokens"
     },
     {
+      "allowed_values": [
+        "off",
+        "early",
+        "lamport",
+        "chain",
+        "chain_after"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "fine_grained_sync_config.mode"
+    },
+    {
+      "allowed_values": [
+        "release",
+        "step"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "fine_grained_sync_config.reset_policy"
+    },
+    {
       "capture_policy": "bool",
       "kind": "value",
       "path": "force_dynamic_quantization"

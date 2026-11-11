@@ -2640,6 +2640,76 @@
       "title": "EncodeExtraInputSpec",
       "type": "object"
     },
+    "FineGrainedSyncConfig": {
+      "additionalProperties": false,
+      "description": "Fine-grained-sync (FGS) recipe: which producer -> consumer edges run per decode batch size.\n\nAn FGS edge lets a consumer kernel start before its producer completes and wait on the producer's data instead\n(sentinel-armed slots or counters). Each CUDA graph is captured at one batch size, so a graph runs the edges whose\nwindows hold its batch size. Used by Kimi K3 on SM107; the model rejects edge names it does not have. Debug and\nA/B overrides: an edge family whose environment variables are set runs as they say (``TLLM_K3_FGS_MIN_ROWS`` /\n``MAX_ROWS`` / ``DROP_EDGES`` for kda.*, ``TLLM_K3_FGS_MLA_MIN_ROWS`` / ``MAX_ROWS`` / ``DROP_EDGES`` for mla.*,\n``TLLM_K3_MOE_FGS`` / ``_ROWS`` / ``_MAX_ROWS`` and ``TLLM_K3_COMM_INBOX`` for moe.*), and ``TLLM_K3_FGS``,\n``TLLM_FGS_RESET_POLICY`` and each kernel switch's variable win over ``mode``, ``reset_policy`` and\n``kernel_switches``.",
+      "properties": {
+        "edges": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "items": {
+                  "maxItems": 2,
+                  "minItems": 2,
+                  "prefixItems": [
+                    {
+                      "exclusiveMinimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "exclusiveMinimum": 0,
+                      "type": "integer"
+                    }
+                  ],
+                  "type": "array"
+                },
+                "type": "array"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Edge name (for example 'kda.x_norm', 'mla.chain', 'moe.recv_norm') -> inclusive [low, high] windows of decode rows per rank where the edge runs. An edge that is not listed is off. None keeps the model's default windows; an empty map runs no edge, which is FGS off on the same kernels.",
+          "title": "Edges"
+        },
+        "kernel_switches": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Fused-MoE kernel switches the MoE edges need (TLLM_K3_MOE*, TLLM_K3_COMM*, TLLM_K3_SHARED*), by environment variable name, for example {'TLLM_K3_MOE': 'cute'}. Applied as defaults when the model is built.",
+          "title": "Kernel Switches",
+          "type": "object"
+        },
+        "mode": {
+          "default": "chain_after",
+          "description": "FGS mode. 'chain' and 'chain_after' run each decode attention layer as one PDL chain of edges; 'chain_after' launches the KDA gate projections behind the qkvg projection. 'early' and 'lamport' cover the attention output projections only.",
+          "enum": [
+            "off",
+            "early",
+            "lamport",
+            "chain",
+            "chain_after"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "reset_policy": {
+          "default": "step",
+          "description": "How edge slots are re-armed: 'release' re-arms a slot when its last reader launches; 'step' re-arms the step's slots with batched fills on the reset stream.",
+          "enum": [
+            "release",
+            "step"
+          ],
+          "title": "Reset Policy",
+          "type": "string"
+        }
+      },
+      "title": "FineGrainedSyncConfig",
+      "type": "object"
+    },
     "GmsConfig": {
       "additionalProperties": false,
       "description": "Prototype configuration for GPU Memory Service (GMS) weight sharing.\n\nComposes orthogonally with ``checkpoint_format`` on ``TorchLlmArgs``:\nGMS controls *where* weights live (a node-shared GPU memory pool\nso multiple TRT-LLM instances zero-copy share the same bytes),\nwhile ``checkpoint_format`` controls *how* they get there (HF disk,\nMX P2P, etc.). Effective only when ``TorchLlmArgs.load_format ==\nLoadFormat.GMS``; setting any non-default field here without that\nload_format triggers a warning via :meth:`TorchLlmArgs.validate_gms_config`.\n\nTwo roles are decided at connect time by the GMS daemon, not by\nconfig:\n\n- **RW (writer)**: the first instance loads weights into the pool\n  via the normal checkpoint-loader pipeline, then commits them.\n- **RO (reader)**: subsequent instances zero-copy materialize the\n  already-committed layout \u2014 no disk I/O, no per-instance copies.\n\nSee :class:`tensorrt_llm._torch.memory.gpu_memory_backend.GMSBackend`\nfor the integration adapter and the ``LoadFormat.GMS`` branch in\n``ModelLoader.load`` for orchestration.",
@@ -6874,6 +6944,19 @@
       "description": "[EXPERIMENTAL] Environment variable overrides. NOTE: import-time-cached env vars in the code won't update unless the code fetches them from os.environ on demand.",
       "status": "prototype",
       "title": "Env Overrides"
+    },
+    "fine_grained_sync_config": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/FineGrainedSyncConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Fine-grained-sync edge recipe per decode batch size. None keeps the model's defaults.",
+      "status": "prototype"
     },
     "force_dynamic_quantization": {
       "default": false,
