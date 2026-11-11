@@ -18,7 +18,9 @@ where the mix is launched, behind the previous layer's MoE and so behind the pre
 reader of the split-KV workspace and plan that every MLA layer shares. :func:`run` joins it right before the latent
 append, the first writer of this step's cache rows; split_kv and the reduction, which read the page table, plan and
 sentinels, follow on the main stream. The chain covers decode batches of ``TLLM_K3_FGS_MLA_MIN_ROWS`` to
-``TLLM_K3_FGS_MLA_MAX_ROWS`` rows; any edge without a slot leaves the whole layer on the stock path.
+``TLLM_K3_FGS_MLA_MAX_ROWS`` rows; any edge without a slot leaves the whole layer on the stock path, except attn_o:
+outside the recipe's ``mla.attn_o`` rows o_proj writes a plain buffer and the pre-MoE mix waits for it to complete
+(a mix polling the slot stays resident beside a multi-wave o_proj and stretches it).
 
 The chain's reduction reduces several head rows per CTA from 8 decode rows up (``TLLM_K3_FGS_MLA_RED_ROWS``, default
 ``auto``): fewer CTAs let W_UV, its PDL dependent, launch sooner; the output is bit-identical. With
@@ -221,6 +223,9 @@ def begin(
         return None
     leases = {}
     for name, readers in _EDGES:
+        if name == ATTN_O and not recipe.slot_allowed(ATTN_O, rows):
+            edges.debug(ATTN_O, rows, "off: o_proj writes a plain buffer")
+            continue
         lease = edges.acquire(name, rows, readers=readers, window=(MIN_ROWS, MAX_ROWS))
         if lease is None:
             for held in leases.values():
@@ -307,7 +312,7 @@ def run(chain: Chain) -> torch.Tensor:
     k.gate(attn_out, g, out=gated, fgs_consumer=True, fgs_producer=True)
     edges.consumed(leases[ATTN_OUT])
     edges.consumed(leases[GATE])
-    o = chain.slot(ATTN_O)
+    o = chain.slot(ATTN_O) if ATTN_O in leases else gated.new_empty(rows, w.o_proj.shape[0])
     kimi_k3_cute_gemm.linear(gated, w.o_proj, o)
     return o
 

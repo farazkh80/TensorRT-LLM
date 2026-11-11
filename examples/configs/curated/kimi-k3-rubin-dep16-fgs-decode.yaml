@@ -31,8 +31,10 @@ fine_grained_sync_config:
     kda.g: [[8, 64]]
     kda.core_o: [[8, 64]]
     # No kda.attn_o: o_proj is a single wave, so the early-launched mix beside it only stretches it.
-    # MLA chain up to 32 rows; at 64 it does not pay.
-    mla.chain: [[1, 32]]
+    # MLA chain up to 64 rows. Its o_proj -> pre-MoE mix edge stops at 16 rows: above that the polling mix stays
+    # resident beside a multi-wave o_proj and stretches it.
+    mla.chain: [[1, 64]]
+    mla.attn_o: [[1, 16]]
     # Lamport combine inbox at every decode batch, with the data-only push below.
     moe.recv_norm: [[1, 128]]
     # FC1 -> FC2 and the latent mix up to 64 rows; at 128 neither pays.

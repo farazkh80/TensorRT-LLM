@@ -9,8 +9,9 @@ list is off. The mode, the reset policy and the kernel switches become defaults 
 variable that is set wins.
 
 Edge names: the KDA chain edges (``KDA_EDGES``); ``mla.chain``, every mla.* slot (the decode MLA layer runs as a
-chain only with all of them); ``moe.<edge>`` for the MoE edges of ``moe_chain``, where ``moe.recv_norm`` also selects
-the Lamport combine inbox at its rows.
+chain only with all of them) except ``mla.attn_o``, the chain's o_proj -> pre-MoE mix edge, which when listed runs only
+at its own rows (unlisted: wherever the chain runs); ``moe.<edge>`` for the MoE edges of ``moe_chain``, where
+``moe.recv_norm`` also selects the Lamport combine inbox at its rows.
 """
 
 import os
@@ -18,6 +19,7 @@ from typing import Dict, Optional, Tuple
 
 KDA_EDGES = ("kda.x_norm", "kda.qkvg", "kda.bfa", "kda.g", "kda.core_o", "kda.attn_o")
 MLA_CHAIN = "mla.chain"
+MLA_ATTN_O = "mla.attn_o"
 FAMILY_ENVS = {
     "kda": ("TLLM_K3_FGS_MIN_ROWS", "TLLM_K3_FGS_MAX_ROWS", "TLLM_K3_FGS_DROP_EDGES"),
     "mla": ("TLLM_K3_FGS_MLA_MIN_ROWS", "TLLM_K3_FGS_MLA_MAX_ROWS", "TLLM_K3_FGS_DROP_EDGES"),
@@ -62,7 +64,7 @@ def install(config) -> None:
     os.environ.setdefault(RESET_ENV, config.reset_policy)
     if config.edges is None:
         return
-    known = set(KDA_EDGES) | {MLA_CHAIN} | set(moe_edges())
+    known = set(KDA_EDGES) | {MLA_CHAIN, MLA_ATTN_O} | set(moe_edges())
     unknown = sorted(set(config.edges) - known)
     if unknown:
         raise ValueError(
@@ -110,6 +112,8 @@ def slot_allowed(slot: str, rows: int) -> bool:
     if family == "kda" and slot in KDA_EDGES and owns("kda"):
         return on(slot, rows)
     if family == "mla" and owns("mla"):
+        if slot == MLA_ATTN_O and MLA_ATTN_O in _windows:
+            return on(MLA_CHAIN, rows) and on(MLA_ATTN_O, rows)
         return on(MLA_CHAIN, rows)
     return True
 

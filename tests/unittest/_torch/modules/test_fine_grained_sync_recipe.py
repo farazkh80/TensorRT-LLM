@@ -127,6 +127,16 @@ def test_install_sets_windows_and_defaults():
     assert moe_chain._edge_rows("recv_norm") == (1, 64)
 
 
+def test_mla_attn_o_window():
+    chain = "    mla.chain: [[2, 32]]\n"
+    recipe.install(config(RECIPE_YAML.replace(chain, chain + "    mla.attn_o: [[2, 16]]\n")))
+    assert (mla_chain.MIN_ROWS, mla_chain.MAX_ROWS) == (2, 32)
+    assert recipe.slot_allowed("mla.attn_o", 16) and not recipe.slot_allowed("mla.attn_o", 32)
+    assert recipe.slot_allowed("mla.gated", 32)
+    recipe.install(config())
+    assert recipe.slot_allowed("mla.attn_o", 32) and not recipe.slot_allowed("mla.attn_o", 64)
+
+
 def test_environment_wins():
     os.environ[recipe.MODE_ENV] = "off"
     os.environ["TLLM_K3_MOE_FGS"] = "fc1_fc2"
