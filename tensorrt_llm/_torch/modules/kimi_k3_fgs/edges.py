@@ -78,6 +78,9 @@ _rows: Dict[str, int] = {}
 _windows: Dict[str, Tuple[int, int]] = {}
 # Counter edge name -> int32 words per slot (int32 slabs armed to zero instead of bf16 slots).
 _counter_words: Dict[str, int] = {}
+# Byte edge name -> (slot rows, element dtype, reset policy override or None, bounded, bound-sharing edge or None);
+# see ``declare_bytes``.
+_byte_slots: Dict[str, Tuple[int, torch.dtype, Optional[str], bool, Optional[str]]] = {}
 _local = threading.local()
 # One slot set per device: the executor runs forwards from several threads (memory profiling, warm-up, the step
 # loop), never concurrently, and a set per thread would keep a full copy of every edge's slots for each of them.
@@ -178,6 +181,36 @@ def declare_counters(
         declare(name, 1, layer_idx, max_rows=max_rows, min_rows=min_rows)
 
 
+def declare_bytes(
+    name: str,
+    width: int,
+    dtype: torch.dtype,
+    slot_rows: int,
+    layer_idx: int,
+    max_rows: int,
+    min_rows: int = 1,
+    policy: Optional[str] = None,
+    bounded: bool = False,
+    bounds_from: Optional[str] = None,
+) -> None:
+    """Declare a [slot_rows, width] edge of 1-byte ``dtype`` (float8_e4m3fn data armed with -0, uint8 UE8M0 scales
+    armed with 0xFF) used once per step by ``layer_idx`` for ``min_rows`` to ``max_rows`` tokens per rank.
+
+    ``slot_rows`` counts rows of the edge (e.g. permuted rows), not tokens. ``policy`` (``step`` / ``release``)
+    overrides ``TLLM_FGS_RESET_POLICY`` for this edge; ``bounded`` re-arms only the rows a kernel of the use writes
+    into ``lease.bound``; ``bounds_from`` (an edge declared before this one, acquired together with it) shares that
+    edge's bound words. Not a GEMM operand: ``acquire_bytes`` hands the slots out."""
+    if slots():
+        _byte_slots[name] = (
+            max(slot_rows, _byte_slots.get(name, (0,))[0]),
+            dtype,
+            policy,
+            bounded,
+            bounds_from,
+        )
+        declare(name, width, layer_idx, max_rows=max_rows, min_rows=min_rows)
+
+
 def _workspaces():
     device = torch.cuda.current_device()
     workspaces = _device_workspaces.get(device)
@@ -225,12 +258,26 @@ def model_scope(
     if missing and not torch.cuda.is_current_stream_capturing():
         from ..fine_grained_sync import ResetPolicy
 
-        per_step = workspaces.reset_policy is ResetPolicy.STEP
         for name in missing:
             width = _declared[name][0]
+            slot_rows, dtype, policy, bounded, bounds_from = _byte_slots.get(
+                name, (0, None, None, False, None)
+            )
+            per_step = ResetPolicy(policy or workspaces.reset_policy) is ResetPolicy.STEP
             num_slots = len(users[name]) if per_step else 2
             if name in _counter_words:
                 workspaces.workspace(name, (_counter_words[name], 1), torch.int32, slots=num_slots)
+                continue
+            if name in _byte_slots:
+                workspaces.workspace(
+                    name,
+                    (slot_rows, width),
+                    dtype,
+                    slots=num_slots,
+                    policy=None if policy is None else ResetPolicy(policy),
+                    bounded=bounded,
+                    bounds_from=bounds_from,
+                )
                 continue
             workspaces.workspace(
                 name, (_rows.get(name, MAX_ROWS), width), torch.bfloat16, slots=num_slots
@@ -329,6 +376,31 @@ def acquire_counters(name: str, rows: int, words: int, readers: int = 1, window=
     if name not in workspaces or name not in _counter_words:
         return _refuse(f"counter edge {name} not registered")
     lease = workspaces.acquire(name, rows=words)
+    live[lease.tensor.data_ptr()] = lease
+    _local.readers[lease.tensor.data_ptr()] = readers
+    return lease
+
+
+def acquire_bytes(name: str, rows: int, slot_rows: int, readers: int = 1, window=None):
+    """The next armed slot of byte edge ``name`` truncated to ``slot_rows`` rows, for a forward of ``rows`` tokens per
+    rank, or None (same refusals as ``acquire_counters``)."""
+    low, high = (MIN_ROWS, MAX_ROWS) if window is None else window
+    if not slots():
+        return _refuse(f"{ENV}={mode()} has no slots")
+    if not low <= rows <= high:
+        return _refuse(f"{rows} rows outside [{low}, {high}]")
+    if not recipe.slot_allowed(name, rows):
+        return _refuse(f"edge {name} off at {rows} rows (fine_grained_sync_config)")
+    if not hasattr(_local, "live"):
+        return _refuse(f"no model_scope opened in thread {threading.current_thread().name}")
+    workspaces, live = _state()
+    if not workspaces.in_scope:
+        return _refuse("outside a model_scope")
+    if name not in workspaces or name not in _byte_slots:
+        return _refuse(f"byte edge {name} not registered")
+    if slot_rows > workspaces[name].shape[0]:
+        return _refuse(f"{slot_rows} slot rows above the {workspaces[name].shape[0]} registered")
+    lease = workspaces.acquire(name, rows=slot_rows)
     live[lease.tensor.data_ptr()] = lease
     _local.readers[lease.tensor.data_ptr()] = readers
     return lease

@@ -132,6 +132,20 @@ def ld_relaxed_sys_b32(addr: cutlass.Int64, *, loc=None, ip=None) -> Int32:
 
 
 @dsl_user_op
+def ld_relaxed_gpu_b32(addr: cutlass.Int64, *, loc=None, ip=None) -> Int32:
+    return Int32(
+        _asm(
+            T.i32(),
+            [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)],
+            "ld.relaxed.gpu.global.b32 $0, [$1];",
+            "=r,l,~{memory}",
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
 def fence_proxy_async_global(*, loc=None, ip=None) -> None:
     _asm(None, [], "fence.proxy.async.global;", "", loc, ip)
 

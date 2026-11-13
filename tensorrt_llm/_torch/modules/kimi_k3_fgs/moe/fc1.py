@@ -363,6 +363,7 @@ class Fc1Kernel:
         source: Optional[Tuple] = None,
         plan_pub: bool = False,
         nowait: bool = False,
+        lamport: bool = False,
     ):
         if n_tile not in (8, 16, 32):
             raise ValueError(f"n_tile must be 8, 16 or 32, got {n_tile}")
@@ -391,7 +392,11 @@ class Fc1Kernel:
         self.source = source if routed else None
         self.plan_pub = plan_pub and routed
         self.nowait = nowait
-        self.delay_ns = delay_ns if (signal_done or self.plan_pub) else 0
+        if lamport and signal_done:
+            raise ValueError("the Lamport FC1 -> FC2 build publishes no fc1_done counters")
+        # lamport: act / act_sf are FC1 -> FC2 slots armed with 0x80 / 0xFF, which FC2 validates byte by byte.
+        self.lamport = lamport
+        self.delay_ns = delay_ns if (signal_done or self.plan_pub or lamport) else 0
         self.full_wait = full_wait
         self.info_fields = 6 if routed else 5
         self.max_ab_stages = max_ab_stages
@@ -1420,7 +1425,7 @@ class Fc1Kernel:
         # warp prefetched (weight tile bidx % 48 of expert bidx // 48).
         if cutlass.const_expr(self.routed):
             if warp_idx == self.sched_warp_id:
-                if cutlass.const_expr(self.use_pdl and self.signal_done):
+                if cutlass.const_expr(self.use_pdl and (self.signal_done or self.lamport)):
                     cute.arch.griddepcontrol_launch_dependents()
                 info_state = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.num_tile_stage
@@ -1508,7 +1513,9 @@ class Fc1Kernel:
                 if cutlass.const_expr(self.wait_plan):
                     wait_at_least(mPlanReady.iterator.toint(), cutlass.Int32(1))
                 # The dependent (FC2) may start once the plan it also reads is complete.
-                if cutlass.const_expr(self.use_pdl and (self.wait_plan or self.signal_done)):
+                if cutlass.const_expr(
+                    self.use_pdl and (self.wait_plan or self.signal_done or self.lamport)
+                ):
                     cute.arch.griddepcontrol_launch_dependents()
                 info_state = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.num_tile_stage
@@ -2035,6 +2042,14 @@ class Fc1Kernel:
                             codes = _e4m3x2(
                                 act[4 * i + 2 * j + 1] * inv_scale, act[4 * i + 2 * j] * inv_scale
                             )
+                            if cutlass.const_expr(self.lamport):
+                                # E4M3 -0 is the slot sentinel: store +0 (the same value).
+                                zero_signs = cutlass.select_(
+                                    (codes & 0x7F) == 0, cutlass.Int32(0x80), cutlass.Int32(0)
+                                ) | cutlass.select_(
+                                    (codes & 0x7F00) == 0, cutlass.Int32(0x8000), cutlass.Int32(0)
+                                )
+                                codes = codes & (zero_signs ^ cutlass.Int32(-1))
                             if prow < limit:
                                 mAct16[(prow, m_tile * 32 + act16_col)] = cutlass.Uint16(codes)
                                 if (quad & 1) == 0:
@@ -2213,7 +2228,19 @@ def _check_word(name, t, words):
         raise ValueError(f"{name} must be a contiguous int32 tensor of at least {words} words")
 
 
-def run(x, x_sf, weights, plan, act, act_sf, *, plan_ready=None, fc1_done=None, hazard_delay_ns=0):
+def run(
+    x,
+    x_sf,
+    weights,
+    plan,
+    act,
+    act_sf,
+    *,
+    plan_ready=None,
+    fc1_done=None,
+    lamport=False,
+    hazard_delay_ns=0,
+):
     """FC1 of the moe_chain contract: act[p], act_sf[p] = MXFP8(SiTU-GLU(x[p2e[p] // 16] @ W31[e]^T)) for every
     valid permuted row p of expert e; rows past each tile's mn_limit are left untouched. Launches one kernel on the
     current stream; no allocation, no host synchronization.
@@ -2222,8 +2249,11 @@ def run(x, x_sf, weights, plan, act, act_sf, *, plan_ready=None, fc1_done=None, 
     consumer: the plan is read only after the word is acquired. ``fc1_done`` (int32 [T * 12], zero-armed) makes it
     the FC1 -> FC2 producer: after the stores of weight tile j of token tile t < ``EARLY_TILES``,
     fc1_done[t * 12 + j // 4] is incremented with release semantics, so each 256-channel K stage of such a tile
-    reaches 4 (later tiles are covered by the grid dependency). Both are owned by the caller. ``hazard_delay_ns``
-    delays the stores of token tile 0 in the ``fc1_done`` build (hazard tests only)."""
+    reaches 4 (later tiles are covered by the grid dependency). Both are owned by the caller. ``lamport`` makes it
+    the Lamport FC1 -> FC2 producer instead: ``act`` / ``act_sf`` are slots armed with 0x80 / 0xFF, FC1 never writes
+    those bytes (E4M3 -0 is stored as +0, a scale byte is at most 253) and releases FC2 as the ``fc1_done`` build
+    does, without counters. ``hazard_delay_ns`` delays the stores of token tile 0 in the ``fc1_done`` and ``lamport``
+    builds (hazard tests only)."""
     _check(x, x_sf, weights, plan, act, act_sf)
     _check_word("plan_ready", plan_ready, 1)
     _check_word("fc1_done", fc1_done, plan.tile_idx_to_expert_idx.shape[0] * DONE_PER_TILE)
@@ -2234,14 +2264,15 @@ def run(x, x_sf, weights, plan, act, act_sf, *, plan_ready=None, fc1_done=None, 
         _use_pdl(),
         plan_ready is not None,
         fc1_done is not None,
-        hazard_delay_ns if fc1_done is not None else 0,
+        hazard_delay_ns if (fc1_done is not None or lamport) else 0,
         plan_ready is not None and fgs_diag("route_fc1") == "ready",
+        lamport,
     )
     args = _launch_args(x, x_sf, weights, plan, act, act_sf, plan_ready, fc1_done)
     stream = cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
     compiled = _compiled.get(key)
     if compiled is None:
-        kernel = Fc1Kernel(*key[:6], delay_ns=key[6], full_wait=key[7])
+        kernel = Fc1Kernel(*key[:6], delay_ns=key[6], full_wait=key[7], lamport=key[8])
         compiled = _compiled[key] = cute.compile(kernel, *args, stream)
     compiled(*args, stream)
 
@@ -2259,6 +2290,7 @@ def run_routed(
     prefetch=False,
     plan_pub=None,
     fc1_done=None,
+    lamport=False,
     hazard_delay_ns=0,
     hazard_nowait=False,
 ):
@@ -2274,8 +2306,8 @@ def run_routed(
     region ``x`` / ``x_sf`` / ``topk_ids`` are: each 32-row step of the scan first waits for the byte counters of its
     source blocks. ``plan_pub`` (int32 word, zero-armed): every CTA adds 1 after its plan share, so a consumer that
     starts before FC1 ends reads the plan once the word reaches ``num_ctas_for(x, plan)``; required with a
-    ``defer_data_wait`` source (the add that completes the grid advances the byte-counter baselines). ``fc1_done``:
-    as in ``run``.
+    ``defer_data_wait`` source (the add that completes the grid advances the byte-counter baselines). ``fc1_done``,
+    ``lamport``: as in ``run``.
     ``hazard_delay_ns`` delays the plan share of the CTAs that publish an expert (and, with ``fc1_done``, the
     token-tile-0 stores); ``hazard_nowait`` skips the source waits (hazard tests only)."""
     _check(x, x_sf, weights, plan, act, act_sf)
@@ -2339,13 +2371,14 @@ def run_routed(
         weights.linear_cap,
         _use_pdl(),
         fc1_done is not None,
-        hazard_delay_ns if (fc1_done is not None or plan_pub is not None) else 0,
+        hazard_delay_ns if (fc1_done is not None or plan_pub is not None or lamport) else 0,
         num_local,
         plan.max_rows,
         prefetch,
         src,
         plan_pub is not None,
         hazard_nowait,
+        lamport,
     )
     args = _launch_args(
         x, x_sf, weights, plan, act, act_sf, None, fc1_done, topk_ids, plan_pub, recv
@@ -2367,6 +2400,7 @@ def run_routed(
             source=src,
             plan_pub=plan_pub is not None,
             nowait=hazard_nowait,
+            lamport=lamport,
         )
         compiled = _compiled[key] = cute.compile(kernel, *args, stream)
         k3_edges.debug(
@@ -2389,7 +2423,8 @@ def run_v2(x, x_sf, ids, weights_e, plan, act, act_sf, *, fgs=None, enable_pdl=T
     ``fgs.waits["recv_fc1"]``: the receive of a send-only dispatch; its ``source`` is the dispatch's receive
     descriptor (``CuteA2A.routing_source()``). With it the weight stages of the speculative first unit are issued at
     launch (FUSED-ON); ``diag`` ``oracle`` skips the counter waits, ``ready`` drops the early weight stages.
-    ``fgs.publishes["fc1_fc2"]``: the ``fc1_done`` slab. ``fgs.publishes["fc1_plan"]``: the ``plan_pub`` word (needed
+    ``fgs.publishes["fc1_fc2"]``: the ``fc1_done`` slab, or for ``kind == "lamport"`` the Lamport build (``act`` /
+    ``act_sf`` are the slots). ``fgs.publishes["fc1_plan"]``: the ``plan_pub`` word (needed
     with either edge; an FC2 that overlaps this kernel waits for it to reach ``num_ctas_for(x, plan)``).
     ``enable_pdl`` must match ``TRTLLM_ENABLE_PDL``, which the kernel reads."""
     waits = fgs.waits if fgs is not None else {}
@@ -2417,7 +2452,8 @@ def run_v2(x, x_sf, ids, weights_e, plan, act, act_sf, *, fgs=None, enable_pdl=T
         source=None if recv is None else recv.source,
         prefetch=recv is not None and recv.diag != "ready",
         plan_pub=None if pub is None else pub.tensor,
-        fc1_done=None if done is None else done.tensor,
+        fc1_done=None if done is None or done.kind == "lamport" else done.tensor,
+        lamport=done is not None and done.kind == "lamport",
         hazard_delay_ns=delay,
         hazard_nowait=recv is not None and (recv.hazard_nowait or recv.diag == "oracle"),
     )

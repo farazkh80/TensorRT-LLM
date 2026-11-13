@@ -36,6 +36,11 @@ Fine-grained sync with the neighbouring stages (int32 counter slabs, zero-armed 
   (FC1's four 64-column units of that stage). A gate warp (7) polls the counters ahead of the loader and hands it one
   smem token per stage; the weight TMA does not wait. FC1 counts only the first ``EARLY_TILES`` token tiles, so a unit
   with a later tile waits for the FC1 grid (``griddepcontrol.wait`` in the gate warp) instead.
+- Lamport alternative to ``fc1_done``: ``act`` / ``act_sf`` are slots armed with 0x80 (E4M3 -0) / 0xFF, bytes FC1
+  never writes. Checker warps (7 ..) take the loader's stages in turn once their copies landed, check every 32-bit
+  word of the stage for a sentinel byte, re-copy stale 16 B pieces from L2 (scale words from global with relaxed loads)
+  until none is left, and only then hand the stage to the MMA. No counters and no grid wait before the loads; with
+  ``rows_used`` CTA 0 stores the plan's padded rows there (the rows a bounded re-arm of the slots covers).
 - ``fc2_done[T]``: after a unit's ``y`` stores, a release add of 1 per token tile of the unit, so tile t is complete at
   28. The epilogue hands each unit to a signal warp (7 or 8) through an mbarrier; that warp issues one gpu-scope fence
   per unit and relaxed adds, keeping the fence off the epilogue. Dependents launch when each CTA starts its last unit,
@@ -61,7 +66,7 @@ import torch
 from cutlass._mlir.dialects import llvm, nvvm
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.runtime import make_ptr
-from cutlass.cutlass_dsl import dsl_user_op
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 from . import finalize
 from .sync import (
@@ -70,6 +75,8 @@ from .sync import (
     fgs_diag,
     ld_cg_b32,
     ld_cg_v4,
+    ld_relaxed_gpu_b32,
+    nanosleep,
     spin_ns,
     wait_at_least_short,
 )
@@ -97,6 +104,8 @@ SCAN_BATCHES = 4
 FC1_UNITS_PER_K_STAGE = K_STAGE // 64
 SIGNAL_STAGES = 4
 TOP_K = 16
+# Lamport checker warps: warp w checks the CTA's stages w, w + 4, ..., so four stages are checked at once.
+CHECK_WARPS = 4
 # Fused finalize: per-row metadata of a unit in shared memory (received row, routing weight bits, local pairs of the
 # row), double-buffered by unit.
 META_FIELDS = 3
@@ -124,6 +133,90 @@ def _red_add_relaxed_gpu(ptr: cute.Pointer, val: cutlass.Int32, *, loc=None, ip=
     )
 
 
+def _asm(res, operands, text, constraints, loc, ip):
+    return llvm.inline_asm(
+        res,
+        operands,
+        text,
+        constraints,
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _ld_shared_v4(addr, *, loc=None, ip=None):
+    res = _asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [cutlass.Int32(addr).ir_value(loc=loc, ip=ip)],
+        "ld.shared.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,r,~{memory}",
+        loc,
+        ip,
+    )
+    return [cutlass.Int32(llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(4)]
+
+
+@dsl_user_op
+def _ld_shared_b32(addr, *, loc=None, ip=None):
+    return cutlass.Int32(
+        _asm(
+            T.i32(),
+            [cutlass.Int32(addr).ir_value(loc=loc, ip=ip)],
+            "ld.shared.b32 $0, [$1];",
+            "=r,r,~{memory}",
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
+def _st_shared_b32(addr, v, *, loc=None, ip=None):
+    _asm(
+        None,
+        [cutlass.Int32(addr).ir_value(loc=loc, ip=ip), cutlass.Int32(v).ir_value(loc=loc, ip=ip)],
+        "st.shared.b32 [$0], $1;",
+        "r,r,~{memory}",
+        loc,
+        ip,
+    )
+
+
+@dsl_user_op
+def _cp_async_cg_16(smem_addr, addr, *, loc=None, ip=None):
+    _asm(
+        None,
+        [
+            cutlass.Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            cutlass.Int64(addr).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.cg.shared.global [$0], [$1], 16;",
+        "r,l,~{memory}",
+        loc,
+        ip,
+    )
+
+
+@dsl_user_op
+def _cp_async_wait_all(*, loc=None, ip=None):
+    _asm(None, [], "cp.async.commit_group;\ncp.async.wait_group 0;", "~{memory}", loc, ip)
+
+
+def _has_byte(word, pattern: int):
+    """Nonzero when a byte of ``word`` equals the repeated byte of the 32-bit ``pattern``."""
+    x = word ^ cutlass.Int32(pattern)
+    return (x - cutlass.Int32(0x01010101)) & (x ^ cutlass.Int32(-1)) & cutlass.Int32(-0x7F7F7F80)
+
+
+# Sentinel words of the Lamport FC1 -> FC2 slots: E4M3 -0 per data byte, 0xFF per UE8M0 scale byte.
+_ACT_SENTINEL = -0x7F7F7F80
+_SF_SENTINEL = -1
+
+
 def _tcgen05_fence_after_thread_sync():
     nvvm.tcgen05_fence(kind=nvvm.Tcgen05FenceKind.AFTER_THREAD_SYNC)
 
@@ -149,6 +242,9 @@ class Fc2Kernel:
         wait_plan: bool = False,
         fused_fin: bool = False,
         push: bool = False,
+        lamport: bool = False,
+        bound: bool = False,
+        check: bool = True,
     ):
         if tile_n not in TILE_NS:
             raise ValueError(f"tile_n must be one of {TILE_NS}, got {tile_n}")
@@ -158,6 +254,12 @@ class Fc2Kernel:
             raise ValueError(
                 f"at most 128 local experts (7-bit group entry field), got {num_local}"
             )
+        if lamport and wait_fc1:
+            raise ValueError(
+                "FC2 waits on FC1 through fc1_done counters or Lamport slots, not both"
+            )
+        if lamport and group * tile_n // 4 > 31:
+            raise ValueError("the Lamport checker tracks at most 31 row passes of 4 rows")
         self.tile_n = tile_n
         self.num_local = num_local
         self.num_ab_stage = num_stages
@@ -174,6 +276,10 @@ class Fc2Kernel:
         self.wait_plan = wait_plan
         self.fused_fin = fused_fin
         self.push = push and fused_fin
+        self.lamport = lamport
+        self.bound = bound and lamport
+        # check=False (TLLM_K3_MOE_FGS_DIAG=oracle): the checker warps hand stages on unchecked (timing only).
+        self.check = check
         self.mma_tiler = (TILE_M, self.n_max, K_STAGE)
         self.cta_group = tcgen05.CtaGroup.ONE
         self.a_dtype = cutlass.Float4E2M1FN
@@ -185,10 +291,13 @@ class Fc2Kernel:
         self.tma_warp_id = 5
         self.load_warp_id = 6
         self.gate_warp_id = 7
-        self.signal_warp_id = 7 + int(wait_fc1)
+        self.check_warp_id = 7
+        self.signal_warp_id = 7 + int(wait_fc1) + CHECK_WARPS * int(lamport)
         # With fc2_push the fused finalize hands each unit's finished rows to the signal warp, which publishes them.
         self.has_signal_warp = signal_fc2 or (fused_fin and push)
-        self.threads_per_cta = 32 * (7 + int(wait_fc1) + int(self.has_signal_warp))
+        self.threads_per_cta = 32 * (
+            7 + int(wait_fc1) + CHECK_WARPS * int(lamport) + int(self.has_signal_warp)
+        )
         self.epilog_sync_barrier = pipeline.NamedBarrier(barrier_id=1, num_threads=32 * 4)
         self.tmem_alloc_barrier = pipeline.NamedBarrier(barrier_id=2, num_threads=32 * 5)
         self.b_bytes_per_stage = self.n_max * K_STAGE
@@ -268,6 +377,129 @@ class Fc2Kernel:
                     seen = cute.arch.load(word, cutlass.Int32, sem="acquire", scope="gpu")
 
     @cute.jit
+    def _check_stages(
+        self,
+        cw,
+        tidx,
+        bidx,
+        num_mine,
+        used_ctas,
+        sGroup,
+        sB_base,
+        sSFB_base,
+        act_base,
+        act_sf_base,
+        landed_pipeline,
+        load_pipeline,
+    ):
+        """Checker warp ``cw`` of the Lamport build checks the CTA's stages cw, cw + CHECK_WARPS, ...; each lane covers
+        the pieces and scale words its loader lane copied."""
+        tile_n, n_max = self.tile_n, self.n_max
+        lane = tidx % 32
+        chunk = lane % 8
+        row_in_pass = lane // 8
+        n_pass = n_max // 4
+        n_sf = max(1, n_max // 32)
+        n_katom = K_STAGE // 128
+        landed_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.num_ab_stage
+        )
+        full_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, self.num_ab_stage
+        )
+        rows = [p * 4 + row_in_pass for p in range(n_pass)]
+        piece = [(chunk ^ (r % 8)) << 4 for r in rows]
+        stage = cutlass.Int32(0)
+        for i in cutlass.range(num_mine, unroll=1):
+            entry = sGroup[(bidx + i * used_ctas) // M_TILES]
+            row_base = (entry & 0xFFFF) * tile_n
+            valid_rows = (entry >> 16) & 0xFF
+            for k_tile in cutlass.range(K_TILES, unroll=1):
+                if stage % CHECK_WARPS == cw:
+                    landed_pipeline.consumer_wait(landed_state)
+                    sB_stage = sB_base + landed_state.index * self.b_bytes_per_stage
+                    sSFB_stage = sSFB_base + landed_state.index * (n_katom * self.sf_atom_bytes)
+                    for kt in cutlass.range_constexpr(n_katom if self.check else 0):
+                        # Activation pieces: K atom kt of group row r sits at kt * n_max * 128 + r * 128, its 16 B
+                        # piece c at piece c ^ (r % 8) (128 B swizzle). Scale-factor atom (128 rows x 4 K blocks,
+                        # 512 B): row r at byte 16 (r % 32) + 4 (r / 32). All loads of the atom are issued before any
+                        # test, so they overlap.
+                        s_atom = sB_stage + kt * n_max * 128
+                        s_sf = sSFB_stage + kt * self.sf_atom_bytes + lane * 16
+                        words = [
+                            _ld_shared_v4(s_atom + rows[p] * 128 + piece[p]) for p in range(n_pass)
+                        ]
+                        sf_words = [_ld_shared_b32(s_sf + q * 4) for q in range(n_sf)]
+                        stale = cutlass.Int32(0)
+                        for p in cutlass.range_constexpr(n_pass):
+                            w = words[p]
+                            bad = _has_byte(w[0], _ACT_SENTINEL) | _has_byte(w[1], _ACT_SENTINEL)
+                            bad = (
+                                bad
+                                | _has_byte(w[2], _ACT_SENTINEL)
+                                | _has_byte(w[3], _ACT_SENTINEL)
+                            )
+                            stale = stale | cutlass.select_(
+                                (bad != 0) & (rows[p] < valid_rows),
+                                cutlass.Int32(1 << p),
+                                cutlass.Int32(0),
+                            )
+                        sf_stale = cutlass.Int32(0)
+                        for q in cutlass.range_constexpr(n_sf):
+                            sf_stale = sf_stale | cutlass.select_(
+                                (_has_byte(sf_words[q], _SF_SENTINEL) != 0)
+                                & (q * 32 + lane < n_max)
+                                & (q * 32 + lane < valid_rows),
+                                cutlass.Int32(1 << q),
+                                cutlass.Int32(0),
+                            )
+                        if (stale | sf_stale) != 0:
+                            # Re-copy this lane's stale pieces from L2 until none holds a sentinel byte.
+                            g_k = act_base + cutlass.Int64(k_tile * K_STAGE + kt * 128 + chunk * 16)
+                            delay = cutlass.Int32(32)
+                            while stale != 0:
+                                for p in cutlass.range_constexpr(n_pass):
+                                    if (stale & cutlass.Int32(1 << p)) != 0:
+                                        _cp_async_cg_16(
+                                            s_atom + rows[p] * 128 + piece[p],
+                                            g_k + cutlass.Int64(row_base + rows[p]) * INTER,
+                                        )
+                                _cp_async_wait_all()
+                                still = cutlass.Int32(0)
+                                for p in cutlass.range_constexpr(n_pass):
+                                    if (stale & cutlass.Int32(1 << p)) != 0:
+                                        w = _ld_shared_v4(s_atom + rows[p] * 128 + piece[p])
+                                        bad = _has_byte(w[0], _ACT_SENTINEL) | _has_byte(
+                                            w[1], _ACT_SENTINEL
+                                        )
+                                        bad = bad | _has_byte(w[2], _ACT_SENTINEL)
+                                        bad = bad | _has_byte(w[3], _ACT_SENTINEL)
+                                        if bad != 0:
+                                            still = still | cutlass.Int32(1 << p)
+                                stale = still
+                                if stale != 0:
+                                    nanosleep(delay)
+                                    delay = cutlass.min(delay * 2, cutlass.Int32(256))
+                            for q in cutlass.range_constexpr(n_sf):
+                                if (sf_stale & cutlass.Int32(1 << q)) != 0:
+                                    g_word = act_sf_base + cutlass.Int64(
+                                        (row_base + q * 32 + lane) * (INTER // SF_VEC)
+                                        + k_tile * (K_STAGE // SF_VEC)
+                                        + kt * 4
+                                    )
+                                    v = ld_relaxed_gpu_b32(g_word)
+                                    sf_delay = cutlass.Int32(32)
+                                    while _has_byte(v, _SF_SENTINEL) != 0:
+                                        nanosleep(sf_delay)
+                                        sf_delay = cutlass.min(sf_delay * 2, cutlass.Int32(256))
+                                        v = ld_relaxed_gpu_b32(g_word)
+                                    _st_shared_b32(s_sf + q * 4, v)
+                    load_pipeline.producer_commit(full_state)
+                landed_state.advance()
+                full_state.advance()
+                stage = stage + 1
+
+    @cute.jit
     def _signal_fc2(self, fc2_done, first_tile, n_tiles):
         # fence + relaxed adds is a release; one fence for all tiles of the unit.
         cute.arch.fence_acq_rel_gpu()
@@ -314,6 +546,7 @@ class Fc2Kernel:
         num_tiles_ptr: cute.Pointer,
         stamps_ptr: Optional[cute.Pointer],
         fc1_done_ptr: Optional[cute.Pointer],
+        rows_used_ptr: Optional[cute.Pointer],
         fc2_done_ptr: Optional[cute.Pointer],
         plan_pub_ptr: Optional[cute.Pointer],
         out_ptr: Optional[cute.Pointer],
@@ -349,6 +582,9 @@ class Fc2Kernel:
         fc1_done = None
         if cutlass.const_expr(self.wait_fc1):
             fc1_done = cute.make_tensor(fc1_done_ptr, cute.make_layout((num_tile_slots * K_TILES,)))
+        rows_used = None
+        if cutlass.const_expr(self.bound):
+            rows_used = cute.make_tensor(rows_used_ptr, cute.make_layout((1,)))
         fc2_done = None
         if cutlass.const_expr(self.signal_fc2):
             fc2_done = cute.make_tensor(fc2_done_ptr, cute.make_layout((num_tile_slots,)))
@@ -429,6 +665,9 @@ class Fc2Kernel:
             load_mbar: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
             acc_mbar: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
             gate_mbar: cute.struct.MemRange[cutlass.Int64, K_TILES * 2 if self.wait_fc1 else 1]
+            landed_mbar: cute.struct.MemRange[
+                cutlass.Int64, self.num_ab_stage * 2 if self.lamport else 1
+            ]
             signal_mbar: cute.struct.MemRange[
                 cutlass.Int64, SIGNAL_STAGES * 2 if self.has_signal_warp else 1
             ]
@@ -469,6 +708,7 @@ class Fc2Kernel:
             num_tiles,
             stamps,
             fc1_done,
+            rows_used,
             fc2_done,
             plan_pub,
             plan_pub_expected,
@@ -542,6 +782,7 @@ class Fc2Kernel:
         num_tiles: cute.Tensor,
         stamps: Optional[cute.Tensor],
         fc1_done: Optional[cute.Tensor],
+        rows_used: Optional[cute.Tensor],
         fc2_done: Optional[cute.Tensor],
         plan_pub: Optional[cute.Tensor],
         plan_pub_expected: cutlass.Int32,
@@ -584,7 +825,8 @@ class Fc2Kernel:
             defer_sync=True,
         )
         # Activation rows + scale factors: every lane of the loader warp arrives through
-        # cp.async.mbarrier.arrive.noinc once its own copies of the stage have landed.
+        # cp.async.mbarrier.arrive.noinc once its own copies of the stage have landed (Lamport: every lane of the
+        # stage's checker warp arrives once its share of the stage is valid).
         load_pipeline = pipeline.PipelineAsyncUmma.create(
             barrier_storage=storage.load_mbar.data_ptr(),
             num_stages=self.num_ab_stage,
@@ -593,12 +835,28 @@ class Fc2Kernel:
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
-        load_pipeline = dataclasses.replace(
-            load_pipeline,
-            sync_object_full=load_pipeline.sync_object_full.recast_to_new_op_type(
-                pipeline.PipelineOp.AsyncLoad
-            ),
-        )
+        if cutlass.const_expr(self.lamport):
+            # The loader's copies land on landed[stage]; the checker warp arrives on the MMA's full barrier.
+            landed_pipeline = pipeline.PipelineAsync.create(
+                barrier_storage=storage.landed_mbar.data_ptr(),
+                num_stages=self.num_ab_stage,
+                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 32),
+                consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 32 * CHECK_WARPS),
+                defer_sync=True,
+            )
+            landed_pipeline = dataclasses.replace(
+                landed_pipeline,
+                sync_object_full=landed_pipeline.sync_object_full.recast_to_new_op_type(
+                    pipeline.PipelineOp.AsyncLoad
+                ),
+            )
+        else:
+            load_pipeline = dataclasses.replace(
+                load_pipeline,
+                sync_object_full=load_pipeline.sync_object_full.recast_to_new_op_type(
+                    pipeline.PipelineOp.AsyncLoad
+                ),
+            )
         acc_pipeline = pipeline.PipelineUmmaAsync.create(
             barrier_storage=storage.acc_mbar.data_ptr(),
             num_stages=self.num_acc_stage,
@@ -676,7 +934,7 @@ class Fc2Kernel:
 
         # With fc1_done, only FC1's act can be outstanding at launch (FC1 triggers dependents after its own wait, so the
         # plan is complete); the act is guarded per K stage.
-        if cutlass.const_expr(self.use_pdl and not self.wait_fc1):
+        if cutlass.const_expr(self.use_pdl and not (self.wait_fc1 or self.lamport)):
             cute.arch.griddepcontrol_wait()
         if warp_idx == self.load_warp_id:
             # A plan written by FC1 itself (routed FC1) is complete once every FC1 CTA has added to plan_pub.
@@ -729,6 +987,9 @@ class Fc2Kernel:
                 )
             if lane == 0:
                 sNumGroups[0] = n_groups
+            if cutlass.const_expr(self.bound):
+                if (bidx == 0) & (lane == 0):
+                    rows_used[0] = num_t * tile_n
         pipeline.pipeline_init_wait(cluster_shape_mn=(1, 1))
         if cutlass.const_expr(not self.signal_fc2):
             cute.arch.griddepcontrol_launch_dependents()
@@ -866,7 +1127,10 @@ class Fc2Kernel:
                             )
                             pred[0] = sf_ok[q]
                             cute.copy_atom_call(sf_copy, sf_g, sf_s, pred=pred)
-                    load_pipeline.producer_commit(load_state)
+                    if cutlass.const_expr(self.lamport):
+                        landed_pipeline.producer_commit(load_state)
+                    else:
+                        load_pipeline.producer_commit(load_state)
                     load_state.advance()
             load_pipeline.producer_tail(load_state)
 
@@ -895,6 +1159,23 @@ class Fc2Kernel:
                             gate_pipeline.producer_acquire(gate_state)
                             gate_pipeline.producer_commit(gate_state)
                         gate_state.advance()
+
+        if cutlass.const_expr(self.lamport):
+            if (warp_idx >= self.check_warp_id) & (warp_idx < self.check_warp_id + CHECK_WARPS):
+                self._check_stages(
+                    warp_idx - self.check_warp_id,
+                    tidx,
+                    bidx,
+                    num_mine,
+                    used_ctas,
+                    sGroup,
+                    storage.sB.data_ptr().toint(),
+                    storage.sSFB.data_ptr().toint(),
+                    act.iterator.toint(),
+                    act_sf.iterator.toint(),
+                    landed_pipeline,
+                    load_pipeline,
+                )
 
         if cutlass.const_expr(self.signal_fc2):
             if warp_idx == self.signal_warp_id:
@@ -1154,7 +1435,7 @@ class Fc2Kernel:
             tmem.free(acc_tmem_ptr)
 
         # Completion of this grid still implies FC1's.
-        if cutlass.const_expr(self.use_pdl and self.wait_fc1):
+        if cutlass.const_expr(self.use_pdl and (self.wait_fc1 or self.lamport)):
             cute.arch.griddepcontrol_wait()
 
 
@@ -1187,6 +1468,9 @@ def _compiled(
     wait_plan: bool = False,
     fused_fin: bool = False,
     push: bool = False,
+    lamport: bool = False,
+    bound: bool = False,
+    check: bool = True,
 ):
     kernel = Fc2Kernel(
         tile_n,
@@ -1203,6 +1487,9 @@ def _compiled(
         wait_plan,
         fused_fin,
         push,
+        lamport,
+        bound,
+        check,
     )
     fake = cute.AddressSpace.gmem
     args = (
@@ -1216,6 +1503,7 @@ def _compiled(
         make_ptr(cutlass.Int32, 1 << 20, fake, assumed_align=4),
         make_ptr(cutlass.Int32, 1 << 20, fake, assumed_align=4) if timeline else None,
         make_ptr(cutlass.Int32, 1 << 20, fake, assumed_align=4) if wait_fc1 else None,
+        make_ptr(cutlass.Int32, 1 << 20, fake, assumed_align=4) if bound and lamport else None,
         make_ptr(cutlass.Int32, 1 << 20, fake, assumed_align=4) if signal_fc2 else None,
         make_ptr(cutlass.Int32, 1 << 20, fake, assumed_align=4) if wait_plan else None,
         make_ptr(cutlass.BFloat16, 1 << 20, fake, assumed_align=16) if fused_fin else None,
@@ -1259,6 +1547,8 @@ def run(
     plan_pub: Optional[torch.Tensor] = None,
     plan_pub_expected: int = 0,
     fin: Optional[tuple] = None,
+    lamport: bool = False,
+    rows_used: Optional[torch.Tensor] = None,
 ) -> None:
     """``y[p] = bf16(dequant(act[p]) @ dequant(W2[e]).T)`` for every valid permuted row (moe_chain FC2 stage).
 
@@ -1267,7 +1557,9 @@ def run(
     launched with PDL and does not wait for FC1's grid before streaming weights. ``hazard_delay_ns`` delays the last
     unit of the first 28 CTAs in the ``fc2_done`` build (hazard tests only). ``plan_pub`` (int32 word): the plan is
     written by the routed FC1 this kernel may overlap; it is read once the word reaches ``plan_pub_expected``
-    (``fc1.num_ctas_for``).
+    (``fc1.num_ctas_for``). ``lamport``: FC1's output is a Lamport edge instead of ``fc1_done``: ``act`` / ``act_sf``
+    are slots armed with 0x80 / 0xFF that FC1 writes without counters (``fc1.run(..., lamport=True)``), and this kernel
+    validates every byte it uses. ``rows_used`` (int32 word): CTA 0 stores the plan's padded rows there.
     """
     tile_n = plan.tile_n
     rows = act.shape[0]
@@ -1288,7 +1580,9 @@ def run(
     assert w2_sf.shape == (num_local, HIDDEN, INTER // SF_VEC) and w2_sf.is_contiguous()
     tile_slots = plan.tile_idx_to_expert_idx.numel()
     assert tile_slots < 1 << 16
-    for done, words in ((fc1_done, tile_slots * K_TILES), (fc2_done, tile_slots)):
+    if lamport and fc1_done is not None:
+        raise ValueError("fc2.run: fc1_done and lamport are two builds of the same edge")
+    for done, words in ((fc1_done, tile_slots * K_TILES), (fc2_done, tile_slots), (rows_used, 1)):
         assert done is None or (
             done.dtype == torch.int32 and done.numel() >= words and done.is_contiguous()
         )
@@ -1319,8 +1613,8 @@ def run(
         tile_n,
         num_local,
         stages,
-        (_env_int("PDL", 0) == 1 or fc1_done is not None)
-        and not (fc1_done is not None and fgs_diag("fc1_fc2") == "ready"),
+        (_env_int("PDL", 0) == 1 or fc1_done is not None or lamport)
+        and not ((fc1_done is not None or lamport) and fgs_diag("fc1_fc2") == "ready"),
         _env_int("PAIRED_STORE", 1) == 1,
         group,
         group_cap,
@@ -1331,6 +1625,9 @@ def run(
         plan_pub is not None,
         fin is not None,
         fin is not None and fin[2] is not None,
+        lamport,
+        lamport and rows_used is not None,
+        not (lamport and fgs_diag("fc1_fc2") == "oracle"),
     )
     compiled(
         _ptr(cutlass.Float4E2M1FN, w2, 32),
@@ -1343,6 +1640,7 @@ def run(
         _ptr(cutlass.Int32, plan.num_non_exiting_tiles, 4),
         _ptr(cutlass.Int32, timeline_buffer(device), 4) if timeline else None,
         _ptr(cutlass.Int32, fc1_done, 4) if fc1_done is not None else None,
+        _ptr(cutlass.Int32, rows_used, 4) if lamport and rows_used is not None else None,
         _ptr(cutlass.Int32, fc2_done, 4) if fc2_done is not None else None,
         _ptr(cutlass.Int32, plan_pub, 4) if plan_pub is not None else None,
         *(_ptr(*f) if f is not None else None for f in fin_ptrs),
@@ -1369,7 +1667,8 @@ def run_v2(act, act_sf, weights_e, plan, topk_w, out, *, fgs=None, enable_pdl=Tr
     pairs of a row with several are staged in ``y`` (the workspace's FC2 output) and summed, and rows without a
     pair zeroed, by the finalize kernel launched behind FC2, which skips the rows FC2 wrote. Which rows those are
     follows from the plan on the device, so one graph serves any routing. ``fgs.waits["fc1_fc2"]`` /
-    ``["fc1_plan"]``: as ``fc2.run``'s ``fc1_done`` / ``plan_pub``. ``fgs.publishes["fc2_push"]``: int32 [R] words,
+    ``["fc1_plan"]``: as ``fc2.run``'s ``fc1_done`` / ``plan_pub``; an ``fc1_fc2`` of ``kind == "lamport"`` is the
+    Lamport build, with ``rows_used`` its tensor (if any). ``fgs.publishes["fc2_push"]``: int32 [R] words,
     zero-armed; each row reaches 28. By default the finalize kernel publishes every row once the FC2 grid is complete:
     FC2's per-unit publish needs a GPU-scope fence per unit, which slows the whole SM. With
     ``TLLM_K3_MOE_FC2_PUSH=unit`` FC2 adds 1 per weight tile to the rows it wrote, so they are final before FC2 ends."""
@@ -1396,13 +1695,16 @@ def run_v2(act, act_sf, weights_e, plan, topk_w, out, *, fgs=None, enable_pdl=Tr
     unit_push = push is not None and os.environ.get(PUSH_ENV) == "unit"
     done = waits.get("fc1_fc2")
     pub = waits.get("fc1_plan")
+    lamport = done is not None and done.kind == "lamport"
     run(
         act,
         act_sf,
         weights_e,
         plan,
         y,
-        fc1_done=None if done is None else done.tensor,
+        fc1_done=None if done is None or lamport else done.tensor,
+        lamport=lamport,
+        rows_used=done.tensor if lamport else None,
         plan_pub=None if pub is None else pub.tensor,
         plan_pub_expected=0 if pub is None else pub.expected,
         fin=(out, topk_w, push.tensor if unit_push else None),

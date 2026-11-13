@@ -54,6 +54,10 @@ if pytest is not None:
 
 
 def _lane(dtype):
+    if dtype == torch.float8_e4m3fn:
+        return torch.uint8, 0x80
+    if dtype == torch.uint8:
+        return torch.uint8, 0xFF
     return (
         (torch.int16, -0x8000)
         if dtype in (torch.bfloat16, torch.float16)
@@ -72,7 +76,7 @@ def count_non_sentinel(t: torch.Tensor) -> int:
 
 def junk_(t: torch.Tensor) -> torch.Tensor:
     lane, _ = _lane(t.dtype)
-    t.view(lane).fill_(0x1234)
+    t.view(lane).fill_(0x34 if lane == torch.uint8 else 0x1234)
     return t
 
 
@@ -489,6 +493,105 @@ def test_step_reuse_rules():
         assert count_non_sentinel(edges[name].storage) == 0
 
 
+BYTE_SHAPES = [((40, 3072), torch.float8_e4m3fn), ((40, 96), torch.uint8), ((7, 9), torch.uint8)]
+
+
+@_parametrize("backend", _backends())
+def test_byte_sentinels(backend):
+    edges = _edges(backend)
+    for index, (shape, dtype) in enumerate(BYTE_SHAPES):
+        edges.workspace(f"b{index}", shape, dtype)
+    torch.cuda.synchronize()
+    for index, _ in enumerate(BYTE_SHAPES):
+        for slot in edges[f"b{index}"].slots:
+            assert count_non_sentinel(slot) == 0, (backend, BYTE_SHAPES[index])
+    with edges.scope():
+        for index, _ in enumerate(BYTE_SHAPES):
+            for _ in range(2):
+                lease = edges.acquire(f"b{index}")
+                junk_(lease.tensor)
+                edges.release(lease)
+    torch.cuda.synchronize()
+    for index, _ in enumerate(BYTE_SHAPES):
+        assert count_non_sentinel(edges[f"b{index}"].storage) == 0, (backend, BYTE_SHAPES[index])
+
+
+@_parametrize("policy", ["release", "step"])
+def test_bounded_reset(policy):
+    edges = _edges("auto", reset_policy=fgs().ResetPolicy(policy))
+    slots = 3 if policy == "step" else 2
+    act = edges.workspace("act", (64, 3072), torch.float8_e4m3fn, slots=slots, bounded=True)
+    sf = edges.workspace("sf", (64, 96), torch.uint8, slots=slots, bounds_from="act")
+    assert sf.bounds is act.bounds
+    used = [5, 17, 40][:slots]
+    leases = []
+    with edges.scope():
+        for rows_used in used:
+            a, s = edges.acquire("act", rows=48), edges.acquire("sf", rows=48)
+            assert a.slot == s.slot and a.bound.data_ptr() == s.bound.data_ptr()
+            junk_(a.tensor)
+            junk_(s.tensor)
+            a.bound.fill_(rows_used)
+            edges.release(a)
+            edges.release(s)
+            leases.append((a, s))
+    torch.cuda.synchronize()
+    for (a, s), rows_used in zip(leases, used):
+        for t in (a.tensor, s.tensor):
+            assert count_non_sentinel(t[:rows_used]) == 0, (policy, rows_used)
+            assert count_non_sentinel(t[rows_used:]) == (48 - rows_used) * t.shape[1], (
+                "the reset went past the bound",
+                policy,
+                rows_used,
+            )
+    assert any(row.get("bounded") for row in edges.ledger())
+
+
+def test_bounded_fill_standalone():
+    fill = importlib.import_module(fgs().__name__.rsplit(".", 1)[0] + ".fine_grained_sync_fill")
+    row_bytes, rows, slot_rows = 96, 8, 10
+    region = torch.full((3 * slot_rows * row_bytes,), 0x34, dtype=torch.uint8, device="cuda")
+    bounds = torch.tensor([0, 3, 99], dtype=torch.int32, device="cuda")
+    for ctas in (1, 7, 512):
+        region.fill_(0x34)
+        fill.sentinel_fill_bounded_(
+            region, bounds, slot_rows * row_bytes, rows * row_bytes, row_bytes, -0x7F7F7F80, ctas
+        )
+        torch.cuda.synchronize()
+        view = region.view(3, slot_rows, row_bytes)
+        for slot, filled in enumerate((0, 3, rows)):
+            assert bool((view[slot, :filled] == 0x80).all()), (ctas, slot)
+            assert bool((view[slot, filled:] == 0x34).all()), ("filled past the bound", ctas, slot)
+
+
+def test_policy_override():
+    edges = _edges("fill", reset_policy=fgs().ResetPolicy.STEP)
+    stepped = edges.workspace("stepped", (16, 1024), torch.bfloat16, slots=2)
+    released = edges.workspace(
+        "released", (16, 1024), torch.bfloat16, slots=2, policy=fgs().ResetPolicy.RELEASE
+    )
+    assert stepped.packed and not released.packed
+    with edges.scope():
+        for _ in range(3):
+            lease = edges.acquire("released")
+            lease.tensor.fill_(1.0)
+            edges.release(lease)
+        assert edges.flushes == 0
+        lease = edges.acquire("stepped")
+        lease.tensor.fill_(1.0)
+        edges.release(lease)
+        assert edges.flushes == 0
+        lease = edges.acquire("stepped")
+        lease.tensor.fill_(1.0)
+        edges.release(lease)
+        assert edges.flushes == 1, "the release workspace held the step flush back"
+    torch.cuda.synchronize()
+    assert count_non_sentinel(stepped.storage) == 0
+    assert count_non_sentinel(released.storage) == 0
+    policies = {row["name"]: row["policy"] for row in edges.ledger() if "policy" in row}
+    assert policies == {"stepped": "step", "released": "release"}
+
+
 def test_spans_fill_standalone():
     fill = importlib.import_module(fgs().__name__.rsplit(".", 1)[0] + ".fine_grained_sync_fill")
     guard = 4096
@@ -672,6 +775,10 @@ TESTS = [
     ("fill_split_into_pieces", test_fill_split_into_pieces, ()),
     *[(f"step_batched_reset[{b}]", test_step_batched_reset, (b,)) for b in _backends()],
     ("step_reuse_rules", test_step_reuse_rules, ()),
+    *[(f"byte_sentinels[{b}]", test_byte_sentinels, (b,)) for b in _backends()],
+    *[(f"bounded_reset[{p}]", test_bounded_reset, (p,)) for p in ("release", "step")],
+    ("bounded_fill_standalone", test_bounded_fill_standalone, ()),
+    ("policy_override", test_policy_override, ()),
     ("memory_ledger", test_memory_ledger, ()),
     ("stream_manager_lamport_region", test_stream_manager_lamport_region, ()),
     ("standalone_unchanged", test_standalone_unchanged, ()),

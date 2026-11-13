@@ -77,6 +77,15 @@ FC2_PUSH_UNITS = HIDDEN // 128
 ROUTER_MAX_ROWS_ENV = "TLLM_K3_MOE_ROUTER_MAX_ROWS"
 # FC2 K stages of 256 columns, each fed by 4 FC1 units of 64 columns.
 FC1_K_STAGES = INTER // 256
+# How FC2 learns FC1's output is ready: "counter" (the fc1_done slabs) or "lamport" (FC1 writes act / act_sf into
+# FC1_ACT / FC1_SF slots armed with 0x80 / 0xFF, FC2 checks every byte it reads). With lamport the edge workspaces
+# re-arm the slots on their reset stream, for the rows FC2 reports, under TLLM_K3_MOE_FC1_FC2_RESET_POLICY (default:
+# TLLM_FGS_RESET_POLICY).
+FC1_FC2_SYNC_ENV = "TLLM_K3_MOE_FC1_FC2_SYNC"
+FC1_FC2_REARM_ENV = "TLLM_K3_MOE_FC1_FC2_REARM"
+FC1_FC2_POLICY_ENV = "TLLM_K3_MOE_FC1_FC2_RESET_POLICY"
+FC1_ACT = "moe.fc1_act"
+FC1_SF = "moe.fc1_sf"
 # Rows per rank the expert-path edges serve; the tail edges stop where the split-K up-projection consumer does.
 FGS_MAX_ROWS = int(os.environ.get("TLLM_K3_MOE_FGS_MAX_ROWS", "64"))
 TAIL_FGS_MAX_ROWS = 32
@@ -359,6 +368,27 @@ def _missing_v2_sides(edges: frozenset) -> List[str]:
     return missing
 
 
+def _choice(env: str, default: str, valid: Tuple[str, ...]) -> str:
+    value = os.environ.get(env, "") or default
+    if value not in valid:
+        raise ValueError(f"{env}={value!r}; valid: {', '.join(valid)}")
+    return value
+
+
+def fc1_fc2_sync() -> str:
+    return _choice(FC1_FC2_SYNC_ENV, "counter", ("counter", "lamport"))
+
+
+def fc1_fc2_rearm() -> str:
+    return _choice(FC1_FC2_REARM_ENV, "framework", ("framework",))
+
+
+def fc1_fc2_policy() -> Optional[str]:
+    """The FC1 -> FC2 slots' reset policy override, or None for the workspaces' policy."""
+    value = os.environ.get(FC1_FC2_POLICY_ENV, "")
+    return _choice(FC1_FC2_POLICY_ENV, "", ("step", "release")) if value else None
+
+
 def _switch_on(env: str) -> bool:
     return tail_enabled() if env == TAIL_ENV else os.environ.get(env, "") == "cute"
 
@@ -599,6 +629,7 @@ def run_expert_path(
     ws: Optional[Workspace] = None,
     stage_kwargs: Optional[Dict[str, dict]] = None,
     tokens_per_rank: Optional[int] = None,
+    act_bufs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Workspace:
     """Run routing -> FC1 -> FC2 -> finalize on the current stream; writes ``out`` [R, 3584] bf16.
 
@@ -610,7 +641,8 @@ def run_expert_path(
       finalize(y, topk_w, plan, out)
       fc1_v2(x, x_sf, topk_ids, weights, plan, act, act_sf)      routing fused, replaces routing + fc1
       fc2_v2(act, act_sf, weights, plan, topk_w, out)            finalize fused, replaces fc2 + finalize
-    ``stage_kwargs`` adds keyword arguments per stage (the FGS edge builds).
+    ``stage_kwargs`` adds keyword arguments per stage (the FGS edge builds). ``act_bufs`` replaces the workspace's
+    ``act`` / ``act_sf`` (the Lamport FC1 -> FC2 slots).
     """
     rows = x.shape[0]
     assert x.shape == (rows, HIDDEN) and x.dtype == torch.float8_e4m3fn, (x.shape, x.dtype)
@@ -625,18 +657,19 @@ def run_expert_path(
     if ws is None:
         ws = workspace(x.device, rows, weights.num_local, tile_n_for(rows))
     plan = ws.plan
+    act, act_sf = act_bufs if act_bufs is not None else (ws.act, ws.act_sf)
     if "fc1_v2" in run:
-        run["fc1_v2"](x, x_sf, topk_ids, weights, plan, ws.act, ws.act_sf, **kw.get("fc1", {}))
+        run["fc1_v2"](x, x_sf, topk_ids, weights, plan, act, act_sf, **kw.get("fc1", {}))
     else:
         run["routing"](
             topk_ids, weights.local_expert_offset, weights.num_local, plan, **kw.get("routing", {})
         )
-        run["fc1"](x, x_sf, weights, plan, ws.act, ws.act_sf, **kw.get("fc1", {}))
+        run["fc1"](x, x_sf, weights, plan, act, act_sf, **kw.get("fc1", {}))
     moe_streams.fc1_done()
     if "fc2_v2" in run:
-        run["fc2_v2"](ws.act, ws.act_sf, weights, plan, topk_w, out, y=ws.y, **kw.get("fc2", {}))
+        run["fc2_v2"](act, act_sf, weights, plan, topk_w, out, y=ws.y, **kw.get("fc2", {}))
     else:
-        run["fc2"](ws.act, ws.act_sf, weights, plan, ws.y, **kw.get("fc2", {}))
+        run["fc2"](act, act_sf, weights, plan, ws.y, **kw.get("fc2", {}))
         run["finalize"](ws.y, topk_w, plan, out, **kw.get("finalize", {}))
     return ws
 
@@ -796,7 +829,9 @@ class _Call:
         self.rows = rows
         self.leases: Dict[str, object] = {}
         self.source = None
-        counters = layer.edges & set(_COUNTERS)
+        counters = layer.counter_edges
+        if layer.fc1_fc2_lamport and 1 <= rows <= FGS_MAX_ROWS:
+            self._acquire_fc1_slots(layer, rows)
         if counters and 1 <= rows <= FGS_MAX_ROWS:
             r = layer.ep * rows
             ws = layer.workspace(r)
@@ -854,7 +889,45 @@ class _Call:
                 self.leases["fc1_plan"] = lease
             else:
                 k3_edges.consumed(self.leases.pop("fc1_fc2"))
+                if "fc1_sf" in self.leases:
+                    k3_edges.consumed(self.leases.pop("fc1_sf"))
                 k3_edges.debug("moe.fc1_fc2", rows, f"off: {FC1_PLAN} {k3_edges.last_refusal()}")
+
+    def _acquire_fc1_slots(self, layer: "_Layer", rows: int) -> None:
+        low, high = _edge_rows("fc1_fc2")
+        if not (low <= rows <= high and k3_recipe.moe_on("fc1_fc2", rows)):
+            k3_edges.debug("moe.fc1_fc2", rows, f"off: outside its rows {low}..{high}")
+            return
+        p = layer.workspace(layer.ep * rows).act.shape[0]
+        act = k3_edges.acquire_bytes(FC1_ACT, rows, p, window=(1, FGS_MAX_ROWS))
+        sf = (
+            None
+            if act is None
+            else k3_edges.acquire_bytes(FC1_SF, rows, p, window=(1, FGS_MAX_ROWS))
+        )
+        if sf is None:
+            reason = k3_edges.last_refusal()
+            if act is not None:
+                k3_edges.consumed(act)
+            k3_edges.debug("moe.fc1_fc2", rows, f"off: lamport slots {reason}")
+            return
+        if act.slot != sf.slot:
+            raise RuntimeError(f"{FC1_ACT} slot {act.slot} and {FC1_SF} slot {sf.slot} must pair")
+        self.leases["fc1_fc2"] = act
+        self.leases["fc1_sf"] = sf
+        policy = act.workspace.policy.value
+        k3_edges.debug(
+            "moe.fc1_fc2",
+            rows,
+            f"on, lamport, {fc1_fc2_rearm()} re-arm ({policy}, bounded), slot {act.slot}, {p} rows",
+        )
+
+    def fc1_slots(self, rows: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The Lamport FC1 -> FC2 slots as the workspace's ``rows``-row ``act`` / ``act_sf``."""
+        act, sf = self.leases["fc1_fc2"].tensor, self.leases["fc1_sf"].tensor
+        if act.shape[0] < rows:
+            raise RuntimeError(f"{FC1_ACT}: a {act.shape[0]}-row slot for a {rows}-row workspace")
+        return act[:rows], sf[:rows]
 
     def on(self, edge: str) -> bool:
         return edge in self.leases
@@ -905,7 +978,11 @@ class _Layer:
             )
             for rows in range(1, FGS_MAX_ROWS + 1)
         )
-        self.words = {edge: _counter_words(edge, tiles, self.ep) for edge in edges & set(_COUNTERS)}
+        self.fc1_fc2_lamport = "fc1_fc2" in edges and fc1_fc2_sync() == "lamport"
+        self.counter_edges = edges & set(_COUNTERS) - (
+            {"fc1_fc2"} if self.fc1_fc2_lamport else set()
+        )
+        self.words = {edge: _counter_words(edge, tiles, self.ep) for edge in self.counter_edges}
         for edge, words in self.words.items():
             k3_edges.declare_counters(
                 _COUNTERS[edge], words, layer_idx, max_rows=FGS_MAX_ROWS, min_rows=1
@@ -926,6 +1003,32 @@ class _Layer:
             k3_edges.declare_counters(
                 RN_READY, TAIL_FGS_MAX_ROWS, layer_idx, max_rows=TAIL_FGS_MAX_ROWS, min_rows=1
             )
+        if self.fc1_fc2_lamport:
+            fc1_fc2_rearm()
+            # The workspace's act rows for any R the edge serves (the tile_n bucket's largest R).
+            slot_rows = max(
+                max_permuted(
+                    _bucket_rows(self.ep * rows, self.num_experts, self.max_rows),
+                    self.num_local,
+                    tile_n_for(self.ep * rows, self.num_experts),
+                )
+                for rows in range(1, FGS_MAX_ROWS + 1)
+            )
+            for name, width, dtype, shared in (
+                (FC1_ACT, INTER, torch.float8_e4m3fn, None),
+                (FC1_SF, INTER // SF_VEC, torch.uint8, FC1_ACT),
+            ):
+                k3_edges.declare_bytes(
+                    name,
+                    width,
+                    dtype,
+                    slot_rows,
+                    layer_idx,
+                    max_rows=FGS_MAX_ROWS,
+                    policy=fc1_fc2_policy(),
+                    bounded=shared is None,
+                    bounds_from=shared,
+                )
         self.fc1_plan = switched(FC1_ENV, "v2") and "fc1_fc2" in edges
         if self.fc1_plan:
             k3_edges.declare_counters(FC1_PLAN, 1, layer_idx, max_rows=FGS_MAX_ROWS, min_rows=1)
@@ -976,8 +1079,13 @@ class _Layer:
                 kw["routing"]["hazard_delay_ns"] = _HAZARD_DELAY_NS
             kw["fc1"]["plan_ready"] = consumer_slab("route_fc1")
         if call.on("fc1_fc2"):
-            kw["fc1"]["fc1_done"] = call.slab("fc1_fc2")
-            kw["fc2"]["fc1_done"] = consumer_slab("fc1_fc2")
+            if self.fc1_fc2_lamport:
+                kw["fc1"]["lamport"] = True
+                kw["fc2"]["lamport"] = True
+                kw["fc2"]["rows_used"] = call.leases["fc1_fc2"].bound
+            else:
+                kw["fc1"]["fc1_done"] = call.slab("fc1_fc2")
+                kw["fc2"]["fc1_done"] = consumer_slab("fc1_fc2")
             if _HAZARD_DELAY_NS:
                 kw["fc1"]["hazard_delay_ns"] = _HAZARD_DELAY_NS
         if call.on("fc2_fin"):
@@ -1039,7 +1147,24 @@ class _Layer:
             stage_sync["fc2"].publishes["fc2_push"] = self._edge_sync(call, "fc2_push", False)
             mode = "per FC2 unit" if switched(FC2_PUSH_ENV, "unit") else "finalize tail"
             k3_edges.debug("moe.fc2_push", rows, f"published by the {mode}")
-        if fc1_fc2:
+        if fc1_fc2 and self.fc1_fc2_lamport:
+            bound = call.leases["fc1_fc2"].bound
+            if fc1_v2:
+                stage_sync["fc1"].publishes["fc1_fc2"] = EdgeSync(
+                    "fc1_fc2", "lamport", None, hazard_delay_ns=_HAZARD_DELAY_NS
+                )
+            else:
+                kw["fc1"]["lamport"] = True
+                if _HAZARD_DELAY_NS:
+                    kw["fc1"]["hazard_delay_ns"] = _HAZARD_DELAY_NS
+            if fc2_v2:
+                stage_sync["fc2"].waits["fc1_fc2"] = EdgeSync(
+                    "fc1_fc2", "lamport", bound, diag=fgs_diag("fc1_fc2")
+                )
+            else:
+                kw["fc2"]["lamport"] = True
+                kw["fc2"]["rows_used"] = bound
+        elif fc1_fc2:
             if fc1_v2:
                 stage_sync["fc1"].publishes["fc1_fc2"] = self._edge_sync(call, "fc1_fc2", False)
             else:
@@ -1085,9 +1210,12 @@ class _Layer:
             ws=ws,
             stage_kwargs=self.stage_kwargs(call, rows, fc1_ctas),
             tokens_per_rank=rows,
+            act_bufs=(
+                call.fc1_slots(ws.act.shape[0]) if call is not None and call.on("fc1_sf") else None
+            ),
         )
         if call is not None:
-            for edge in ("route_fc1", "fc1_fc2", "fc2_fin", "fc1_plan"):
+            for edge in ("route_fc1", "fc1_fc2", "fc1_sf", "fc2_fin", "fc1_plan"):
                 call.consumed(edge)
             if (
                 call.on("fin_push")

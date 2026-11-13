@@ -52,8 +52,9 @@ Configuration is read from the environment when the manager is first used:
 ``LAMPORT`` edges are scheduled like ``ORACLE`` edges that always wait for the
 producer's start, but the data itself carries readiness: the producer writes
 into a slot of an :class:`EdgeWorkspace` that holds the exact sentinel
-(``-0.0``, i.e. ``0x8000`` per BF16/FP16 lane and ``0x80000000`` per FP32 lane),
-and the consumer kernel retries tiles that still hold it. Kernels never write
+(``-0.0``, i.e. ``0x8000`` per BF16/FP16 lane, ``0x80000000`` per FP32 lane and
+``0x80`` per E4M3 byte; ``0xFF``, the NaN encoding, per UE8M0 scale byte held as
+uint8), and the consumer kernel retries tiles that still hold it. Kernels never write
 the sentinel; :class:`EdgeWorkspaces` owns the slot lifecycle:
 
 1. Registering a workspace allocates every slot once (never a caching-allocator
@@ -91,7 +92,11 @@ row count: slot ``s`` of ``rows`` rows starts at ``s * rows`` rows, so the
 dirty slots of a step form one contiguous span.
 
 A reset covers only the rows the lease handed out, so a producer must write
-inside its lease. Views of one slot (e.g. column ranges read by different
+inside its lease. A ``bounded`` workspace narrows that further on the device: its
+leases carry a one-word ``bound`` that a kernel of the use sets to the rows it
+used (e.g. from a routing plan), and the reset covers only that many rows. A
+workspace may override the scope's reset policy (``policy``); a STEP flush then
+waits only for the STEP workspaces. Views of one slot (e.g. column ranges read by different
 consumers) are aliases of one physical region; it is re-armed only after the
 last of its declared readers releases it. Committed KV history, recurrent and
 convolution state are not edge workspaces and are never reset here.
@@ -172,6 +177,9 @@ _SENTINELS: Dict[torch.dtype, Tuple[torch.dtype, int, int]] = {
     torch.float16: (torch.int16, -0x8000, -0x7FFF8000),
     torch.float32: (torch.int32, -0x80000000, -0x80000000),
     torch.int32: (torch.int32, 0, 0),
+    torch.float8_e4m3fn: (torch.int8, -0x80, -0x7F7F7F80),
+    # UE8M0 scale bytes: no -0, so the NaN encoding (never written for a finite scale).
+    torch.uint8: (torch.uint8, 0xFF, -1),
 }
 
 
@@ -261,6 +269,12 @@ class EdgeLease:
     def __iter__(self) -> Iterator[object]:
         return iter((self.tensor, self.slot, self.gen))
 
+    @property
+    def bound(self) -> Optional[torch.Tensor]:
+        """int32 [1]: rows of the lease the use wrote (a bounded workspace re-arms only those), else None."""
+        bounds = self.workspace.bounds
+        return None if bounds is None else bounds[self.slot : self.slot + 1]
+
     def view(self, alias: str) -> torch.Tensor:
         dim, start, length = self.workspace.aliases[alias]
         return self.tensor.narrow(dim, start, length)
@@ -310,7 +324,8 @@ class EdgeWorkspace:
         reset_ctas: int,
         device: torch.device,
         max_streams: int,
-        packed: bool,
+        policy: "ResetPolicy",
+        bounds: Optional[torch.Tensor] = None,
     ) -> None:
         if dtype not in _SENTINELS:
             raise ValueError(f"edge {name}: no sentinel for {dtype}")
@@ -321,6 +336,7 @@ class EdgeWorkspace:
         self.dtype = dtype
         self.backend = backend
         self.reset_ctas = reset_ctas
+        self.policy = policy
         self.aliases: Dict[str, Tuple[int, int, int]] = {}
         numel = torch.Size(self.shape).numel()
         element_size = torch.empty((), dtype=dtype).element_size()
@@ -331,7 +347,9 @@ class EdgeWorkspace:
             self.storage[i * stride : i * stride + numel].view(self.shape) for i in range(slots)
         ]
         self._row_numel = numel // self.shape[0]
-        self.packed = packed and self._row_numel * element_size % 16 == 0
+        self.packed = policy is ResetPolicy.STEP and self._row_numel * element_size % 16 == 0
+        # int32 [slots]: rows each slot's last use wrote, set on the device; a bounded slot's reset covers only those.
+        self.bounds = bounds
         self._scope_rows: Optional[int] = None
         # Released leases awaiting a STEP flush.
         self._dirty: List[Optional[EdgeLease]] = [None] * slots
@@ -451,12 +469,20 @@ class EdgeWorkspaces:
         slots: int = 2,
         backend: Optional[ResetBackend] = None,
         reset_ctas: Optional[int] = None,
+        policy: Optional[ResetPolicy] = None,
+        bounded: bool = False,
+        bounds_from: Optional[str] = None,
     ) -> EdgeWorkspace:
         """Register (or return the matching) workspace and arm all its slots.
 
         Dim 0 is the row dimension leases can truncate; size it for the
         largest token count the edge serves. Under the ``step`` policy,
-        ``slots`` must cover every use of the edge in one scope.
+        ``slots`` must cover every use of the edge in one scope. ``policy``
+        overrides the reset policy for this workspace; ``bounded`` gives each
+        lease a ``bound`` word and re-arms only the rows it holds (rows of 16
+        bytes or a multiple). ``bounds_from`` names a registered bounded
+        workspace with as many slots whose bound words this one shares: the two
+        are leased together, so slot ``s`` of both holds the rows of one use.
         """
         existing = self._workspaces.get(name)
         if existing is not None:
@@ -469,9 +495,23 @@ class EdgeWorkspaces:
         if torch.cuda.is_current_stream_capturing() or self.in_scope:
             raise RuntimeError(f"register edge {name} before capture and outside a scope")
         backend = ResetBackend(backend or self.backend)
-        if dtype == torch.int32 and backend is ResetBackend.TEMPLATE:
-            # Templates are keyed by lane dtype, and int32 is also the float32 lane (another sentinel).
+        policy = ResetPolicy(policy or self.reset_policy)
+        if dtype not in (torch.bfloat16, torch.float16, torch.float32) and (
+            backend is ResetBackend.TEMPLATE
+        ):
+            # Templates are keyed by lane dtype and hold the 16- or 32-bit float sentinel: int32 is also the float32
+            # lane (another sentinel), and byte lanes have none.
             backend = ResetBackend.AUTO
+        bounds = None
+        if bounds_from is not None:
+            owner = self._workspaces.get(bounds_from)
+            if owner is None or owner.bounds is None or owner.num_slots != slots:
+                raise ValueError(
+                    f"edge {name}: {bounds_from} is not a registered bounded edge of {slots} slots"
+                )
+            bounds = owner.bounds
+        elif bounded:
+            bounds = torch.full((slots,), shape[0], dtype=torch.int32, device=self.device)
         ws = EdgeWorkspace(
             name,
             shape,
@@ -481,14 +521,23 @@ class EdgeWorkspaces:
             self.reset_ctas if reset_ctas is None else reset_ctas,
             self.device,
             self.max_streams_per_slot,
-            self.reset_policy is ResetPolicy.STEP,
+            policy,
+            bounds,
         )
+        if bounds is not None and ws._row_numel * ws.storage.element_size() % 16:
+            raise ValueError(
+                f"edge {name}: a bounded workspace needs rows of a multiple of 16 bytes"
+            )
         if ws.backend is ResetBackend.TEMPLATE:
             self._ensure_template(_SENTINELS[dtype][0], ws.bytes_per_slot)
         self._workspaces[name] = ws
         self.preinitialize((ws,))
         cute_capable = (ResetBackend.CUTE, ResetBackend.AUTO)
-        if self.reset_policy is ResetPolicy.STEP and ws.backend in cute_capable:
+        if bounds is not None:
+            from .fine_grained_sync_fill import compile_sentinel_fill_bounded
+
+            compile_sentinel_fill_bounded(self.reset_threads)
+        elif policy is ResetPolicy.STEP and ws.backend in cute_capable:
             from .fine_grained_sync_fill import compile_sentinel_fill_spans
 
             # The first flush may run inside a graph capture; compile before it.
@@ -617,7 +666,7 @@ class EdgeWorkspaces:
         lease.pending_readers -= 1
         if lease.pending_readers == 0:
             self._retire(lease)
-            if self.reset_policy is ResetPolicy.STEP and self._all_dirty():
+            if ws.policy is ResetPolicy.STEP and self._all_dirty():
                 self.flush()
 
     def flush(self) -> None:
@@ -659,8 +708,9 @@ class EdgeWorkspaces:
                     "slots": ws.num_slots,
                     "bytes_per_slot": ws.bytes_per_slot,
                     "bytes": ws.storage_bytes,
-                    "policy": self.reset_policy.value,
+                    "policy": ws.policy.value,
                     "packed": ws.packed,
+                    "bounded": ws.bounds is not None,
                     "backend": ws.backend.value,
                     "aliases": dict(ws.aliases),
                     "events": ws.num_slots * (1 + self.max_streams_per_slot),
@@ -692,7 +742,7 @@ class EdgeWorkspaces:
         return lease
 
     def _retire(self, lease: EdgeLease) -> None:
-        if self.reset_policy is ResetPolicy.RELEASE:
+        if lease.workspace.policy is ResetPolicy.RELEASE:
             self._recycle(lease)
             return
         ws = lease.workspace
@@ -703,11 +753,12 @@ class EdgeWorkspaces:
         lease.released = True
 
     def _all_dirty(self) -> bool:
-        for name in self._touched:
-            ws = self._workspaces[name]
-            if any(lease is None for lease in ws._dirty):
-                return False
-        return bool(self._touched)
+        stepped = [
+            self._workspaces[name]
+            for name in self._touched
+            if self._workspaces[name].policy is ResetPolicy.STEP
+        ]
+        return bool(stepped) and all(lease is not None for ws in stepped for lease in ws._dirty)
 
     def _recycle(self, lease: EdgeLease) -> None:
         ws = lease.workspace
@@ -717,7 +768,10 @@ class EdgeWorkspaces:
         for index in lease._joins.values():
             self.reset_stream.wait_event(events[index])
         with torch.cuda.stream(self.reset_stream):
-            self._fill(ws, lease.tensor)
+            if ws.bounds is not None:
+                self._fill_bounded(ws, [lease])
+            else:
+                self._fill(ws, lease.tensor)
         ws._ready[lease.slot].record(self.reset_stream)
         ws._pending[lease.slot] = True
         ws._lease[lease.slot] = None
@@ -750,6 +804,9 @@ class EdgeWorkspaces:
         # slots of one scope are adjacent), then CUTE spans share launches.
         spans: List[Tuple[EdgeWorkspace, torch.Tensor]] = []
         for ws in {id(ws): ws for ws, _ in dirty}.values():
+            if ws.bounds is not None:
+                self._fill_bounded(ws, [lease for other, lease in dirty if other is ws])
+                continue
             base = ws.storage.data_ptr()
             element_size = ws.storage.element_size()
             ranges = sorted(
@@ -786,6 +843,49 @@ class EdgeWorkspaces:
             max_ctas = self.reset_ctas or (1 << 30)
             sentinel_fill_spans_(cute_spans, max_ctas, self.reset_threads, self.reset_unroll)
 
+    def _fill_bounded(self, ws: EdgeWorkspace, leases: List[EdgeLease]) -> None:
+        # One launch per run of consecutive slots at a fixed spacing (packed STEP slots of one scope are).
+        from .fine_grained_sync_fill import sentinel_fill_bounded_
+
+        row_bytes = ws._row_numel * ws.storage.element_size()
+        word = _SENTINELS[ws.dtype][2]
+        leases = sorted(leases, key=lambda lease: lease.slot)
+        runs: List[List[EdgeLease]] = []
+        for lease in leases:
+            run = runs[-1] if runs else None
+            if (
+                run is not None
+                and lease.slot == run[-1].slot + 1
+                and lease.tensor.numel() == run[0].tensor.numel()
+                and (
+                    len(run) == 1
+                    or lease.tensor.data_ptr() - run[-1].tensor.data_ptr()
+                    == run[1].tensor.data_ptr() - run[0].tensor.data_ptr()
+                )
+            ):
+                run.append(lease)
+            else:
+                runs.append([lease])
+        base = ws.storage.data_ptr()
+        element_size = ws.storage.element_size()
+        for run in runs:
+            cap_bytes = run[0].tensor.numel() * element_size
+            slot_bytes = (
+                run[1].tensor.data_ptr() - run[0].tensor.data_ptr() if len(run) > 1 else cap_bytes
+            )
+            start = (run[0].tensor.data_ptr() - base) // element_size
+            end = start + ((len(run) - 1) * slot_bytes + cap_bytes) // element_size
+            sentinel_fill_bounded_(
+                ws.storage[start:end],
+                ws.bounds[run[0].slot : run[0].slot + len(run)],
+                slot_bytes,
+                cap_bytes,
+                row_bytes,
+                word,
+                ws.reset_ctas or self.reset_ctas or (1 << 30),
+                self.reset_threads,
+            )
+
     def _fill(
         self, ws: EdgeWorkspace, tensor: torch.Tensor, backend: Optional[ResetBackend] = None
     ) -> None:
@@ -818,7 +918,10 @@ def _memset_sentinel(tensor: torch.Tensor, lane: torch.dtype) -> None:
 
     stream = driver.CUstream(torch.cuda.current_stream().cuda_stream)
     pointer = driver.CUdeviceptr(tensor.data_ptr())
-    if lane == torch.int16:
+    if lane in (torch.int8, torch.uint8):
+        value = 0x80 if lane == torch.int8 else 0xFF
+        result = driver.cuMemsetD8Async(pointer, value, tensor.numel(), stream)
+    elif lane == torch.int16:
         result = driver.cuMemsetD16Async(pointer, 0x8000, tensor.numel(), stream)
     else:
         result = driver.cuMemsetD32Async(pointer, 0x80000000, tensor.numel(), stream)

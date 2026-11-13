@@ -20,8 +20,11 @@ from cutlass.cute.runtime import make_ptr
 _VECTOR_BYTES = 16
 # Spans one multi-span launch fills; longer span lists take several launches.
 MAX_SPANS = 4
+# CTAs of one bounded fill launch, shared by its slots: the rows each slot used are known only on the device.
+BOUNDED_CTAS = 512
 _COMPILED: Dict[Tuple[int, int], Callable] = {}
 _COMPILED_SPANS: Dict[Tuple[int, int], Callable] = {}
+_COMPILED_BOUNDED: Dict[int, Callable] = {}
 _DUMMY: Dict[int, torch.Tensor] = {}
 
 
@@ -271,11 +274,13 @@ def sentinel_fill_(
     if tail:
         flat = tensor.view(-1).view(torch.uint8)[num_vecs * _VECTOR_BYTES :]
         lane_bytes = tensor.element_size()
-        if lane_bytes not in (2, 4):
-            raise ValueError(f"sentinel_fill_ supports 2- and 4-byte elements, got {lane_bytes}")
+        if lane_bytes not in (1, 2, 4):
+            raise ValueError(
+                f"sentinel_fill_ supports 1-, 2- and 4-byte elements, got {lane_bytes}"
+            )
         lane_raw = word.to_bytes(4, "little", signed=True)[:lane_bytes]
-        lane = int.from_bytes(lane_raw, "little", signed=True)
-        flat.view(torch.int16 if lane_bytes == 2 else torch.int32).fill_(lane)
+        lane = int.from_bytes(lane_raw, "little", signed=lane_bytes > 1)
+        flat.view({1: torch.uint8, 2: torch.int16, 4: torch.int32}[lane_bytes]).fill_(lane)
     return tensor
 
 
@@ -352,3 +357,132 @@ def sentinel_fill_spans_(
         for _ in range(MAX_SPANS - len(group)):
             args += _span_args(_dummy_words().data_ptr(), 0, chunk, 0)
         fn(*args, cutlass.Int32(num_ctas), stream)
+
+
+@cute.kernel
+def _fill_bounded_kernel(
+    m_words: cute.Tensor,
+    m_bounds: cute.Tensor,
+    slot_vecs: cutlass.Int64,
+    cap_vecs: cutlass.Int64,
+    row_vecs: cutlass.Int32,
+    word: cutlass.Int32,
+    ctas_per_slot: cutlass.Int32,
+    threads: cutlass.Constexpr,
+):
+    # CTA (x, s) strides over the first m_bounds[s] rows of slot s.
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, slot, _ = cute.arch.block_idx()
+    words = cutlass.make_array_view(m_words)
+    num_vecs = cutlass.min(cutlass.Int64(m_bounds[slot]) * cutlass.Int64(row_vecs), cap_vecs)
+    base = cutlass.Int64(slot) * slot_vecs
+    first = cutlass.Int64(bidx) * cutlass.Int64(threads) + cutlass.Int64(tidx)
+    stride = cutlass.Int64(ctas_per_slot) * cutlass.Int64(threads)
+    rounds = cutlass.Int32((num_vecs - first + stride - 1) // stride)
+    fill = cutlass.Vector.from_elements((word, word, word, word), dtype=cutlass.Int32)
+    for r in cutlass.range(0, rounds, 1, unroll=1):
+        idx = (base + first + cutlass.Int64(r) * stride) * cutlass.Int64(4)
+        words.store(fill, idx=idx, vector_size=4, alignment=_VECTOR_BYTES)
+
+
+@cute.jit
+def _fill_bounded_host(
+    words_ptr: cute.Pointer,
+    num_words: cutlass.Int32,
+    bounds_ptr: cute.Pointer,
+    num_slots: cutlass.Int32,
+    slot_vecs: cutlass.Int64,
+    cap_vecs: cutlass.Int64,
+    row_vecs: cutlass.Int32,
+    word: cutlass.Int32,
+    ctas_per_slot: cutlass.Int32,
+    stream: cuda.CUstream,
+    threads: cutlass.Constexpr,
+):
+    m_words = cute.make_tensor(words_ptr, cute.make_layout((num_words,), stride=(1,)))
+    m_bounds = cute.make_tensor(bounds_ptr, cute.make_layout((num_slots,), stride=(1,)))
+    _fill_bounded_kernel(
+        m_words, m_bounds, slot_vecs, cap_vecs, row_vecs, word, ctas_per_slot, threads
+    ).launch(grid=(ctas_per_slot, num_slots, 1), block=(threads, 1, 1), stream=stream)
+
+
+def _bounds_ptr(address: int):
+    return make_ptr(cutlass.Int32, address, cute.AddressSpace.gmem, assumed_align=4)
+
+
+def compile_sentinel_fill_bounded(threads: int = 256) -> Callable:
+    """Compile (once per configuration) the bounded fill; call it before graph capture."""
+    fn = _COMPILED_BOUNDED.get(threads)
+    if fn is None:
+        if threads % 32 or not 32 <= threads <= 1024:
+            raise ValueError(f"threads must be a warp multiple in [32, 1024], got {threads}")
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        dummy = _dummy_words()
+        with BaseDSL.enable_pyir():
+            fn = cute.compile(
+                _fill_bounded_host,
+                _words_ptr(dummy.data_ptr()),
+                cutlass.Int32(4),
+                _bounds_ptr(dummy.data_ptr()),
+                cutlass.Int32(1),
+                cutlass.Int64(1),
+                cutlass.Int64(1),
+                cutlass.Int32(1),
+                cutlass.Int32(0),
+                cutlass.Int32(1),
+                stream,
+                threads,
+            )
+        _COMPILED_BOUNDED[threads] = fn
+    return fn
+
+
+def sentinel_fill_bounded_(
+    region: torch.Tensor,
+    bounds: torch.Tensor,
+    slot_bytes: int,
+    cap_bytes: int,
+    row_bytes: int,
+    word: int,
+    max_ctas: int = 1 << 30,
+    threads: int = 256,
+) -> None:
+    """Fill the used rows of ``bounds.numel()`` equally spaced slots with the repeated 32-bit ``word``.
+
+    Slot ``s`` starts ``s * slot_bytes`` into the contiguous, 16-byte-aligned ``region`` and is filled for its first
+    ``min(bounds[s] * row_bytes, cap_bytes)`` bytes; ``bounds`` (int32, on the device) is read when the fill runs.
+    The byte counts must be multiples of 16.
+    """
+    num_slots = bounds.numel()
+    if not region.is_contiguous() or region.data_ptr() % _VECTOR_BYTES:
+        raise ValueError("sentinel_fill_bounded_ needs a contiguous, 16-byte-aligned region")
+    if bounds.dtype != torch.int32 or not bounds.is_contiguous():
+        raise ValueError("sentinel_fill_bounded_ needs contiguous int32 bounds")
+    if (slot_bytes | cap_bytes | row_bytes) % _VECTOR_BYTES or cap_bytes > slot_bytes:
+        raise ValueError("slot, cap and row bytes must be multiples of 16, cap <= slot")
+    if region.numel() * region.element_size() < (num_slots - 1) * slot_bytes + cap_bytes:
+        raise ValueError("region is shorter than its slots")
+    if num_slots == 0 or cap_bytes == 0:
+        return
+    # The kernel indexes 32-bit words with Int32: at most _MAX_FILL_BYTES of slots per launch.
+    per_launch = max(1, _MAX_FILL_BYTES // slot_bytes)
+    cap_vecs = cap_bytes // _VECTOR_BYTES
+    ctas_per_slot = max(
+        1, min(-(-cap_vecs // threads), max(1, min(max_ctas, BOUNDED_CTAS) // num_slots))
+    )
+    fn = compile_sentinel_fill_bounded(threads)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    for first in range(0, num_slots, per_launch):
+        count = min(per_launch, num_slots - first)
+        fn(
+            _words_ptr(region.data_ptr() + first * slot_bytes),
+            cutlass.Int32(((count - 1) * slot_bytes + cap_bytes) // 4),
+            _bounds_ptr(bounds.data_ptr() + first * 4),
+            cutlass.Int32(count),
+            cutlass.Int64(slot_bytes // _VECTOR_BYTES),
+            cutlass.Int64(cap_vecs),
+            cutlass.Int32(row_bytes // _VECTOR_BYTES),
+            cutlass.Int32(word),
+            cutlass.Int32(ctas_per_slot),
+            stream,
+        )
