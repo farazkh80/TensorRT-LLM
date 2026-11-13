@@ -9,6 +9,10 @@ and matches both that kernel and the fixed-order torch oracle bit for bit.
 
 One CTA per (row, column chunk); each thread owns one 16 B vector of the row. Rows of ``y`` that no (row, k) maps to
 (padding, other ranks' rows) are never read.
+
+``rearm`` (consumer re-arm of the Lamport FC1 -> FC2 slots): once the FC2 grid is complete, the CTAs share the 16 B
+pieces of rows [0, total_num_padded_tokens) of FC2's inputs and store the sentinel back (0x80 per E4M3 byte, 0xFF per
+scale byte), after their own rows.
 """
 
 from __future__ import annotations
@@ -21,11 +25,28 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import BFloat16, Float32, Int32, Int64
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import dsl_user_op
 
-from ..moe_chain import HIDDEN, TOP_K
+from ..moe_chain import HIDDEN, INTER, SF_VEC, TOP_K
 from .sync import fgs_diag, release_add, spin_ns, wait_at_least_short
 
 _VEC = 8
+
+
+@dsl_user_op
+def _st_v4(addr, w, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [Int64(addr).ir_value(loc=loc, ip=ip)] + [Int32(w).ir_value(loc=loc, ip=ip)] * 4,
+        "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 
 def _pdl() -> bool:
@@ -63,6 +84,7 @@ class FinalizeKernel:
         skip_single: bool = False,
         signal_add: int = 1,
         signal_skipped: bool = False,
+        rearm: bool = False,
     ):
         vecs = hidden // _VEC
         assert hidden % _VEC == 0 and vecs % chunks == 0, (hidden, chunks)
@@ -79,6 +101,7 @@ class FinalizeKernel:
         self.skip_single = skip_single
         self.signal_add = signal_add
         self.signal_skipped = signal_skipped and signal and skip_single
+        self.rearm = rearm
 
     @cute.jit
     def __call__(
@@ -89,6 +112,9 @@ class FinalizeKernel:
         mO: cute.Tensor,
         mFc2: cute.Tensor,
         mFin: cute.Tensor,
+        mAct: cute.Tensor,
+        mSf: cute.Tensor,
+        mTotal: cute.Tensor,
         tile_n: Int32,
         rows: Int32,
         stream,
@@ -100,6 +126,9 @@ class FinalizeKernel:
             cute.zipped_divide(mO, (1, _VEC)),
             mFc2,
             mFin,
+            mAct,
+            mSf,
+            mTotal,
             tile_n,
         ).launch(
             grid=[rows, self.chunks, 1],
@@ -117,6 +146,9 @@ class FinalizeKernel:
         gO: cute.Tensor,
         mFc2: cute.Tensor,
         mFin: cute.Tensor,
+        mAct: cute.Tensor,
+        mSf: cute.Tensor,
+        mTotal: cute.Tensor,
         tile_n: Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
@@ -170,6 +202,22 @@ class FinalizeKernel:
             cute.arch.griddepcontrol_wait()
             if cutlass.const_expr(not self.signal):
                 cute.arch.griddepcontrol_launch_dependents()
+        if cutlass.const_expr(self.rearm):
+            self._rearm(mAct, mSf, mTotal, row, chunk, tidx)
+
+    @cute.jit
+    def _rearm(self, mAct, mSf, mTotal, row, chunk, tidx):
+        grid_x, _, _ = cute.arch.grid_dim()
+        total = mTotal[0]
+        first = (row * self.chunks + chunk) * self.threads + tidx
+        stride = grid_x * self.chunks * self.threads
+        for base, pieces, word in (
+            (mAct.iterator.toint(), total * (INTER // 16), Int32(-0x7F7F7F80)),
+            (mSf.iterator.toint(), total * (INTER // SF_VEC // 16), Int32(-1)),
+        ):
+            rounds = (pieces - first + stride - 1) // stride
+            for r in cutlass.range(0, rounds, 1, unroll=1):
+                _st_v4(base + Int64(first + r * stride) * 16, word)
 
 
 @functools.lru_cache(maxsize=None)
@@ -185,6 +233,7 @@ def _compiled(
     skip_single: bool = False,
     signal_add: int = 1,
     signal_skipped: bool = False,
+    rearm: bool = False,
 ):
     kernel = FinalizeKernel(
         hidden,
@@ -198,6 +247,7 @@ def _compiled(
         skip_single,
         signal_add,
         signal_skipped,
+        rearm,
     )
 
     def fake(dtype, cols):
@@ -205,8 +255,8 @@ def _compiled(
             dtype, (cute.sym_int(), cols), stride_order=(1, 0), assumed_align=16
         )
 
-    def fake_words():
-        return cute.runtime.make_fake_compact_tensor(Int32, (cute.sym_int(),), assumed_align=4)
+    def fake_words(align=4):
+        return cute.runtime.make_fake_compact_tensor(Int32, (cute.sym_int(),), assumed_align=align)
 
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     return cute.compile(
@@ -216,6 +266,9 @@ def _compiled(
         fake(Int32, TOP_K),
         fake(BFloat16, hidden),
         fake_words(),
+        fake_words(),
+        fake_words(16),
+        fake_words(16),
         fake_words(),
         Int32(1),
         Int32(1),
@@ -238,6 +291,7 @@ def run(
     fin_per_row: int = 0,
     skip_single: bool = False,
     signal_skipped: bool = False,
+    rearm: Optional[tuple] = None,
 ) -> None:
     """``moe_chain`` finalize stage: y bf16 [P, 3584] (permuted rows), topk_w bf16 [R, 16], out bf16 [R, 3584].
 
@@ -245,6 +299,7 @@ def run(
     one word per row of ``out``) the finalize -> combine producer. Both are zero-armed counter slabs owned by the
     caller; a row's word reaches ``fin_per_row`` (default: ``chunks``). ``hazard_delay_ns`` delays the stores of every
     third row of the producer build (hazard tests only). ``skip_single`` / ``signal_skipped``: see ``FinalizeKernel``.
+    ``rearm`` (``(act, act_sf)``, FC2's inputs): the Lamport FC1 -> FC2 slots this kernel re-arms (module docstring).
     """
     rows = out.shape[0]
     if rows == 0:
@@ -276,8 +331,13 @@ def run(
         skip_single,
         fin_per_row // chunks if signal else 1,
         signal_skipped,
+        rearm is not None,
     )
     words = plan.num_non_exiting_tiles
+    if rearm is not None:
+        act, act_sf = (t.view(torch.int32).view(-1) for t in rearm)
+    else:
+        act = act_sf = plan.expert_offsets
     fn(
         y,
         topk_w,
@@ -285,6 +345,9 @@ def run(
         out,
         (fc2_done if wait_fc2 else words).view(-1),
         (fin_done if signal else words).view(-1),
+        act,
+        act_sf,
+        plan.total_num_padded_tokens,
         plan.tile_n,
         rows,
     )

@@ -1658,7 +1658,9 @@ PUSH_ENV = "TLLM_K3_MOE_FC2_PUSH"
 FGS_PUBLISHES = {"run_v2": ("fc2_push",)}
 
 
-def run_v2(act, act_sf, weights_e, plan, topk_w, out, *, fgs=None, enable_pdl=True, y=None):
+def run_v2(
+    act, act_sf, weights_e, plan, topk_w, out, *, fgs=None, enable_pdl=True, y=None, rearm=None
+):
     """``TLLM_K3_MOE_FIN=fc2`` entry (moe_chain contract): FC2 with the finalize fused into its epilogue.
 
     ``out[r] = bf16(sum over k in order, fp32, of topk_w[r, k] * y[e2p[r * 16 + k]])`` for every received row r (zero
@@ -1670,7 +1672,8 @@ def run_v2(act, act_sf, weights_e, plan, topk_w, out, *, fgs=None, enable_pdl=Tr
     ``["fc1_plan"]``: as ``fc2.run``'s ``fc1_done`` / ``plan_pub``; an ``fc1_fc2`` of ``kind == "lamport"`` is the
     Lamport build, with ``rows_used`` its tensor (if any). ``fgs.publishes["fc2_push"]``: int32 [R] words,
     zero-armed; each row reaches 28. By default the finalize kernel publishes every row once the FC2 grid is complete:
-    FC2's per-unit publish needs a GPU-scope fence per unit, which slows the whole SM. With
+    FC2's per-unit publish needs a GPU-scope fence per unit, which slows the whole SM. ``rearm`` (``(act, act_sf)``):
+    the finalize kernel re-arms FC2's Lamport inputs once the FC2 grid is complete (``finalize.run``). With
     ``TLLM_K3_MOE_FC2_PUSH=unit`` FC2 adds 1 per weight tile to the rows it wrote, so they are final before FC2 ends."""
     waits = fgs.waits if fgs is not None else {}
     pubs = fgs.publishes if fgs is not None else {}
@@ -1719,4 +1722,5 @@ def run_v2(act, act_sf, weights_e, plan, topk_w, out, *, fgs=None, enable_pdl=Tr
         skip_single=True,
         signal_skipped=not unit_push,
         hazard_delay_ns=0 if push is None else push.hazard_delay_ns,
+        rearm=rearm,
     )

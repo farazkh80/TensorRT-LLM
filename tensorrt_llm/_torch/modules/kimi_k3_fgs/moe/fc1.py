@@ -217,6 +217,22 @@ def _e4m3x2(hi, lo, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _st_v4(addr, w, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)]
+        + [cutlass.Int32(w).ir_value(loc=loc, ip=ip)] * 4,
+        "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def _tmem_load_16x256b(addrs, *, loc=None, ip=None):
     """One tcgen05.ld.16x256b.x1 per TMEM address, then tcgen05.wait::ld. For each address, thread T
     receives lane T // 4 (values 0, 1) and lane T // 4 + 8 (values 2, 3), both at columns 2 * (T % 4) and
@@ -364,6 +380,7 @@ class Fc1Kernel:
         plan_pub: bool = False,
         nowait: bool = False,
         lamport: bool = False,
+        rearm_prev: bool = False,
     ):
         if n_tile not in (8, 16, 32):
             raise ValueError(f"n_tile must be 8, 16 or 32, got {n_tile}")
@@ -396,6 +413,9 @@ class Fc1Kernel:
             raise ValueError("the Lamport FC1 -> FC2 build publishes no fc1_done counters")
         # lamport: act / act_sf are FC1 -> FC2 slots armed with 0x80 / 0xFF, which FC2 validates byte by byte.
         self.lamport = lamport
+        # rearm_prev (consumer re-arm, next_fc1 rule): the epilogue warps first store the sentinel over the rows the
+        # previous layer's FC2 reported in its slot pair, which this layer's successor writes next.
+        self.rearm_prev = rearm_prev
         self.delay_ns = delay_ns if (signal_done or self.plan_pub or lamport) else 0
         self.full_wait = full_wait
         self.info_fields = 6 if routed else 5
@@ -598,6 +618,9 @@ class Fc1Kernel:
         e2p_ptr: cute.Pointer,
         total_ptr: cute.Pointer,
         plan_pub_ptr: cute.Pointer,
+        rearm_act_ptr: cute.Pointer,
+        rearm_sf_ptr: cute.Pointer,
+        rearm_bound_ptr: cute.Pointer,
         num_experts: cutlass.Int32,
         num_rows: cutlass.Int32,
         num_permuted: cutlass.Int32,
@@ -644,6 +667,9 @@ class Fc1Kernel:
         e2p = cute.make_tensor(e2p_ptr, cute.make_layout((num_rows * TOP_K,)))
         total = cute.make_tensor(total_ptr, cute.make_layout((1,)))
         plan_pub = cute.make_tensor(plan_pub_ptr, cute.make_layout((1,)))
+        rearm_act = cute.make_tensor(rearm_act_ptr, cute.make_layout((1,)))
+        rearm_sf = cute.make_tensor(rearm_sf_ptr, cute.make_layout((1,)))
+        rearm_bound = cute.make_tensor(rearm_bound_ptr, cute.make_layout((1,)))
 
         tiled_mma = self._make_tiled_mma(self.mma_inst_shape_mn)
         tiled_mma_sfb = self._make_tiled_mma(self.mma_inst_shape_mn_sfb)
@@ -756,6 +782,9 @@ class Fc1Kernel:
             e2p,
             total,
             plan_pub,
+            rearm_act,
+            rearm_sf,
+            rearm_bound,
             num_ctas,
             local_expert_offset,
             my_ws,
@@ -775,6 +804,22 @@ class Fc1Kernel:
             min_blocks_per_mp=1,
             use_pdl=self.use_pdl,
         )
+
+    @cute.jit
+    def _rearm_prev(self, mRearmAct, mRearmSf, mRearmBound, tidx, bidx, num_ctas):
+        """Epilogue warps of every CTA share the 16 B pieces of the previous slot pair's used rows. The grid wait
+        orders them after the previous layer's FC2 (its reads and its rows word)."""
+        cute.arch.griddepcontrol_wait()
+        rows = mRearmBound[0]
+        first = bidx * self.num_epilog_threads + tidx
+        stride = num_ctas * self.num_epilog_threads
+        for base, pieces, word in (
+            (mRearmAct.iterator.toint(), rows * (INTER // 16), cutlass.Int32(-0x7F7F7F80)),
+            (mRearmSf.iterator.toint(), rows * (INTER // SF_VEC // 16), cutlass.Int32(-1)),
+        ):
+            rounds = (pieces - first + stride - 1) // stride
+            for r in cutlass.range(0, rounds, 1, unroll=1):
+                _st_v4(base + cutlass.Int64(first + r * stride) * 16, word)
 
     def _s2t_copy_and_partition(self, sSF: cute.Tensor, tSF: cute.Tensor):
         tCsSF_compact = cute.filter_zeros(sSF)
@@ -1237,6 +1282,9 @@ class Fc1Kernel:
         mE2p: cute.Tensor,
         mTotal: cute.Tensor,
         mPlanPub: cute.Tensor,
+        mRearmAct: cute.Tensor,
+        mRearmSf: cute.Tensor,
+        mRearmBound: cute.Tensor,
         num_ctas: cutlass.Int32,
         lo: cutlass.Int32,
         my_ws: cutlass.Int64,
@@ -1924,6 +1972,8 @@ class Fc1Kernel:
                     mTotal,
                     mPlanPub,
                 )
+            if cutlass.const_expr(self.rearm_prev):
+                self._rearm_prev(mRearmAct, mRearmSf, mRearmBound, tidx, bidx, num_ctas)
             n_chunk = n_mma // 8
             mAct16 = cute.make_tensor(
                 cute.recast_ptr(mAct.iterator, dtype=cutlass.Uint16),
@@ -2139,6 +2189,7 @@ def _launch_args(
     topk_ids=None,
     plan_pub=None,
     recv=(0, 1, 0),
+    rearm_prev=None,
 ):
     num_experts = weights.w3_w1_weight.shape[0]
     num_tiles_cap = plan.tile_idx_to_expert_idx.shape[0]
@@ -2166,6 +2217,10 @@ def _launch_args(
         _gmem_ptr(cutlass.Int32, plan.expanded_idx_to_permuted_idx, 4),
         _gmem_ptr(cutlass.Int32, plan.total_num_padded_tokens, 4),
         _gmem_ptr(cutlass.Int32, dummy if plan_pub is None else plan_pub, 4),
+        *(
+            _gmem_ptr(cutlass.Int32, dummy if rearm_prev is None else t, align)
+            for t, align in zip(rearm_prev or (None,) * 3, (16, 16, 4))
+        ),
         cutlass.Int32(num_experts),
         cutlass.Int32(x.shape[0]),
         cutlass.Int32(act.shape[0]),
@@ -2223,6 +2278,13 @@ def _check(x, x_sf, weights, plan, act, act_sf):
         raise ValueError("plan tiles exceed the permuted rows")
 
 
+def _rearm_words(rearm_prev):
+    if rearm_prev is None:
+        return None
+    act, act_sf, rows = rearm_prev
+    return act.view(torch.int32), act_sf.view(torch.int32), rows
+
+
 def _check_word(name, t, words):
     if t is not None and (t.dtype != torch.int32 or not t.is_contiguous() or t.numel() < words):
         raise ValueError(f"{name} must be a contiguous int32 tensor of at least {words} words")
@@ -2239,6 +2301,7 @@ def run(
     plan_ready=None,
     fc1_done=None,
     lamport=False,
+    rearm_prev=None,
     hazard_delay_ns=0,
 ):
     """FC1 of the moe_chain contract: act[p], act_sf[p] = MXFP8(SiTU-GLU(x[p2e[p] // 16] @ W31[e]^T)) for every
@@ -2252,8 +2315,9 @@ def run(
     reaches 4 (later tiles are covered by the grid dependency). Both are owned by the caller. ``lamport`` makes it
     the Lamport FC1 -> FC2 producer instead: ``act`` / ``act_sf`` are slots armed with 0x80 / 0xFF, FC1 never writes
     those bytes (E4M3 -0 is stored as +0, a scale byte is at most 253) and releases FC2 as the ``fc1_done`` build
-    does, without counters. ``hazard_delay_ns`` delays the stores of token tile 0 in the ``fc1_done`` and ``lamport``
-    builds (hazard tests only)."""
+    does, without counters. ``rearm_prev`` (``(act, act_sf, rows)``, with ``lamport``): the previous layer's slot pair
+    and its rows word, which this kernel re-arms (consumer re-arm, ``next_fc1``). ``hazard_delay_ns`` delays the
+    stores of token tile 0 in the ``fc1_done`` and ``lamport`` builds (hazard tests only)."""
     _check(x, x_sf, weights, plan, act, act_sf)
     _check_word("plan_ready", plan_ready, 1)
     _check_word("fc1_done", fc1_done, plan.tile_idx_to_expert_idx.shape[0] * DONE_PER_TILE)
@@ -2267,12 +2331,25 @@ def run(
         hazard_delay_ns if (fc1_done is not None or lamport) else 0,
         plan_ready is not None and fgs_diag("route_fc1") == "ready",
         lamport,
+        rearm_prev is not None,
     )
-    args = _launch_args(x, x_sf, weights, plan, act, act_sf, plan_ready, fc1_done)
+    args = _launch_args(
+        x,
+        x_sf,
+        weights,
+        plan,
+        act,
+        act_sf,
+        plan_ready,
+        fc1_done,
+        rearm_prev=_rearm_words(rearm_prev),
+    )
     stream = cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
     compiled = _compiled.get(key)
     if compiled is None:
-        kernel = Fc1Kernel(*key[:6], delay_ns=key[6], full_wait=key[7], lamport=key[8])
+        kernel = Fc1Kernel(
+            *key[:6], delay_ns=key[6], full_wait=key[7], lamport=key[8], rearm_prev=key[9]
+        )
         compiled = _compiled[key] = cute.compile(kernel, *args, stream)
     compiled(*args, stream)
 
@@ -2291,6 +2368,7 @@ def run_routed(
     plan_pub=None,
     fc1_done=None,
     lamport=False,
+    rearm_prev=None,
     hazard_delay_ns=0,
     hazard_nowait=False,
 ):
@@ -2307,7 +2385,7 @@ def run_routed(
     source blocks. ``plan_pub`` (int32 word, zero-armed): every CTA adds 1 after its plan share, so a consumer that
     starts before FC1 ends reads the plan once the word reaches ``num_ctas_for(x, plan)``; required with a
     ``defer_data_wait`` source (the add that completes the grid advances the byte-counter baselines). ``fc1_done``,
-    ``lamport``: as in ``run``.
+    ``lamport``, ``rearm_prev``: as in ``run``.
     ``hazard_delay_ns`` delays the plan share of the CTAs that publish an expert (and, with ``fc1_done``, the
     token-tile-0 stores); ``hazard_nowait`` skips the source waits (hazard tests only)."""
     _check(x, x_sf, weights, plan, act, act_sf)
@@ -2379,9 +2457,21 @@ def run_routed(
         plan_pub is not None,
         hazard_nowait,
         lamport,
+        rearm_prev is not None,
     )
     args = _launch_args(
-        x, x_sf, weights, plan, act, act_sf, None, fc1_done, topk_ids, plan_pub, recv
+        x,
+        x_sf,
+        weights,
+        plan,
+        act,
+        act_sf,
+        None,
+        fc1_done,
+        topk_ids,
+        plan_pub,
+        recv,
+        rearm_prev=_rearm_words(rearm_prev),
     )
     stream = cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
     compiled = _compiled.get(key)
@@ -2401,6 +2491,7 @@ def run_routed(
             plan_pub=plan_pub is not None,
             nowait=hazard_nowait,
             lamport=lamport,
+            rearm_prev=rearm_prev is not None,
         )
         compiled = _compiled[key] = cute.compile(kernel, *args, stream)
         k3_edges.debug(
@@ -2417,7 +2508,9 @@ FGS_WAITS = {"run_v2": ("recv_fc1",)}
 FGS_PUBLISHES = {"run_v2": ("fc1_fc2", "fc1_plan")}
 
 
-def run_v2(x, x_sf, ids, weights_e, plan, act, act_sf, *, fgs=None, enable_pdl=True):
+def run_v2(
+    x, x_sf, ids, weights_e, plan, act, act_sf, *, fgs=None, enable_pdl=True, rearm_prev=None
+):
     """``TLLM_K3_MOE_FC1=v2`` entry (moe_chain contract): ``run_routed`` with its sync objects from ``fgs``.
 
     ``fgs.waits["recv_fc1"]``: the receive of a send-only dispatch; its ``source`` is the dispatch's receive
@@ -2454,6 +2547,7 @@ def run_v2(x, x_sf, ids, weights_e, plan, act, act_sf, *, fgs=None, enable_pdl=T
         plan_pub=None if pub is None else pub.tensor,
         fc1_done=None if done is None or done.kind == "lamport" else done.tensor,
         lamport=done is not None and done.kind == "lamport",
+        rearm_prev=rearm_prev,
         hazard_delay_ns=delay,
         hazard_nowait=recv is not None and (recv.hazard_nowait or recv.diag == "oracle"),
     )

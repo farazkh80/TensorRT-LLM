@@ -78,12 +78,15 @@ ROUTER_MAX_ROWS_ENV = "TLLM_K3_MOE_ROUTER_MAX_ROWS"
 # FC2 K stages of 256 columns, each fed by 4 FC1 units of 64 columns.
 FC1_K_STAGES = INTER // 256
 # How FC2 learns FC1's output is ready: "counter" (the fc1_done slabs) or "lamport" (FC1 writes act / act_sf into
-# FC1_ACT / FC1_SF slots armed with 0x80 / 0xFF, FC2 checks every byte it reads). With lamport the edge workspaces
-# re-arm the slots on their reset stream, for the rows FC2 reports, under TLLM_K3_MOE_FC1_FC2_RESET_POLICY (default:
-# TLLM_FGS_RESET_POLICY).
+# FC1_ACT / FC1_SF slots armed with 0x80 / 0xFF, FC2 checks every byte it reads). TLLM_K3_MOE_FC1_FC2_REARM picks who
+# re-arms the lamport slots: "framework" (the edge workspaces' reset stream, for the rows FC2 reports, under
+# TLLM_K3_MOE_FC1_FC2_RESET_POLICY, default TLLM_FGS_RESET_POLICY) or "consumer" (slots this module owns, re-armed by
+# a kernel of the expert path, TLLM_K3_MOE_FC1_FC2_CONSUMER_RULE): "finalize", the finalize behind FC2 re-arms what
+# FC2 read (one slot pair); "next_fc1", the next MoE layer's FC1 re-arms the previous layer's pair (pairs alternate).
 FC1_FC2_SYNC_ENV = "TLLM_K3_MOE_FC1_FC2_SYNC"
 FC1_FC2_REARM_ENV = "TLLM_K3_MOE_FC1_FC2_REARM"
 FC1_FC2_POLICY_ENV = "TLLM_K3_MOE_FC1_FC2_RESET_POLICY"
+FC1_FC2_RULE_ENV = "TLLM_K3_MOE_FC1_FC2_CONSUMER_RULE"
 FC1_ACT = "moe.fc1_act"
 FC1_SF = "moe.fc1_sf"
 # Rows per rank the expert-path edges serve; the tail edges stop where the split-K up-projection consumer does.
@@ -380,7 +383,51 @@ def fc1_fc2_sync() -> str:
 
 
 def fc1_fc2_rearm() -> str:
-    return _choice(FC1_FC2_REARM_ENV, "framework", ("framework",))
+    return _choice(FC1_FC2_REARM_ENV, "framework", ("framework", "consumer"))
+
+
+def fc1_fc2_rule() -> str:
+    return _choice(FC1_FC2_RULE_ENV, "finalize", ("finalize", "next_fc1"))
+
+
+@dataclass
+class Fc1Slots:
+    """The Lamport FC1 -> FC2 slot pair of one MoE forward: ``act`` / ``act_sf`` (rows past the workspace's are never
+    touched), the int32 [1] word FC2 stores its padded rows into, and with ``next_fc1`` the previous layer's pair
+    ``(act, act_sf, rows)`` that this layer's FC1 re-arms."""
+
+    act: torch.Tensor
+    act_sf: torch.Tensor
+    rows_used: torch.Tensor
+    prev: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
+
+
+class _ConsumerSlots:
+    """Consumer-re-armed FC1 -> FC2 slot pairs of one device, armed once here; the edge workspaces never touch them."""
+
+    def __init__(self, device: torch.device, rows: int, pairs: int):
+        self.act = torch.full((pairs, rows, INTER), 0x80, dtype=torch.uint8, device=device)
+        self.act = self.act.view(torch.float8_e4m3fn)
+        self.act_sf = torch.full(
+            (pairs, rows, INTER // SF_VEC), 0xFF, dtype=torch.uint8, device=device
+        )
+        self.rows_used = torch.zeros(pairs, dtype=torch.int32, device=device)
+
+    def pair(self, i: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.act[i], self.act_sf[i], self.rows_used[i : i + 1]
+
+
+_consumer_slots: Dict[torch.device, _ConsumerSlots] = {}
+# Every MoE layer on the consumer path, in construction (= forward) order.
+_consumer_layers: List["_Layer"] = []
+
+
+def _consumer_pair(ordinal: int, count: int, rule: str) -> int:
+    """The slot pair of the ``ordinal``-th consumer layer. ``next_fc1``: neighbouring layers, including the last and the
+    next forward's first, never share a pair (two pairs alternate; an odd layer count gives the last layer a third)."""
+    if rule == "finalize":
+        return 0
+    return 2 if count % 2 and ordinal == count - 1 else ordinal % 2
 
 
 def fc1_fc2_policy() -> Optional[str]:
@@ -829,6 +876,7 @@ class _Call:
         self.rows = rows
         self.leases: Dict[str, object] = {}
         self.source = None
+        self.fc1: Optional[Fc1Slots] = None
         counters = layer.counter_edges
         if layer.fc1_fc2_lamport and 1 <= rows <= FGS_MAX_ROWS:
             self._acquire_fc1_slots(layer, rows)
@@ -888,9 +936,11 @@ class _Call:
             if lease is not None:
                 self.leases["fc1_plan"] = lease
             else:
-                k3_edges.consumed(self.leases.pop("fc1_fc2"))
-                if "fc1_sf" in self.leases:
-                    k3_edges.consumed(self.leases.pop("fc1_sf"))
+                for edge in ("fc1_fc2", "fc1_sf"):
+                    lease = self.leases.pop(edge, None)
+                    if lease is not None:
+                        k3_edges.consumed(lease)
+                self.fc1 = None
                 k3_edges.debug("moe.fc1_fc2", rows, f"off: {FC1_PLAN} {k3_edges.last_refusal()}")
 
     def _acquire_fc1_slots(self, layer: "_Layer", rows: int) -> None:
@@ -899,6 +949,9 @@ class _Call:
             k3_edges.debug("moe.fc1_fc2", rows, f"off: outside its rows {low}..{high}")
             return
         p = layer.workspace(layer.ep * rows).act.shape[0]
+        if layer.fc1_rearm == "consumer":
+            self._take_consumer_slots(layer, rows, p)
+            return
         act = k3_edges.acquire_bytes(FC1_ACT, rows, p, window=(1, FGS_MAX_ROWS))
         sf = (
             None
@@ -915,6 +968,7 @@ class _Call:
             raise RuntimeError(f"{FC1_ACT} slot {act.slot} and {FC1_SF} slot {sf.slot} must pair")
         self.leases["fc1_fc2"] = act
         self.leases["fc1_sf"] = sf
+        self.fc1 = Fc1Slots(act.tensor, sf.tensor, act.bound)
         policy = act.workspace.policy.value
         k3_edges.debug(
             "moe.fc1_fc2",
@@ -922,12 +976,71 @@ class _Call:
             f"on, lamport, {fc1_fc2_rearm()} re-arm ({policy}, bounded), slot {act.slot}, {p} rows",
         )
 
+    def _take_consumer_slots(self, layer: "_Layer", rows: int, p: int) -> None:
+        rule, count = fc1_fc2_rule(), len(_consumer_layers)
+        if rule == "next_fc1" and count < 2:
+            raise ValueError(f"{FC1_FC2_RULE_ENV}=next_fc1 needs two or more MoE layers")
+        slots = _consumer_slots.get(layer.device)
+        if slots is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    f"{FC1_FC2_REARM_ENV}=consumer: slots are allocated by an eager forward, before capture"
+                )
+            from ..fine_grained_sync_fill import compile_sentinel_fill_bounded
+
+            pairs = 1 if rule == "finalize" else 2 + count % 2
+            slots = _consumer_slots[layer.device] = _ConsumerSlots(
+                layer.device, layer.fc1_slot_rows, pairs
+            )
+            compile_sentinel_fill_bounded()
+        if p > slots.act.shape[1]:
+            k3_edges.debug(
+                "moe.fc1_fc2", rows, f"off: {p} rows above the {slots.act.shape[1]}-row slots"
+            )
+            return
+        mine = _consumer_pair(layer.fc1_ordinal, count, rule)
+        prev = None
+        if rule == "next_fc1":
+            prev = slots.pair(_consumer_pair((layer.fc1_ordinal - 1) % count, count, rule))
+        self.leases["fc1_fc2"] = None
+        self.fc1 = Fc1Slots(*slots.pair(mine), prev=prev)
+        k3_edges.debug(
+            "moe.fc1_fc2",
+            rows,
+            f"on, lamport, consumer re-arm ({rule}), slot {mine}"
+            + (
+                ""
+                if prev is None
+                else f", re-arms slot {_consumer_pair((layer.fc1_ordinal - 1) % count, count, rule)}"
+            )
+            + f", {p} rows",
+        )
+
     def fc1_slots(self, rows: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """The Lamport FC1 -> FC2 slots as the workspace's ``rows``-row ``act`` / ``act_sf``."""
-        act, sf = self.leases["fc1_fc2"].tensor, self.leases["fc1_sf"].tensor
+        act, sf = self.fc1.act, self.fc1.act_sf
         if act.shape[0] < rows:
             raise RuntimeError(f"{FC1_ACT}: a {act.shape[0]}-row slot for a {rows}-row workspace")
         return act[:rows], sf[:rows]
+
+    def rearm_skipped(self) -> None:
+        """This forward's FC1 does not run: re-arm the previous pair it would have re-armed (``next_fc1``)."""
+        prev = None if self.fc1 is None else self.fc1.prev
+        if prev is None:
+            return
+        from ..fine_grained_sync_fill import sentinel_fill_bounded_
+
+        rows = prev[2]
+        for tensor, word in ((prev[0], -0x7F7F7F80), (prev[1], -1)):
+            nbytes = tensor.numel() * tensor.element_size()
+            sentinel_fill_bounded_(
+                tensor.view(-1).view(torch.uint8),
+                rows,
+                nbytes,
+                nbytes,
+                nbytes // tensor.shape[0],
+                word,
+            )
 
     def on(self, edge: str) -> bool:
         return edge in self.leases
@@ -1003,8 +1116,8 @@ class _Layer:
             k3_edges.declare_counters(
                 RN_READY, TAIL_FGS_MAX_ROWS, layer_idx, max_rows=TAIL_FGS_MAX_ROWS, min_rows=1
             )
+        self.fc1_rearm = fc1_fc2_rearm() if self.fc1_fc2_lamport else ""
         if self.fc1_fc2_lamport:
-            fc1_fc2_rearm()
             # The workspace's act rows for any R the edge serves (the tile_n bucket's largest R).
             slot_rows = max(
                 max_permuted(
@@ -1014,6 +1127,11 @@ class _Layer:
                 )
                 for rows in range(1, FGS_MAX_ROWS + 1)
             )
+            self.fc1_slot_rows = slot_rows
+        if self.fc1_rearm == "consumer":
+            self.fc1_ordinal = len(_consumer_layers)
+            _consumer_layers.append(self)
+        elif self.fc1_fc2_lamport:
             for name, width, dtype, shared in (
                 (FC1_ACT, INTER, torch.float8_e4m3fn, None),
                 (FC1_SF, INTER // SF_VEC, torch.uint8, FC1_ACT),
@@ -1082,7 +1200,11 @@ class _Layer:
             if self.fc1_fc2_lamport:
                 kw["fc1"]["lamport"] = True
                 kw["fc2"]["lamport"] = True
-                kw["fc2"]["rows_used"] = call.leases["fc1_fc2"].bound
+                kw["fc2"]["rows_used"] = call.fc1.rows_used
+                if call.fc1.prev is not None:
+                    kw["fc1"]["rearm_prev"] = call.fc1.prev
+                elif self.fc1_rearm == "consumer":
+                    kw["finalize"]["rearm"] = (call.fc1.act, call.fc1.act_sf)
             else:
                 kw["fc1"]["fc1_done"] = call.slab("fc1_fc2")
                 kw["fc2"]["fc1_done"] = consumer_slab("fc1_fc2")
@@ -1148,7 +1270,11 @@ class _Layer:
             mode = "per FC2 unit" if switched(FC2_PUSH_ENV, "unit") else "finalize tail"
             k3_edges.debug("moe.fc2_push", rows, f"published by the {mode}")
         if fc1_fc2 and self.fc1_fc2_lamport:
-            bound = call.leases["fc1_fc2"].bound
+            bound = call.fc1.rows_used
+            if call.fc1.prev is not None:
+                kw["fc1"]["rearm_prev"] = call.fc1.prev
+            elif self.fc1_rearm == "consumer":
+                kw["fc2" if fc2_v2 else "finalize"]["rearm"] = (call.fc1.act, call.fc1.act_sf)
             if fc1_v2:
                 stage_sync["fc1"].publishes["fc1_fc2"] = EdgeSync(
                     "fc1_fc2", "lamport", None, hazard_delay_ns=_HAZARD_DELAY_NS
@@ -1211,7 +1337,9 @@ class _Layer:
             stage_kwargs=self.stage_kwargs(call, rows, fc1_ctas),
             tokens_per_rank=rows,
             act_bufs=(
-                call.fc1_slots(ws.act.shape[0]) if call is not None and call.on("fc1_sf") else None
+                call.fc1_slots(ws.act.shape[0])
+                if call is not None and call.fc1 is not None
+                else None
             ),
         )
         if call is not None:
@@ -1400,6 +1528,7 @@ class _Layer:
                 )
             for edge in call.leases:
                 call.consumed(edge)
+            call.rearm_skipped()
 
     def install_comm(self, comm) -> None:
         """Wrap the CuteA2A dispatch / combine that ``moe.comm.install`` put on ``comm`` so a forward on the CuTe
