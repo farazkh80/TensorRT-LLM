@@ -83,6 +83,9 @@ FC1_K_STAGES = INTER // 256
 # TLLM_K3_MOE_FC1_FC2_RESET_POLICY, default TLLM_FGS_RESET_POLICY) or "consumer" (slots this module owns, re-armed by
 # a kernel of the expert path, TLLM_K3_MOE_FC1_FC2_CONSUMER_RULE): "finalize", the finalize behind FC2 re-arms what
 # FC2 read (one slot pair); "next_fc1", the next MoE layer's FC1 re-arms the previous layer's pair (pairs alternate).
+# "flag": one int32 flag per FC1 unit in buffers this module owns (armed 0x80000000, alternating by layer like
+# next_fc1); FC1 publishes each unit's flag after its stores, FC2's gate waits for a K stage's 4 flags, and the next MoE
+# layer's FC1 re-arms the previous layer's buffer (moe/sync.py FLAG_SIGNAL_ENV / FLAG_TILES_ENV pick the publish).
 FC1_FC2_SYNC_ENV = "TLLM_K3_MOE_FC1_FC2_SYNC"
 FC1_FC2_REARM_ENV = "TLLM_K3_MOE_FC1_FC2_REARM"
 FC1_FC2_POLICY_ENV = "TLLM_K3_MOE_FC1_FC2_RESET_POLICY"
@@ -379,7 +382,7 @@ def _choice(env: str, default: str, valid: Tuple[str, ...]) -> str:
 
 
 def fc1_fc2_sync() -> str:
-    return _choice(FC1_FC2_SYNC_ENV, "counter", ("counter", "lamport"))
+    return _choice(FC1_FC2_SYNC_ENV, "counter", ("counter", "lamport", "flag"))
 
 
 def fc1_fc2_rearm() -> str:
@@ -420,6 +423,8 @@ class _ConsumerSlots:
 _consumer_slots: Dict[torch.device, _ConsumerSlots] = {}
 # Every MoE layer on the consumer path, in construction (= forward) order.
 _consumer_layers: List["_Layer"] = []
+# Flag-link buffers per device: (flags [buffers, words], 16 B pieces per buffer as an int32 word).
+_flag_buffers: Dict[torch.device, Tuple[torch.Tensor, torch.Tensor]] = {}
 
 
 def _consumer_pair(ordinal: int, count: int, rule: str) -> int:
@@ -877,9 +882,12 @@ class _Call:
         self.leases: Dict[str, object] = {}
         self.source = None
         self.fc1: Optional[Fc1Slots] = None
+        self.flag: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
         counters = layer.counter_edges
         if layer.fc1_fc2_lamport and 1 <= rows <= FGS_MAX_ROWS:
             self._acquire_fc1_slots(layer, rows)
+        if layer.fc1_fc2_flag and 1 <= rows <= FGS_MAX_ROWS:
+            self._take_flag_buffers(layer, rows)
         if counters and 1 <= rows <= FGS_MAX_ROWS:
             r = layer.ep * rows
             ws = layer.workspace(r)
@@ -1016,6 +1024,45 @@ class _Call:
             + f", {p} rows",
         )
 
+    def _take_flag_buffers(self, layer: "_Layer", rows: int) -> None:
+        from .moe.sync import FLAG_SENTINEL, FLAGS_PER_TILE, flag_signal, flag_tiles
+
+        low, high = _edge_rows("fc1_fc2")
+        if not (low <= rows <= high and k3_recipe.moe_on("fc1_fc2", rows)):
+            k3_edges.debug("moe.fc1_fc2", rows, f"off: outside its rows {low}..{high}")
+            return
+        count = len(_consumer_layers)
+        if count < 2:
+            raise ValueError(f"{FC1_FC2_SYNC_ENV}=flag needs two or more MoE layers")
+        bufs = _flag_buffers.get(layer.device)
+        if bufs is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    f"{FC1_FC2_SYNC_ENV}=flag: buffers are allocated by an eager forward, before capture"
+                )
+            words = layer.fc1_flag_tiles * FLAGS_PER_TILE
+            bufs = _flag_buffers[layer.device] = (
+                torch.full(
+                    (2 + count % 2, words), FLAG_SENTINEL, dtype=torch.int32, device=layer.device
+                ),
+                torch.tensor([words // 4], dtype=torch.int32, device=layer.device),
+            )
+        flags, pieces = bufs
+        tiles = layer.workspace(layer.ep * rows).plan.tile_idx_to_expert_idx.numel()
+        if tiles * FLAGS_PER_TILE > flags.shape[1]:
+            k3_edges.debug("moe.fc1_fc2", rows, f"off: {tiles} tiles above the flag buffers")
+            return
+        mine = _consumer_pair(layer.fc1_ordinal, count, "next_fc1")
+        prev = _consumer_pair((layer.fc1_ordinal - 1) % count, count, "next_fc1")
+        self.leases["fc1_fc2"] = None
+        self.flag = (flags[mine], flags[prev], pieces)
+        k3_edges.debug(
+            "moe.fc1_fc2",
+            rows,
+            f"on, flag link ({flag_signal()} publish, {flag_tiles()} tiles publish), buffer "
+            f"{mine}, re-arms buffer {prev}, {tiles} tiles",
+        )
+
     def fc1_slots(self, rows: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """The Lamport FC1 -> FC2 slots as the workspace's ``rows``-row ``act`` / ``act_sf``."""
         act, sf = self.fc1.act, self.fc1.act_sf
@@ -1025,6 +1072,11 @@ class _Call:
 
     def rearm_skipped(self) -> None:
         """This forward's FC1 does not run: re-arm the previous pair it would have re-armed (``next_fc1``)."""
+        if self.flag is not None:
+            from .moe.sync import FLAG_SENTINEL
+
+            self.flag[1].fill_(FLAG_SENTINEL)
+            return
         prev = None if self.fc1 is None else self.fc1.prev
         if prev is None:
             return
@@ -1092,8 +1144,10 @@ class _Layer:
             for rows in range(1, FGS_MAX_ROWS + 1)
         )
         self.fc1_fc2_lamport = "fc1_fc2" in edges and fc1_fc2_sync() == "lamport"
+        self.fc1_fc2_flag = "fc1_fc2" in edges and fc1_fc2_sync() == "flag"
+        self.fc1_flag_tiles = tiles
         self.counter_edges = edges & set(_COUNTERS) - (
-            {"fc1_fc2"} if self.fc1_fc2_lamport else set()
+            {"fc1_fc2"} if self.fc1_fc2_lamport or self.fc1_fc2_flag else set()
         )
         self.words = {edge: _counter_words(edge, tiles, self.ep) for edge in self.counter_edges}
         for edge, words in self.words.items():
@@ -1128,7 +1182,7 @@ class _Layer:
                 for rows in range(1, FGS_MAX_ROWS + 1)
             )
             self.fc1_slot_rows = slot_rows
-        if self.fc1_rearm == "consumer":
+        if self.fc1_rearm == "consumer" or self.fc1_fc2_flag:
             self.fc1_ordinal = len(_consumer_layers)
             _consumer_layers.append(self)
         elif self.fc1_fc2_lamport:
@@ -1197,7 +1251,11 @@ class _Layer:
                 kw["routing"]["hazard_delay_ns"] = _HAZARD_DELAY_NS
             kw["fc1"]["plan_ready"] = consumer_slab("route_fc1")
         if call.on("fc1_fc2"):
-            if self.fc1_fc2_lamport:
+            if self.fc1_fc2_flag:
+                mine, prev, pieces = call.flag
+                kw["fc1"].update(fc1_done=mine, flags=True, rearm_prev=(prev, prev, pieces))
+                kw["fc2"].update(fc1_done=mine, flags=True)
+            elif self.fc1_fc2_lamport:
                 kw["fc1"]["lamport"] = True
                 kw["fc2"]["lamport"] = True
                 kw["fc2"]["rows_used"] = call.fc1.rows_used
@@ -1269,7 +1327,24 @@ class _Layer:
             stage_sync["fc2"].publishes["fc2_push"] = self._edge_sync(call, "fc2_push", False)
             mode = "per FC2 unit" if switched(FC2_PUSH_ENV, "unit") else "finalize tail"
             k3_edges.debug("moe.fc2_push", rows, f"published by the {mode}")
-        if fc1_fc2 and self.fc1_fc2_lamport:
+        if fc1_fc2 and self.fc1_fc2_flag:
+            mine, prev, pieces = call.flag
+            kw["fc1"]["rearm_prev"] = (prev, prev, pieces)
+            if fc1_v2:
+                stage_sync["fc1"].publishes["fc1_fc2"] = EdgeSync(
+                    "fc1_fc2", "flag", mine, hazard_delay_ns=_HAZARD_DELAY_NS
+                )
+            else:
+                kw["fc1"].update(fc1_done=mine, flags=True)
+                if _HAZARD_DELAY_NS:
+                    kw["fc1"]["hazard_delay_ns"] = _HAZARD_DELAY_NS
+            if fc2_v2:
+                stage_sync["fc2"].waits["fc1_fc2"] = EdgeSync(
+                    "fc1_fc2", "flag", mine, diag=fgs_diag("fc1_fc2")
+                )
+            else:
+                kw["fc2"].update(fc1_done=mine, flags=True)
+        elif fc1_fc2 and self.fc1_fc2_lamport:
             bound = call.fc1.rows_used
             if call.fc1.prev is not None:
                 kw["fc1"]["rearm_prev"] = call.fc1.prev

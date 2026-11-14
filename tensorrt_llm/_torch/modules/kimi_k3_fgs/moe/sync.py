@@ -282,6 +282,29 @@ def spin_ns(ns: cutlass.Int64):
 # those tiles first; FC2 units of later tiles wait for the FC1 grid instead, which saves FC1 a fence per item.
 EARLY_TILES = 8
 
+# Flag link (TLLM_K3_MOE_FC1_FC2_SYNC=flag): one int32 per FC1 unit (token tile t, 64-channel weight tile j) at
+# t * FLAGS_PER_TILE + j, armed with FLAG_SENTINEL and set to 1 by the unit's only writer once its stores are visible.
+FLAGS_PER_TILE = 48
+FLAG_SENTINEL = -0x80000000
+FLAG_SIGNAL_ENV = "TLLM_K3_MOE_FC1_FC2_FLAG_SIGNAL"
+FLAG_TILES_ENV = "TLLM_K3_MOE_FC1_FC2_FLAG_TILES"
+
+
+def flag_signal() -> str:
+    """How FC1 publishes a flag: "fence" (fence.acq_rel.gpu, relaxed stores; a pair shares the fence) or "release"
+    (st.release.gpu per flag)."""
+    value = os.environ.get(FLAG_SIGNAL_ENV, "fence")
+    if value not in ("fence", "release"):
+        raise ValueError(f"{FLAG_SIGNAL_ENV} must be fence or release, got {value!r}")
+    return value
+
+
+def flag_tiles() -> int:
+    """Token tiles that publish flags (default EARLY_TILES, or "all"); FC2 units of later tiles wait for the FC1 grid.
+    Every published flag costs FC1 a fence, so "all" pays only where most of FC2 would otherwise wait for the grid."""
+    value = os.environ.get(FLAG_TILES_ENV, str(EARLY_TILES))
+    return 1 << 20 if value == "all" else int(value)
+
 
 DIAG_ENV = "TLLM_K3_MOE_FGS_DIAG"
 DIAG_EDGES_ENV = "TLLM_K3_MOE_FGS_DIAG_EDGES"

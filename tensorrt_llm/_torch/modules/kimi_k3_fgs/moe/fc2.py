@@ -71,8 +71,11 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from . import finalize
 from .sync import (
     EARLY_TILES,
+    FLAG_SENTINEL,
+    FLAGS_PER_TILE,
     bits_to_f32,
     fgs_diag,
+    flag_tiles,
     ld_cg_b32,
     ld_cg_v4,
     ld_relaxed_gpu_b32,
@@ -245,6 +248,8 @@ class Fc2Kernel:
         lamport: bool = False,
         bound: bool = False,
         check: bool = True,
+        flags: bool = False,
+        flag_tiles: int = EARLY_TILES,
     ):
         if tile_n not in TILE_NS:
             raise ValueError(f"tile_n must be one of {TILE_NS}, got {tile_n}")
@@ -271,6 +276,9 @@ class Fc2Kernel:
         self.group_cap = group_cap
         self.timeline = timeline
         self.wait_fc1 = wait_fc1
+        # flags (flag link): fc1_done holds one flag per FC1 unit; a K stage is ready when its 4 flags are set.
+        self.flags = flags and wait_fc1
+        self.gate_tiles = flag_tiles if self.flags else EARLY_TILES
         self.signal_fc2 = signal_fc2
         self.delay_ns = delay_ns if signal_fc2 else 0
         self.wait_plan = wait_plan
@@ -353,28 +361,56 @@ class Fc2Kernel:
     def _fc1_missing(self, fc1_done, first_tile, n_tiles, lane):
         """Warp-wide acquire of all fc1_done words of a unit's token tiles: the number not yet complete."""
         missing = cutlass.Int32(0)
-        for c in cutlass.range_constexpr((self.group * K_TILES + 31) // 32):
-            w = c * 32 + lane
-            seen = cutlass.Int32(FC1_UNITS_PER_K_STAGE)
-            if w < n_tiles * K_TILES:
-                seen = cute.arch.load(
-                    fc1_done.iterator + first_tile * K_TILES + w,
-                    cutlass.Int32,
-                    sem="acquire",
-                    scope="gpu",
-                )
-            ready = cute.arch.vote_ballot_sync(seen >= FC1_UNITS_PER_K_STAGE)
-            missing += 32 - cute.arch.popc(ready)
+        if cutlass.const_expr(self.flags):
+            for c in cutlass.range_constexpr((self.group * FLAGS_PER_TILE + 31) // 32):
+                w = c * 32 + lane
+                seen = cutlass.Int32(1)
+                if w < n_tiles * FLAGS_PER_TILE:
+                    seen = cute.arch.load(
+                        fc1_done.iterator + first_tile * FLAGS_PER_TILE + w,
+                        cutlass.Int32,
+                        sem="acquire",
+                        scope="gpu",
+                    )
+                ready = cute.arch.vote_ballot_sync(seen != cutlass.Int32(FLAG_SENTINEL))
+                missing += 32 - cute.arch.popc(ready)
+        else:
+            for c in cutlass.range_constexpr((self.group * K_TILES + 31) // 32):
+                w = c * 32 + lane
+                seen = cutlass.Int32(FC1_UNITS_PER_K_STAGE)
+                if w < n_tiles * K_TILES:
+                    seen = cute.arch.load(
+                        fc1_done.iterator + first_tile * K_TILES + w,
+                        cutlass.Int32,
+                        sem="acquire",
+                        scope="gpu",
+                    )
+                ready = cute.arch.vote_ballot_sync(seen >= FC1_UNITS_PER_K_STAGE)
+                missing += 32 - cute.arch.popc(ready)
         return missing
 
     @cute.jit
     def _wait_fc1_stage(self, fc1_done, first_tile, n_tiles, k_tile):
-        for j in cutlass.range_constexpr(self.group):
-            if j < n_tiles:
-                word = fc1_done.iterator + (first_tile + j) * K_TILES + k_tile
-                seen = cute.arch.load(word, cutlass.Int32, sem="acquire", scope="gpu")
-                while seen < FC1_UNITS_PER_K_STAGE:
+        if cutlass.const_expr(self.flags):
+            for j in cutlass.range_constexpr(self.group):
+                if j < n_tiles:
+                    for u in cutlass.range_constexpr(FC1_UNITS_PER_K_STAGE):
+                        word = (
+                            fc1_done.iterator
+                            + (first_tile + j) * FLAGS_PER_TILE
+                            + k_tile * FC1_UNITS_PER_K_STAGE
+                            + u
+                        )
+                        seen = cute.arch.load(word, cutlass.Int32, sem="acquire", scope="gpu")
+                        while seen == cutlass.Int32(FLAG_SENTINEL):
+                            seen = cute.arch.load(word, cutlass.Int32, sem="acquire", scope="gpu")
+        else:
+            for j in cutlass.range_constexpr(self.group):
+                if j < n_tiles:
+                    word = fc1_done.iterator + (first_tile + j) * K_TILES + k_tile
                     seen = cute.arch.load(word, cutlass.Int32, sem="acquire", scope="gpu")
+                    while seen < FC1_UNITS_PER_K_STAGE:
+                        seen = cute.arch.load(word, cutlass.Int32, sem="acquire", scope="gpu")
 
     @cute.jit
     def _check_stages(
@@ -581,7 +617,10 @@ class Fc2Kernel:
             stamps = cute.make_tensor(stamps_ptr, cute.make_layout((grid_size * TIMELINE_FIELDS,)))
         fc1_done = None
         if cutlass.const_expr(self.wait_fc1):
-            fc1_done = cute.make_tensor(fc1_done_ptr, cute.make_layout((num_tile_slots * K_TILES,)))
+            fc1_done = cute.make_tensor(
+                fc1_done_ptr,
+                cute.make_layout((num_tile_slots * (FLAGS_PER_TILE if self.flags else K_TILES),)),
+            )
         rows_used = None
         if cutlass.const_expr(self.bound):
             rows_used = cute.make_tensor(rows_used_ptr, cute.make_layout((1,)))
@@ -1145,7 +1184,7 @@ class Fc2Kernel:
                     first_tile = entry & 0xFFFF
                     n_tiles = (((entry >> 16) & 0xFF) + tile_n - 1) // tile_n
                     missing = cutlass.Int32(0)
-                    if first_tile + n_tiles <= EARLY_TILES:
+                    if first_tile + n_tiles <= self.gate_tiles:
                         missing = self._fc1_missing(fc1_done, first_tile, n_tiles, lane)
                     else:
                         # FC1 publishes no counters for these tiles: wait for its grid.
@@ -1471,6 +1510,8 @@ def _compiled(
     lamport: bool = False,
     bound: bool = False,
     check: bool = True,
+    flags: bool = False,
+    flag_tiles: int = EARLY_TILES,
 ):
     kernel = Fc2Kernel(
         tile_n,
@@ -1490,6 +1531,8 @@ def _compiled(
         lamport,
         bound,
         check,
+        flags,
+        flag_tiles,
     )
     fake = cute.AddressSpace.gmem
     args = (
@@ -1549,6 +1592,7 @@ def run(
     fin: Optional[tuple] = None,
     lamport: bool = False,
     rows_used: Optional[torch.Tensor] = None,
+    flags: bool = False,
 ) -> None:
     """``y[p] = bf16(dequant(act[p]) @ dequant(W2[e]).T)`` for every valid permuted row (moe_chain FC2 stage).
 
@@ -1559,7 +1603,9 @@ def run(
     written by the routed FC1 this kernel may overlap; it is read once the word reaches ``plan_pub_expected``
     (``fc1.num_ctas_for``). ``lamport``: FC1's output is a Lamport edge instead of ``fc1_done``: ``act`` / ``act_sf``
     are slots armed with 0x80 / 0xFF that FC1 writes without counters (``fc1.run(..., lamport=True)``), and this kernel
-    validates every byte it uses. ``rows_used`` (int32 word): CTA 0 stores the plan's padded rows there.
+    validates every byte it uses. ``rows_used`` (int32 word): CTA 0 stores the plan's padded rows there. ``flags``:
+    ``fc1_done`` is the flag-link buffer (int32 [T * 48], ``moe/sync.py``); a K stage is ready when its 4 flags are
+    set.
     """
     tile_n = plan.tile_n
     rows = act.shape[0]
@@ -1582,7 +1628,8 @@ def run(
     assert tile_slots < 1 << 16
     if lamport and fc1_done is not None:
         raise ValueError("fc2.run: fc1_done and lamport are two builds of the same edge")
-    for done, words in ((fc1_done, tile_slots * K_TILES), (fc2_done, tile_slots), (rows_used, 1)):
+    fc1_words = tile_slots * (FLAGS_PER_TILE if flags else K_TILES)
+    for done, words in ((fc1_done, fc1_words), (fc2_done, tile_slots), (rows_used, 1)):
         assert done is None or (
             done.dtype == torch.int32 and done.numel() >= words and done.is_contiguous()
         )
@@ -1628,6 +1675,8 @@ def run(
         lamport,
         lamport and rows_used is not None,
         not (lamport and fgs_diag("fc1_fc2") == "oracle"),
+        flags and fc1_done is not None,
+        flag_tiles() if flags else EARLY_TILES,
     )
     compiled(
         _ptr(cutlass.Float4E2M1FN, w2, 32),
@@ -1669,10 +1718,11 @@ def run_v2(
     pairs of a row with several are staged in ``y`` (the workspace's FC2 output) and summed, and rows without a
     pair zeroed, by the finalize kernel launched behind FC2, which skips the rows FC2 wrote. Which rows those are
     follows from the plan on the device, so one graph serves any routing. ``fgs.waits["fc1_fc2"]`` /
-    ``["fc1_plan"]``: as ``fc2.run``'s ``fc1_done`` / ``plan_pub``; an ``fc1_fc2`` of ``kind == "lamport"`` is the
-    Lamport build, with ``rows_used`` its tensor (if any). ``fgs.publishes["fc2_push"]``: int32 [R] words,
-    zero-armed; each row reaches 28. By default the finalize kernel publishes every row once the FC2 grid is complete:
-    FC2's per-unit publish needs a GPU-scope fence per unit, which slows the whole SM. ``rearm`` (``(act, act_sf)``):
+    ``["fc1_plan"]``: as ``fc2.run``'s ``fc1_done`` / ``plan_pub`` (``kind == "flag"``: its ``flags``); an
+    ``fc1_fc2`` of ``kind == "lamport"`` is the Lamport build, with ``rows_used`` its tensor (if any).
+    ``fgs.publishes["fc2_push"]``: int32 [R] words, zero-armed; each row reaches 28. By default the finalize kernel
+    publishes every row once the FC2 grid is complete: FC2's per-unit publish needs a GPU-scope fence per unit, which
+    slows the whole SM. ``rearm`` (``(act, act_sf)``):
     the finalize kernel re-arms FC2's Lamport inputs once the FC2 grid is complete (``finalize.run``). With
     ``TLLM_K3_MOE_FC2_PUSH=unit`` FC2 adds 1 per weight tile to the rows it wrote, so they are final before FC2 ends."""
     waits = fgs.waits if fgs is not None else {}
@@ -1707,6 +1757,7 @@ def run_v2(
         y,
         fc1_done=None if done is None or lamport else done.tensor,
         lamport=lamport,
+        flags=done is not None and done.kind == "flag",
         rows_used=done.tensor if lamport else None,
         plan_pub=None if pub is None else pub.tensor,
         plan_pub_expected=0 if pub is None else pub.expected,

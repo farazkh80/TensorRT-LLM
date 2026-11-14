@@ -57,10 +57,14 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from .. import edges as k3_edges
 from .sync import (
     EARLY_TILES,
+    FLAG_SENTINEL,
+    FLAGS_PER_TILE,
     atom_add_acq_rel,
     fence_fabric_acquire,
     fence_proxy_async_global,
     fgs_diag,
+    flag_signal,
+    flag_tiles,
     ld_cg_b32,
     ld_cg_v4,
     ld_volatile_b32,
@@ -260,6 +264,22 @@ def _tmem_load_16x256b(addrs, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _st_flag_gpu(addr, val, release, *, loc=None, ip=None):
+    """GPU-scope int32 flag store: ``st.release`` or ``st.relaxed`` (after a fence)."""
+    llvm.inline_asm(
+        None,
+        [cutlass.Int64(addr).ir_value(loc=loc, ip=ip), cutlass.Int32(val).ir_value(loc=loc, ip=ip)],
+        f"st.{'release' if release else 'relaxed'}.gpu.global.s32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def _red_add_gpu(addr, val, *, loc=None, ip=None):
     """Relaxed GPU-scope ``red.add`` on a global int32 word; ordering comes from a preceding fence."""
     llvm.inline_asm(
@@ -381,6 +401,7 @@ class Fc1Kernel:
         nowait: bool = False,
         lamport: bool = False,
         rearm_prev: bool = False,
+        flags: bool = False,
     ):
         if n_tile not in (8, 16, 32):
             raise ValueError(f"n_tile must be 8, 16 or 32, got {n_tile}")
@@ -416,6 +437,13 @@ class Fc1Kernel:
         # rearm_prev (consumer re-arm, next_fc1 rule): the epilogue warps first store the sentinel over the rows the
         # previous layer's FC2 reported in its slot pair, which this layer's successor writes next.
         self.rearm_prev = rearm_prev
+        # flags (flag link): fc1_done holds one flag per unit instead of one counter per K stage, and rearm_prev
+        # re-arms the previous layer's flag buffer.
+        if flags and not signal_done:
+            raise ValueError("the flag link publishes through the signal warp (signal_done)")
+        self.flags = flags
+        self.flag_release = flags and flag_signal() == "release"
+        self.signal_tiles = flag_tiles() if flags else EARLY_TILES
         self.delay_ns = delay_ns if (signal_done or self.plan_pub or lamport) else 0
         self.full_wait = full_wait
         self.info_fields = 6 if routed else 5
@@ -659,7 +687,8 @@ class Fc1Kernel:
         ntiles = cute.make_tensor(ntiles_ptr, cute.make_layout((1,)))
         plan_ready = cute.make_tensor(plan_ready_ptr, cute.make_layout((1,)))
         fc1_done = cute.make_tensor(
-            fc1_done_ptr, cute.make_layout((num_tiles_cap * DONE_PER_TILE,))
+            fc1_done_ptr,
+            cute.make_layout((num_tiles_cap * (FLAGS_PER_TILE if self.flags else DONE_PER_TILE),)),
         )
         ids = cute.make_tensor(ids_ptr, cute.make_layout((num_rows * TOP_K,)))
         counts = cute.make_tensor(counts_ptr, cute.make_layout((self.em,)))
@@ -813,13 +842,20 @@ class Fc1Kernel:
         rows = mRearmBound[0]
         first = bidx * self.num_epilog_threads + tidx
         stride = num_ctas * self.num_epilog_threads
-        for base, pieces, word in (
-            (mRearmAct.iterator.toint(), rows * (INTER // 16), cutlass.Int32(-0x7F7F7F80)),
-            (mRearmSf.iterator.toint(), rows * (INTER // SF_VEC // 16), cutlass.Int32(-1)),
-        ):
-            rounds = (pieces - first + stride - 1) // stride
+        if cutlass.const_expr(self.flags):
+            # Flag buffer: mRearmBound holds its 16 B pieces.
+            base = mRearmAct.iterator.toint()
+            rounds = (rows - first + stride - 1) // stride
             for r in cutlass.range(0, rounds, 1, unroll=1):
-                _st_v4(base + cutlass.Int64(first + r * stride) * 16, word)
+                _st_v4(base + cutlass.Int64(first + r * stride) * 16, cutlass.Int32(FLAG_SENTINEL))
+        else:
+            for base, pieces, word in (
+                (mRearmAct.iterator.toint(), rows * (INTER // 16), cutlass.Int32(-0x7F7F7F80)),
+                (mRearmSf.iterator.toint(), rows * (INTER // SF_VEC // 16), cutlass.Int32(-1)),
+            ):
+                rounds = (pieces - first + stride - 1) // stride
+                for r in cutlass.range(0, rounds, 1, unroll=1):
+                    _st_v4(base + cutlass.Int64(first + r * stride) * 16, word)
 
     def _s2t_copy_and_partition(self, sSF: cute.Tensor, tSF: cute.Tensor):
         tCsSF_compact = cute.filter_zeros(sSF)
@@ -2123,8 +2159,8 @@ class Fc1Kernel:
             tmem.free(tmem_ptr)
 
         # Signal warp: after all stores of (token tile t, weight tile j), fc1_done[t * 12 + j // 4] += 1 with release
-        # semantics, for both tiles of a pair and for t < EARLY_TILES only. The GPU-scope fence slows the whole SM,
-        # so a pair shares one.
+        # semantics, for both tiles of a pair and for t < EARLY_TILES only (flag link: fc1_done[t * 48 + j] = 1, for
+        # t < flag_tiles()). The GPU-scope fence slows the whole SM, so a pair shares one.
         if cutlass.const_expr(self.signal_done):
             if warp_idx == self.signal_warp_id:
                 stored_state = pipeline.make_pipeline_state(
@@ -2141,12 +2177,24 @@ class Fc1Kernel:
                 info_state.advance()
                 while info[4] == 1:
                     stored_pipeline.consumer_wait(stored_state)
-                    if (tidx % self.threads_per_warp == 0) & (info[1] < EARLY_TILES):
-                        done = mFc1Done.iterator + info[1] * DONE_PER_TILE + info[0] // 4
-                        cute.arch.fence_acq_rel_gpu()
-                        _red_add_gpu(done.toint(), cutlass.Int32(1))
-                        if info[3] > (info[1] + 1) * n_tile:
-                            _red_add_gpu((done + DONE_PER_TILE).toint(), cutlass.Int32(1))
+                    if (tidx % self.threads_per_warp == 0) & (info[1] < self.signal_tiles):
+                        if cutlass.const_expr(self.flags):
+                            flag = mFc1Done.iterator + info[1] * FLAGS_PER_TILE + info[0]
+                            if cutlass.const_expr(not self.flag_release):
+                                cute.arch.fence_acq_rel_gpu()
+                            _st_flag_gpu(flag.toint(), cutlass.Int32(1), self.flag_release)
+                            if info[3] > (info[1] + 1) * n_tile:
+                                _st_flag_gpu(
+                                    (flag + FLAGS_PER_TILE).toint(),
+                                    cutlass.Int32(1),
+                                    self.flag_release,
+                                )
+                        else:
+                            done = mFc1Done.iterator + info[1] * DONE_PER_TILE + info[0] // 4
+                            cute.arch.fence_acq_rel_gpu()
+                            _red_add_gpu(done.toint(), cutlass.Int32(1))
+                            if info[3] > (info[1] + 1) * n_tile:
+                                _red_add_gpu((done + DONE_PER_TILE).toint(), cutlass.Int32(1))
                     stored_pipeline.consumer_release(stored_state)
                     stored_state.advance()
                     info_pipeline.consumer_wait(info_state)
@@ -2303,6 +2351,7 @@ def run(
     lamport=False,
     rearm_prev=None,
     hazard_delay_ns=0,
+    flags=False,
 ):
     """FC1 of the moe_chain contract: act[p], act_sf[p] = MXFP8(SiTU-GLU(x[p2e[p] // 16] @ W31[e]^T)) for every
     valid permuted row p of expert e; rows past each tile's mn_limit are left untouched. Launches one kernel on the
@@ -2317,10 +2366,16 @@ def run(
     those bytes (E4M3 -0 is stored as +0, a scale byte is at most 253) and releases FC2 as the ``fc1_done`` build
     does, without counters. ``rearm_prev`` (``(act, act_sf, rows)``, with ``lamport``): the previous layer's slot pair
     and its rows word, which this kernel re-arms (consumer re-arm, ``next_fc1``). ``hazard_delay_ns`` delays the
-    stores of token tile 0 in the ``fc1_done`` and ``lamport`` builds (hazard tests only)."""
+    stores of token tile 0 in the ``fc1_done`` and ``lamport`` builds (hazard tests only). ``flags`` (flag link,
+    ``moe/sync.py``): ``fc1_done`` is int32 [T * 48], one flag per unit armed with ``FLAG_SENTINEL`` and set to 1 after
+    the unit's stores, and ``rearm_prev`` is ``(previous buffer, previous buffer, its 16 B pieces as a word)``."""
     _check(x, x_sf, weights, plan, act, act_sf)
     _check_word("plan_ready", plan_ready, 1)
-    _check_word("fc1_done", fc1_done, plan.tile_idx_to_expert_idx.shape[0] * DONE_PER_TILE)
+    _check_word(
+        "fc1_done",
+        fc1_done,
+        plan.tile_idx_to_expert_idx.shape[0] * (FLAGS_PER_TILE if flags else DONE_PER_TILE),
+    )
     key = (
         plan.tile_n,
         weights.gate_cap,
@@ -2332,6 +2387,7 @@ def run(
         plan_ready is not None and fgs_diag("route_fc1") == "ready",
         lamport,
         rearm_prev is not None,
+        (flag_signal(), flag_tiles()) if flags else None,
     )
     args = _launch_args(
         x,
@@ -2348,7 +2404,12 @@ def run(
     compiled = _compiled.get(key)
     if compiled is None:
         kernel = Fc1Kernel(
-            *key[:6], delay_ns=key[6], full_wait=key[7], lamport=key[8], rearm_prev=key[9]
+            *key[:6],
+            delay_ns=key[6],
+            full_wait=key[7],
+            lamport=key[8],
+            rearm_prev=key[9],
+            flags=flags,
         )
         compiled = _compiled[key] = cute.compile(kernel, *args, stream)
     compiled(*args, stream)
@@ -2371,6 +2432,7 @@ def run_routed(
     rearm_prev=None,
     hazard_delay_ns=0,
     hazard_nowait=False,
+    flags=False,
 ):
     """Routing fused into FC1: the ``routing.run`` + ``run`` pair as one kernel, with the same ``plan`` contents and
     bit-identical ``act`` / ``act_sf``. Every CTA scans ``topk_ids`` [R, 16] (global ids; -1 rows unused) for its
@@ -2406,7 +2468,11 @@ def run_routed(
         raise ValueError(
             f"plan of {plan.expert_counts.numel()} experts / {plan.max_rows} rows cannot take {rows} rows"
         )
-    _check_word("fc1_done", fc1_done, plan.tile_idx_to_expert_idx.shape[0] * DONE_PER_TILE)
+    _check_word(
+        "fc1_done",
+        fc1_done,
+        plan.tile_idx_to_expert_idx.shape[0] * (FLAGS_PER_TILE if flags else DONE_PER_TILE),
+    )
     _check_word("plan_pub", plan_pub, 1)
     src, recv = None, (0, 1, 0)
     if source is not None:
@@ -2458,6 +2524,7 @@ def run_routed(
         hazard_nowait,
         lamport,
         rearm_prev is not None,
+        (flag_signal(), flag_tiles()) if flags else None,
     )
     args = _launch_args(
         x,
@@ -2492,6 +2559,7 @@ def run_routed(
             nowait=hazard_nowait,
             lamport=lamport,
             rearm_prev=rearm_prev is not None,
+            flags=flags,
         )
         compiled = _compiled[key] = cute.compile(kernel, *args, stream)
         k3_edges.debug(
@@ -2516,9 +2584,10 @@ def run_v2(
     ``fgs.waits["recv_fc1"]``: the receive of a send-only dispatch; its ``source`` is the dispatch's receive
     descriptor (``CuteA2A.routing_source()``). With it the weight stages of the speculative first unit are issued at
     launch (FUSED-ON); ``diag`` ``oracle`` skips the counter waits, ``ready`` drops the early weight stages.
-    ``fgs.publishes["fc1_fc2"]``: the ``fc1_done`` slab, or for ``kind == "lamport"`` the Lamport build (``act`` /
-    ``act_sf`` are the slots). ``fgs.publishes["fc1_plan"]``: the ``plan_pub`` word (needed
-    with either edge; an FC2 that overlaps this kernel waits for it to reach ``num_ctas_for(x, plan)``).
+    ``fgs.publishes["fc1_fc2"]``: the ``fc1_done`` slab (the flag buffer for ``kind == "flag"``), or for
+    ``kind == "lamport"`` the Lamport build (``act`` / ``act_sf`` are the slots). ``fgs.publishes["fc1_plan"]``: the
+    ``plan_pub`` word (needed with either edge; an FC2 that overlaps this kernel waits for it to reach
+    ``num_ctas_for(x, plan)``).
     ``enable_pdl`` must match ``TRTLLM_ENABLE_PDL``, which the kernel reads."""
     waits = fgs.waits if fgs is not None else {}
     pubs = fgs.publishes if fgs is not None else {}
@@ -2547,6 +2616,7 @@ def run_v2(
         plan_pub=None if pub is None else pub.tensor,
         fc1_done=None if done is None or done.kind == "lamport" else done.tensor,
         lamport=done is not None and done.kind == "lamport",
+        flags=done is not None and done.kind == "flag",
         rearm_prev=rearm_prev,
         hazard_delay_ns=delay,
         hazard_nowait=recv is not None and (recv.hazard_nowait or recv.diag == "oracle"),
