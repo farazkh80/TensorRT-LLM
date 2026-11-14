@@ -58,18 +58,24 @@ from .. import edges as k3_edges
 from .sync import (
     EARLY_TILES,
     FLAG_SENTINEL,
+    FLAG_SKIP,
     FLAGS_PER_TILE,
+    SIGNAL_BATCH_MAX,
     atom_add_acq_rel,
     fence_fabric_acquire,
     fence_proxy_async_global,
     fgs_diag,
+    flag_check,
     flag_signal,
+    flag_skip_last,
     flag_tiles,
+    flag_words,
     ld_cg_b32,
     ld_cg_v4,
     ld_volatile_b32,
     ld_volatile_b64,
     match_any,
+    signal_batch,
     spin_ns,
     st_b64,
     wait_at_least,
@@ -402,6 +408,7 @@ class Fc1Kernel:
         lamport: bool = False,
         rearm_prev: bool = False,
         flags: bool = False,
+        signal_tiles: Optional[int] = None,
     ):
         if n_tile not in (8, 16, 32):
             raise ValueError(f"n_tile must be 8, 16 or 32, got {n_tile}")
@@ -443,7 +450,16 @@ class Fc1Kernel:
             raise ValueError("the flag link publishes through the signal warp (signal_done)")
         self.flags = flags
         self.flag_release = flags and flag_signal() == "release"
-        self.signal_tiles = flag_tiles() if flags else EARLY_TILES
+        self.signal_tiles = (
+            (signal_tiles or flag_tiles()) if flags else (signal_tiles or EARLY_TILES)
+        )
+        self.flag_words = flag_words() if flags else 1
+        self.skip_last = flags and flag_skip_last()
+        self.sig_batch = signal_done and signal_batch()
+        if self.sig_batch and self.skip_last:
+            raise ValueError(
+                "the per-CTA publish fences every signalled unit; it has no last-unit skip"
+            )
         self.delay_ns = delay_ns if (signal_done or self.plan_pub or lamport) else 0
         self.full_wait = full_wait
         self.info_fields = 6 if routed else 5
@@ -688,7 +704,12 @@ class Fc1Kernel:
         plan_ready = cute.make_tensor(plan_ready_ptr, cute.make_layout((1,)))
         fc1_done = cute.make_tensor(
             fc1_done_ptr,
-            cute.make_layout((num_tiles_cap * (FLAGS_PER_TILE if self.flags else DONE_PER_TILE),)),
+            cute.make_layout(
+                (
+                    num_tiles_cap
+                    * (FLAGS_PER_TILE * self.flag_words if self.flags else DONE_PER_TILE),
+                )
+            ),
         )
         ids = cute.make_tensor(ids_ptr, cute.make_layout((num_rows * TOP_K,)))
         counts = cute.make_tensor(counts_ptr, cute.make_layout((self.em,)))
@@ -833,6 +854,71 @@ class Fc1Kernel:
             min_blocks_per_mp=1,
             use_pdl=self.use_pdl,
         )
+
+    @cute.jit
+    def _signal_batched(
+        self,
+        tidx,
+        info,
+        nxt,
+        nf,
+        n_tile,
+        sInfo,
+        info_pipeline,
+        info_state,
+        stored_pipeline,
+        stored_state,
+        mFc1Done,
+    ):
+        """Signal warp, per-CTA publish: each signalled unit's stored handoff is released at once and the unit held;
+        after the CTA's last signalled unit (or SIGNAL_BATCH_MAX held) one GPU-scope fence publishes every held unit.
+        Units are dealt in token-tile order, so the next info tells whether another signalled unit follows."""
+        held = cute.make_rmem_tensor((SIGNAL_BATCH_MAX,), cutlass.Int32)
+        n_held = cutlass.Int32(0)
+        fw = self.flag_words
+        lane0 = tidx % self.threads_per_warp == 0
+        while info[4] == 1:
+            info_pipeline.consumer_wait(info_state)
+            for i in cutlass.range_constexpr(nf):
+                nxt[i] = sInfo[(i, info_state.index)]
+            info_pipeline.consumer_release(info_state)
+            info_state.advance()
+            if info[1] < self.signal_tiles:
+                stored_pipeline.consumer_wait(stored_state)
+                stored_pipeline.consumer_release(stored_state)
+                stored_state.advance()
+                pair = cutlass.select_(
+                    info[3] > (info[1] + 1) * n_tile, cutlass.Int32(1), cutlass.Int32(0)
+                )
+                # token tile * 128 + weight tile (< 64) * 2 + pair
+                held[n_held] = info[1] * 128 + info[0] * 2 + pair
+                n_held = n_held + 1
+                if (nxt[4] == 0) | (nxt[1] >= self.signal_tiles) | (n_held == SIGNAL_BATCH_MAX):
+                    if lane0:
+                        cute.arch.fence_acq_rel_gpu()
+                        for b in cutlass.range_constexpr(SIGNAL_BATCH_MAX):
+                            if b < n_held:
+                                t = held[b] // 128
+                                j = (held[b] // 2) % 64
+                                if cutlass.const_expr(self.flags):
+                                    flag = mFc1Done.iterator + (t * FLAGS_PER_TILE + j) * fw
+                                    _st_flag_gpu(flag.toint(), cutlass.Int32(1), False)
+                                    if held[b] % 2 == 1:
+                                        _st_flag_gpu(
+                                            (flag + FLAGS_PER_TILE * fw).toint(),
+                                            cutlass.Int32(1),
+                                            False,
+                                        )
+                                else:
+                                    done = mFc1Done.iterator + t * DONE_PER_TILE + j // 4
+                                    _red_add_gpu(done.toint(), cutlass.Int32(1))
+                                    if held[b] % 2 == 1:
+                                        _red_add_gpu(
+                                            (done + DONE_PER_TILE).toint(), cutlass.Int32(1)
+                                        )
+                    n_held = cutlass.Int32(0)
+            for i in cutlass.range_constexpr(nf):
+                info[i] = nxt[i]
 
     @cute.jit
     def _rearm_prev(self, mRearmAct, mRearmSf, mRearmBound, tidx, bidx, num_ctas):
@@ -2142,9 +2228,10 @@ class Fc1Kernel:
                                     mActSf[(prow, m_tile * 2 + sf_group)] = cutlass.Uint8(sf_byte)
                 parity = parity ^ 1
                 if cutlass.const_expr(self.signal_done):
-                    stored_pipeline.producer_acquire(stored_state)
-                    stored_pipeline.producer_commit(stored_state)
-                    stored_state.advance()
+                    if (not self.sig_batch) or (info[1] < self.signal_tiles):
+                        stored_pipeline.producer_acquire(stored_state)
+                        stored_pipeline.producer_commit(stored_state)
+                        stored_state.advance()
 
                 info_pipeline.consumer_wait(info_state)
                 for i in cutlass.range_constexpr(nf):
@@ -2159,8 +2246,10 @@ class Fc1Kernel:
             tmem.free(tmem_ptr)
 
         # Signal warp: after all stores of (token tile t, weight tile j), fc1_done[t * 12 + j // 4] += 1 with release
-        # semantics, for both tiles of a pair and for t < EARLY_TILES only (flag link: fc1_done[t * 48 + j] = 1, for
-        # t < flag_tiles()). The GPU-scope fence slows the whole SM, so a pair shares one.
+        # semantics, for both tiles of a pair and for t < EARLY_TILES only (flag link: the flag of (t, j) at word
+        # (t * 48 + j) * flag_words() is set to 1, for t < flag_tiles()). The GPU-scope fence slows the whole SM, so a
+        # pair shares one. With skip_last the CTA's last unit gets FLAG_SKIP, stored without a fence as soon as the
+        # next info shows the end, so no fence holds the CTA's exit.
         if cutlass.const_expr(self.signal_done):
             if warp_idx == self.signal_warp_id:
                 stored_state = pipeline.make_pipeline_state(
@@ -2170,38 +2259,77 @@ class Fc1Kernel:
                     pipeline.PipelineUserType.Consumer, self.num_tile_stage
                 )
                 info = cute.make_rmem_tensor((nf,), cutlass.Int32)
+                nxt = cute.make_rmem_tensor((nf,), cutlass.Int32)
+                fw = self.flag_words
                 info_pipeline.consumer_wait(info_state)
                 for i in cutlass.range_constexpr(nf):
                     info[i] = sInfo[(i, info_state.index)]
                 info_pipeline.consumer_release(info_state)
                 info_state.advance()
-                while info[4] == 1:
-                    stored_pipeline.consumer_wait(stored_state)
-                    if (tidx % self.threads_per_warp == 0) & (info[1] < self.signal_tiles):
-                        if cutlass.const_expr(self.flags):
-                            flag = mFc1Done.iterator + info[1] * FLAGS_PER_TILE + info[0]
-                            if cutlass.const_expr(not self.flag_release):
+                if cutlass.const_expr(self.sig_batch):
+                    self._signal_batched(
+                        tidx,
+                        info,
+                        nxt,
+                        nf,
+                        n_tile,
+                        sInfo,
+                        info_pipeline,
+                        info_state,
+                        stored_pipeline,
+                        stored_state,
+                        mFc1Done,
+                    )
+                else:
+                    while info[4] == 1:
+                        lane0 = tidx % self.threads_per_warp == 0
+                        last = cutlass.Int32(0)
+                        if cutlass.const_expr(self.skip_last):
+                            info_pipeline.consumer_wait(info_state)
+                            for i in cutlass.range_constexpr(nf):
+                                nxt[i] = sInfo[(i, info_state.index)]
+                            info_pipeline.consumer_release(info_state)
+                            info_state.advance()
+                            last = cutlass.select_(nxt[4] == 0, cutlass.Int32(1), cutlass.Int32(0))
+                            if lane0 & (info[1] < self.signal_tiles) & (last == 1):
+                                flag = mFc1Done.iterator + (info[1] * FLAGS_PER_TILE + info[0]) * fw
+                                _st_flag_gpu(flag.toint(), cutlass.Int32(FLAG_SKIP), False)
+                                if info[3] > (info[1] + 1) * n_tile:
+                                    _st_flag_gpu(
+                                        (flag + FLAGS_PER_TILE * fw).toint(),
+                                        cutlass.Int32(FLAG_SKIP),
+                                        False,
+                                    )
+                        stored_pipeline.consumer_wait(stored_state)
+                        if lane0 & (info[1] < self.signal_tiles) & (last == 0):
+                            if cutlass.const_expr(self.flags):
+                                flag = mFc1Done.iterator + (info[1] * FLAGS_PER_TILE + info[0]) * fw
+                                if cutlass.const_expr(not self.flag_release):
+                                    cute.arch.fence_acq_rel_gpu()
+                                _st_flag_gpu(flag.toint(), cutlass.Int32(1), self.flag_release)
+                                if info[3] > (info[1] + 1) * n_tile:
+                                    _st_flag_gpu(
+                                        (flag + FLAGS_PER_TILE * fw).toint(),
+                                        cutlass.Int32(1),
+                                        self.flag_release,
+                                    )
+                            else:
+                                done = mFc1Done.iterator + info[1] * DONE_PER_TILE + info[0] // 4
                                 cute.arch.fence_acq_rel_gpu()
-                            _st_flag_gpu(flag.toint(), cutlass.Int32(1), self.flag_release)
-                            if info[3] > (info[1] + 1) * n_tile:
-                                _st_flag_gpu(
-                                    (flag + FLAGS_PER_TILE).toint(),
-                                    cutlass.Int32(1),
-                                    self.flag_release,
-                                )
+                                _red_add_gpu(done.toint(), cutlass.Int32(1))
+                                if info[3] > (info[1] + 1) * n_tile:
+                                    _red_add_gpu((done + DONE_PER_TILE).toint(), cutlass.Int32(1))
+                        stored_pipeline.consumer_release(stored_state)
+                        stored_state.advance()
+                        if cutlass.const_expr(self.skip_last):
+                            for i in cutlass.range_constexpr(nf):
+                                info[i] = nxt[i]
                         else:
-                            done = mFc1Done.iterator + info[1] * DONE_PER_TILE + info[0] // 4
-                            cute.arch.fence_acq_rel_gpu()
-                            _red_add_gpu(done.toint(), cutlass.Int32(1))
-                            if info[3] > (info[1] + 1) * n_tile:
-                                _red_add_gpu((done + DONE_PER_TILE).toint(), cutlass.Int32(1))
-                    stored_pipeline.consumer_release(stored_state)
-                    stored_state.advance()
-                    info_pipeline.consumer_wait(info_state)
-                    for i in cutlass.range_constexpr(nf):
-                        info[i] = sInfo[(i, info_state.index)]
-                    info_pipeline.consumer_release(info_state)
-                    info_state.advance()
+                            info_pipeline.consumer_wait(info_state)
+                            for i in cutlass.range_constexpr(nf):
+                                info[i] = sInfo[(i, info_state.index)]
+                            info_pipeline.consumer_release(info_state)
+                            info_state.advance()
 
         if cutlass.const_expr(self.use_pdl):
             cute.arch.griddepcontrol_launch_dependents()
@@ -2352,6 +2480,7 @@ def run(
     rearm_prev=None,
     hazard_delay_ns=0,
     flags=False,
+    tiles=None,
 ):
     """FC1 of the moe_chain contract: act[p], act_sf[p] = MXFP8(SiTU-GLU(x[p2e[p] // 16] @ W31[e]^T)) for every
     valid permuted row p of expert e; rows past each tile's mn_limit are left untouched. Launches one kernel on the
@@ -2367,14 +2496,16 @@ def run(
     does, without counters. ``rearm_prev`` (``(act, act_sf, rows)``, with ``lamport``): the previous layer's slot pair
     and its rows word, which this kernel re-arms (consumer re-arm, ``next_fc1``). ``hazard_delay_ns`` delays the
     stores of token tile 0 in the ``fc1_done`` and ``lamport`` builds (hazard tests only). ``flags`` (flag link,
-    ``moe/sync.py``): ``fc1_done`` is int32 [T * 48], one flag per unit armed with ``FLAG_SENTINEL`` and set to 1 after
-    the unit's stores, and ``rearm_prev`` is ``(previous buffer, previous buffer, its 16 B pieces as a word)``."""
+    ``moe/sync.py``): ``fc1_done`` is int32 [T * 48 * flag_words()], one flag per unit armed with ``FLAG_SENTINEL``
+    and set to 1 after the unit's stores, and ``rearm_prev`` is ``(previous buffer, previous buffer, its 16 B pieces
+    as a word)``. ``tiles``: the token tiles that count or publish (default ``flag_tiles()`` / ``EARLY_TILES``)."""
     _check(x, x_sf, weights, plan, act, act_sf)
     _check_word("plan_ready", plan_ready, 1)
     _check_word(
         "fc1_done",
         fc1_done,
-        plan.tile_idx_to_expert_idx.shape[0] * (FLAGS_PER_TILE if flags else DONE_PER_TILE),
+        plan.tile_idx_to_expert_idx.shape[0]
+        * (FLAGS_PER_TILE * flag_words() if flags else DONE_PER_TILE),
     )
     key = (
         plan.tile_n,
@@ -2387,7 +2518,9 @@ def run(
         plan_ready is not None and fgs_diag("route_fc1") == "ready",
         lamport,
         rearm_prev is not None,
-        (flag_signal(), flag_tiles()) if flags else None,
+        (flag_signal(), tiles or flag_tiles(), flag_check(), flag_skip_last()) if flags else None,
+        signal_batch(),
+        tiles,
     )
     args = _launch_args(
         x,
@@ -2410,6 +2543,7 @@ def run(
             lamport=key[8],
             rearm_prev=key[9],
             flags=flags,
+            signal_tiles=tiles,
         )
         compiled = _compiled[key] = cute.compile(kernel, *args, stream)
     compiled(*args, stream)
@@ -2433,6 +2567,7 @@ def run_routed(
     hazard_delay_ns=0,
     hazard_nowait=False,
     flags=False,
+    tiles=None,
 ):
     """Routing fused into FC1: the ``routing.run`` + ``run`` pair as one kernel, with the same ``plan`` contents and
     bit-identical ``act`` / ``act_sf``. Every CTA scans ``topk_ids`` [R, 16] (global ids; -1 rows unused) for its
@@ -2471,7 +2606,8 @@ def run_routed(
     _check_word(
         "fc1_done",
         fc1_done,
-        plan.tile_idx_to_expert_idx.shape[0] * (FLAGS_PER_TILE if flags else DONE_PER_TILE),
+        plan.tile_idx_to_expert_idx.shape[0]
+        * (FLAGS_PER_TILE * flag_words() if flags else DONE_PER_TILE),
     )
     _check_word("plan_pub", plan_pub, 1)
     src, recv = None, (0, 1, 0)
@@ -2524,7 +2660,9 @@ def run_routed(
         hazard_nowait,
         lamport,
         rearm_prev is not None,
-        (flag_signal(), flag_tiles()) if flags else None,
+        (flag_signal(), tiles or flag_tiles(), flag_check(), flag_skip_last()) if flags else None,
+        signal_batch(),
+        tiles,
     )
     args = _launch_args(
         x,
@@ -2560,6 +2698,7 @@ def run_routed(
             lamport=lamport,
             rearm_prev=rearm_prev is not None,
             flags=flags,
+            signal_tiles=tiles,
         )
         compiled = _compiled[key] = cute.compile(kernel, *args, stream)
         k3_edges.debug(
@@ -2617,6 +2756,7 @@ def run_v2(
         fc1_done=None if done is None or done.kind == "lamport" else done.tensor,
         lamport=done is not None and done.kind == "lamport",
         flags=done is not None and done.kind == "flag",
+        tiles=done.tiles if done is not None and done.tiles else None,
         rearm_prev=rearm_prev,
         hazard_delay_ns=delay,
         hazard_nowait=recv is not None and (recv.hazard_nowait or recv.diag == "oracle"),

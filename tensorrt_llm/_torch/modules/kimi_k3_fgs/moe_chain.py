@@ -85,7 +85,8 @@ FC1_K_STAGES = INTER // 256
 # FC2 read (one slot pair); "next_fc1", the next MoE layer's FC1 re-arms the previous layer's pair (pairs alternate).
 # "flag": one int32 flag per FC1 unit in buffers this module owns (armed 0x80000000, alternating by layer like
 # next_fc1); FC1 publishes each unit's flag after its stores, FC2's gate waits for a K stage's 4 flags, and the next MoE
-# layer's FC1 re-arms the previous layer's buffer (moe/sync.py FLAG_SIGNAL_ENV / FLAG_TILES_ENV pick the publish).
+# layer's FC1 re-arms the previous layer's buffer (moe/sync.py FLAG_SIGNAL_ENV / FLAG_TILES_ENV / FLAG_LAST_ENV pick
+# the publish, FLAG_CHECK_ENV the check).
 FC1_FC2_SYNC_ENV = "TLLM_K3_MOE_FC1_FC2_SYNC"
 FC1_FC2_REARM_ENV = "TLLM_K3_MOE_FC1_FC2_REARM"
 FC1_FC2_POLICY_ENV = "TLLM_K3_MOE_FC1_FC2_RESET_POLICY"
@@ -245,7 +246,8 @@ class EdgeSync:
     """One edge's sync object as a fused kernel sees it (see ``EdgeSpec`` for ``kind``). ``expected`` is the
     per-unit target when fixed here (0: the stage derives it). Consumer side: ``diag`` (``TLLM_K3_MOE_FGS_DIAG``)
     and ``hazard_nowait``; producer side: ``hazard_delay_ns``. A ``comm`` edge has no tensor; ``source`` is the
-    dispatch's receive descriptor."""
+    dispatch's receive descriptor. ``tiles`` (``fc1_fc2``): token tiles FC1 counts or flags (0: the kernels'
+    default)."""
 
     edge: str
     kind: str
@@ -255,6 +257,7 @@ class EdgeSync:
     hazard_delay_ns: int = 0
     hazard_nowait: bool = False
     source: Optional[object] = None
+    tiles: int = 0
 
 
 @dataclass(frozen=True)
@@ -883,6 +886,10 @@ class _Call:
         self.source = None
         self.fc1: Optional[Fc1Slots] = None
         self.flag: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
+        self.flag_tiles = 0
+        from .moe.sync import count_tiles
+
+        self.count_tiles = count_tiles(rows)
         counters = layer.counter_edges
         if layer.fc1_fc2_lamport and 1 <= rows <= FGS_MAX_ROWS:
             self._acquire_fc1_slots(layer, rows)
@@ -1025,7 +1032,15 @@ class _Call:
         )
 
     def _take_flag_buffers(self, layer: "_Layer", rows: int) -> None:
-        from .moe.sync import FLAG_SENTINEL, FLAGS_PER_TILE, flag_signal, flag_tiles
+        from .moe.sync import (
+            FLAG_SENTINEL,
+            FLAGS_PER_TILE,
+            flag_check,
+            flag_signal,
+            flag_skip_last,
+            flag_tiles,
+            flag_words,
+        )
 
         low, high = _edge_rows("fc1_fc2")
         if not (low <= rows <= high and k3_recipe.moe_on("fc1_fc2", rows)):
@@ -1040,7 +1055,7 @@ class _Call:
                 raise RuntimeError(
                     f"{FC1_FC2_SYNC_ENV}=flag: buffers are allocated by an eager forward, before capture"
                 )
-            words = layer.fc1_flag_tiles * FLAGS_PER_TILE
+            words = layer.fc1_flag_tiles * FLAGS_PER_TILE * flag_words()
             bufs = _flag_buffers[layer.device] = (
                 torch.full(
                     (2 + count % 2, words), FLAG_SENTINEL, dtype=torch.int32, device=layer.device
@@ -1049,17 +1064,19 @@ class _Call:
             )
         flags, pieces = bufs
         tiles = layer.workspace(layer.ep * rows).plan.tile_idx_to_expert_idx.numel()
-        if tiles * FLAGS_PER_TILE > flags.shape[1]:
+        if tiles * FLAGS_PER_TILE * flag_words() > flags.shape[1]:
             k3_edges.debug("moe.fc1_fc2", rows, f"off: {tiles} tiles above the flag buffers")
             return
         mine = _consumer_pair(layer.fc1_ordinal, count, "next_fc1")
         prev = _consumer_pair((layer.fc1_ordinal - 1) % count, count, "next_fc1")
         self.leases["fc1_fc2"] = None
         self.flag = (flags[mine], flags[prev], pieces)
+        self.flag_tiles = flag_tiles(rows)
         k3_edges.debug(
             "moe.fc1_fc2",
             rows,
-            f"on, flag link ({flag_signal()} publish, {flag_tiles()} tiles publish), buffer "
+            f"on, flag link ({flag_signal()} publish, {self.flag_tiles} tiles publish, last unit "
+            f"{'skipped' if flag_skip_last() else 'fenced'}, {flag_check()} check), buffer "
             f"{mine}, re-arms buffer {prev}, {tiles} tiles",
         )
 
@@ -1253,8 +1270,13 @@ class _Layer:
         if call.on("fc1_fc2"):
             if self.fc1_fc2_flag:
                 mine, prev, pieces = call.flag
-                kw["fc1"].update(fc1_done=mine, flags=True, rearm_prev=(prev, prev, pieces))
-                kw["fc2"].update(fc1_done=mine, flags=True)
+                kw["fc1"].update(
+                    fc1_done=mine,
+                    flags=True,
+                    tiles=call.flag_tiles,
+                    rearm_prev=(prev, prev, pieces),
+                )
+                kw["fc2"].update(fc1_done=mine, flags=True, tiles=call.flag_tiles)
             elif self.fc1_fc2_lamport:
                 kw["fc1"]["lamport"] = True
                 kw["fc2"]["lamport"] = True
@@ -1289,6 +1311,7 @@ class _Layer:
             diag=diag,
             hazard_delay_ns=0 if consumer else _HAZARD_DELAY_NS,
             hazard_nowait=consumer and edge in _HAZARD_NOWAIT,
+            tiles=call.count_tiles if edge == "fc1_fc2" else 0,
         )
 
     def _fused_stage_kwargs(
@@ -1332,18 +1355,22 @@ class _Layer:
             kw["fc1"]["rearm_prev"] = (prev, prev, pieces)
             if fc1_v2:
                 stage_sync["fc1"].publishes["fc1_fc2"] = EdgeSync(
-                    "fc1_fc2", "flag", mine, hazard_delay_ns=_HAZARD_DELAY_NS
+                    "fc1_fc2",
+                    "flag",
+                    mine,
+                    hazard_delay_ns=_HAZARD_DELAY_NS,
+                    tiles=call.flag_tiles,
                 )
             else:
-                kw["fc1"].update(fc1_done=mine, flags=True)
+                kw["fc1"].update(fc1_done=mine, flags=True, tiles=call.flag_tiles)
                 if _HAZARD_DELAY_NS:
                     kw["fc1"]["hazard_delay_ns"] = _HAZARD_DELAY_NS
             if fc2_v2:
                 stage_sync["fc2"].waits["fc1_fc2"] = EdgeSync(
-                    "fc1_fc2", "flag", mine, diag=fgs_diag("fc1_fc2")
+                    "fc1_fc2", "flag", mine, diag=fgs_diag("fc1_fc2"), tiles=call.flag_tiles
                 )
             else:
-                kw["fc2"].update(fc1_done=mine, flags=True)
+                kw["fc2"].update(fc1_done=mine, flags=True, tiles=call.flag_tiles)
         elif fc1_fc2 and self.fc1_fc2_lamport:
             bound = call.fc1.rows_used
             if call.fc1.prev is not None:

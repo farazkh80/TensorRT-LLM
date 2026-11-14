@@ -34,8 +34,14 @@ row with several go to ``y``, and the finalize kernel launched behind FC2 sums t
 Fine-grained sync with the neighbouring stages (int32 counter slabs, zero-armed by the caller, T = tile slots):
 - ``fc1_done[T * 12]``: before K stage k of token tile t the activation loader waits until ``fc1_done[t * 12 + k] >= 4``
   (FC1's four 64-column units of that stage). A gate warp (7) polls the counters ahead of the loader and hands it one
-  smem token per stage; the weight TMA does not wait. FC1 counts only the first ``EARLY_TILES`` token tiles, so a unit
-  with a later tile waits for the FC1 grid (``griddepcontrol.wait`` in the gate warp) instead.
+  smem token per stage; the weight TMA does not wait. FC1 counts only the first ``EARLY_TILES`` token tiles (or
+  ``tiles``), so a unit with a later tile waits for the FC1 grid instead: the loader issues ``griddepcontrol.wait``
+  itself and takes no gate tokens for it.
+- Flag link (``flags``): ``fc1_done`` holds one int32 flag per FC1 unit (``moe/sync.py``); the gate waits for a K
+  stage's 4 flags. ``flag_tma``: each flag owns a 16 B chunk, and the gate warp loads a stage's flags with one TMA
+  ``report_valid`` load per token tile (64 B, the 32-bit -0 sentinel checked by the TMA unit), re-issuing the stage
+  until it lands valid; the loader's cp.async data reads follow the gate token, issued after the valid flag load
+  completed. A stage holding FLAG_SKIP (``flag_skip``) waits for the FC1 grid instead.
 - Lamport alternative to ``fc1_done``: ``act`` / ``act_sf`` are slots armed with 0x80 (E4M3 -0) / 0xFF, bytes FC1
   never writes. Checker warps (7 ..) take the loader's stages in turn once their copies landed, check every 32-bit
   word of the stage for a sentinel byte, re-copy stale 16 B pieces from L2 (scale words from global with relaxed loads)
@@ -72,10 +78,14 @@ from . import finalize
 from .sync import (
     EARLY_TILES,
     FLAG_SENTINEL,
+    FLAG_SKIP,
     FLAGS_PER_TILE,
     bits_to_f32,
     fgs_diag,
+    flag_check,
+    flag_skip_last,
     flag_tiles,
+    flag_words,
     ld_cg_b32,
     ld_cg_v4,
     ld_relaxed_gpu_b32,
@@ -112,6 +122,12 @@ CHECK_WARPS = 4
 # Fused finalize: per-row metadata of a unit in shared memory (received row, routing weight bits, local pairs of the
 # row), double-buffered by unit.
 META_FIELDS = 3
+# Flag link with the TMA check: one 128 B shared-memory slot per (K stage, token tile of the unit) receives the stage's
+# 64 B of flags.
+FLAG_SLOT_WORDS = 32
+# _fc1_missing's weight of a FLAG_SKIP flag: any count at or above it means "wait for the FC1 grid".
+FLAG_SKIP_UNITS = 1 << 16
+FLAG_BACKOFF_NS = 512
 
 
 def _pow2_at_least(n: int, lo: int) -> int:
@@ -250,6 +266,9 @@ class Fc2Kernel:
         check: bool = True,
         flags: bool = False,
         flag_tiles: int = EARLY_TILES,
+        flag_tma: bool = False,
+        flag_skip: bool = False,
+        flag_backoff: int = FLAG_BACKOFF_NS,
     ):
         if tile_n not in TILE_NS:
             raise ValueError(f"tile_n must be one of {TILE_NS}, got {tile_n}")
@@ -278,7 +297,11 @@ class Fc2Kernel:
         self.wait_fc1 = wait_fc1
         # flags (flag link): fc1_done holds one flag per FC1 unit; a K stage is ready when its 4 flags are set.
         self.flags = flags and wait_fc1
-        self.gate_tiles = flag_tiles if self.flags else EARLY_TILES
+        self.gate_tiles = flag_tiles
+        self.flag_tma = flag_tma and self.flags
+        self.flag_words = 4 if self.flag_tma else 1
+        self.flag_skip = flag_skip and self.flags
+        self.flag_backoff = flag_backoff
         self.signal_fc2 = signal_fc2
         self.delay_ns = delay_ns if signal_fc2 else 0
         self.wait_plan = wait_plan
@@ -359,7 +382,8 @@ class Fc2Kernel:
 
     @cute.jit
     def _fc1_missing(self, fc1_done, first_tile, n_tiles, lane):
-        """Warp-wide acquire of all fc1_done words of a unit's token tiles: the number not yet complete."""
+        """Warp-wide acquire of all fc1_done words of a unit's token tiles: the number not yet complete (flag_skip:
+        plus FLAG_SKIP_UNITS per FLAG_SKIP flag)."""
         missing = cutlass.Int32(0)
         if cutlass.const_expr(self.flags):
             for c in cutlass.range_constexpr((self.group * FLAGS_PER_TILE + 31) // 32):
@@ -374,6 +398,9 @@ class Fc2Kernel:
                     )
                 ready = cute.arch.vote_ballot_sync(seen != cutlass.Int32(FLAG_SENTINEL))
                 missing += 32 - cute.arch.popc(ready)
+                if cutlass.const_expr(self.flag_skip):
+                    skipped = cute.arch.vote_ballot_sync(seen == cutlass.Int32(FLAG_SKIP))
+                    missing += FLAG_SKIP_UNITS * cute.arch.popc(skipped)
         else:
             for c in cutlass.range_constexpr((self.group * K_TILES + 31) // 32):
                 w = c * 32 + lane
@@ -404,6 +431,9 @@ class Fc2Kernel:
                         seen = cute.arch.load(word, cutlass.Int32, sem="acquire", scope="gpu")
                         while seen == cutlass.Int32(FLAG_SENTINEL):
                             seen = cute.arch.load(word, cutlass.Int32, sem="acquire", scope="gpu")
+                        if cutlass.const_expr(self.flag_skip):
+                            if seen == cutlass.Int32(FLAG_SKIP):
+                                cute.arch.griddepcontrol_wait()
         else:
             for j in cutlass.range_constexpr(self.group):
                 if j < n_tiles:
@@ -411,6 +441,133 @@ class Fc2Kernel:
                     seen = cute.arch.load(word, cutlass.Int32, sem="acquire", scope="gpu")
                     while seen < FC1_UNITS_PER_K_STAGE:
                         seen = cute.arch.load(word, cutlass.Int32, sem="acquire", scope="gpu")
+
+    @cute.jit
+    def _issue_flag_stage(
+        self, flag_bar, tFgF, tFsF, tma_atom_flag, first_tile, n_tiles, k_tile, stage_bytes
+    ):
+        # The TMA copy elects its issuing thread itself; only the arrive is ours to elect.
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive_and_expect_tx(flag_bar, n_tiles * stage_bytes)
+        for jt in cutlass.range_constexpr(self.group):
+            if jt < n_tiles:
+                cute.copy(
+                    tma_atom_flag,
+                    tFgF[(None, (first_tile + jt) * K_TILES + k_tile)],
+                    tFsF[(None, k_tile * self.group + jt)],
+                    tma_bar_ptr=flag_bar,
+                    report_valid=cpasync.SentinelPattern.PER_16BYTES_80000000,
+                )
+
+    @cute.jit
+    def _flag_stage_invalid(self, flag_bar, phase):
+        """Wait for the stage barrier's primary phase; 1 when its load landed a sentinel flag. DSL 4.9's
+        ``mbarrier_wait_primary`` never returns on SM107, so this loops on ``mbarrier_try_wait_primary``."""
+        done = cutlass.Int32(0)
+        invalid = cutlass.Int32(0)
+        while done == 0:
+            res = cute.arch.mbarrier_try_wait_primary(flag_bar, phase)
+            done = cutlass.select_(res[0], cutlass.Int32(1), cutlass.Int32(0))
+            invalid = cutlass.select_(res[1], cutlass.Int32(1), cutlass.Int32(0))
+        return invalid
+
+    @cute.jit
+    def _flag_tma_gate(
+        self,
+        tidx,
+        bidx,
+        num_mine,
+        used_ctas,
+        sGroup,
+        tma_atom_flag,
+        mFlag,
+        flag_mbar,
+        flag_ring,
+        gate_pipeline,
+    ):
+        """Gate warp of the TMA flag check. Per unit, every K stage's flags are loaded at once (one report_valid TMA
+        load per token tile into the stage's ring slot, on the stage's v1 barrier); then, stage by stage, a load that
+        completed with a sentinel flag is re-issued until it lands valid, and the stage's token goes to the loader.
+        Units past gate_tiles are the loader's: it waits for the FC1 grid itself."""
+        lane = tidx % 32
+        group = self.group
+        stage_flags = FC1_UNITS_PER_K_STAGE * self.flag_words
+        stage_bytes = stage_flags * 4
+        cpasync.prefetch_descriptor(tma_atom_flag)
+        if lane == 0:
+            for k in cutlass.range_constexpr(K_TILES):
+                cute.arch.mbarrier_v1_init(flag_mbar + k, 1)
+        cute.arch.mbarrier_init_fence()
+        cute.arch.sync_warp()
+        sF = cute.make_tensor(
+            flag_ring,
+            cute.make_layout((stage_flags, 1, K_TILES * group), stride=(1, 0, FLAG_SLOT_WORDS)),
+        )
+        gF = cute.local_tile(mFlag, (stage_flags, 1), (0, None))
+        tFsF, tFgF = cpasync.tma_partition(
+            tma_atom_flag,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sF, 0, 2),
+            cute.group_modes(gF, 0, 2),
+        )
+        sFlagWords = cute.make_tensor(
+            flag_ring, cute.make_layout((K_TILES * group * FLAG_SLOT_WORDS,))
+        )
+        gate_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, K_TILES)
+        phases = cutlass.Int32(0)
+        for i in cutlass.range(num_mine, unroll=1):
+            entry = sGroup[(bidx + i * used_ctas) // M_TILES]
+            first_tile = entry & 0xFFFF
+            n_tiles = (((entry >> 16) & 0xFF) + self.tile_n - 1) // self.tile_n
+            if first_tile + n_tiles <= self.gate_tiles:
+                for k_tile in cutlass.range(K_TILES, unroll=1):
+                    self._issue_flag_stage(
+                        flag_mbar + k_tile,
+                        tFgF,
+                        tFsF,
+                        tma_atom_flag,
+                        first_tile,
+                        n_tiles,
+                        k_tile,
+                        stage_bytes,
+                    )
+                for k_tile in cutlass.range(K_TILES, unroll=1):
+                    invalid = self._flag_stage_invalid(flag_mbar + k_tile, (phases >> k_tile) & 1)
+                    phases = phases ^ (cutlass.Int32(1) << k_tile)
+                    backoff = cutlass.Int32(min(32, self.flag_backoff))
+                    while invalid != 0:
+                        if cutlass.const_expr(self.flag_backoff > 0):
+                            nanosleep(backoff)
+                            backoff = cutlass.min(backoff * 2, cutlass.Int32(self.flag_backoff))
+                        self._issue_flag_stage(
+                            flag_mbar + k_tile,
+                            tFgF,
+                            tFsF,
+                            tma_atom_flag,
+                            first_tile,
+                            n_tiles,
+                            k_tile,
+                            stage_bytes,
+                        )
+                        invalid = self._flag_stage_invalid(
+                            flag_mbar + k_tile, (phases >> k_tile) & 1
+                        )
+                        phases = phases ^ (cutlass.Int32(1) << k_tile)
+                    if cutlass.const_expr(self.flag_skip):
+                        seen = cutlass.Int32(1)
+                        if lane < n_tiles * FC1_UNITS_PER_K_STAGE:
+                            seen = sFlagWords[
+                                (k_tile * group + lane // FC1_UNITS_PER_K_STAGE) * FLAG_SLOT_WORDS
+                                + (lane % FC1_UNITS_PER_K_STAGE) * self.flag_words
+                            ]
+                        if cute.arch.vote_ballot_sync(seen == cutlass.Int32(FLAG_SKIP)) != 0:
+                            cute.arch.griddepcontrol_wait()
+                    cute.arch.sync_warp()
+                    if lane == 0:
+                        gate_pipeline.producer_acquire(gate_state)
+                        gate_pipeline.producer_commit(gate_state)
+                    gate_state.advance()
 
     @cute.jit
     def _check_stages(
@@ -619,7 +776,27 @@ class Fc2Kernel:
         if cutlass.const_expr(self.wait_fc1):
             fc1_done = cute.make_tensor(
                 fc1_done_ptr,
-                cute.make_layout((num_tile_slots * (FLAGS_PER_TILE if self.flags else K_TILES),)),
+                cute.make_layout(
+                    (
+                        num_tile_slots
+                        * (FLAGS_PER_TILE * self.flag_words if self.flags else K_TILES),
+                    )
+                ),
+            )
+        tma_atom_flag = tma_tensor_flag = None
+        if cutlass.const_expr(self.flag_tma):
+            # A (token tile, K stage) owns 4 consecutive 16 B flag chunks: one 64 B row of this view.
+            stage_flags = FC1_UNITS_PER_K_STAGE * self.flag_words
+            tma_atom_flag, tma_tensor_flag = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(),
+                cute.make_tensor(
+                    fc1_done_ptr,
+                    cute.make_layout(
+                        (stage_flags, num_tile_slots * K_TILES), stride=(1, stage_flags)
+                    ),
+                ),
+                cute.make_layout((stage_flags, 1)),
+                (stage_flags, 1),
             )
         rows_used = None
         if cutlass.const_expr(self.bound):
@@ -704,6 +881,13 @@ class Fc2Kernel:
             load_mbar: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
             acc_mbar: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
             gate_mbar: cute.struct.MemRange[cutlass.Int64, K_TILES * 2 if self.wait_fc1 else 1]
+            flag_mbar: cute.struct.MemRange[cutlass.Int64, K_TILES if self.flag_tma else 1]
+            flag_ring: cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Int32, K_TILES * self.group * FLAG_SLOT_WORDS if self.flag_tma else 1
+                ],
+                128,
+            ]
             landed_mbar: cute.struct.MemRange[
                 cutlass.Int64, self.num_ab_stage * 2 if self.lamport else 1
             ]
@@ -747,6 +931,8 @@ class Fc2Kernel:
             num_tiles,
             stamps,
             fc1_done,
+            tma_atom_flag,
+            tma_tensor_flag,
             rows_used,
             fc2_done,
             plan_pub,
@@ -821,6 +1007,8 @@ class Fc2Kernel:
         num_tiles: cute.Tensor,
         stamps: Optional[cute.Tensor],
         fc1_done: Optional[cute.Tensor],
+        tma_atom_flag: Optional[cute.CopyAtom],
+        mFlag: Optional[cute.Tensor],
         rows_used: Optional[cute.Tensor],
         fc2_done: Optional[cute.Tensor],
         plan_pub: Optional[cute.Tensor],
@@ -1108,6 +1296,12 @@ class Fc2Kernel:
                 entry = sGroup[(bidx + i * used_ctas) // M_TILES]
                 row_base = (entry & 0xFFFF) * tile_n
                 valid_rows = (entry >> 16) & 0xFF
+                gated = cutlass.Int32(1)
+                if cutlass.const_expr(self.wait_fc1):
+                    # A unit past the published tiles waits for the FC1 grid here and takes no gate tokens.
+                    if (entry & 0xFFFF) + (valid_rows + tile_n - 1) // tile_n > self.gate_tiles:
+                        gated = cutlass.Int32(0)
+                        cute.arch.griddepcontrol_wait()
                 group_rows = (valid_rows + tile_n - 1) // tile_n * tile_n
                 row_end = row_base + valid_rows
                 for p in cutlass.range_constexpr(n_pass):
@@ -1125,10 +1319,11 @@ class Fc2Kernel:
                     if cutlass.const_expr(self.wait_fc1):
                         # Every lane acquires the token. cp.async (non-bulk) reads in the generic proxy, so no proxy
                         # fence is needed.
-                        gate_pipeline.consumer_wait(gate_state)
-                        if lane == 0:
-                            gate_pipeline.consumer_release(gate_state)
-                        gate_state.advance()
+                        if gated == 1:
+                            gate_pipeline.consumer_wait(gate_state)
+                            if lane == 0:
+                                gate_pipeline.consumer_release(gate_state)
+                            gate_state.advance()
                     sB_stage = sB.iterator + load_state.index * self.b_bytes_per_stage
                     sSFB_stage = sSFB.iterator + load_state.index * (n_katom * self.sf_atom_bytes)
                     for kt in cutlass.range_constexpr(n_katom):
@@ -1173,7 +1368,7 @@ class Fc2Kernel:
                     load_state.advance()
             load_pipeline.producer_tail(load_state)
 
-        if cutlass.const_expr(self.wait_fc1):
+        if cutlass.const_expr(self.wait_fc1 and not self.flag_tma):
             if warp_idx == self.gate_warp_id:
                 lane = tidx % 32
                 gate_state = pipeline.make_pipeline_state(
@@ -1183,21 +1378,36 @@ class Fc2Kernel:
                     entry = sGroup[(bidx + i * used_ctas) // M_TILES]
                     first_tile = entry & 0xFFFF
                     n_tiles = (((entry >> 16) & 0xFF) + tile_n - 1) // tile_n
-                    missing = cutlass.Int32(0)
                     if first_tile + n_tiles <= self.gate_tiles:
                         missing = self._fc1_missing(fc1_done, first_tile, n_tiles, lane)
-                    else:
-                        # FC1 publishes no counters for these tiles: wait for its grid.
-                        cute.arch.griddepcontrol_wait()
-                    for k_tile in cutlass.range(K_TILES, unroll=1):
-                        if missing > 0:
-                            self._wait_fc1_stage(fc1_done, first_tile, n_tiles, k_tile)
-                        # Lane 0's arrive is ordered after every lane's acquire.
-                        cute.arch.sync_warp()
-                        if lane == 0:
-                            gate_pipeline.producer_acquire(gate_state)
-                            gate_pipeline.producer_commit(gate_state)
-                        gate_state.advance()
+                        if cutlass.const_expr(self.flag_skip):
+                            if missing >= FLAG_SKIP_UNITS:
+                                cute.arch.griddepcontrol_wait()
+                                missing = cutlass.Int32(0)
+                        for k_tile in cutlass.range(K_TILES, unroll=1):
+                            if missing > 0:
+                                self._wait_fc1_stage(fc1_done, first_tile, n_tiles, k_tile)
+                            # Lane 0's arrive is ordered after every lane's acquire.
+                            cute.arch.sync_warp()
+                            if lane == 0:
+                                gate_pipeline.producer_acquire(gate_state)
+                                gate_pipeline.producer_commit(gate_state)
+                            gate_state.advance()
+
+        if cutlass.const_expr(self.flag_tma):
+            if warp_idx == self.gate_warp_id:
+                self._flag_tma_gate(
+                    tidx,
+                    bidx,
+                    num_mine,
+                    used_ctas,
+                    sGroup,
+                    tma_atom_flag,
+                    mFlag,
+                    storage.flag_mbar.data_ptr(),
+                    storage.flag_ring.data_ptr(),
+                    gate_pipeline,
+                )
 
         if cutlass.const_expr(self.lamport):
             if (warp_idx >= self.check_warp_id) & (warp_idx < self.check_warp_id + CHECK_WARPS):
@@ -1512,6 +1722,9 @@ def _compiled(
     check: bool = True,
     flags: bool = False,
     flag_tiles: int = EARLY_TILES,
+    flag_tma: bool = False,
+    flag_skip: bool = False,
+    flag_backoff: int = FLAG_BACKOFF_NS,
 ):
     kernel = Fc2Kernel(
         tile_n,
@@ -1533,6 +1746,9 @@ def _compiled(
         check,
         flags,
         flag_tiles,
+        flag_tma,
+        flag_skip,
+        flag_backoff,
     )
     fake = cute.AddressSpace.gmem
     args = (
@@ -1545,7 +1761,9 @@ def _compiled(
         make_ptr(cutlass.Int32, 1 << 20, fake, assumed_align=4),
         make_ptr(cutlass.Int32, 1 << 20, fake, assumed_align=4),
         make_ptr(cutlass.Int32, 1 << 20, fake, assumed_align=4) if timeline else None,
-        make_ptr(cutlass.Int32, 1 << 20, fake, assumed_align=4) if wait_fc1 else None,
+        make_ptr(cutlass.Int32, 1 << 20, fake, assumed_align=16 if flags else 4)
+        if wait_fc1
+        else None,
         make_ptr(cutlass.Int32, 1 << 20, fake, assumed_align=4) if bound and lamport else None,
         make_ptr(cutlass.Int32, 1 << 20, fake, assumed_align=4) if signal_fc2 else None,
         make_ptr(cutlass.Int32, 1 << 20, fake, assumed_align=4) if wait_plan else None,
@@ -1593,6 +1811,7 @@ def run(
     lamport: bool = False,
     rows_used: Optional[torch.Tensor] = None,
     flags: bool = False,
+    tiles: Optional[int] = None,
 ) -> None:
     """``y[p] = bf16(dequant(act[p]) @ dequant(W2[e]).T)`` for every valid permuted row (moe_chain FC2 stage).
 
@@ -1604,8 +1823,9 @@ def run(
     (``fc1.num_ctas_for``). ``lamport``: FC1's output is a Lamport edge instead of ``fc1_done``: ``act`` / ``act_sf``
     are slots armed with 0x80 / 0xFF that FC1 writes without counters (``fc1.run(..., lamport=True)``), and this kernel
     validates every byte it uses. ``rows_used`` (int32 word): CTA 0 stores the plan's padded rows there. ``flags``:
-    ``fc1_done`` is the flag-link buffer (int32 [T * 48], ``moe/sync.py``); a K stage is ready when its 4 flags are
-    set.
+    ``fc1_done`` is the flag-link buffer (int32 [T * 48 * flag_words()], 16 B aligned, ``moe/sync.py``); a K stage is
+    ready when its 4 flags are set. ``tiles``: the token tiles FC1 counts or flags (default ``flag_tiles()`` /
+    ``EARLY_TILES``).
     """
     tile_n = plan.tile_n
     rows = act.shape[0]
@@ -1628,7 +1848,7 @@ def run(
     assert tile_slots < 1 << 16
     if lamport and fc1_done is not None:
         raise ValueError("fc2.run: fc1_done and lamport are two builds of the same edge")
-    fc1_words = tile_slots * (FLAGS_PER_TILE if flags else K_TILES)
+    fc1_words = tile_slots * (FLAGS_PER_TILE * flag_words() if flags else K_TILES)
     for done, words in ((fc1_done, fc1_words), (fc2_done, tile_slots), (rows_used, 1)):
         assert done is None or (
             done.dtype == torch.int32 and done.numel() >= words and done.is_contiguous()
@@ -1676,7 +1896,10 @@ def run(
         lamport and rows_used is not None,
         not (lamport and fgs_diag("fc1_fc2") == "oracle"),
         flags and fc1_done is not None,
-        flag_tiles() if flags else EARLY_TILES,
+        (tiles or flag_tiles()) if flags else (tiles or EARLY_TILES),
+        flags and flag_check() == "tma",
+        flags and flag_skip_last(),
+        _env_int("FLAG_BACKOFF", FLAG_BACKOFF_NS),
     )
     compiled(
         _ptr(cutlass.Float4E2M1FN, w2, 32),
@@ -1688,7 +1911,7 @@ def run(
         _ptr(cutlass.Int32, plan.tile_idx_to_mn_limit, 4),
         _ptr(cutlass.Int32, plan.num_non_exiting_tiles, 4),
         _ptr(cutlass.Int32, timeline_buffer(device), 4) if timeline else None,
-        _ptr(cutlass.Int32, fc1_done, 4) if fc1_done is not None else None,
+        _ptr(cutlass.Int32, fc1_done, 16 if flags else 4) if fc1_done is not None else None,
         _ptr(cutlass.Int32, rows_used, 4) if lamport and rows_used is not None else None,
         _ptr(cutlass.Int32, fc2_done, 4) if fc2_done is not None else None,
         _ptr(cutlass.Int32, plan_pub, 4) if plan_pub is not None else None,
@@ -1758,6 +1981,7 @@ def run_v2(
         fc1_done=None if done is None or lamport else done.tensor,
         lamport=lamport,
         flags=done is not None and done.kind == "flag",
+        tiles=done.tiles if done is not None and done.tiles else None,
         rows_used=done.tensor if lamport else None,
         plan_pub=None if pub is None else pub.tensor,
         plan_pub_expected=0 if pub is None else pub.expected,

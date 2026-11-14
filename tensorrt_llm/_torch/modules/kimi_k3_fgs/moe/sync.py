@@ -4,6 +4,7 @@
 barrier that orders its threads' stores; a consumer spins with ``wait_at_least`` before reading the unit's data."""
 
 import os
+from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -286,8 +287,16 @@ EARLY_TILES = 8
 # t * FLAGS_PER_TILE + j, armed with FLAG_SENTINEL and set to 1 by the unit's only writer once its stores are visible.
 FLAGS_PER_TILE = 48
 FLAG_SENTINEL = -0x80000000
+# FC1 writes FLAG_SKIP (no fence) for each CTA's last unit; FC2 waits for the FC1 grid for a stage that holds one.
+FLAG_SKIP = 2
 FLAG_SIGNAL_ENV = "TLLM_K3_MOE_FC1_FC2_FLAG_SIGNAL"
 FLAG_TILES_ENV = "TLLM_K3_MOE_FC1_FC2_FLAG_TILES"
+COUNT_TILES_ENV = "TLLM_K3_MOE_FC1_FC2_COUNT_TILES"
+FLAG_CHECK_ENV = "TLLM_K3_MOE_FC1_FC2_FLAG_CHECK"
+FLAG_LAST_ENV = "TLLM_K3_MOE_FC1_FC2_FLAG_LAST"
+SIGNAL_BATCH_ENV = "TLLM_K3_MOE_FC1_FC2_SIGNAL"
+# Signalled units FC1's signal warp holds before one fence publishes them (TLLM_K3_MOE_FC1_FC2_SIGNAL=cta).
+SIGNAL_BATCH_MAX = 4
 
 
 def flag_signal() -> str:
@@ -299,11 +308,62 @@ def flag_signal() -> str:
     return value
 
 
-def flag_tiles() -> int:
-    """Token tiles that publish flags (default EARLY_TILES, or "all"); FC2 units of later tiles wait for the FC1 grid.
-    Every published flag costs FC1 a fence, so "all" pays only where most of FC2 would otherwise wait for the grid."""
-    value = os.environ.get(FLAG_TILES_ENV, str(EARLY_TILES))
+# FLAG_TILES / COUNT_TILES=auto: FC2's first wave of units reaches tile 7 at up to FLAG_AUTO_ROWS rows per rank (one
+# tile per group) and tile 15 above (two-tile groups); covering further tiles only adds FC1 fences.
+FLAG_AUTO_ROWS = 32
+FLAG_AUTO_TILES = (EARLY_TILES, 2 * EARLY_TILES)
+
+
+def flag_tiles(rows: Optional[int] = None) -> int:
+    """Token tiles that publish flags (default EARLY_TILES, "all", or "auto" by ``rows`` per rank); FC2 units of later
+    tiles wait for the FC1 grid. Every published flag costs FC1 a fence, so "all" pays only where most of FC2 would
+    otherwise wait for the grid."""
+    return _tiles(FLAG_TILES_ENV, rows)
+
+
+def count_tiles(rows: Optional[int] = None) -> int:
+    """Token tiles the counter link counts (default EARLY_TILES; "auto" / "all" / a number as for flag_tiles)."""
+    return _tiles(COUNT_TILES_ENV, rows)
+
+
+def _tiles(env: str, rows: Optional[int]) -> int:
+    value = os.environ.get(env, str(EARLY_TILES))
+    if value == "auto":
+        return FLAG_AUTO_TILES[rows is not None and rows > FLAG_AUTO_ROWS]
     return 1 << 20 if value == "all" else int(value)
+
+
+def flag_check() -> str:
+    """How FC2 checks the flags: "poll" (``ld.acquire`` in the gate warp) or "tma" (the gate warp loads a stage's
+    flags with a TMA ``report_valid`` load and re-issues it until no flag is the sentinel)."""
+    value = os.environ.get(FLAG_CHECK_ENV, "poll")
+    if value not in ("poll", "tma"):
+        raise ValueError(f"{FLAG_CHECK_ENV} must be poll or tma, got {value!r}")
+    return value
+
+
+def flag_words() -> int:
+    """int32 words per flag: the TMA check reads element 0 of each 16 B chunk only, so each flag owns a chunk."""
+    return 4 if flag_check() == "tma" else 1
+
+
+def signal_batch() -> bool:
+    """FC1's publish (counter or flag link) per unit (``TLLM_K3_MOE_FC1_FC2_SIGNAL=item``, one fence per unit or
+    pair) or per CTA (``cta``): only signalled units go through the signal warp, which fences once after the CTA's
+    last signalled unit (or every SIGNAL_BATCH_MAX units) and then publishes them all."""
+    value = os.environ.get(SIGNAL_BATCH_ENV, "item")
+    if value not in ("item", "cta"):
+        raise ValueError(f"{SIGNAL_BATCH_ENV} must be item or cta, got {value!r}")
+    return value == "cta"
+
+
+def flag_skip_last() -> bool:
+    """FC1 marks each CTA's last unit with FLAG_SKIP instead of fencing it (``TLLM_K3_MOE_FC1_FC2_FLAG_LAST=skip``):
+    the fence would hold the CTA's exit, and FC2 reaches those tiles after the FC1 grid anyway."""
+    value = os.environ.get(FLAG_LAST_ENV, "fence")
+    if value not in ("fence", "skip"):
+        raise ValueError(f"{FLAG_LAST_ENV} must be fence or skip, got {value!r}")
+    return value == "skip"
 
 
 DIAG_ENV = "TLLM_K3_MOE_FGS_DIAG"
