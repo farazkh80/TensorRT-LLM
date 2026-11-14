@@ -1286,8 +1286,8 @@ class _Layer:
                 elif self.fc1_rearm == "consumer":
                     kw["finalize"]["rearm"] = (call.fc1.act, call.fc1.act_sf)
             else:
-                kw["fc1"]["fc1_done"] = call.slab("fc1_fc2")
-                kw["fc2"]["fc1_done"] = consumer_slab("fc1_fc2")
+                kw["fc1"].update(fc1_done=call.slab("fc1_fc2"), tiles=call.count_tiles)
+                kw["fc2"].update(fc1_done=consumer_slab("fc1_fc2"), tiles=call.count_tiles)
             if _HAZARD_DELAY_NS:
                 kw["fc1"]["hazard_delay_ns"] = _HAZARD_DELAY_NS
         if call.on("fc2_fin"):
@@ -1396,7 +1396,7 @@ class _Layer:
             if fc1_v2:
                 stage_sync["fc1"].publishes["fc1_fc2"] = self._edge_sync(call, "fc1_fc2", False)
             else:
-                kw["fc1"]["fc1_done"] = call.slab("fc1_fc2")
+                kw["fc1"].update(fc1_done=call.slab("fc1_fc2"), tiles=call.count_tiles)
                 if _HAZARD_DELAY_NS:
                     kw["fc1"]["hazard_delay_ns"] = _HAZARD_DELAY_NS
             if fc2_v2:
@@ -1406,6 +1406,7 @@ class _Layer:
                 kw["fc2"]["fc1_done"] = (
                     _full_counters(self.device) if diag == "oracle" else call.slab("fc1_fc2")
                 )
+                kw["fc2"]["tiles"] = call.count_tiles
         for stage, sync in stage_sync.items():
             if sync.waits or sync.publishes:
                 kw[stage]["fgs"] = sync
