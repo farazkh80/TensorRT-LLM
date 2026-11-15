@@ -61,6 +61,7 @@ from .sync import (
     FLAG_SKIP,
     FLAGS_PER_TILE,
     SIGNAL_BATCH_MAX,
+    act_store,
     atom_add_acq_rel,
     fence_fabric_acquire,
     fence_proxy_async_global,
@@ -70,6 +71,7 @@ from .sync import (
     flag_skip_last,
     flag_tiles,
     flag_words,
+    lamport_check,
     ld_cg_b32,
     ld_cg_v4,
     ld_volatile_b32,
@@ -243,6 +245,38 @@ def _st_v4(addr, w, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _st_v4_words(addr, w0, w1, w2, w3, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)]
+        + [cutlass.Int32(w).ir_value(loc=loc, ip=ip) for w in (w0, w1, w2, w3)],
+        "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _ld_shared_v4(addr, *, loc=None, ip=None):
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [cutlass.Int32(addr).ir_value(loc=loc, ip=ip)],
+        "ld.shared.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,r,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return [cutlass.Int32(llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(4)]
+
+
+@dsl_user_op
 def _tmem_load_16x256b(addrs, *, loc=None, ip=None):
     """One tcgen05.ld.16x256b.x1 per TMEM address, then tcgen05.wait::ld. For each address, thread T
     receives lane T // 4 (values 0, 1) and lane T // 4 + 8 (values 2, 3), both at columns 2 * (T % 4) and
@@ -409,6 +443,7 @@ class Fc1Kernel:
         rearm_prev: bool = False,
         flags: bool = False,
         signal_tiles: Optional[int] = None,
+        act16: bool = False,
     ):
         if n_tile not in (8, 16, 32):
             raise ValueError(f"n_tile must be 8, 16 or 32, got {n_tile}")
@@ -441,6 +476,13 @@ class Fc1Kernel:
             raise ValueError("the Lamport FC1 -> FC2 build publishes no fc1_done counters")
         # lamport: act / act_sf are FC1 -> FC2 slots armed with 0x80 / 0xFF, which FC2 validates byte by byte.
         self.lamport = lamport
+        # act16 (FC2's TMA check, lamport_check() == "tma"): the TMA unit tests element 0 of each 16 B chunk, so each
+        # act chunk is stored whole (act_store()), and the padding rows of an expert's last token tile are stored as
+        # zeros (a TMA box covers the whole tile).
+        self.act16 = act16 and lamport
+        self.act_v4 = self.act16 and act_store() == "v4"
+        # Per epilogue warp, its 16 channels of every token row of an item (the 16 B chunks it stores whole).
+        self.stage16_bytes = 4 * self.n_mma * 16 if self.act_v4 else 16
         # rearm_prev (consumer re-arm, next_fc1 rule): the epilogue warps first store the sentinel over the rows the
         # previous layer's FC2 reported in its slot pair, which this layer's successor writes next.
         self.rearm_prev = rearm_prev
@@ -536,6 +578,7 @@ class Fc1Kernel:
             2048
             + (self.info_fields + self.n_mma) * 4 * self.num_tile_stage
             + 2 * 4 * self.n_mma * 4
+            + self.stage16_bytes
             + 4 * 1024
             + 2048
         )
@@ -604,6 +647,7 @@ class Fc1Kernel:
 
         def main_bytes(stages):
             head = up((self.info_fields + self.n_mma) * 4 * nts, 16) + 2 * 4 * self.n_mma * 4
+            head = up(head, 16) + self.stage16_bytes
             head = up(head, 8) + 8 * (
                 4 * stages + 2 * self.num_acc_stage + 2 * nts + 2 * self.num_stored_stage
             )
@@ -753,6 +797,9 @@ class Fc1Kernel:
             info: cute.struct.MemRange[cutlass.Int32, self.info_fields * self.num_tile_stage]
             rows: cute.struct.MemRange[cutlass.Int32, self.n_mma * self.num_tile_stage]
             amax: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, 2 * 4 * self.n_mma], 16]
+            stage16: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint16, self.stage16_bytes // 2], 16
+            ]
             ab_mbar: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
             b_mbar: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
             acc_mbar: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
@@ -1496,6 +1543,11 @@ class Fc1Kernel:
         sAmax = storage.amax.get_tensor(
             cute.make_layout((n_mma, 4, 2), stride=(1, n_mma, 4 * n_mma))
         )
+        sStage16 = None
+        if cutlass.const_expr(self.act_v4):
+            sStage16 = storage.stage16.get_tensor(
+                cute.make_layout((8, n_mma, 4), stride=(1, 8, 8 * n_mma))
+            )
 
         # (bM, bK, loopM, loopK, loopL)
         gA_mkl = cute.local_tile(
@@ -2129,6 +2181,7 @@ class Fc1Kernel:
             act16_col = 8 * quad + (lane >> 2)
             sf_group = quad >> 1
             partner = quad ^ 1
+            stage16_warp = storage.stage16.data_ptr().toint() + quad * (n_mma * 16)
             tmem_quad = tmem_ptr.toint() + ((32 * quad) << 16)
             gate_cap = cutlass.Float32(self.gate_cap)
             inv_gate_cap = cutlass.Float32(1.0 / self.gate_cap)
@@ -2145,6 +2198,9 @@ class Fc1Kernel:
                 row_base = info[1] * n_tile
                 limit = info[3]
                 num_valid = limit - row_base
+                store_end = limit
+                if cutlass.const_expr(self.act16):
+                    store_end = (limit + n_tile - 1) // n_tile * n_tile
 
                 acc_pipeline.consumer_wait(acc_state)
                 _tcgen05_fence("after")
@@ -2222,10 +2278,52 @@ class Fc1Kernel:
                                     (codes & 0x7F00) == 0, cutlass.Int32(0x8000), cutlass.Int32(0)
                                 )
                                 codes = codes & (zero_signs ^ cutlass.Int32(-1))
-                            if prow < limit:
+                            if cutlass.const_expr(self.act_v4):
+                                sStage16[(lane >> 2, col, quad)] = cutlass.Uint16(
+                                    cutlass.select_(prow < limit, codes, cutlass.Int32(0))
+                                )
+                                if prow < limit:
+                                    if (quad & 1) == 0:
+                                        mActSf[(prow, m_tile * 2 + sf_group)] = cutlass.Uint8(
+                                            sf_byte
+                                        )
+                            elif prow < limit:
                                 mAct16[(prow, m_tile * 32 + act16_col)] = cutlass.Uint16(codes)
                                 if (quad & 1) == 0:
                                     mActSf[(prow, m_tile * 2 + sf_group)] = cutlass.Uint8(sf_byte)
+                if cutlass.const_expr(self.act16):
+                    # Padding rows of the expert's last token tile (limit .. store_end): zeros. Each row's chunk is
+                    # still written by one instruction.
+                    if store_end > limit:
+                        for i in cutlass.range_constexpr(n_chunk):
+                            if (8 * i + 8 > num_valid) & (row_base + 8 * i < store_end):
+                                for j in cutlass.range_constexpr(2):
+                                    pad_row = row_base + 8 * i + col_in_chunk + j
+                                    if pad_row >= limit:
+                                        if cutlass.const_expr(self.act_v4):
+                                            sStage16[(lane >> 2, pad_row - row_base, quad)] = (
+                                                cutlass.Uint16(0)
+                                            )
+                                        else:
+                                            mAct16[(pad_row, m_tile * 32 + act16_col)] = (
+                                                cutlass.Uint16(0)
+                                            )
+                if cutlass.const_expr(self.act_v4):
+                    # A row's 16 B chunk came from the 8 lanes with the same lane % 4: lane r % 32 stores row r whole.
+                    cute.arch.sync_warp()
+                    for r in cutlass.range_constexpr((n_mma + 31) // 32):
+                        if r * 32 + lane < n_mma:
+                            srow = row_base + r * 32 + lane
+                            if srow < store_end:
+                                words = _ld_shared_v4(stage16_warp + (r * 32 + lane) * 16)
+                                _st_v4_words(
+                                    mAct.iterator.toint()
+                                    + cutlass.Int64(srow) * INTER
+                                    + m_tile * 64
+                                    + 16 * quad,
+                                    *words,
+                                )
+                    cute.arch.sync_warp()
                 parity = parity ^ 1
                 if cutlass.const_expr(self.signal_done):
                     if (not self.sig_batch) or (info[1] < self.signal_tiles):
@@ -2521,6 +2619,8 @@ def run(
         (flag_signal(), tiles or flag_tiles(), flag_check(), flag_skip_last()) if flags else None,
         signal_batch(),
         tiles,
+        lamport and lamport_check() == "tma",
+        act_store(),
     )
     args = _launch_args(
         x,
@@ -2544,6 +2644,7 @@ def run(
             rearm_prev=key[9],
             flags=flags,
             signal_tiles=tiles,
+            act16=key[13],
         )
         compiled = _compiled[key] = cute.compile(kernel, *args, stream)
     compiled(*args, stream)
@@ -2663,6 +2764,8 @@ def run_routed(
         (flag_signal(), tiles or flag_tiles(), flag_check(), flag_skip_last()) if flags else None,
         signal_batch(),
         tiles,
+        lamport and lamport_check() == "tma",
+        act_store(),
     )
     args = _launch_args(
         x,
@@ -2699,6 +2802,7 @@ def run_routed(
             rearm_prev=rearm_prev is not None,
             flags=flags,
             signal_tiles=tiles,
+            act16=key[-2],
         )
         compiled = _compiled[key] = cute.compile(kernel, *args, stream)
         k3_edges.debug(

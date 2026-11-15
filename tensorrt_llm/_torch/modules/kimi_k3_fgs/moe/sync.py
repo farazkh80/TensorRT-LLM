@@ -293,6 +293,8 @@ FLAG_SIGNAL_ENV = "TLLM_K3_MOE_FC1_FC2_FLAG_SIGNAL"
 FLAG_TILES_ENV = "TLLM_K3_MOE_FC1_FC2_FLAG_TILES"
 COUNT_TILES_ENV = "TLLM_K3_MOE_FC1_FC2_COUNT_TILES"
 FLAG_CHECK_ENV = "TLLM_K3_MOE_FC1_FC2_FLAG_CHECK"
+LAMPORT_CHECK_ENV = "TLLM_K3_MOE_FC1_FC2_LAMPORT_CHECK"
+ACT_STORE_ENV = "TLLM_K3_MOE_FC1_ACT_STORE"
 FLAG_LAST_ENV = "TLLM_K3_MOE_FC1_FC2_FLAG_LAST"
 SIGNAL_BATCH_ENV = "TLLM_K3_MOE_FC1_FC2_SIGNAL"
 # Signalled units FC1's signal warp holds before one fence publishes them (TLLM_K3_MOE_FC1_FC2_SIGNAL=cta).
@@ -339,6 +341,27 @@ def flag_check() -> str:
     value = os.environ.get(FLAG_CHECK_ENV, "poll")
     if value not in ("poll", "tma"):
         raise ValueError(f"{FLAG_CHECK_ENV} must be poll or tma, got {value!r}")
+    return value
+
+
+def lamport_check() -> str:
+    """How FC2 validates the Lamport FC1 -> FC2 slots: "sm" (checker warps test every byte of a landed stage) or "tma"
+    (each act load is a TMA ``report_valid`` load, checked by the TMA unit on element 0 of every 16 B chunk; only a
+    stage that lands invalid is checked and re-copied on the SM). With "tma" FC1 stores whole 16 B chunks and the
+    padding rows of each expert's last token tile."""
+    value = os.environ.get(LAMPORT_CHECK_ENV, "sm")
+    if value not in ("sm", "tma"):
+        raise ValueError(f"{LAMPORT_CHECK_ENV} must be sm or tma, got {value!r}")
+    return value
+
+
+def act_store() -> str:
+    """How FC1 writes a 16 B act chunk for the TMA check: "v4" (one lane, one ``st.global.v4``, from a per-warp
+    shared-memory transpose) or "warp" (the byte stores: 8 lanes x 2 B of one warp instruction, one coalesced segment,
+    which the hardware writes whole but the PTX memory model does not promise)."""
+    value = os.environ.get(ACT_STORE_ENV, "v4")
+    if value not in ("v4", "warp"):
+        raise ValueError(f"{ACT_STORE_ENV} must be v4 or warp, got {value!r}")
     return value
 
 

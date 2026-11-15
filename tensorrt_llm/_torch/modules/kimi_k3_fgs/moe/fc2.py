@@ -46,7 +46,9 @@ Fine-grained sync with the neighbouring stages (int32 counter slabs, zero-armed 
   never writes. Checker warps (7 ..) take the loader's stages in turn once their copies landed, check every 32-bit
   word of the stage for a sentinel byte, re-copy stale 16 B pieces from L2 (scale words from global with relaxed loads)
   until none is left, and only then hand the stage to the MMA. No counters and no grid wait before the loads; with
-  ``rows_used`` CTA 0 stores the plan's padded rows there (the rows a bounded re-arm of the slots covers).
+  ``rows_used`` CTA 0 stores the plan's padded rows there (the rows a bounded re-arm of the slots covers). ``act_tma``:
+  act comes by TMA ``report_valid`` loads (one per token tile and 128-wide K atom), the TMA unit tests element 0 of
+  every 16 B piece, and the checker warp tests the pieces itself only in a stage that landed invalid.
 - ``fc2_done[T]``: after a unit's ``y`` stores, a release add of 1 per token tile of the unit, so tile t is complete at
   28. The epilogue hands each unit to a signal warp (7 or 8) through an mbarrier; that warp issues one gpu-scope fence
   per unit and relaxed adds, keeping the fence off the epilogue. Dependents launch when each CTA starts its last unit,
@@ -86,6 +88,7 @@ from .sync import (
     flag_skip_last,
     flag_tiles,
     flag_words,
+    lamport_check,
     ld_cg_b32,
     ld_cg_v4,
     ld_relaxed_gpu_b32,
@@ -269,6 +272,7 @@ class Fc2Kernel:
         flag_tma: bool = False,
         flag_skip: bool = False,
         flag_backoff: int = FLAG_BACKOFF_NS,
+        act_tma: bool = False,
     ):
         if tile_n not in TILE_NS:
             raise ValueError(f"tile_n must be one of {TILE_NS}, got {tile_n}")
@@ -309,6 +313,10 @@ class Fc2Kernel:
         self.push = push and fused_fin
         self.lamport = lamport
         self.bound = bound and lamport
+        # act_tma (lamport_check() == "tma"): the loader loads act with one TMA report_valid load per (token tile, K
+        # atom) on the stage's v1 barrier; the checker warp waits for its primary phase and checks the act pieces on
+        # the SM only when the stage landed invalid (a sentinel at element 0 of a 16 B chunk).
+        self.act_tma = act_tma and lamport
         # check=False (TLLM_K3_MOE_FGS_DIAG=oracle): the checker warps hand stages on unchecked (timing only).
         self.check = check
         self.mma_tiler = (TILE_M, self.n_max, K_STAGE)
@@ -441,6 +449,26 @@ class Fc2Kernel:
                     seen = cute.arch.load(word, cutlass.Int32, sem="acquire", scope="gpu")
                     while seen < FC1_UNITS_PER_K_STAGE:
                         seen = cute.arch.load(word, cutlass.Int32, sem="acquire", scope="gpu")
+
+    @cute.jit
+    def _issue_act_stage(
+        self, act_bar, tma_atom_act, tAgAct, tAsAct, first_tile, n_tiles, k_tile, slot_base
+    ):
+        """One TMA report_valid load per (token tile, K atom) of the unit's K stage k_tile onto the stage barrier."""
+        n_katom = K_STAGE // 128
+        # The TMA copy elects its issuing thread itself; only the arrive is ours to elect.
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive_and_expect_tx(act_bar, n_tiles * n_katom * self.tile_n * 128)
+        for kt in cutlass.range_constexpr(n_katom):
+            for jt in cutlass.range_constexpr(self.group):
+                if jt < n_tiles:
+                    cute.copy(
+                        tma_atom_act,
+                        tAgAct[(None, k_tile * n_katom + kt, first_tile + jt)],
+                        tAsAct[(None, slot_base + kt * self.group + jt)],
+                        tma_bar_ptr=act_bar,
+                        report_valid=cpasync.SentinelPattern.PER_16BYTES_80,
+                    )
 
     @cute.jit
     def _issue_flag_stage(
@@ -584,9 +612,15 @@ class Fc2Kernel:
         act_sf_base,
         landed_pipeline,
         load_pipeline,
+        act_bar_base,
+        sActPhase,
+        tma_atom_act,
+        tAgAct,
+        tAsAct,
     ):
         """Checker warp ``cw`` of the Lamport build checks the CTA's stages cw, cw + CHECK_WARPS, ...; each lane covers
-        the pieces and scale words its loader lane copied."""
+        the pieces and scale words its loader lane copied (act_tma: the TMA unit checked the act pieces, so the warp
+        checks them only in a stage that landed invalid; it always checks the scale words)."""
         tile_n, n_max = self.tile_n, self.n_max
         lane = tidx % 32
         chunk = lane % 8
@@ -610,6 +644,14 @@ class Fc2Kernel:
             for k_tile in cutlass.range(K_TILES, unroll=1):
                 if stage % CHECK_WARPS == cw:
                     landed_pipeline.consumer_wait(landed_state)
+                    if cutlass.const_expr(self.act_tma):
+                        # The TMA unit checked element 0 of every 16 B piece; invalid means FC2 ran ahead of FC1 on
+                        # this stage, and the warp then finds and re-copies the stale pieces itself (below).
+                        phase = sActPhase[landed_state.index]
+                        invalid = self._flag_stage_invalid(act_bar_base + landed_state.index, phase)
+                        cute.arch.sync_warp()
+                        if lane == 0:
+                            sActPhase[landed_state.index] = phase ^ 1
                     sB_stage = sB_base + landed_state.index * self.b_bytes_per_stage
                     sSFB_stage = sSFB_base + landed_state.index * (n_katom * self.sf_atom_bytes)
                     for kt in cutlass.range_constexpr(n_katom if self.check else 0):
@@ -619,24 +661,45 @@ class Fc2Kernel:
                         # test, so they overlap.
                         s_atom = sB_stage + kt * n_max * 128
                         s_sf = sSFB_stage + kt * self.sf_atom_bytes + lane * 16
-                        words = [
-                            _ld_shared_v4(s_atom + rows[p] * 128 + piece[p]) for p in range(n_pass)
-                        ]
                         sf_words = [_ld_shared_b32(s_sf + q * 4) for q in range(n_sf)]
                         stale = cutlass.Int32(0)
-                        for p in cutlass.range_constexpr(n_pass):
-                            w = words[p]
-                            bad = _has_byte(w[0], _ACT_SENTINEL) | _has_byte(w[1], _ACT_SENTINEL)
-                            bad = (
-                                bad
-                                | _has_byte(w[2], _ACT_SENTINEL)
-                                | _has_byte(w[3], _ACT_SENTINEL)
-                            )
-                            stale = stale | cutlass.select_(
-                                (bad != 0) & (rows[p] < valid_rows),
-                                cutlass.Int32(1 << p),
-                                cutlass.Int32(0),
-                            )
+                        if cutlass.const_expr(self.act_tma):
+                            if invalid != 0:
+                                for p in cutlass.range_constexpr(n_pass):
+                                    wv = _ld_shared_v4(s_atom + rows[p] * 128 + piece[p])
+                                    badv = _has_byte(wv[0], _ACT_SENTINEL) | _has_byte(
+                                        wv[1], _ACT_SENTINEL
+                                    )
+                                    badv = (
+                                        badv
+                                        | _has_byte(wv[2], _ACT_SENTINEL)
+                                        | _has_byte(wv[3], _ACT_SENTINEL)
+                                    )
+                                    stale = stale | cutlass.select_(
+                                        (badv != 0) & (rows[p] < valid_rows),
+                                        cutlass.Int32(1 << p),
+                                        cutlass.Int32(0),
+                                    )
+                        else:
+                            words = [
+                                _ld_shared_v4(s_atom + rows[p] * 128 + piece[p])
+                                for p in range(n_pass)
+                            ]
+                            for p in cutlass.range_constexpr(n_pass):
+                                w = words[p]
+                                bad = _has_byte(w[0], _ACT_SENTINEL) | _has_byte(
+                                    w[1], _ACT_SENTINEL
+                                )
+                                bad = (
+                                    bad
+                                    | _has_byte(w[2], _ACT_SENTINEL)
+                                    | _has_byte(w[3], _ACT_SENTINEL)
+                                )
+                                stale = stale | cutlass.select_(
+                                    (bad != 0) & (rows[p] < valid_rows),
+                                    cutlass.Int32(1 << p),
+                                    cutlass.Int32(0),
+                                )
                         sf_stale = cutlass.Int32(0)
                         for q in cutlass.range_constexpr(n_sf):
                             sf_stale = sf_stale | cutlass.select_(
@@ -661,13 +724,13 @@ class Fc2Kernel:
                                 still = cutlass.Int32(0)
                                 for p in cutlass.range_constexpr(n_pass):
                                     if (stale & cutlass.Int32(1 << p)) != 0:
-                                        w = _ld_shared_v4(s_atom + rows[p] * 128 + piece[p])
-                                        bad = _has_byte(w[0], _ACT_SENTINEL) | _has_byte(
-                                            w[1], _ACT_SENTINEL
+                                        wr = _ld_shared_v4(s_atom + rows[p] * 128 + piece[p])
+                                        bd = _has_byte(wr[0], _ACT_SENTINEL) | _has_byte(
+                                            wr[1], _ACT_SENTINEL
                                         )
-                                        bad = bad | _has_byte(w[2], _ACT_SENTINEL)
-                                        bad = bad | _has_byte(w[3], _ACT_SENTINEL)
-                                        if bad != 0:
+                                        bd = bd | _has_byte(wr[2], _ACT_SENTINEL)
+                                        bd = bd | _has_byte(wr[3], _ACT_SENTINEL)
+                                        if bd != 0:
                                             still = still | cutlass.Int32(1 << p)
                                 stale = still
                                 if stale != 0:
@@ -798,6 +861,19 @@ class Fc2Kernel:
                 cute.make_layout((stage_flags, 1)),
                 (stage_flags, 1),
             )
+        tma_atom_act = tma_tensor_act = None
+        if cutlass.const_expr(self.act_tma):
+            # One K atom (128 B) of a token tile, 128 B swizzle: the layout the cp.async loader writes.
+            tma_atom_act, tma_tensor_act = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(),
+                cute.make_tensor(act_ptr, cute.make_layout((INTER, num_rows), stride=(1, INTER))),
+                cute.make_composed_layout(
+                    cute.make_swizzle(3, 4, 3),
+                    0,
+                    cute.make_layout((128, self.tile_n), stride=(1, 128)),
+                ),
+                (128, self.tile_n),
+            )
         rows_used = None
         if cutlass.const_expr(self.bound):
             rows_used = cute.make_tensor(rows_used_ptr, cute.make_layout((1,)))
@@ -891,6 +967,8 @@ class Fc2Kernel:
             landed_mbar: cute.struct.MemRange[
                 cutlass.Int64, self.num_ab_stage * 2 if self.lamport else 1
             ]
+            act_mbar: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage if self.act_tma else 1]
+            act_phase: cute.struct.MemRange[cutlass.Int32, self.num_ab_stage if self.act_tma else 1]
             signal_mbar: cute.struct.MemRange[
                 cutlass.Int64, SIGNAL_STAGES * 2 if self.has_signal_warp else 1
             ]
@@ -933,6 +1011,8 @@ class Fc2Kernel:
             fc1_done,
             tma_atom_flag,
             tma_tensor_flag,
+            tma_atom_act,
+            tma_tensor_act,
             rows_used,
             fc2_done,
             plan_pub,
@@ -1009,6 +1089,8 @@ class Fc2Kernel:
         fc1_done: Optional[cute.Tensor],
         tma_atom_flag: Optional[cute.CopyAtom],
         mFlag: Optional[cute.Tensor],
+        tma_atom_act: Optional[cute.CopyAtom],
+        mActT: Optional[cute.Tensor],
         rows_used: Optional[cute.Tensor],
         fc2_done: Optional[cute.Tensor],
         plan_pub: Optional[cute.Tensor],
@@ -1041,6 +1123,32 @@ class Fc2Kernel:
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
+        sActPhase = tAsAct = tAgAct = None
+        if cutlass.const_expr(self.act_tma):
+            sActPhase = storage.act_phase.get_tensor(cute.make_layout((self.num_ab_stage,)))
+            if tidx == 0:
+                for st in cutlass.range_constexpr(self.num_ab_stage):
+                    cute.arch.mbarrier_v1_init(storage.act_mbar.data_ptr() + st, 1)
+                    sActPhase[st] = cutlass.Int32(0)
+                cute.arch.mbarrier_init_fence()
+            # Slot (stage, K atom kt, tile j of the group) of sB: (128 B x tile_n rows) at
+            # ((stage * n_katom + kt) * group + j) * tile_n * 128, the layout the cp.async loader writes.
+            n_act_slots = self.num_ab_stage * (K_STAGE // 128) * self.group
+            sActT = cute.make_tensor(
+                storage.sB.data_ptr(),
+                cute.make_composed_layout(
+                    cute.make_swizzle(3, 4, 3),
+                    0,
+                    cute.make_layout((128, tile_n, n_act_slots), stride=(1, 128, tile_n * 128)),
+                ),
+            )
+            tAsAct, tAgAct = cpasync.tma_partition(
+                tma_atom_act,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sActT, 0, 2),
+                cute.group_modes(cute.local_tile(mActT, (128, tile_n), (None, None)), 0, 2),
+            )
 
         ab_pipeline = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.ab_mbar.data_ptr(),
@@ -1164,6 +1272,8 @@ class Fc2Kernel:
         if cutlass.const_expr(self.use_pdl and not (self.wait_fc1 or self.lamport)):
             cute.arch.griddepcontrol_wait()
         if warp_idx == self.load_warp_id:
+            if cutlass.const_expr(self.act_tma):
+                cpasync.prefetch_descriptor(tma_atom_act)
             # A plan written by FC1 itself (routed FC1) is complete once every FC1 CTA has added to plan_pub.
             if cutlass.const_expr(self.wait_plan):
                 wait_at_least_short(plan_pub.iterator.toint(), plan_pub_expected)
@@ -1328,7 +1438,7 @@ class Fc2Kernel:
                     sSFB_stage = sSFB.iterator + load_state.index * (n_katom * self.sf_atom_bytes)
                     for kt in cutlass.range_constexpr(n_katom):
                         k0 = k_tile * K_STAGE + kt * 128
-                        for p in cutlass.range_constexpr(n_pass):
+                        for p in cutlass.range_constexpr(0 if self.act_tma else n_pass):
                             if p * 4 < group_rows:
                                 row = p * 4 + row_in_pass
                                 src = cute.make_tensor(
@@ -1361,6 +1471,17 @@ class Fc2Kernel:
                             )
                             pred[0] = sf_ok[q]
                             cute.copy_atom_call(sf_copy, sf_g, sf_s, pred=pred)
+                    if cutlass.const_expr(self.act_tma):
+                        self._issue_act_stage(
+                            storage.act_mbar.data_ptr() + load_state.index,
+                            tma_atom_act,
+                            tAgAct,
+                            tAsAct,
+                            entry & 0xFFFF,
+                            (valid_rows + tile_n - 1) // tile_n,
+                            k_tile,
+                            load_state.index * n_katom * self.group,
+                        )
                     if cutlass.const_expr(self.lamport):
                         landed_pipeline.producer_commit(load_state)
                     else:
@@ -1424,6 +1545,11 @@ class Fc2Kernel:
                     act_sf.iterator.toint(),
                     landed_pipeline,
                     load_pipeline,
+                    storage.act_mbar.data_ptr(),
+                    sActPhase,
+                    tma_atom_act,
+                    tAgAct,
+                    tAsAct,
                 )
 
         if cutlass.const_expr(self.signal_fc2):
@@ -1725,6 +1851,7 @@ def _compiled(
     flag_tma: bool = False,
     flag_skip: bool = False,
     flag_backoff: int = FLAG_BACKOFF_NS,
+    act_tma: bool = False,
 ):
     kernel = Fc2Kernel(
         tile_n,
@@ -1749,6 +1876,7 @@ def _compiled(
         flag_tma,
         flag_skip,
         flag_backoff,
+        act_tma,
     )
     fake = cute.AddressSpace.gmem
     args = (
@@ -1900,6 +2028,7 @@ def run(
         flags and flag_check() == "tma",
         flags and flag_skip_last(),
         _env_int("FLAG_BACKOFF", FLAG_BACKOFF_NS),
+        lamport and lamport_check() == "tma",
     )
     compiled(
         _ptr(cutlass.Float4E2M1FN, w2, 32),
