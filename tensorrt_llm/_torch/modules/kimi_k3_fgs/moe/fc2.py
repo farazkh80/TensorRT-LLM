@@ -48,7 +48,8 @@ Fine-grained sync with the neighbouring stages (int32 counter slabs, zero-armed 
   until none is left, and only then hand the stage to the MMA. No counters and no grid wait before the loads; with
   ``rows_used`` CTA 0 stores the plan's padded rows there (the rows a bounded re-arm of the slots covers). ``act_tma``:
   act comes by TMA ``report_valid`` loads (one per token tile and 128-wide K atom), the TMA unit tests element 0 of
-  every 16 B piece, and the checker warp tests the pieces itself only in a stage that landed invalid.
+  every 16 B piece, and the checker warp tests only the scale words; a stage that landed invalid or with a stale
+  scale word waits for the FC1 grid and is copied again from L2.
 - ``fc2_done[T]``: after a unit's ``y`` stores, a release add of 1 per token tile of the unit, so tile t is complete at
   28. The epilogue hands each unit to a signal warp (7 or 8) through an mbarrier; that warp issues one gpu-scope fence
   per unit and relaxed adds, keeping the fence off the epilogue. Dependents launch when each CTA starts its last unit,
@@ -205,6 +206,20 @@ def _st_shared_b32(addr, v, *, loc=None, ip=None):
         "r,r,~{memory}",
         loc,
         ip,
+    )
+
+
+@dsl_user_op
+def _ld_global_cg_b32(addr, *, loc=None, ip=None):
+    return cutlass.Int32(
+        _asm(
+            T.i32(),
+            [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)],
+            "ld.global.cg.b32 $0, [$1];",
+            "=r,l,~{memory}",
+            loc,
+            ip,
+        )
     )
 
 
@@ -620,7 +635,7 @@ class Fc2Kernel:
     ):
         """Checker warp ``cw`` of the Lamport build checks the CTA's stages cw, cw + CHECK_WARPS, ...; each lane covers
         the pieces and scale words its loader lane copied (act_tma: the TMA unit checked the act pieces, so the warp
-        checks them only in a stage that landed invalid; it always checks the scale words)."""
+        checks only the scale words)."""
         tile_n, n_max = self.tile_n, self.n_max
         lane = tidx % 32
         chunk = lane % 8
@@ -664,22 +679,44 @@ class Fc2Kernel:
                         sf_words = [_ld_shared_b32(s_sf + q * 4) for q in range(n_sf)]
                         stale = cutlass.Int32(0)
                         if cutlass.const_expr(self.act_tma):
-                            if invalid != 0:
-                                for p in cutlass.range_constexpr(n_pass):
-                                    wv = _ld_shared_v4(s_atom + rows[p] * 128 + piece[p])
-                                    badv = _has_byte(wv[0], _ACT_SENTINEL) | _has_byte(
-                                        wv[1], _ACT_SENTINEL
-                                    )
-                                    badv = (
-                                        badv
-                                        | _has_byte(wv[2], _ACT_SENTINEL)
-                                        | _has_byte(wv[3], _ACT_SENTINEL)
-                                    )
-                                    stale = stale | cutlass.select_(
-                                        (badv != 0) & (rows[p] < valid_rows),
-                                        cutlass.Int32(1 << p),
-                                        cutlass.Int32(0),
-                                    )
+                            # A stage that landed invalid or with a stale scale word is rare: after the FC1 grid every
+                            # store is visible, so the warp copies the atom once. Keep this body small: a larger one
+                            # pushed ptxas into a slower MMA issue loop (~0.1 us per stage).
+                            bad = invalid
+                            for q in cutlass.range_constexpr(n_sf):
+                                bad = bad | cutlass.select_(
+                                    (_has_byte(sf_words[q], _SF_SENTINEL) != 0)
+                                    & (q * 32 + lane < n_max)
+                                    & (q * 32 + lane < valid_rows),
+                                    cutlass.Int32(1),
+                                    cutlass.Int32(0),
+                                )
+                            if cute.arch.vote_ballot_sync(bad != 0) != 0:
+                                cute.arch.griddepcontrol_wait()
+                                g_k = act_base + cutlass.Int64(
+                                    k_tile * K_STAGE + kt * 128 + chunk * 16
+                                )
+                                for p in cutlass.range(n_pass, unroll=1):
+                                    r = p * 4 + row_in_pass
+                                    if r < valid_rows:
+                                        _cp_async_cg_16(
+                                            s_atom + r * 128 + ((chunk ^ (r % 8)) << 4),
+                                            g_k + cutlass.Int64(row_base + r) * INTER,
+                                        )
+                                for q in cutlass.range(n_sf, unroll=1):
+                                    if (q * 32 + lane < n_max) & (q * 32 + lane < valid_rows):
+                                        _st_shared_b32(
+                                            s_sf + q * 4,
+                                            _ld_global_cg_b32(
+                                                act_sf_base
+                                                + cutlass.Int64(
+                                                    (row_base + q * 32 + lane) * (INTER // SF_VEC)
+                                                    + k_tile * (K_STAGE // SF_VEC)
+                                                    + kt * 4
+                                                )
+                                            ),
+                                        )
+                                _cp_async_wait_all()
                         else:
                             words = [
                                 _ld_shared_v4(s_atom + rows[p] * 128 + piece[p])
@@ -700,56 +737,58 @@ class Fc2Kernel:
                                     cutlass.Int32(1 << p),
                                     cutlass.Int32(0),
                                 )
-                        sf_stale = cutlass.Int32(0)
-                        for q in cutlass.range_constexpr(n_sf):
-                            sf_stale = sf_stale | cutlass.select_(
-                                (_has_byte(sf_words[q], _SF_SENTINEL) != 0)
-                                & (q * 32 + lane < n_max)
-                                & (q * 32 + lane < valid_rows),
-                                cutlass.Int32(1 << q),
-                                cutlass.Int32(0),
-                            )
-                        if (stale | sf_stale) != 0:
-                            # Re-copy this lane's stale pieces from L2 until none holds a sentinel byte.
-                            g_k = act_base + cutlass.Int64(k_tile * K_STAGE + kt * 128 + chunk * 16)
-                            delay = cutlass.Int32(32)
-                            while stale != 0:
-                                for p in cutlass.range_constexpr(n_pass):
-                                    if (stale & cutlass.Int32(1 << p)) != 0:
-                                        _cp_async_cg_16(
-                                            s_atom + rows[p] * 128 + piece[p],
-                                            g_k + cutlass.Int64(row_base + rows[p]) * INTER,
-                                        )
-                                _cp_async_wait_all()
-                                still = cutlass.Int32(0)
-                                for p in cutlass.range_constexpr(n_pass):
-                                    if (stale & cutlass.Int32(1 << p)) != 0:
-                                        wr = _ld_shared_v4(s_atom + rows[p] * 128 + piece[p])
-                                        bd = _has_byte(wr[0], _ACT_SENTINEL) | _has_byte(
-                                            wr[1], _ACT_SENTINEL
-                                        )
-                                        bd = bd | _has_byte(wr[2], _ACT_SENTINEL)
-                                        bd = bd | _has_byte(wr[3], _ACT_SENTINEL)
-                                        if bd != 0:
-                                            still = still | cutlass.Int32(1 << p)
-                                stale = still
-                                if stale != 0:
-                                    nanosleep(delay)
-                                    delay = cutlass.min(delay * 2, cutlass.Int32(256))
+                            sf_stale = cutlass.Int32(0)
                             for q in cutlass.range_constexpr(n_sf):
-                                if (sf_stale & cutlass.Int32(1 << q)) != 0:
-                                    g_word = act_sf_base + cutlass.Int64(
-                                        (row_base + q * 32 + lane) * (INTER // SF_VEC)
-                                        + k_tile * (K_STAGE // SF_VEC)
-                                        + kt * 4
-                                    )
-                                    v = ld_relaxed_gpu_b32(g_word)
-                                    sf_delay = cutlass.Int32(32)
-                                    while _has_byte(v, _SF_SENTINEL) != 0:
-                                        nanosleep(sf_delay)
-                                        sf_delay = cutlass.min(sf_delay * 2, cutlass.Int32(256))
+                                sf_stale = sf_stale | cutlass.select_(
+                                    (_has_byte(sf_words[q], _SF_SENTINEL) != 0)
+                                    & (q * 32 + lane < n_max)
+                                    & (q * 32 + lane < valid_rows),
+                                    cutlass.Int32(1 << q),
+                                    cutlass.Int32(0),
+                                )
+                            if (stale | sf_stale) != 0:
+                                # Re-copy this lane's stale pieces from L2 until none holds a sentinel byte.
+                                g_k = act_base + cutlass.Int64(
+                                    k_tile * K_STAGE + kt * 128 + chunk * 16
+                                )
+                                delay = cutlass.Int32(32)
+                                while stale != 0:
+                                    for p in cutlass.range_constexpr(n_pass):
+                                        if (stale & cutlass.Int32(1 << p)) != 0:
+                                            _cp_async_cg_16(
+                                                s_atom + rows[p] * 128 + piece[p],
+                                                g_k + cutlass.Int64(row_base + rows[p]) * INTER,
+                                            )
+                                    _cp_async_wait_all()
+                                    still = cutlass.Int32(0)
+                                    for p in cutlass.range_constexpr(n_pass):
+                                        if (stale & cutlass.Int32(1 << p)) != 0:
+                                            wr = _ld_shared_v4(s_atom + rows[p] * 128 + piece[p])
+                                            bd = _has_byte(wr[0], _ACT_SENTINEL) | _has_byte(
+                                                wr[1], _ACT_SENTINEL
+                                            )
+                                            bd = bd | _has_byte(wr[2], _ACT_SENTINEL)
+                                            bd = bd | _has_byte(wr[3], _ACT_SENTINEL)
+                                            if bd != 0:
+                                                still = still | cutlass.Int32(1 << p)
+                                    stale = still
+                                    if stale != 0:
+                                        nanosleep(delay)
+                                        delay = cutlass.min(delay * 2, cutlass.Int32(256))
+                                for q in cutlass.range_constexpr(n_sf):
+                                    if (sf_stale & cutlass.Int32(1 << q)) != 0:
+                                        g_word = act_sf_base + cutlass.Int64(
+                                            (row_base + q * 32 + lane) * (INTER // SF_VEC)
+                                            + k_tile * (K_STAGE // SF_VEC)
+                                            + kt * 4
+                                        )
                                         v = ld_relaxed_gpu_b32(g_word)
-                                    _st_shared_b32(s_sf + q * 4, v)
+                                        sf_delay = cutlass.Int32(32)
+                                        while _has_byte(v, _SF_SENTINEL) != 0:
+                                            nanosleep(sf_delay)
+                                            sf_delay = cutlass.min(sf_delay * 2, cutlass.Int32(256))
+                                            v = ld_relaxed_gpu_b32(g_word)
+                                        _st_shared_b32(s_sf + q * 4, v)
                     load_pipeline.producer_commit(full_state)
                 landed_state.advance()
                 full_state.advance()
