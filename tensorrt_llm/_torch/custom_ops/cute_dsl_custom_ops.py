@@ -10605,7 +10605,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # C is passed as [M, N, B]; from_dlpack captures the real strides so
             # non-contiguous views are written by TMA without a copy.
             c_tmp = c_tensor.permute(1, 2, 0)
-            c_layout_key = tuple(c_tmp.stride())
+            # C's strides are dynamic in the compiled kernel; key on the
+            # zero / unit-stride modes and 16-B alignment only, so a new M of a
+            # contiguous [B, M, N] output (batch stride M * N) does not recompile.
+            c_layout_key = tuple(0 if s == 0 else min(s & -s, 8)
+                                 for s in c_tmp.stride())
 
             # A/B strides let the kernel consume non-contiguous views (e.g.
             # [M,B,K].transpose(0,1), broadcast batch via expand, or sliced
