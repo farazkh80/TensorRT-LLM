@@ -1553,12 +1553,6 @@ def fused_prefill_conv(
         or any(not t.is_contiguous() for t in (starts, slots, has_init))
     ):
         raise ValueError("Prepare contiguous int32 starts/slots and bool initial-state flags")
-    # The scalar fallback uses CuTe layout arithmetic with int32 extents.
-    # Reject overflowing layouts before launch rather than wrap an address.
-    if any(
-        sum((n - 1) * stride for n, stride in zip(t.shape, t.stride())) >= 2**31 for t in tensors
-    ):
-        raise ValueError("KDA convolution tensor offsets must fit int32")
     writable = (conv_state, q, k, v)
     for i, output in enumerate(writable):
         for other in (src, weight, starts, slots, has_init, *writable[:i]):
@@ -1585,6 +1579,15 @@ def fused_prefill_conv(
     # a 16-byte-aligned base and a slot stride divisible by 8 elements.
     ss = conv_state.stride()
     st_vec = ss[1] == 3 and ss[2] == 1 and ss[0] % 8 == 0 and _align(conv_state) == 0
+    # The vector paths address with 64-bit pointer arithmetic; the scalar fallbacks index CuTe tensors whose
+    # layouts have int32 extents, so only a tensor read through a scalar path is bounded.
+    scalar = [t for t, vec in ((src, src_vec), (conv_state, st_vec), (weight, w_vec)) if not vec]
+    if not out_vec:
+        scalar += [q, k, v]
+    if any(
+        sum((n - 1) * stride for n, stride in zip(t.shape, t.stride())) >= 2**31 for t in scalar
+    ):
+        raise ValueError("KDA convolution tensor offsets must fit int32 on the scalar path")
     if (fgs_consumer or fgs_producer) and not (src_vec and out_vec):
         raise ValueError("KDA convolution FGS modes need 16-byte aligned source rows and outputs")
     with_stats = fgs_consumer and fgs_stats is not None
