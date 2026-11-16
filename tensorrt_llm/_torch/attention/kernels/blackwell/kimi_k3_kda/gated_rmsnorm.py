@@ -127,6 +127,38 @@ def _nanosleep(ns, *, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def _pack_bf16x2_pzo(lo, hi, *, loc=None, ip=None):
+    """Two f32 to one packed bf16x2 word, round to nearest, -0.0 stored as +0.0 (sm_107 ``cvt.rn.pzo``)."""
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [F32(hi).ir_value(loc=loc, ip=ip), F32(lo).ir_value(loc=loc, ip=ip)],
+            "cvt.rn.pzo.bf16x2.f32 $0, $1, $2;",
+            "=r,f,f",
+            has_side_effects=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _st_global_v4(addr, w0, w1, w2, w3, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)]
+        + [cutlass.Int32(w).ir_value(loc=loc, ip=ip) for w in (w0, w1, w2, w3)],
+        "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r,~{memory}",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
 class GatedRmsNorm:
     def __init__(
         self,
@@ -142,18 +174,20 @@ class GatedRmsNorm:
         weak_first_load: bool = False,
         with_timeline: bool = False,
         l1_first_load: bool = False,
+        fgs_producer: bool = False,
     ):
         self.heads = heads
         self.rows_per_thread = rows_per_thread
         self.warps = warps
         self.use_pdl = use_pdl
         self.rows_per_cta = warps * ROWS_PER_WARP_STEP * rows_per_thread
-        assert not fgs_consumer or use_pdl
-        assert fgs_consumer or not (
-            with_stats or persistent_ctas or weak_first_load or l1_first_load
-        )
+        assert not (fgs_consumer or fgs_producer) or use_pdl
+        assert fgs_consumer or not (with_stats or weak_first_load or l1_first_load)
         assert not (weak_first_load and l1_first_load)
         self.fgs_consumer = fgs_consumer
+        # fgs_producer: dependents are released at entry and every 16 B of ``out`` is one store that never holds
+        # -0.0, so a report_valid consumer can read ``out`` while this grid runs.
+        self.fgs_producer = fgs_producer
         self.max_spins = max_spins
         self.with_stats = with_stats
         # persistent_ctas > 0: at most that many CTAs, each walking row blocks in order (the
@@ -227,6 +261,8 @@ class GatedRmsNorm:
 
         if cutlass.const_expr(self.use_pdl and not self.fgs_consumer):
             cute.arch.griddepcontrol_wait()
+        if cutlass.const_expr(self.use_pdl and self.fgs_producer):
+            cute.arch.griddepcontrol_launch_dependents()
         if cutlass.const_expr(self.with_timeline):
             if tidx == 0:
                 cute.arch.atomic_min(timeline.iterator, _globaltimer())
@@ -255,7 +291,7 @@ class GatedRmsNorm:
             cute.arch.barrier()
             if tidx == 0:
                 cute.arch.atomic_max(timeline.iterator + 1, _globaltimer())
-        if cutlass.const_expr(self.use_pdl):
+        if cutlass.const_expr(self.use_pdl and not self.fgs_producer):
             cute.arch.griddepcontrol_launch_dependents()
 
     @cute.jit
@@ -347,6 +383,7 @@ class GatedRmsNorm:
             sum_sq = cute.arch.warp_reduction_sum(sum_sq, threads_in_group=LANES_PER_ROW)
             rstd = cute.math.rsqrt(sum_sq * (1.0 / HEAD_DIM) + eps)
             y_reg = cute.make_rmem_tensor((VEC,), BF16)
+            ys = []
             for c in cutlass.range_constexpr(VEC):
                 gate = cute.math.rcp(
                     cute.math.exp(-z_regs[i][c].to(F32), fastmath=True) + 1.0,
@@ -354,9 +391,15 @@ class GatedRmsNorm:
                     ftz=True,
                 )
                 y = x_regs[i][c].to(F32) * rstd * w_reg[c].to(F32) * gate
+                ys.append(y)
                 y_reg[c] = y.to(BF16)
             if r < rows:
-                cute.copy(copy_x, y_reg, cute.local_tile(out[r, None], (VEC,), (col // VEC,)))
+                out_chunk = cute.local_tile(out[r, None], (VEC,), (col // VEC,))
+                if cutlass.const_expr(self.fgs_producer):
+                    words = [_pack_bf16x2_pzo(ys[2 * w], ys[2 * w + 1]) for w in range(4)]
+                    _st_global_v4(out_chunk.iterator.toint(), *words)
+                else:
+                    cute.copy(copy_x, y_reg, out_chunk)
         return spins, waited
 
 
@@ -378,6 +421,7 @@ def _compile(
     weak_first_load: bool = False,
     with_timeline: bool = False,
     l1_first_load: bool = False,
+    fgs_producer: bool = False,
 ):
     rows, tokens = cute.sym_int(), cute.sym_int()
     x = make_fake_tensor(
@@ -415,6 +459,7 @@ def _compile(
         weak_first_load,
         with_timeline,
         l1_first_load,
+        fgs_producer,
     )
     return cute.compile(
         op,
@@ -490,6 +535,7 @@ def kda_gated_rmsnorm(
     fgs_stats: torch.Tensor | None = None,
     fgs_ctas: int | None = None,
     fgs_timeline: torch.Tensor | None = None,
+    fgs_producer: bool = False,
 ) -> torch.Tensor:
     """Sigmoid-gated RMSNorm of ``x [T*H, 128]`` with ``z [T, H, 128]``; returns ``[T*H, 128]``.
 
@@ -524,6 +570,8 @@ def kda_gated_rmsnorm(
         if out.data_ptr() == x.data_ptr():
             raise ValueError("kda_gated_rmsnorm: fgs_consumer needs out separate from x")
         use_pdl = True
+    if fgs_producer:
+        use_pdl = True
     with_stats = fgs_consumer and fgs_stats is not None
     if with_stats and (fgs_stats.dtype != torch.int32 or fgs_stats.numel() < 2):
         raise ValueError("kda_gated_rmsnorm: fgs_stats must be an int32 tensor of 2 elements")
@@ -539,10 +587,12 @@ def kda_gated_rmsnorm(
         fgs_consumer,
         fgs_max_spins if fgs_consumer else 0,
         with_stats,
-        (fgs_ctas or 0) if fgs_consumer else 0,
+        fgs_ctas or 0,
         None,
         False,
         with_timeline,
+        False,
+        fgs_producer,
     )
     fn(x, z, weight, out, eps, fgs_stats if with_stats else None, fgs_timeline)
     return out

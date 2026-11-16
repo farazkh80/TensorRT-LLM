@@ -101,6 +101,8 @@ import cutlass.experimental.cuda as cuda
 import cutlass.experimental.primitives as prims
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 
 LOG2_E: float = 1.4426950408889634
@@ -3162,6 +3164,42 @@ def pack_output_b16x2_to_i32(
         )
         .to(output_dtype)
         .bitcast(cutlass.Int32)[0]
+    )
+
+
+@dsl_user_op
+def pack_output_bf16x2_pzo_to_i32(value0, value1, *, loc=None, ip=None):
+    """FGS producer: round two FP32 outputs to packed BF16 with -0.0 -> +0.0 (sm_107)."""
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                cutlass.Float32(value1).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(value0).ir_value(loc=loc, ip=ip),
+            ],
+            "cvt.rn.pzo.bf16x2.f32 $0, $1, $2;",
+            "=r,f,f",
+            has_side_effects=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def store_global_v4_b32(addr, w0, w1, w2, w3, *, loc=None, ip=None):
+    """FGS producer: one 16-byte global store."""
+    llvm.inline_asm(
+        None,
+        [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)]
+        + [cutlass.Int32(w).ir_value(loc=loc, ip=ip) for w in (w0, w1, w2, w3)],
+        "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r,~{memory}",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -8375,6 +8413,7 @@ def tcgen05_chain_load_qstate_output_tmem(
     qstate_acc_stage,
     scale: cutlass.Float32,
     output_dtype: cutlass.Constexpr,
+    pzo: cutlass.Constexpr = False,
 ) -> None:
     """M=64 variant of tcgen05_load_qstate_output_tmem (16 rows per warp)."""
 
@@ -8407,11 +8446,14 @@ def tcgen05_chain_load_qstate_output_tmem(
             (loaded0[2 * reg_idx], loaded0[2 * reg_idx + 1]),
             (scale, scale),
         )
-        stsm_regs0[reg_idx] = pack_output_b16x2_to_i32(
-            scaled0_0,
-            scaled0_1,
-            output_dtype,
-        )
+        if cutlass.const_expr(pzo):
+            stsm_regs0[reg_idx] = pack_output_bf16x2_pzo_to_i32(scaled0_0, scaled0_1)
+        else:
+            stsm_regs0[reg_idx] = pack_output_b16x2_to_i32(
+                scaled0_0,
+                scaled0_1,
+                output_dtype,
+            )
 
     smem_dst0 = o_smem_stmatrix_128b_ptr(
         o_smem,
@@ -8531,27 +8573,50 @@ def epilogue_chain_tail_store(
     seqlen,
     o_stage_base,
     lane,
+    vec16: cutlass.Constexpr = False,
 ) -> None:
     """Store a partial packed-sequence half-tail without crossing its boundary."""
 
     valid_tokens = seqlen - chunk_start
     value_base = dv_half * cutlass.Int32(DV_HALF)
-    for elem_iter in cutlass.range_constexpr((BT * DV_HALF) // THREADS_PER_WARP):
-        linear_idx = elem_iter * THREADS_PER_WARP + lane
-        token_coord = linear_idx // DV_HALF
-        value_dim = linear_idx - token_coord * DV_HALF
-        if token_coord < valid_tokens:
-            smem_idx = o_smem_swizzle_128b_elem_index(
-                o_stage_base,
-                value_dim,
-                token_coord,
-            )
-            out[
-                0,
-                sequence_start + chunk_start + token_coord,
-                head_idx,
-                value_base + value_dim,
-            ] = o_smem[smem_idx]
+    if cutlass.const_expr(vec16):
+        # FGS producer: each 16-byte output chunk (8 value dims) goes out in one store.
+        for chunk_iter in cutlass.range_constexpr((BT * DV_HALF) // (8 * THREADS_PER_WARP)):
+            chunk_idx = chunk_iter * THREADS_PER_WARP + lane
+            token_coord = chunk_idx // (DV_HALF // 8)
+            value_dim = (chunk_idx - token_coord * (DV_HALF // 8)) * 8
+            if token_coord < valid_tokens:
+                smem_idx = o_smem_swizzle_128b_elem_index(o_stage_base, value_dim, token_coord)
+                words = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
+                for w in cutlass.range_constexpr(4):
+                    words[w] = cutlass.Vector.from_elements(
+                        (o_smem[smem_idx + 2 * w], o_smem[smem_idx + 2 * w + 1]),
+                        out.element_type,
+                    ).bitcast(cutlass.Int32)[0]
+                offset = cute.crd2idx(
+                    (0, sequence_start + chunk_start + token_coord, head_idx, value_base + value_dim),
+                    out.layout,
+                )
+                store_global_v4_b32(
+                    (out.iterator + offset).toint(), words[0], words[1], words[2], words[3]
+                )
+    else:
+        for elem_iter in cutlass.range_constexpr((BT * DV_HALF) // THREADS_PER_WARP):
+            linear_idx = elem_iter * THREADS_PER_WARP + lane
+            token_coord = linear_idx // DV_HALF
+            value_dim = linear_idx - token_coord * DV_HALF
+            if token_coord < valid_tokens:
+                smem_idx = o_smem_swizzle_128b_elem_index(
+                    o_stage_base,
+                    value_dim,
+                    token_coord,
+                )
+                out[
+                    0,
+                    sequence_start + chunk_start + token_coord,
+                    head_idx,
+                    value_base + value_dim,
+                ] = o_smem[smem_idx]
     prims.bar_warp_sync(cute.arch.FULL_MASK)
 
 
@@ -8602,6 +8667,7 @@ def epilogue_chain_wait_and_store_final_output(
     output_chunk,
     lane,
     O_STAGES: cutlass.Constexpr,
+    vec16: cutlass.Constexpr = False,
 ):
     """Drain the final half-output chunk, guarding a partial packed tail."""
 
@@ -8635,6 +8701,7 @@ def epilogue_chain_wait_and_store_final_output(
             seqlen,
             o_stage_base,
             lane,
+            vec16,
         )
         output_consumed_arrive(output_consumed_mbar.subview(o_stage))
 
@@ -8661,6 +8728,7 @@ def kernel_chain_dv2(
     cu_ckpts: cute.Tensor | None,
     checkpoint_state_indices: cute.Tensor | None,
     checkpoint_stride_chunks: cutlass.Int32,
+    FGS_PRODUCER: cutlass.Constexpr = False,
 ) -> None:
     """kernel 2, DV-split: each CTA owns half the hidden dimension.
 
@@ -8671,6 +8739,9 @@ def kernel_chain_dv2(
     DV-split (one 64-elem s128 TMA segment at value offset half*64).
     """
 
+    if cutlass.const_expr(FGS_PRODUCER):
+        # The o consumer checks each 16-byte chunk instead of waiting for this grid.
+        cute.arch.griddepcontrol_launch_dependents()
     tidx, _, _ = cute.arch.thread_idx()
     bidx, bidy, _ = cute.arch.block_idx()
     dv_half = bidy % 2
@@ -9062,6 +9133,7 @@ def kernel_chain_dv2(
                 num_chunks - cutlass.Int32(1),
                 lane,
                 K2_QSTATE_STAGE_COUNT,
+                FGS_PRODUCER,
             )
 
     # ================= CG1 (warps 8-11): TMEM epilogues ====================
@@ -9324,6 +9396,7 @@ def kernel_chain_dv2(
                     o_stage,
                     SCALE,
                     out.element_type,
+                    FGS_PRODUCER,
                 )
                 output_ready_arrive(output_ready_mbar.subview(o_stage))
             final_state_stored_arrive(final_state_stored_mbar)
@@ -9405,6 +9478,7 @@ def host_chain_dv2(
     checkpoint_state_indices: cute.Tensor | None,
     checkpoint_stride_chunks: cutlass.Int32,
     THREADS: cutlass.Constexpr,
+    FGS_PRODUCER: cutlass.Constexpr = False,
 ) -> None:
     """DV2 host: identical tensor maps to the base chain host, doubled grid-y."""
 
@@ -9511,6 +9585,7 @@ def host_chain_dv2(
         cu_ckpts,
         checkpoint_state_indices,
         checkpoint_stride_chunks,
+        FGS_PRODUCER,
     ).launch(
         grid=(num_sequences, launch_heads * 2, 1),
         block=(THREADS, 1, 1),
@@ -9573,6 +9648,7 @@ def host_unified(
     THREADS: cutlass.Constexpr,
     MODE: cutlass.Constexpr,
     gate_dtype: cutlass.Constexpr,
+    FGS_PRODUCER: cutlass.Constexpr = False,
 ) -> None:
     n_seq = cu_seqlens.shape[0] - 1
     heads = q.shape[2]
@@ -9663,6 +9739,7 @@ def host_unified(
             checkpoint_state_indices,
             checkpoint_stride_chunks,
             THREADS,
+            FGS_PRODUCER,
         )
     else:
         # ------------------------------ ENGINE ------------------------------
@@ -10305,8 +10382,13 @@ def compile(  # noqa: A001
     has_state_indices: bool = False,
     has_checkpoint_state_indices: bool = False,
     mode=None,
+    fgs_producer: bool = False,
 ) -> CompiledKDA:
     """Compile KDA; the returned callable is the single host entry.
+
+    ``fgs_producer`` (decomp builds only) makes kernel 2 a fine-grained-sync producer of
+    ``out``: ``griddepcontrol.launch_dependents`` at entry, -0.0 stored as +0.0, and each
+    16-byte chunk written by one store (TMA tiles, 16-byte stores in a partial tail).
 
     The signature matches the reference `kda_chunked_bt16.compile`; the only
     user-visible additions are the decomp `workspace` (a single opaque uint8
@@ -10334,6 +10416,8 @@ def compile(  # noqa: A001
         mode = None
     if mode not in (None, "engine", "decomp"):
         raise ValueError(f"Unknown mode: {mode}")
+    if fgs_producer and (mode != "decomp" or dtype is not cutlass.BFloat16):
+        raise ValueError("fgs_producer needs mode='decomp' and BF16 output")
     gate_scale_log2 = gate_lower_bound * LOG2_E
 
     fakes, fckpt, fcuk, fcheckpoint_state_indices = _unified_fakes(
@@ -10364,6 +10448,7 @@ def compile(  # noqa: A001
         THREADS_PER_CTA,
         mode,  # MODE constexpr (route specialization)
         gate_dtype,  # gate ABI dtype constexpr (32-bit vs 16-bit gate path)
+        fgs_producer,
         options="--enable-tvm-ffi",
     )
     fn = _make_call(

@@ -62,6 +62,7 @@ the values it then reads.
 released at entry, -0.0 is never stored (cvt.rn.pzo; raw copies map 0x8000 to 0), and
 each 16-byte chunk is stored once: a token group is staged in shared memory and stored
 after its SiLU vote, so groups that take the exact recompute are only stored by it.
+``pdl`` (no FGS role) launches as a PDL dependent that waits for the primary grid at entry.
 
 Caller contract (stated by the problem: "Slot -1 bypasses ... Other slots are unique and
 valid"; not checked on device): slots other than -1 are unique after wrapping and lie in
@@ -507,9 +508,11 @@ class KdaConv:
         fgs_producer=False,
         max_spins=0,
         with_stats=False,
+        pdl=False,
     ):
         self.W = warps
         self.MB = FORCE_MB
+        self.pdl = pdl
         self.heads = heads
         self.P = heads * 128
         self.C = 3 * heads * 128
@@ -591,6 +594,8 @@ class KdaConv:
         if cutlass.const_expr(self.fgs_producer):
             # The q/k/v consumer validates its input per 16 B instead of waiting for this grid.
             cute.arch.griddepcontrol_launch_dependents()
+        if cutlass.const_expr(self.pdl and not self.fgs_consumer):
+            cute.arch.griddepcontrol_wait()
         b0, b1, b2 = cute.arch.block_idx()
         _, gdy, gdz = cute.arch.grid_dim()
         smem = cutlass.utils.SmemAllocator()
@@ -1385,7 +1390,7 @@ class KdaConv:
             block=(self.W * 32, 1, 1),
             min_blocks_per_mp=self.MB,
             stream=stream,
-            use_pdl=self.fgs_consumer,
+            use_pdl=self.fgs_consumer or self.pdl,
         )
 
 
@@ -1435,6 +1440,7 @@ def compile_prefill_conv(
     fgs_producer: bool = False,
     max_spins: int = 0,
     with_stats: bool = False,
+    pdl: bool = False,
 ) -> Callable:
     """Compile and cache a convolution layout without retaining caller-owned tensors."""
     with torch.cuda.device(device):
@@ -1474,6 +1480,7 @@ def compile_prefill_conv(
             fgs_producer,
             max_spins,
             with_stats,
+            pdl,
         )
         op.MB = min_blocks_per_mp
         stats = None
@@ -1500,6 +1507,7 @@ def fused_prefill_conv(
     fgs_producer=False,
     fgs_max_spins=1 << 16,
     fgs_stats=None,
+    pdl=False,
 ):
     """Convolve raw packed QKV into contiguous, unnormalized BF16 Q/K/V.
 
@@ -1618,6 +1626,7 @@ def fused_prefill_conv(
         fgs_producer,
         fgs_max_spins if fgs_consumer else 0,
         with_stats,
+        pdl,
     )
     stats = fgs_stats if with_stats else None
     fn(src, weight, conv_state, starts, slots, has_init, q, k, v, grid_y, stats, stream)

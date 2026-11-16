@@ -1,0 +1,410 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""KDA prefill as one PDL chain of fine-grained-sync edges with chain-owned slots and producer re-arm
+(``TLLM_K3_FGS_PREFILL=1``), or the same kernels chained by standard PDL (``TLLM_K3_FGS_PREFILL=pdl``, the FGS-off
+twin). Decode is untouched: the mixer calls :func:`forward` only for a prefill-only batch.
+
+  pre-attention mix -> qkvg GEMM --pk2 p_qkvg--> KdaConv | bfa, f_b GEMMs | BT16 --pk7 p_o--> gated norm
+  --pk8 p_core--> o_proj --pk9 p_attn_o--> pre-MoE mix (consumer only, through ``edges.register_external``)
+
+Slots are bf16 ``[pairs, MAX_ROWS, width]`` buffers per edge, allocated on the first eager prefill and armed with
+-0.0 once; the edge workspaces never touch them. KDA layers take pairs in registration order (ordinal mod 2; an odd
+layer count gives the last layer a third pair, so the next forward's first layer never writes the pair it arms).
+Re-arm is producer side, inside the next layer's GEMMs: layer L+1's qkvg GEMM arms p_qkvg / p_o of layer L, its
+o_proj arms p_core / p_attn_o of layer L (the norm produces p_core but is memory-bound without an idle warp, so
+its slot is armed by the next o_proj instead). Every reader of layer L's slots has completed before the MoE's plain
+launches of layer L, which complete before layer L+1 starts, and the arm warp runs after its grid wait. A layer that
+refuses the chain while a pair is dirty fills it from the host (:func:`rearm_skipped`), so stale data is never read
+as valid.
+
+``TLLM_K3_FGS_PREFILL_EDGES`` (default ``pk2,pk8,pk9``; ``pk7`` needs BT16's decomposition route, i.e. one request
+at 96 heads, and is diagnostic), ``_MIN_ROWS`` / ``_MAX_ROWS`` (1024 / 8256 tokens per rank; the slots are sized to
+``_MAX_ROWS``), ``_RASTER`` (producer GEMM tile order, ``n`` publishes row blocks in order), ``_NORM_CTAS`` (gated
+norm persistent grid, both arms; 0 = one CTA per SM), ``_DELAY_NS`` (producer GEMMs spin at entry; hazard tests),
+``_MAX_SPINS`` (consumer rounds before the grid-wait fallback; small values force the slow path).
+"""
+
+import atexit
+import collections
+import functools
+import os
+from typing import Dict, List, Optional, Tuple
+
+import torch
+
+from ....logger import logger
+from .. import kimi_k3_cute_gemm
+from . import edges
+
+ENV = "TLLM_K3_FGS_PREFILL"
+MIN_ROWS = int(os.environ.get("TLLM_K3_FGS_PREFILL_MIN_ROWS", "1024"))
+MAX_ROWS = int(os.environ.get("TLLM_K3_FGS_PREFILL_MAX_ROWS", "8256"))
+RASTER = os.environ.get("TLLM_K3_FGS_PREFILL_RASTER", "n")
+NORM_CTAS = int(os.environ.get("TLLM_K3_FGS_PREFILL_NORM_CTAS", "0"))
+DELAY_NS = int(os.environ.get("TLLM_K3_FGS_PREFILL_DELAY_NS", "0"))
+MAX_SPINS = int(os.environ.get("TLLM_K3_FGS_PREFILL_MAX_SPINS", str(1 << 16)))
+
+P_QKVG, P_O, P_CORE, P_ATTN_O = "kda.p_qkvg", "kda.p_o", "kda.p_core", "kda.p_attn_o"
+_EDGE_IDS = {"pk2": P_QKVG, "pk7": P_O, "pk8": P_CORE, "pk9": P_ATTN_O}
+NEG0 = -0x8000  # bf16 -0.0 as int16
+
+
+def mode() -> str:
+    value = os.environ.get(ENV, "0").strip().lower() or "0"
+    if value not in ("0", "1", "pdl"):
+        raise ValueError(f"{ENV}={value!r}; valid: 0, 1, pdl")
+    return value
+
+
+def active() -> bool:
+    return mode() != "0"
+
+
+def fgs() -> bool:
+    return mode() == "1"
+
+
+@functools.lru_cache(maxsize=None)
+def edges_on() -> frozenset:
+    value = os.environ.get("TLLM_K3_FGS_PREFILL_EDGES", "pk2,pk8,pk9")
+    ids = frozenset(v.strip().lower() for v in value.split(",") if v.strip())
+    unknown = ids - set(_EDGE_IDS)
+    if unknown:
+        raise ValueError(f"TLLM_K3_FGS_PREFILL_EDGES: unknown {sorted(unknown)}; valid: {', '.join(_EDGE_IDS)}")
+    return frozenset(_EDGE_IDS[i] for i in ids)
+
+
+def on(edge: str) -> bool:
+    return fgs() and edge in edges_on()
+
+
+# KDA layer indices in construction (= forward) order.
+_layers: List[int] = []
+
+
+def register(layer_idx: int) -> None:
+    if layer_idx not in _layers:
+        _layers.append(layer_idx)
+
+
+def _pair(ordinal: int) -> int:
+    count = len(_layers)
+    return 2 if count % 2 and ordinal == count - 1 else ordinal % 2
+
+
+class _Slots:
+    """One device's slot pairs: ``buf[edge][pair, :rows, :]``; ``dirty[edge][pair]`` = rows written by the last
+    use, 0 once re-armed."""
+
+    def __init__(self, device: torch.device, widths: Dict[str, int], pairs: int):
+        self.buf: Dict[str, torch.Tensor] = {}
+        self.dirty: Dict[str, List[int]] = {}
+        for edge, width in widths.items():
+            if edge in edges_on():
+                buf = torch.empty((pairs, MAX_ROWS, width), dtype=torch.bfloat16, device=device)
+                buf.view(torch.int16).fill_(NEG0)
+                self.buf[edge] = buf
+                self.dirty[edge] = [0] * pairs
+        total = sum(b.numel() * 2 for b in self.buf.values())
+        shown = {e: w for e, w in widths.items() if e in self.buf}
+        logger.info(
+            f"{ENV}=1: KDA prefill slots {pairs} pairs x {MAX_ROWS} rows, {shown} -> {total / 2**30:.2f} GiB"
+        )
+
+    def slot(self, edge: str, pair: int, rows: int) -> Optional[torch.Tensor]:
+        buf = self.buf.get(edge)
+        return None if buf is None else buf[pair, :rows]
+
+    def arm_region(self, edge: str, pair: int) -> Optional[torch.Tensor]:
+        """The dirty rows of ``edge``'s ``pair`` as a flat region for a GEMM arm warp (marks them clean)."""
+        rows = self.dirty.get(edge, [0] * 3)[pair] if edge in self.buf else 0
+        if rows == 0:
+            return None
+        self.dirty[edge][pair] = 0
+        return self.buf[edge][pair, :rows]
+
+    def fill_dirty(self) -> None:
+        for edge, buf in self.buf.items():
+            for pair, rows in enumerate(self.dirty[edge]):
+                if rows:
+                    buf[pair, :rows].view(torch.int16).fill_(NEG0)
+                    self.dirty[edge][pair] = 0
+
+
+_slots: Dict[torch.device, _Slots] = {}
+
+
+def _slots_of(device: torch.device, widths: Dict[str, int]) -> _Slots:
+    slots = _slots.get(device)
+    if slots is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(f"{ENV}=1: slots are allocated by an eager prefill, before any capture")
+        slots = _slots[device] = _Slots(device, widths, 2 + len(_layers) % 2)
+    return slots
+
+
+def rearm_skipped(device: torch.device) -> None:
+    """A layer did not run the chain: fill every dirty slot from the host (the next use's GEMM would have)."""
+    slots = _slots.get(device)
+    if slots is not None:
+        slots.fill_dirty()
+
+
+outcomes: collections.Counter = collections.Counter()
+LOG_EVERY = 20
+
+
+def _note(layer_idx: int, refusal: Optional[str]) -> None:
+    if not outcomes:
+        atexit.register(lambda: logger.info(f"{ENV}={mode()} KDA prefill layer-forwards: {dict(outcomes)}"))
+    outcome = mode() if refusal is None else f"off: {refusal}"
+    if outcome not in outcomes:
+        logger.info(f"{ENV}={mode()} KDA prefill chain, first {outcome!r} at KDA layer {layer_idx}")
+    outcomes[outcome] += 1
+    if sum(outcomes.values()) % LOG_EVERY == 0:
+        logger.info(f"{ENV}={mode()} KDA prefill layer-forwards: {dict(outcomes)}")
+
+
+def _kernels():
+    try:
+        from ...attention.kernels.blackwell.kimi_k3_kda import fused_prefill_conv, gated_rmsnorm, kda_chunked_bt16
+    except ImportError:  # release-image layout
+        from ..kimi_kda.cute_kda import fused_prefill_conv, gated_rmsnorm, kda_chunked_bt16
+    return fused_prefill_conv, gated_rmsnorm, kda_chunked_bt16
+
+
+@functools.lru_cache(maxsize=16)
+def _compile_bt16(device: torch.device, lower_bound: float, mode_: Optional[str], producer: bool):
+    import cutlass
+
+    bt16 = _kernels()[2]
+    with torch.cuda.device(device):
+        return bt16.compile(
+            dtype=cutlass.BFloat16,
+            state_dtype=cutlass.Float32,
+            gate_dtype=cutlass.BFloat16,
+            safe_gate=True,
+            gate_lower_bound=lower_bound,
+            has_state_in=True,
+            has_state_out=True,
+            has_state_indices=True,
+            mode=mode_,
+            fgs_producer=producer,
+        )
+
+
+def _refusal(mixer, rows: int, num_prefills: int, ssm_pool, layer_cache) -> Optional[str]:
+    from ..fine_grained_sync import active_stream_manager
+
+    sms = torch.cuda.get_device_properties(ssm_pool.device).multi_processor_count
+    for refused, reason in (
+        (not kimi_k3_cute_gemm.enabled(), "TLLM_K3_CUTE_GEMM off"),
+        (not MIN_ROWS <= rows <= MAX_ROWS, f"{rows} rows outside [{MIN_ROWS}, {MAX_ROWS}]"),
+        (active_stream_manager() is not None, "stream manager active"),
+        (mixer._qkvg_proj_weight is None or mixer._bfa_proj_weight is None, "no merged projection weights"),
+        (not mixer.use_full_rank_gate, "low-rank output gate"),
+        (mixer._o_allreduce is not None, "o_proj TP all-reduce"),
+        (
+            getattr(mixer.o_proj, "weight", None) is None
+            or mixer.o_proj.weight.dtype != torch.bfloat16
+            or mixer.f_b_proj.weight.dtype != torch.bfloat16,
+            "quantized o_proj / f_b_proj",
+        ),
+        (mixer._has_kda_replay_caches(layer_cache), "replay caches"),
+        (not mixer._fuse_prefill_conv or mixer._dispatch.prefill_kernel_path != "optimized", "stock prefill path"),
+        (mixer._packed_conv_weight is None or mixer._A_log_f32 is None, "prefill constants not built"),
+        (ssm_pool.dtype != torch.float32, "BF16 state (Small-BH route)"),
+        (mixer.layer_idx not in _layers, "layer not registered"),
+        (on(P_O) and 2 * num_prefills * mixer.num_heads > sms, "pk7 needs BT16's decomposition route"),
+    ):
+        if refused:
+            return reason
+    return None
+
+
+def forward(
+    mixer,
+    x2d: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    mamba_metadata,
+    num_prefills: int,
+    conv_pool: torch.Tensor,
+    ssm_pool: torch.Tensor,
+    layer_cache,
+) -> Optional[torch.Tensor]:
+    """The prefill core ``[T, H, 128]`` of one KDA layer through the chain (or its PDL twin), or None when the chain
+    does not apply (nothing launched; the caller runs its own path). :func:`o_proj` must follow."""
+    rows = x2d.shape[0]
+    refusal = _refusal(mixer, rows, num_prefills, ssm_pool, layer_cache)
+    _note(mixer.layer_idx, refusal)
+    if refusal is not None:
+        if fgs():
+            rearm_skipped(x2d.device)
+        return None
+    conv_mod, norm_mod, _ = _kernels()
+    d, H, hd = mixer.proj_size, mixer.num_heads, mixer.head_dim
+    T = rows
+    device = x2d.device
+    slot_indices = mamba_metadata.state_indices[:num_prefills]
+    has_init = mamba_metadata.has_initial_states[:num_prefills]
+    starts = mamba_metadata.query_start_loc[: num_prefills + 1]
+    live = fgs()
+    slots = None
+    pair = prev = 0
+    if live:
+        widths = {P_QKVG: 4 * d, P_O: d, P_CORE: d, P_ATTN_O: mixer.hidden_size}
+        slots = _slots_of(device, widths)
+        ordinal = _layers.index(mixer.layer_idx)
+        pair, prev = _pair(ordinal), _pair((ordinal - 1) % len(_layers))
+
+    def arm(*edges_):
+        return tuple(r for r in (slots.arm_region(e, prev) for e in edges_) if r is not None) if live else ()
+
+    from ..kimi_kda.kimi_kda_mixer import _reset_state_rows
+
+    # Ahead of the GEMM, so the conv is the GEMM's direct PDL dependent.
+    _reset_state_rows(ssm_pool, slot_indices, has_init)
+    qkvg_slot = slots.slot(P_QKVG, pair, T) if live else None
+    qkvg = kimi_k3_cute_gemm.linear_fgs(
+        x2d,
+        mixer._qkvg_proj_weight,
+        qkvg_slot if qkvg_slot is not None else x2d.new_empty(T, 4 * d),
+        produce=qkvg_slot is not None,
+        raster_along=RASTER if qkvg_slot is not None else "m",
+        arm=arm(P_QKVG, P_O),
+        start_delay_ns=DELAY_NS if qkvg_slot is not None else 0,
+    )
+    if qkvg_slot is not None:
+        slots.dirty[P_QKVG][pair] = T
+    q, k, v = (x2d.new_empty(1, T, H, hd) for _ in range(3))
+    conv_mod.fused_prefill_conv(
+        qkvg,
+        mixer._packed_conv_weight,
+        conv_pool,
+        starts,
+        slot_indices,
+        has_init,
+        getattr(mamba_metadata, "kda_max_seqlen", T),
+        q,
+        k,
+        v,
+        fgs_consumer=qkvg_slot is not None,
+        fgs_max_spins=MAX_SPINS,
+        pdl=qkvg_slot is None,
+    )
+    bfa = kimi_k3_cute_gemm.linear(x2d, mixer._bfa_proj_weight)
+    g = kimi_k3_cute_gemm.linear(bfa[:, :hd], mixer.f_b_proj.weight)
+    beta = bfa[:, hd : hd + H].unsqueeze(0)
+
+    o_slot = slots.slot(P_O, pair, T) if live else None
+    o = _bt16(
+        mixer, q, k, v, g.view(1, T, H, hd), beta, ssm_pool, slot_indices, cu_seqlens, mamba_metadata,
+        None if o_slot is None else o_slot.view(1, T, H, hd),
+    )  # fmt: skip
+    if o_slot is not None:
+        slots.dirty[P_O][pair] = T
+    mixer._sync_kda_replay_conv_window(layer_cache, slot_indices, conv_pool)
+
+    core_slot = slots.slot(P_CORE, pair, T) if live else None
+    core = norm_mod.kda_gated_rmsnorm(
+        o.view(T * H, hd),
+        qkvg[:, 3 * d :].view(T, H, hd),
+        mixer.o_norm.weight,
+        mixer.o_norm.eps,
+        out=None if core_slot is None else core_slot.view(T * H, hd),
+        use_pdl=True,
+        fgs_consumer=o_slot is not None,
+        fgs_max_spins=MAX_SPINS,
+        fgs_ctas=NORM_CTAS or torch.cuda.get_device_properties(device).multi_processor_count,
+        fgs_producer=core_slot is not None,
+    )
+    if core_slot is not None:
+        slots.dirty[P_CORE][pair] = T
+    mixer._k3_prefill_pending = (pair, prev, T, core_slot is not None)
+    edges.debug(
+        "kda.prefill_chain",
+        T,
+        f"{mode()} pair {pair} edges {sorted(e for e in edges_on() if live)} norm_ctas {NORM_CTAS or 'sms'}",
+    )
+    return core.view(T, H, hd)
+
+
+def _bt16(mixer, q, k, v, g, beta, ssm_pool, slot_indices, cu_seqlens, mamba_metadata, out):
+    """The BT16 chain on raw q / k / v as ``trtllm::kda_prefill`` runs it (FP32 state), into ``out`` when given
+    (a p_o slot: the decomposition kernel's producer build)."""
+    device = q.device
+    n, heads = slot_indices.numel(), q.shape[2]
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    decomp = 2 * n * heads <= sms
+    beta = beta if decomp and beta.stride(1) * 2 % 16 == 0 else beta.contiguous()
+    if beta.data_ptr() % 16:
+        beta = beta.clone(memory_format=torch.contiguous_format)
+    producer = out is not None
+    if producer and not decomp:
+        raise RuntimeError("pk7 needs BT16's decomposition route")
+    compiled = _compile_bt16(device, mixer.gate_lower_bound, "decomp" if producer else None, producer)
+    output = out if out is not None else torch.empty_like(q)
+    nonempty = min(q.shape[1], n)
+    capacity = nonempty + (q.shape[1] - nonempty) // 16
+    size = compiled.workspace_size_from_total_chunks(n, heads, capacity, device)
+    workspace = torch.empty(size, dtype=torch.uint8, device=device) if size else None
+    seq_order = getattr(mamba_metadata, "kda_seq_order", None)
+    cu_chunks = getattr(mamba_metadata, "kda_cu_chunks", None)
+    generate = seq_order is None or cu_chunks is None
+    if generate:
+        seq_order = torch.empty(n, dtype=torch.int32, device=device)
+        cu_chunks = torch.empty(n + 1, dtype=torch.int32, device=device)
+    compiled(
+        q,
+        k,
+        v,
+        g,
+        mixer._A_log_f32,
+        mixer._dt_bias_f32.reshape(heads, 128),
+        beta,
+        cu_seqlens,
+        ssm_pool,
+        output,
+        ssm_pool,
+        workspace,
+        torch.cuda.current_stream(device).cuda_stream,
+        scale=mixer.head_k_dim**-0.5,
+        seq_order=seq_order,
+        planned_cu_chunks=cu_chunks,
+        planned_total_chunks=capacity,
+        generate_planned_metadata=generate,
+        state_indices=slot_indices,
+    )
+    return output
+
+
+def pending(mixer) -> bool:
+    return getattr(mixer, "_k3_prefill_pending", None) is not None
+
+
+def o_proj(mixer, core2d: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """``core2d @ weight^T`` closing the chain :func:`forward` opened: consumes p_core, produces p_attn_o (registered
+    for the pre-MoE mix), arms the previous layer's p_core / p_attn_o."""
+    pair, prev, T, core_in_slot = mixer._k3_prefill_pending
+    mixer._k3_prefill_pending = None
+    if core2d.shape[0] != T:
+        raise RuntimeError(f"KDA prefill chain: o_proj got {core2d.shape[0]} rows for a {T}-row layer")
+    slots = _slots.get(core2d.device) if fgs() else None
+    out_slot = slots.slot(P_ATTN_O, pair, T) if slots is not None else None
+    arm = ()
+    if slots is not None:
+        arm = tuple(r for r in (slots.arm_region(e, prev) for e in (P_CORE, P_ATTN_O)) if r is not None)
+    out = kimi_k3_cute_gemm.linear_fgs(
+        core2d,
+        weight,
+        out_slot if out_slot is not None else core2d.new_empty(T, weight.shape[0]),
+        consume=core_in_slot,
+        produce=out_slot is not None,
+        raster_along=RASTER if out_slot is not None else "m",
+        arm=arm,
+        start_delay_ns=DELAY_NS if out_slot is not None else 0,
+    )
+    if out_slot is not None:
+        slots.dirty[P_ATTN_O][pair] = T
+        edges.register_external(out, P_ATTN_O)
+    return out

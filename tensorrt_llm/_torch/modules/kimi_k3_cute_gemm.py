@@ -381,6 +381,59 @@ def _fgs_rubin(
     )
 
 
+def linear_fgs(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    consume: bool = False,
+    produce: bool = False,
+    raster_along: str = "m",
+    arm: Tuple[torch.Tensor, ...] = (),
+    max_ctas: Optional[int] = None,
+    start_delay_ns: int = 0,
+) -> torch.Tensor:
+    """``out[M, N] = x[M, K] @ weight[N, K]^T`` with the table's ``rubin`` persistent GEMM in its fine-grained-sync
+    build, roles given explicitly (the prefill chains hand their own slots in, which are not edge leases):
+    ``consume`` checks ``x`` per 16 B (report_valid, no grid wait), ``produce`` stores ``out`` -0.0-free and triggers
+    its dependents at entry, ``raster_along="n"`` completes output row blocks in order, ``arm`` regions are re-armed
+    with -0.0 by the kernel's extra warp. With every role off it is the same kernel chained by standard PDL."""
+    from .kimi_k3_fgs.dense_gemm_fgs import run_gemm_fgs
+
+    m, k = x.shape
+    n = weight.shape[0]
+    x, weight = x.detach(), weight.detach()
+    backend, tactic = _select(_GEMM_TABLE.get((n, k)), m)
+    if backend != "rubin":
+        raise ValueError(f"linear_fgs: N={n} K={k} at M={m} selects {backend}, not the rubin GEMM")
+    if consume and not fgs_dsl():
+        raise RuntimeError("linear_fgs: the report_valid consumer needs CuTe DSL 4.9")
+    if tactic is None:
+        tactic = _FGS_LARGE_TACTIC
+    _debug(
+        f"linear N={n} K={k}",
+        m,
+        f"fgs rubin {tuple(tactic)} consume={consume} produce={produce} raster={raster_along} arm={len(arm)}",
+    )
+    run_gemm_fgs(
+        x.unsqueeze(0),
+        weight.unsqueeze(0),
+        out.unsqueeze(0),
+        tactic,
+        report_valid=consume,
+        retry_warp=consume,
+        wait_input=not consume,
+        pzo=produce,
+        early_trigger=produce,
+        use_pdl=_pdl(),
+        raster_along=raster_along,
+        max_ctas=max_ctas,
+        arm=arm,
+        start_delay_ns=start_delay_ns,
+    )
+    return out
+
+
 def _fgs_direct(
     x, weight, out, tactic, consume: bool, produce: str, in_edge: Optional[str]
 ) -> None:

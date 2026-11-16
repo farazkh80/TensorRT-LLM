@@ -423,6 +423,7 @@ class KimiKDALinearAttention(nn.Module):
         # TLLM_K3_FGS=lamport: decode writes the core into a slot of this edge, read only by o_proj.
         if k3_fgs_edges is not None:
             k3_fgs_edges.declare("kda.core_o", self.proj_size, self.layer_idx)
+            k3_kda_chain.prefill_register(self.layer_idx)
         self._projection_bufs: Optional[Tuple[torch.Tensor, ...]] = None
         self._packed_conv_weight: Optional[torch.Tensor] = None
         self._mtp_conv_weights: Optional[Tuple[torch.Tensor, ...]] = None
@@ -641,17 +642,38 @@ class KimiKDALinearAttention(nn.Module):
 
         cores: List[torch.Tensor] = []
         if num_prefills > 0:
-            prefill_core = self.forward_prefill(
-                hidden_states[:num_ctx_tokens],
-                cu_seqlens,
-                mamba_metadata,
-                num_prefills,
-                conv_pool,
-                ssm_pool,
-                state_indices[:num_prefills],
-                layer_cache,
-                output=output[:num_ctx_tokens] if output is not None else None,
-            )
+            prefill_core = None
+            # TLLM_K3_FGS_PREFILL: a prefill-only batch runs the KDA prefill chain (or its PDL twin); the core it
+            # returns reaches o_proj as is (_project_output).
+            if (
+                k3_kda_chain is not None
+                and num_decodes == 0
+                and output is None
+                and num_ctx_tokens > 0
+                and k3_kda_chain.prefill_active()
+            ):
+                prefill_core = k3_kda_chain.prefill_forward(
+                    self,
+                    hidden_states[:num_ctx_tokens],
+                    cu_seqlens,
+                    mamba_metadata,
+                    num_prefills,
+                    conv_pool,
+                    ssm_pool,
+                    layer_cache,
+                )
+            if prefill_core is None:
+                prefill_core = self.forward_prefill(
+                    hidden_states[:num_ctx_tokens],
+                    cu_seqlens,
+                    mamba_metadata,
+                    num_prefills,
+                    conv_pool,
+                    ssm_pool,
+                    state_indices[:num_prefills],
+                    layer_cache,
+                    output=output[:num_ctx_tokens] if output is not None else None,
+                )
             if output is None:
                 cores.append(prefill_core)
         if num_decodes > 0:
@@ -705,6 +727,10 @@ class KimiKDALinearAttention(nn.Module):
         """Project the post-o_norm KDA core and reduce TP partials."""
         if isinstance(core, _KdaPrequantizedCore):
             out = self.o_proj.forward_prequantized(core.activation, core.scale)
+        elif k3_kda_chain is not None and k3_kda_chain.prefill_pending(self):
+            out = k3_kda_chain.prefill_o_proj(
+                self, core.reshape(-1, self.proj_size), self.o_proj.weight
+            )
         else:
             out = _linear(self.o_proj, core.reshape(-1, self.proj_size))
         if self._o_allreduce is not None:

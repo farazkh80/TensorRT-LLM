@@ -416,6 +416,28 @@ def last_refusal() -> str:
     return _refusal[0]
 
 
+class ExternalLease:
+    """A slot a chain owns and re-arms itself (``kda_prefill``), visible to consumers through
+    ``lease_containing``; ``consumed`` only forgets it."""
+
+    def __init__(self, tensor: torch.Tensor, name: str):
+        self.tensor = tensor
+        self.name = name
+        self.workspace = None
+
+
+def register_external(tensor: torch.Tensor, name: str, readers: int = 1) -> ExternalLease:
+    """Make ``tensor`` (an armed slot the producer on the current stream writes) findable by its consumers."""
+    if not hasattr(_local, "live"):
+        _local.live = {}
+        _local.readers = {}
+        _local.step = {}
+    lease = ExternalLease(tensor, name)
+    _local.live[tensor.data_ptr()] = lease
+    _local.readers[tensor.data_ptr()] = readers
+    return lease
+
+
 def lease_containing(t: torch.Tensor):
     """The live lease whose slot holds ``t``'s first element (``t`` may be any view of it), else None."""
     live = getattr(_local, "live", None)
@@ -433,6 +455,8 @@ def release(lease) -> None:
     workspaces, live = _state()
     live.pop(lease.tensor.data_ptr(), None)
     _local.readers.pop(lease.tensor.data_ptr(), None)
+    if isinstance(lease, ExternalLease):
+        return
     workspaces.release(lease)
 
 
