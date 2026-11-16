@@ -78,7 +78,8 @@ ROUTER_MAX_ROWS_ENV = "TLLM_K3_MOE_ROUTER_MAX_ROWS"
 # FC2 K stages of 256 columns, each fed by 4 FC1 units of 64 columns.
 FC1_K_STAGES = INTER // 256
 # How FC2 learns FC1's output is ready: "counter" (the fc1_done slabs) or "lamport" (FC1 writes act / act_sf into
-# FC1_ACT / FC1_SF slots armed with 0x80 / 0xFF, FC2 checks every byte it reads). TLLM_K3_MOE_FC1_FC2_REARM picks who
+# FC1_ACT / FC1_SF slots armed with 0x80 / 0xFF, act 0xFF in the TMA check's "ff" store mode (moe/sync.py), FC2
+# checks every byte it reads). TLLM_K3_MOE_FC1_FC2_REARM picks who
 # re-arms the lamport slots: "framework" (the edge workspaces' reset stream, for the rows FC2 reports, under
 # TLLM_K3_MOE_FC1_FC2_RESET_POLICY, default TLLM_FGS_RESET_POLICY) or "consumer" (slots this module owns, re-armed by
 # a kernel of the expert path, TLLM_K3_MOE_FC1_FC2_CONSUMER_RULE): "finalize", the finalize behind FC2 re-arms what
@@ -412,7 +413,14 @@ class _ConsumerSlots:
     """Consumer-re-armed FC1 -> FC2 slot pairs of one device, armed once here; the edge workspaces never touch them."""
 
     def __init__(self, device: torch.device, rows: int, pairs: int):
-        self.act = torch.full((pairs, rows, INTER), 0x80, dtype=torch.uint8, device=device)
+        from .moe.sync import act_sentinel_word
+
+        self.act = torch.full(
+            (pairs, rows, INTER),
+            0xFF if act_sentinel_word() == -1 else 0x80,
+            dtype=torch.uint8,
+            device=device,
+        )
         self.act = self.act.view(torch.float8_e4m3fn)
         self.act_sf = torch.full(
             (pairs, rows, INTER // SF_VEC), 0xFF, dtype=torch.uint8, device=device
@@ -983,7 +991,7 @@ class _Call:
             raise RuntimeError(f"{FC1_ACT} slot {act.slot} and {FC1_SF} slot {sf.slot} must pair")
         self.leases["fc1_fc2"] = act
         self.leases["fc1_sf"] = sf
-        self.fc1 = Fc1Slots(act.tensor, sf.tensor, act.bound)
+        self.fc1 = Fc1Slots(act.tensor.view(torch.float8_e4m3fn), sf.tensor, act.bound)
         policy = act.workspace.policy.value
         k3_edges.debug(
             "moe.fc1_fc2",
@@ -1098,9 +1106,10 @@ class _Call:
         if prev is None:
             return
         from ..fine_grained_sync_fill import sentinel_fill_bounded_
+        from .moe.sync import act_sentinel_word
 
         rows = prev[2]
-        for tensor, word in ((prev[0], -0x7F7F7F80), (prev[1], -1)):
+        for tensor, word in ((prev[0], act_sentinel_word()), (prev[1], -1)):
             nbytes = tensor.numel() * tensor.element_size()
             sentinel_fill_bounded_(
                 tensor.view(-1).view(torch.uint8),
@@ -1203,8 +1212,12 @@ class _Layer:
             self.fc1_ordinal = len(_consumer_layers)
             _consumer_layers.append(self)
         elif self.fc1_fc2_lamport:
+            from .moe.sync import act_sentinel_word
+
+            # The framework arms a 1-byte edge by dtype: E4M3 with -0, uint8 with 0xFF.
+            act_dtype = torch.uint8 if act_sentinel_word() == -1 else torch.float8_e4m3fn
             for name, width, dtype, shared in (
-                (FC1_ACT, INTER, torch.float8_e4m3fn, None),
+                (FC1_ACT, INTER, act_dtype, None),
                 (FC1_SF, INTER // SF_VEC, torch.uint8, FC1_ACT),
             ):
                 k3_edges.declare_bytes(

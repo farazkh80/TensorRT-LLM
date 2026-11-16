@@ -476,11 +476,13 @@ class Fc1Kernel:
             raise ValueError("the Lamport FC1 -> FC2 build publishes no fc1_done counters")
         # lamport: act / act_sf are FC1 -> FC2 slots armed with 0x80 / 0xFF, which FC2 validates byte by byte.
         self.lamport = lamport
-        # act16 (FC2's TMA check, lamport_check() == "tma"): the TMA unit tests element 0 of each 16 B chunk, so each
-        # act chunk is stored whole (act_store()), and the padding rows of an expert's last token tile are stored as
-        # zeros (a TMA box covers the whole tile).
+        # act16 (FC2's TMA check, lamport_check() == "tma"): the padding rows of an expert's last token tile are stored
+        # as zeros (a TMA box covers the whole tile); with the v4 / warp checks of element 0 of each 16 B chunk, each
+        # act chunk is also stored whole (act_store()).
         self.act16 = act16 and lamport
         self.act_v4 = self.act16 and act_store() == "v4"
+        # act_ff: slots armed 0xFF and checked byte by byte, so an E4M3 -0 is a plain value.
+        self.act_ff = self.act16 and act_store() == "ff"
         # Per epilogue warp, its 16 channels of every token row of an item (the 16 B chunks it stores whole).
         self.stage16_bytes = 4 * self.n_mma * 16 if self.act_v4 else 16
         # rearm_prev (consumer re-arm, next_fc1 rule): the epilogue warps first store the sentinel over the rows the
@@ -983,7 +985,11 @@ class Fc1Kernel:
                 _st_v4(base + cutlass.Int64(first + r * stride) * 16, cutlass.Int32(FLAG_SENTINEL))
         else:
             for base, pieces, word in (
-                (mRearmAct.iterator.toint(), rows * (INTER // 16), cutlass.Int32(-0x7F7F7F80)),
+                (
+                    mRearmAct.iterator.toint(),
+                    rows * (INTER // 16),
+                    cutlass.Int32(-1 if self.act_ff else -0x7F7F7F80),
+                ),
                 (mRearmSf.iterator.toint(), rows * (INTER // SF_VEC // 16), cutlass.Int32(-1)),
             ):
                 rounds = (pieces - first + stride - 1) // stride
@@ -2270,7 +2276,7 @@ class Fc1Kernel:
                             codes = _e4m3x2(
                                 act[4 * i + 2 * j + 1] * inv_scale, act[4 * i + 2 * j] * inv_scale
                             )
-                            if cutlass.const_expr(self.lamport):
+                            if cutlass.const_expr(self.lamport and not self.act_ff):
                                 # E4M3 -0 is the slot sentinel: store +0 (the same value).
                                 zero_signs = cutlass.select_(
                                     (codes & 0x7F) == 0, cutlass.Int32(0x80), cutlass.Int32(0)

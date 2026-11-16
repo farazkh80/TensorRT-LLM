@@ -11,8 +11,8 @@ One CTA per (row, column chunk); each thread owns one 16 B vector of the row. Ro
 (padding, other ranks' rows) are never read.
 
 ``rearm`` (consumer re-arm of the Lamport FC1 -> FC2 slots): once the FC2 grid is complete, the CTAs share the 16 B
-pieces of rows [0, total_num_padded_tokens) of FC2's inputs and store the sentinel back (0x80 per E4M3 byte, 0xFF per
-scale byte), after their own rows.
+pieces of rows [0, total_num_padded_tokens) of FC2's inputs and store the sentinel back (0x80 per E4M3 byte, 0xFF in
+the TMA check's "ff" store mode; 0xFF per scale byte), after their own rows.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
 
 from ..moe_chain import HIDDEN, INTER, SF_VEC, TOP_K
-from .sync import fgs_diag, release_add, spin_ns, wait_at_least_short
+from .sync import act_sentinel_word, fgs_diag, release_add, spin_ns, wait_at_least_short
 
 _VEC = 8
 
@@ -85,6 +85,7 @@ class FinalizeKernel:
         signal_add: int = 1,
         signal_skipped: bool = False,
         rearm: bool = False,
+        act_word: int = -0x7F7F7F80,
     ):
         vecs = hidden // _VEC
         assert hidden % _VEC == 0 and vecs % chunks == 0, (hidden, chunks)
@@ -102,6 +103,7 @@ class FinalizeKernel:
         self.signal_add = signal_add
         self.signal_skipped = signal_skipped and signal and skip_single
         self.rearm = rearm
+        self.act_word = act_word
 
     @cute.jit
     def __call__(
@@ -212,7 +214,7 @@ class FinalizeKernel:
         first = (row * self.chunks + chunk) * self.threads + tidx
         stride = grid_x * self.chunks * self.threads
         for base, pieces, word in (
-            (mAct.iterator.toint(), total * (INTER // 16), Int32(-0x7F7F7F80)),
+            (mAct.iterator.toint(), total * (INTER // 16), Int32(self.act_word)),
             (mSf.iterator.toint(), total * (INTER // SF_VEC // 16), Int32(-1)),
         ):
             rounds = (pieces - first + stride - 1) // stride
@@ -234,6 +236,7 @@ def _compiled(
     signal_add: int = 1,
     signal_skipped: bool = False,
     rearm: bool = False,
+    act_word: int = -0x7F7F7F80,
 ):
     kernel = FinalizeKernel(
         hidden,
@@ -248,6 +251,7 @@ def _compiled(
         signal_add,
         signal_skipped,
         rearm,
+        act_word,
     )
 
     def fake(dtype, cols):
@@ -332,6 +336,7 @@ def run(
         fin_per_row // chunks if signal else 1,
         signal_skipped,
         rearm is not None,
+        act_sentinel_word() if rearm is not None else -0x7F7F7F80,
     )
     words = plan.num_non_exiting_tiles
     if rearm is not None:

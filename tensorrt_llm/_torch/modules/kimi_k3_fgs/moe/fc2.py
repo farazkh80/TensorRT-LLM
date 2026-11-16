@@ -47,9 +47,9 @@ Fine-grained sync with the neighbouring stages (int32 counter slabs, zero-armed 
   word of the stage for a sentinel byte, re-copy stale 16 B pieces from L2 (scale words from global with relaxed loads)
   until none is left, and only then hand the stage to the MMA. No counters and no grid wait before the loads; with
   ``rows_used`` CTA 0 stores the plan's padded rows there (the rows a bounded re-arm of the slots covers). ``act_tma``:
-  act comes by TMA ``report_valid`` loads (one per token tile and 128-wide K atom), the TMA unit tests element 0 of
-  every 16 B piece, and the checker warp tests only the scale words; a stage that landed invalid or with a stale
-  scale word waits for the FC1 grid and is copied again from L2.
+  act comes by TMA ``report_valid`` loads (one per token tile and 128-wide K atom), the TMA unit tests every byte
+  against 0xFF (``act_ff``; or element 0 of every 16 B piece against 0x80), and the checker warp tests only the scale
+  words; a stage that landed invalid or with a stale scale word waits for the FC1 grid and is copied again from L2.
 - ``fc2_done[T]``: after a unit's ``y`` stores, a release add of 1 per token tile of the unit, so tile t is complete at
   28. The epilogue hands each unit to a signal warp (7 or 8) through an mbarrier; that warp issues one gpu-scope fence
   per unit and relaxed adds, keeping the fence off the epilogue. Dependents launch when each CTA starts its last unit,
@@ -83,6 +83,7 @@ from .sync import (
     FLAG_SENTINEL,
     FLAG_SKIP,
     FLAGS_PER_TILE,
+    act_store,
     bits_to_f32,
     fgs_diag,
     flag_check,
@@ -288,6 +289,7 @@ class Fc2Kernel:
         flag_skip: bool = False,
         flag_backoff: int = FLAG_BACKOFF_NS,
         act_tma: bool = False,
+        act_ff: bool = False,
     ):
         if tile_n not in TILE_NS:
             raise ValueError(f"tile_n must be one of {TILE_NS}, got {tile_n}")
@@ -329,9 +331,10 @@ class Fc2Kernel:
         self.lamport = lamport
         self.bound = bound and lamport
         # act_tma (lamport_check() == "tma"): the loader loads act with one TMA report_valid load per (token tile, K
-        # atom) on the stage's v1 barrier; the checker warp waits for its primary phase and checks the act pieces on
-        # the SM only when the stage landed invalid (a sentinel at element 0 of a 16 B chunk).
+        # atom) on the stage's v1 barrier; the checker warp waits for its primary phase.
         self.act_tma = act_tma and lamport
+        # act_ff: act slots armed 0xFF and each act TMA load checks every byte (PER_ELEMENT_FF).
+        self.act_ff = act_ff and self.act_tma
         # check=False (TLLM_K3_MOE_FGS_DIAG=oracle): the checker warps hand stages on unchecked (timing only).
         self.check = check
         self.mma_tiler = (TILE_M, self.n_max, K_STAGE)
@@ -482,7 +485,9 @@ class Fc2Kernel:
                         tAgAct[(None, k_tile * n_katom + kt, first_tile + jt)],
                         tAsAct[(None, slot_base + kt * self.group + jt)],
                         tma_bar_ptr=act_bar,
-                        report_valid=cpasync.SentinelPattern.PER_16BYTES_80,
+                        report_valid=cpasync.SentinelPattern.PER_ELEMENT_FF
+                        if self.act_ff
+                        else cpasync.SentinelPattern.PER_16BYTES_80,
                     )
 
     @cute.jit
@@ -1891,6 +1896,7 @@ def _compiled(
     flag_skip: bool = False,
     flag_backoff: int = FLAG_BACKOFF_NS,
     act_tma: bool = False,
+    act_ff: bool = False,
 ):
     kernel = Fc2Kernel(
         tile_n,
@@ -1916,6 +1922,7 @@ def _compiled(
         flag_skip,
         flag_backoff,
         act_tma,
+        act_ff,
     )
     fake = cute.AddressSpace.gmem
     args = (
@@ -2068,6 +2075,7 @@ def run(
         flags and flag_skip_last(),
         _env_int("FLAG_BACKOFF", FLAG_BACKOFF_NS),
         lamport and lamport_check() == "tma",
+        lamport and lamport_check() == "tma" and act_store() == "ff",
     )
     compiled(
         _ptr(cutlass.Float4E2M1FN, w2, 32),

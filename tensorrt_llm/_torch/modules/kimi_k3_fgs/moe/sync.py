@@ -346,9 +346,9 @@ def flag_check() -> str:
 
 def lamport_check() -> str:
     """How FC2 validates the Lamport FC1 -> FC2 slots: "sm" (checker warps test every byte of a landed stage) or "tma"
-    (each act load is a TMA ``report_valid`` load, checked by the TMA unit on element 0 of every 16 B chunk; only a
-    stage that lands invalid is checked and re-copied on the SM). With "tma" FC1 stores whole 16 B chunks and the
-    padding rows of each expert's last token tile."""
+    (each act load is a TMA ``report_valid`` load checked by the TMA unit, see ``act_store()``; a stage that lands
+    invalid waits for the FC1 grid and is copied again). With "tma" FC1 also stores the padding rows of each expert's
+    last token tile."""
     value = os.environ.get(LAMPORT_CHECK_ENV, "sm")
     if value not in ("sm", "tma"):
         raise ValueError(f"{LAMPORT_CHECK_ENV} must be sm or tma, got {value!r}")
@@ -356,13 +356,21 @@ def lamport_check() -> str:
 
 
 def act_store() -> str:
-    """How FC1 writes a 16 B act chunk for the TMA check: "v4" (one lane, one ``st.global.v4``, from a per-warp
-    shared-memory transpose) or "warp" (the byte stores: 8 lanes x 2 B of one warp instruction, one coalesced segment,
-    which the hardware writes whole but the PTX memory model does not promise)."""
-    value = os.environ.get(ACT_STORE_ENV, "v4")
-    if value not in ("v4", "warp"):
-        raise ValueError(f"{ACT_STORE_ENV} must be v4 or warp, got {value!r}")
+    """How FC1 writes act for the TMA check. "ff" (default): the slots are armed with 0xFF, the TMA load checks every
+    byte, and FC1 stores its 2 B values directly. "v4" (one lane, one ``st.global.v4`` per 16 B chunk, from a per-warp
+    shared-memory transpose) and "warp" (8 lanes x 2 B of one warp instruction per chunk): the slots are armed with
+    0x80 and the TMA load checks element 0 of each 16 B chunk, which relies on the chunk landing whole; the PTX memory
+    model splits even a vector store into scalar stores of unspecified order."""
+    value = os.environ.get(ACT_STORE_ENV, "ff")
+    if value not in ("v4", "warp", "ff"):
+        raise ValueError(f"{ACT_STORE_ENV} must be v4, warp or ff, got {value!r}")
     return value
+
+
+def act_sentinel_word() -> int:
+    """int32 word of the armed Lamport act slots: 0xFF per byte with the TMA check in "ff" store mode (an E4M3 NaN,
+    which FC1's saturating conversion never writes), else 0x80 (E4M3 -0) per byte."""
+    return -1 if lamport_check() == "tma" and act_store() == "ff" else -0x7F7F7F80
 
 
 def flag_words() -> int:
