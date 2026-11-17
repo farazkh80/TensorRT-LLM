@@ -41,7 +41,9 @@ weight-streaming qkvg GEMM 3-21 %, A-02), ``_NORM_CTAS`` (gated norm persistent 
 default grid, one CTA per row block), ``_DELAY_NS`` (producer GEMMs spin at entry; hazard tests),
 ``_MAX_SPINS`` (consumer rounds before the grid-wait fallback; small values force the slow path),
 ``_QKVG_CTAS`` (cap the qkvg GEMM's persistent grid; with a few CTAs its gate tiles outlive the conv → norm chain,
-the hazard test of the norm's acquire), ``_NORM_GATE=0`` (drop the norm's acquire: that test's negative control).
+the hazard test of the norm's acquire), ``_NORM_GATE=0`` (drop the norm's acquire: that test's negative control),
+``_CONV=bulk|cpasync`` (the conv's source loads: one ``cp.async.bulk`` per ring slot onto an mbarrier, after the
+counter acquire and a proxy fence, or the per-lane ``cp.async`` ring; the twin uses the same build).
 """
 
 import atexit
@@ -69,6 +71,9 @@ DELAY_NS = int(os.environ.get("TLLM_K3_FGS_PREFILL_DELAY_NS", "0"))
 MAX_SPINS = int(os.environ.get("TLLM_K3_FGS_PREFILL_MAX_SPINS", str(1 << 16)))
 QKVG_CTAS = int(os.environ.get("TLLM_K3_FGS_PREFILL_QKVG_CTAS", "0")) or None
 NORM_GATE = os.environ.get("TLLM_K3_FGS_PREFILL_NORM_GATE", "1") != "0"
+CONV = os.environ.get("TLLM_K3_FGS_PREFILL_CONV", "bulk")
+if CONV not in ("bulk", "cpasync"):
+    raise ValueError(f"TLLM_K3_FGS_PREFILL_CONV={CONV!r}; valid: bulk, cpasync")
 # Counter slab words per pair: a word per 64 output rows covers every rubin tactic's CTA tile.
 COUNTER_WORDS = -(-(-(-MAX_ROWS // 64)) // 4) * 4
 
@@ -463,6 +468,7 @@ def _forward_counter(mixer, x2d, cu_seqlens, mamba_metadata, num_prefills, conv_
         fgs_counters=None if pk2 is None else pk2[0],
         fgs_counter_rows=cta_m if pk2 is not None else 0,
         fgs_counter_target=qkv_tiles if pk2 is not None else 0,
+        bulk_src=CONV == "bulk",
     )
     bfa = kimi_k3_cute_gemm.linear(x2d, mixer._bfa_proj_weight)
     g = kimi_k3_cute_gemm.linear(bfa[:, :hd], mixer.f_b_proj.weight)

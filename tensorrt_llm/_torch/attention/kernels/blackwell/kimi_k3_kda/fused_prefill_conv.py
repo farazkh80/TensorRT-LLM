@@ -372,6 +372,85 @@ def cp_async16(saddr, gaddr, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def bulk_g2s(saddr, gaddr, nbytes, mbar, *, loc=None, ip=None):
+    _asm(
+        T.i32(),
+        [
+            cutlass.Int32(saddr).ir_value(loc=loc, ip=ip),
+            cutlass.Int64(gaddr).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(nbytes).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(mbar).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [$1], [$2], $3, [$4];\n\tmov.b32 $0, 0;",
+        "=r,r,l,r,r",
+        side=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def mbar_init(mbar, *, loc=None, ip=None):
+    _asm(
+        T.i32(),
+        [cutlass.Int32(mbar).ir_value(loc=loc, ip=ip)],
+        "mbarrier.init.shared::cta.b64 [$1], 1;\n\tmov.b32 $0, 0;",
+        "=r,r",
+        side=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def mbar_init_fence(*, loc=None, ip=None):
+    _asm(T.i32(), [], "fence.mbarrier_init.release.cluster;\n\tmov.b32 $0, 0;", "=r", side=True, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def mbar_expect_tx(mbar, nbytes, *, loc=None, ip=None):
+    _asm(
+        T.i32(),
+        [cutlass.Int32(mbar).ir_value(loc=loc, ip=ip), cutlass.Int32(nbytes).ir_value(loc=loc, ip=ip)],
+        "mbarrier.arrive.expect_tx.shared::cta.b64 _, [$1], $2;\n\tmov.b32 $0, 0;",
+        "=r,r,r",
+        side=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def mbar_try_wait(mbar, parity, *, loc=None, ip=None):
+    return cutlass.Int32(
+        _asm(
+            T.i32(),
+            [cutlass.Int32(mbar).ir_value(loc=loc, ip=ip), cutlass.Int32(parity).ir_value(loc=loc, ip=ip)],
+            "{\n\t.reg .pred p;\n\tmbarrier.try_wait.parity.shared::cta.b64 p, [$1], $2;\n\tselp.b32 $0, 1, 0, p;\n\t}",
+            "=r,r,r",
+            side=True,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def fence_async_shared(*, loc=None, ip=None):
+    _asm(T.i32(), [], "fence.proxy.async.shared::cta;\n\tmov.b32 $0, 0;", "=r", side=True, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def fence_async_global(*, loc=None, ip=None):
+    _asm(T.i32(), [], "fence.proxy.async.global;\n\tmov.b32 $0, 0;", "=r", side=True, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def warp_sync(*, loc=None, ip=None):
+    _asm(T.i32(), [], "bar.warp.sync 0xffffffff;\n\tmov.b32 $0, 0;", "=r", side=True, loc=loc, ip=ip)
+
+
+@dsl_user_op
 def lds_v4(saddr, *, loc=None, ip=None):
     out = _asm(
         llvm.StructType.get_literal([T.i32()] * 4),
@@ -526,6 +605,7 @@ class KdaConv:
         with_stats=False,
         pdl=False,
         gate_counters=False,
+        bulk_src=False,
     ):
         self.W = warps
         self.MB = FORCE_MB
@@ -533,6 +613,11 @@ class KdaConv:
         # gate_counters: PDL launch without a grid wait; a warp waits for the counter word of every source row
         # block it reads (``gcnt[row // gcnt_rpb] >= gcnt_target``) before its first load.
         self.gate_counters = gate_counters
+        # bulk_src: lane 0 fills each ring slot (one token row x 256 channels, 512 B) with one cp.async.bulk onto
+        # the pack's mbarrier (two per warp, D / ASYNC_GROUP); the pack wait is a parity wait instead of a cp.async
+        # group wait. The ring layout and every read of it stay as in the cp.async path.
+        self.bulk = bulk_src
+        self.NB = depth // ASYNC_GROUP
         self.heads = heads
         self.P = heads * 128
         self.C = 3 * heads * 128
@@ -553,6 +638,7 @@ class KdaConv:
         assert self.D % ASYNC_GROUP == 0 and self.U % ASYNC_GROUP == 0
         assert not (fgs_consumer or fgs_producer) or (src_vec and out_vec)
         assert fgs_consumer or not with_stats
+        assert not bulk_src or (src_vec and not fgs_consumer and self.C % WARP_CH == 0)
         self.fgs_consumer = fgs_consumer
         self.fgs_producer = fgs_producer
         self.max_spins = max_spins
@@ -619,9 +705,19 @@ class KdaConv:
         b0, b1, b2 = cute.arch.block_idx()
         _, gdy, gdz = cute.arch.grid_dim()
         smem = cutlass.utils.SmemAllocator()
-        warp_bytes = (self.D + self.STAGE) * SLOT
+        warp_bytes = (self.D + self.STAGE) * SLOT + (self.NB * 8 if self.bulk else 0)
         ring = smem.allocate_tensor(cutlass.Int8, cute.make_layout(self.W * warp_bytes), 16)
         ring_warp = cutlass.Int32(ring.iterator.toint()) + (tid // 32) * warp_bytes
+        # bulk_src: bit b of phase[0] is the parity the next wait on this warp's barrier b expects.
+        phase = None
+        if cutlass.const_expr(self.bulk):
+            phase = cute.make_rmem_tensor(cute.make_layout(1), cutlass.Int32)
+            phase[0] = cutlass.Int32(0)
+            if tid % 32 == 0:
+                for b in cutlass.range_constexpr(self.NB):
+                    mbar_init(ring_warp + (self.D + self.STAGE) * SLOT + b * 8)
+                mbar_init_fence()
+            warp_sync()
         # Reload rounds and fallbacks of this thread (warp-uniform).
         cnt = None
         if cutlass.const_expr(self.fgs_consumer):
@@ -651,6 +747,7 @@ class KdaConv:
                     gcnt,
                     gcnt_rpb,
                     gcnt_target,
+                    phase,
                 )
         else:
             self.runs(
@@ -673,6 +770,7 @@ class KdaConv:
                 gcnt,
                 gcnt_rpb,
                 gcnt_target,
+                phase,
             )
         if cutlass.const_expr(self.with_stats):
             if tid % 32 == 0:
@@ -703,6 +801,7 @@ class KdaConv:
         gcnt,
         gcnt_rpb,
         gcnt_target,
+        phase,
     ):
         """All runs b1, b1 + gdy, ... of sequence `seq` for channel block b0.
 
@@ -718,7 +817,7 @@ class KdaConv:
         more = b1 + gdy < ((length + (self.RUN - 1)) >> self.RUN_LOG2)
         self.tile(
             b1, b0, tid, ring_warp, begin, length, slot, init, src, weight, state, q, k, v, cnt,
-            gcnt, gcnt_rpb, gcnt_target,
+            gcnt, gcnt_rpb, gcnt_target, phase,
         )  # fmt: skip
         if more:
             begin, length, slot, init = self.meta(seq, state, starts, slots, has_init)
@@ -743,6 +842,7 @@ class KdaConv:
                     gcnt,
                     gcnt_rpb,
                     gcnt_target,
+                    phase,
                 )
 
     @cute.jit
@@ -758,9 +858,41 @@ class KdaConv:
         return begin, length, slot, init
 
     @cute.jit
+    def bulk_wait(self, bar_warp, pk, phase: cute.Tensor):
+        """Wait for pack `pk` of this warp's run (warp-uniform) and flip its barrier's parity bit."""
+        b = pk % self.NB
+        bar = bar_warp + b * 8
+        par = (phase[0] >> b) & 1
+        while mbar_try_wait(bar, par) == 0:
+            pass
+        phase[0] = phase[0] ^ (cutlass.Int32(1) << b)
+
+    @cute.jit
+    def bulk_issue(self, first, n, bar, ring_warp, gbase, count):
+        """Lane 0: rows first .. first + n - 1 (those below count) into their ring slots, n * SLOT bytes on bar."""
+        mbar_expect_tx(bar, n * SLOT)
+        for pe in cutlass.range_constexpr(ASYNC_GROUP):
+            r = first + pe
+            if r < count:
+                bulk_g2s(ring_warp + (r % self.D) * SLOT, gbase + cutlass.Int64(r) * (self.SR * 2), SLOT, bar)
+
+    @cute.jit
+    def bulk_refill(self, first, count, lane, ring_warp, bar_warp, gbase):
+        """After pack `first`'s steps: the generic reads of its slots are ordered before the async-proxy writes
+        of the pack D rows later (warp sync, then fence.proxy.async)."""
+        warp_sync()
+        if lane == 0:
+            fence_async_shared()
+            n = cutlass.min(cutlass.max(count - (first + self.D), 0), ASYNC_GROUP)
+            if n > 0:
+                self.bulk_issue(
+                    first + self.D, n, bar_warp + ((first // ASYNC_GROUP) % self.NB) * 8, ring_warp, gbase, count
+                )
+
+    @cute.jit
     def tile(
         self, bx, by, tid, ring_warp, begin, length, slot, init, src, weight, state, q, k, v, cnt,
-        gcnt, gcnt_rpb, gcnt_target,
+        gcnt, gcnt_rpb, gcnt_target, phase,
     ):  # fmt: skip
         """One warp: run t0 = (bx * W + warp) * L of one sequence, channel block `by`."""
         C, P, L, U = self.C, self.P, self.L, self.U
@@ -820,7 +952,19 @@ class KdaConv:
                             w = ld_v4_first(addr)
                         for e in cutlass.range_constexpr(4):
                             hw[4 * j + e] = w[e]
-            if cutlass.const_expr(self.src_vec):
+            bar_warp = ring_warp + (D + self.STAGE) * SLOT
+            if cutlass.const_expr(self.bulk):
+                if lane == 0:
+                    if cutlass.const_expr(self.gate_counters):
+                        fence_async_global()
+                    for pg in cutlass.range_constexpr(self.NB):
+                        n = cutlass.min(cutlass.max(count - ASYNC_GROUP * pg, 0), ASYNC_GROUP)
+                        if n > 0:
+                            self.bulk_issue(
+                                ASYNC_GROUP * pg, n, bar_warp + pg * 8, ring_warp,
+                                src_base + (cutlass.Int64(row0) * self.SR + cc) * 2, count,
+                            )  # fmt: skip
+            elif cutlass.const_expr(self.src_vec):
                 for pg in cutlass.range_constexpr(D // ASYNC_GROUP):
                     for pe in cutlass.range_constexpr(ASYNC_GROUP):
                         d = ASYNC_GROUP * pg + pe
@@ -923,7 +1067,9 @@ class KdaConv:
                     gg = gbase + cutlass.Int64(g * U) * (self.SR * 2)
                     sg = sbase + cutlass.Int64(g * U) * (P * 2)
                     for p in cutlass.range_constexpr(U // ASYNC_GROUP):
-                        if cutlass.const_expr(self.src_vec):
+                        if cutlass.const_expr(self.bulk):
+                            self.bulk_wait(bar_warp, g * (U // ASYNC_GROUP) + p, phase)
+                        elif cutlass.const_expr(self.src_vec):
                             cute.arch.cp_async_wait_group(D // ASYNC_GROUP - 1)
                         if cutlass.const_expr(self.fgs_consumer):
                             self.check_pack(g * U + ASYNC_GROUP * p, count, ring_lane, gbase, cnt)
@@ -952,7 +1098,9 @@ class KdaConv:
                                 gg,
                                 sg,
                             )
-                        if cutlass.const_expr(self.src_vec):
+                        if cutlass.const_expr(self.bulk):
+                            self.bulk_refill(g * U + ASYNC_GROUP * p, count, lane, ring_warp, bar_warp, gbase)
+                        elif cutlass.const_expr(self.src_vec):
                             cute.arch.cp_async_commit_group()
                     deep = cute.arch.vote_any_sync(hm[0] < FAST_MIN_H)
                     flag[0] = flag[0] | (cutlass.Int32(deep) << g)
@@ -965,7 +1113,9 @@ class KdaConv:
                 npack = (count - first + (ASYNC_GROUP - 1)) // ASYNC_GROUP
                 for p in cutlass.range(npack, unroll=1):
                     i = first + ASYNC_GROUP * p
-                    if cutlass.const_expr(self.src_vec):
+                    if cutlass.const_expr(self.bulk):
+                        self.bulk_wait(bar_warp, i // ASYNC_GROUP, phase)
+                    elif cutlass.const_expr(self.src_vec):
                         cute.arch.cp_async_wait_group(D // ASYNC_GROUP - 1)
                     if cutlass.const_expr(self.fgs_consumer):
                         self.check_pack(i, count, ring_lane, gbase, cnt)
@@ -1019,7 +1169,9 @@ class KdaConv:
                                 gg,
                                 sg,
                             )
-                    if cutlass.const_expr(self.src_vec):
+                    if cutlass.const_expr(self.bulk):
+                        self.bulk_refill(i, count, lane, ring_warp, bar_warp, gbase)
+                    elif cutlass.const_expr(self.src_vec):
                         cute.arch.cp_async_commit_group()
                 deep = cute.arch.vote_any_sync(hm[0] < FAST_MIN_H)
                 flag[0] = flag[0] | (cutlass.Int32(deep) << ngroup)
@@ -1057,7 +1209,9 @@ class KdaConv:
                 npack = (count + (ASYNC_GROUP - 1)) // ASYNC_GROUP
                 for p in cutlass.range(npack, unroll=1):
                     i = ASYNC_GROUP * p
-                    if cutlass.const_expr(self.src_vec):
+                    if cutlass.const_expr(self.bulk):
+                        self.bulk_wait(bar_warp, p, phase)
+                    elif cutlass.const_expr(self.src_vec):
                         cute.arch.cp_async_wait_group(D // ASYNC_GROUP - 1)
                     if cutlass.const_expr(self.fgs_consumer):
                         self.check_pack(i, count, ring_lane, gbase, cnt)
@@ -1111,9 +1265,11 @@ class KdaConv:
                                 gg,
                                 sg,
                             )
-                    if cutlass.const_expr(self.src_vec):
+                    if cutlass.const_expr(self.bulk):
+                        self.bulk_refill(i, count, lane, ring_warp, bar_warp, gbase)
+                    elif cutlass.const_expr(self.src_vec):
                         cute.arch.cp_async_commit_group()
-            if cutlass.const_expr(self.src_vec):
+            if cutlass.const_expr(self.src_vec and not self.bulk):
                 cute.arch.cp_async_wait_group(0)
             if t0 == 0:
                 if slot >= 0:
@@ -1239,7 +1395,7 @@ class KdaConv:
                     yw[j] = xt[j]
         # Refill this slot in program order after its same-thread lds_v4. The
         # caller commits one adjacent-token pack of refills as one cp.async group.
-        if cutlass.const_expr(self.src_vec):
+        if cutlass.const_expr(self.src_vec and not self.bulk):
             if i + D < count:
                 cp_async16(sl, gb + (u + D) * (self.SR * 2))
         if cvalid:
@@ -1496,6 +1652,7 @@ def compile_prefill_conv(
     with_stats: bool = False,
     pdl: bool = False,
     gate_counters: bool = False,
+    bulk_src: bool = False,
 ) -> Callable:
     """Compile and cache a convolution layout without retaining caller-owned tensors."""
     with torch.cuda.device(device):
@@ -1537,6 +1694,7 @@ def compile_prefill_conv(
             with_stats,
             pdl,
             gate_counters,
+            bulk_src,
         )
         op.MB = min_blocks_per_mp
         stats = None
@@ -1570,6 +1728,7 @@ def fused_prefill_conv(
     fgs_counters=None,
     fgs_counter_rows=0,
     fgs_counter_target=0,
+    bulk_src=False,
 ):
     """Convolve raw packed QKV into contiguous, unnormalized BF16 Q/K/V.
 
@@ -1652,6 +1811,8 @@ def fused_prefill_conv(
         raise ValueError("KDA convolution tensor offsets must fit int32 on the scalar path")
     if (fgs_consumer or fgs_producer) and not (src_vec and out_vec):
         raise ValueError("KDA convolution FGS modes need 16-byte aligned source rows and outputs")
+    if bulk_src and (not src_vec or fgs_consumer or (3 * heads * 128) % WARP_CH):
+        raise ValueError("bulk_src needs 16-byte aligned source rows, no fgs_consumer, and 256 | 3 * heads * 128")
     with_stats = fgs_consumer and fgs_stats is not None
     if with_stats and (fgs_stats.dtype != torch.int32 or fgs_stats.numel() < 2):
         raise ValueError("fgs_stats must be an int32 tensor of 2 elements")
@@ -1703,6 +1864,7 @@ def fused_prefill_conv(
         with_stats,
         pdl,
         gate,
+        bulk_src,
     )
     stats = fgs_stats if with_stats else None
     fn(
