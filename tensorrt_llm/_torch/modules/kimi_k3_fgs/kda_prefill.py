@@ -90,7 +90,8 @@ def fgs() -> bool:
 def edges_on() -> frozenset:
     value = os.environ.get("TLLM_K3_FGS_PREFILL_EDGES", "pk2,pk8")
     ids = frozenset(v.strip().lower() for v in value.split(",") if v.strip())
-    unknown = ids - set(_EDGE_IDS)
+    # pm* ids belong to the MLA prefill chain (``mla_prefill``), which shares the variable.
+    unknown = ids - set(_EDGE_IDS) - frozenset(i for i in ids if i.startswith("pm") or i == "gproj")
     if unknown:
         raise ValueError(f"TLLM_K3_FGS_PREFILL_EDGES: unknown {sorted(unknown)}; valid: {', '.join(_EDGE_IDS)}")
     return frozenset(_EDGE_IDS[i] for i in ids)

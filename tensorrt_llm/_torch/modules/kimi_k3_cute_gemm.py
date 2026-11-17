@@ -395,13 +395,15 @@ def linear_fgs(
     early_trigger: Optional[bool] = None,
     publish: Optional[Tuple[torch.Tensor, int]] = None,
     gate: Optional[Tuple[torch.Tensor, int, int, int]] = None,
+    wait: bool = True,
 ) -> torch.Tensor:
     """``out[M, N] = x[M, K] @ weight[N, K]^T`` with the table's ``rubin`` persistent GEMM in its fine-grained-sync
     build, roles given explicitly (the prefill chains hand their own slots in, which are not edge leases):
     ``consume`` checks ``x`` per 16 B (report_valid, no grid wait), ``produce`` stores ``out`` -0.0-free and triggers
     its dependents at entry (``early_trigger`` alone triggers without pzo), ``raster_along="n"`` completes output row
     blocks in order, ``arm`` regions are re-armed by the kernel's extra warp, ``publish`` / ``gate`` are the counter
-    link (``run_gemm_fgs``). With every role off it is the same kernel chained by standard PDL."""
+    link (``run_gemm_fgs``), ``wait=False`` skips the grid wait of a kernel whose inputs are complete by construction.
+    With every role off it is the same kernel chained by standard PDL."""
     from .kimi_k3_fgs.dense_gemm_fgs import run_gemm_fgs
 
     m, k = x.shape
@@ -418,7 +420,7 @@ def linear_fgs(
         f"linear N={n} K={k}",
         m,
         f"fgs rubin {tuple(tactic)} consume={consume} produce={produce} raster={raster_along} arm={len(arm)} "
-        f"publish={publish is not None} gate={gate is not None}",
+        f"publish={publish is not None} gate={gate is not None} wait={wait}",
     )
     run_gemm_fgs(
         x.unsqueeze(0),
@@ -427,7 +429,7 @@ def linear_fgs(
         tactic,
         report_valid=consume,
         retry_warp=consume,
-        wait_input=not consume,
+        wait_input=wait and not consume,
         pzo=produce,
         early_trigger=produce if early_trigger is None else early_trigger,
         use_pdl=_pdl(),
@@ -437,6 +439,42 @@ def linear_fgs(
         start_delay_ns=start_delay_ns,
         publish=publish,
         gate=gate,
+    )
+    return out
+
+
+def bmm_fgs(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    produce: bool = False,
+    early_trigger: Optional[bool] = None,
+) -> torch.Tensor:
+    """``out[B, M, N] = x[B, M, K] @ weight[B, N, K]^T`` with the table's ``rubin`` batched GEMM in its
+    fine-grained-sync build (strided views allowed, as for :func:`bmm`); ``produce`` stores ``out`` -0.0-free."""
+    from .kimi_k3_fgs.dense_gemm_fgs import run_gemm_fgs
+
+    b, m, k = x.shape
+    n = weight.shape[1]
+    x, weight = x.detach(), weight.detach()
+    _, tactic = _select(_BMM_TABLE.get((b, n, k)), m)
+    if tactic is None:
+        tactic = _FGS_SMALL_TACTIC if m <= 64 else _FGS_LARGE_TACTIC
+    else:
+        tactic = tuple(tactic)
+    _debug(f"bmm B={b} N={n} K={k}", m, f"fgs rubin {tactic} produce={produce}")
+    run_gemm_fgs(
+        x,
+        weight,
+        out,
+        tactic,
+        report_valid=False,
+        retry_warp=False,
+        wait_input=True,
+        pzo=produce,
+        early_trigger=produce if early_trigger is None else early_trigger,
+        use_pdl=_pdl(),
     )
     return out
 

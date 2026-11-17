@@ -27,8 +27,10 @@ from ..linear import Linear, TensorParallelMode
 
 try:
     from ..kimi_k3_fgs import edges as k3_fgs_edges
+    from ..kimi_k3_fgs import mla_prefill as k3_mla_prefill
 except ImportError:
     k3_fgs_edges = None
+    k3_mla_prefill = None
 
 
 def _make_pos_embd_params(
@@ -249,12 +251,40 @@ class KimiK3MLAAttention(MLA):
         # TLLM_K3_FGS=lamport: the output gate writes into a slot of this edge, read only by o_proj.
         if self.use_output_gate and k3_fgs_edges is not None:
             k3_fgs_edges.declare("mla.gated", self.o_proj.in_features, self.layer_idx)
+        if k3_mla_prefill is not None:
+            k3_mla_prefill.register(self.layer_idx)
+
+    def forward_impl(
+        self,
+        position_ids: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        attn_metadata,
+        attn_output: list[torch.Tensor],
+        latent_cache_gen: Optional[torch.Tensor] = None,
+    ) -> None:
+        # TLLM_K3_FGS_PREFILL: a context-only batch runs the prefill chain (or its PDL twin) up to the FMHA output;
+        # the output gate and o_proj below close it. Decode batches take the base path unchanged.
+        if k3_mla_prefill is not None and k3_mla_prefill.active() and attn_metadata is not None:
+            o = k3_mla_prefill.forward_from_module(self, hidden_states, attn_metadata)
+            if o is not None:
+                attn_output[0] = o
+                return
+        super().forward_impl(position_ids, hidden_states, attn_metadata, attn_output, latent_cache_gen)
+
+    def _project_output_impl(self, attn_output, position_ids, attn_metadata, all_reduce_params):
+        if k3_mla_prefill is not None and k3_mla_prefill.pending(self):
+            return k3_mla_prefill.o_proj(self, attn_output, self.o_proj.weight)
+        return super()._project_output_impl(attn_output, position_ids, attn_metadata, all_reduce_params)
 
     def _apply_output_gate(
         self,
         hidden_states: torch.Tensor,
         attn_output: torch.Tensor,
     ) -> torch.Tensor:
+        if k3_mla_prefill is not None and k3_mla_prefill.pending(self):
+            return k3_mla_prefill.output_gate(
+                self, k3_mla_prefill.weights_of(self), hidden_states[: attn_output.shape[0]], attn_output
+            )
         # Sigmoid gate on o_proj's input. g_proj matches o_proj's input
         # sharding, so the multiply composes with the helix-CP output
         # projection.

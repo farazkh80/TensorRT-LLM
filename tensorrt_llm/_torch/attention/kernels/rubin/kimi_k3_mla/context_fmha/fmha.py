@@ -49,9 +49,9 @@ from cutlass.cutlass_dsl import BaseDSL
 from .helpers import fmha_helpers as fmha_utils
 
 try:
-    from ..mla_fgs import bf16x2_pzo, trap
+    from ..mla_fgs import bf16x2_pzo, st_global_v4, trap
 except ImportError:
-    from mla_fgs import bf16x2_pzo, trap
+    from mla_fgs import bf16x2_pzo, st_global_v4, trap
 
 # fgs_stats slots: re-issued loads, CTAs that re-issued, of which Q loads, of which K loads.
 FGS_STATS_LEN = 4
@@ -3419,7 +3419,6 @@ class BlackwellFusedMultiHeadAttentionForward:
             tDMrO = cute.make_rmem_tensor(tTMrO.shape, self.o_dtype)
             if cutlass.const_expr(self.fgs_producer):
                 # cvt.rn.pzo: same rounding as the default convert except that -0.0 (the sentinel) becomes +0.0.
-                # The store stays the default one: the consumer (output gate) checks every element of a chunk.
                 assert cutlass.const_expr(self.o_dtype == cutlass.BFloat16)
                 o_words = cute.recast_tensor(tDMrO, Int32)
                 for e in cutlass.range_constexpr(cute.size(tTMrO) // 2):
@@ -3433,7 +3432,19 @@ class BlackwellFusedMultiHeadAttentionForward:
             else:
                 # st.global path: write directly to global memory with bounds check
                 if row_idx < seqlen_q:
-                    cute.autovec_copy(tDMrO, tTMEM_LOADdO_i)
+                    if cutlass.const_expr(self.fgs_producer):
+                        # One 16-B store per chunk: a TMA report_valid consumer checks a chunk by its first element.
+                        o_base = tTMEM_LOADdO_i.iterator.toint()
+                        for c in cutlass.range_constexpr(cute.size(tTMrO) // 8):
+                            st_global_v4(
+                                o_base + c * 16,
+                                o_words[4 * c],
+                                o_words[4 * c + 1],
+                                o_words[4 * c + 2],
+                                o_words[4 * c + 3],
+                            )
+                    else:
+                        cute.autovec_copy(tDMrO, tTMEM_LOADdO_i)
 
         if cutlass.const_expr(mLSE is not None):
             scaled_tmp = scale_softmax * tTMEM_LOAD_VECrS[1]

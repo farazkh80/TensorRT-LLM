@@ -195,6 +195,7 @@ def _context_append_kernel(
     producer: cutlass.Constexpr,
     spin_limit: cutlass.Constexpr,
     with_stats: cutlass.Constexpr,
+    pdl: cutlass.Constexpr,
 ):
     if cutlass.const_expr(producer):
         cute.arch.griddepcontrol_launch_dependents()
@@ -205,10 +206,14 @@ def _context_append_kernel(
             consumer, producer, spin_limit, with_stats,
         )  # fmt: skip
     else:
+        if cutlass.const_expr(pdl):
+            cute.arch.griddepcontrol_wait()
         _append_default(
             mCkv, mKpe, mK, mPool, mPt, mKvLens, mCuSeqlens, pt_stride, page_offset, ckv_stride, kpe_stride,
             k_tok_stride, k_head_stride, pool_row_stride, num_heads, latent, rope, nope, page_size,
         )  # fmt: skip
+        if cutlass.const_expr(pdl):
+            cute.arch.griddepcontrol_launch_dependents()
 
 
 @cute.jit
@@ -336,6 +341,7 @@ def _context_append_host(
     producer: cutlass.Constexpr,
     spin_limit: cutlass.Constexpr,
     with_stats: cutlass.Constexpr,
+    pdl: cutlass.Constexpr,
 ):
     mCkv = cute.make_tensor(ckv_ptr, cute.make_layout((num_tokens, latent), stride=(ckv_stride, 1)))
     mKpe = cute.make_tensor(kpe_ptr, cute.make_layout((num_tokens, rope), stride=(kpe_stride, 1)))
@@ -377,11 +383,12 @@ def _context_append_host(
         producer,
         spin_limit,
         with_stats,
+        pdl,
     ).launch(
         grid=(ctas, batch, 1),
         block=(THREADS, 1, 1),
         stream=stream,
-        use_pdl=consumer or producer,
+        use_pdl=consumer or producer or pdl,
     )
 
 
@@ -401,7 +408,7 @@ def _ptrs(addrs):
 def _compiled(key: tuple, addrs, stream) -> Callable:
     fn = _COMPILED.get(key)
     if fn is None:
-        num_heads, latent, rope, nope, page_size, consumer, producer, spin_limit, with_stats = key
+        num_heads, latent, rope, nope, page_size, consumer, producer, spin_limit, with_stats, pdl = key
         one32, eight64 = cutlass.Int32(1), cutlass.Int64(8)
         with BaseDSL.enable_pyir():
             fn = cute.compile(
@@ -419,6 +426,7 @@ def _compiled(key: tuple, addrs, stream) -> Callable:
                 producer,
                 spin_limit,
                 with_stats,
+                pdl,
             )
         _COMPILED[key] = fn
     return fn
@@ -438,6 +446,7 @@ def mla_context_append(
     fgs_producer: bool = False,
     fgs_stats: Optional[torch.Tensor] = None,
     fgs_spin_limit: int = 0,
+    pdl: bool = False,
 ) -> None:
     """Append a context batch's latent rows to the paged cache and broadcast k_pe into K's rope columns.
 
@@ -446,7 +455,8 @@ def mla_context_append(
     page_table_rows: ``block_offsets[pool, ctx rows, 0, :]`` [B, max_blocks] int32. kv_lens: int32 [B], KV length
     including this chunk. cu_seqlens: int32 [B + 1], this chunk's token offsets. max_seqlen: host max of the lengths.
     fgs_consumer / fgs_producer: see the module docstring; ``fgs_stats`` (int32 [4]) accumulates the consumer's wait
-    statistics and ``fgs_spin_limit`` > 0 traps after that many reload sweeps (diagnostic).
+    statistics and ``fgs_spin_limit`` > 0 traps after that many reload sweeps (diagnostic). ``pdl`` launches the
+    default build with PDL (``griddepcontrol.wait`` before its loads, trigger after its stores).
     """
     fgs = fgs_consumer or fgs_producer
     num_tokens, latent = compressed_kv.shape
@@ -510,6 +520,7 @@ def mla_context_append(
         fgs_producer,
         spin_limit,
         with_stats,
+        pdl and not fgs,
     )
     fn = _compiled(key, addrs, stream)
     i32, i64 = cutlass.Int32, cutlass.Int64

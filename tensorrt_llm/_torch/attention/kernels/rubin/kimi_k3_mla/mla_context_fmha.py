@@ -70,6 +70,7 @@ def _compile(
     fgs_producer: bool = False,
     fgs_retry_limit: int = 0,
     fgs_stats: bool = False,
+    use_pdl: bool = False,
 ):
     is_persistent = dict(tuning).get("persistent", False)
     fmha = BlackwellFusedMultiHeadAttentionForward(
@@ -128,7 +129,7 @@ def _compile(
         None,
         None,
         make_fake_stream(use_tvm_ffi_env_stream=True),
-        fgs,
+        fgs or use_pdl,
         *extra,
         options="--enable-tvm-ffi --opt-level 2",
     )
@@ -161,8 +162,10 @@ def mla_context_fmha(
     fgs_producer: bool = False,
     fgs_retry_limit: int = 0,
     fgs_stats: Optional[torch.Tensor] = None,
+    pdl: bool = False,
 ) -> None:
-    """Causal attention of every sequence in ``cu_seqlens`` onto itself; writes o in place."""
+    """Causal attention of every sequence in ``cu_seqlens`` onto itself; writes o in place. ``pdl`` builds the plain
+    kernel with a PDL launch (its load warp waits for the grid before the first TMA load)."""
     if not supported(q, k, v, o):
         raise ValueError("mla_context_fmha needs contiguous bf16 q/k [T, H, 192], v/o [T, H, 128]")
     if cu_seqlens.dtype != torch.int32 or not cu_seqlens.is_contiguous():
@@ -189,7 +192,7 @@ def mla_context_fmha(
             fgs_stats=fgs_stats is not None,
         )
     else:
-        kernel = _compile(num_heads, key)
+        kernel = _compile(num_heads, key, use_pdl=pdl)
     q5 = q.view(1, total, num_heads, 1, HEAD_DIM_QK)
     k5 = k.view(1, total, num_heads, 1, HEAD_DIM_QK)
     v5 = v.view(1, total, num_heads, 1, HEAD_DIM_V)
@@ -222,6 +225,6 @@ def mla_context_fmha(
         Int32(0),
         None,
         None,
-        fgs,
+        fgs or pdl,
         *((fgs_stats,) if fgs_stats is not None else ()),
     )
