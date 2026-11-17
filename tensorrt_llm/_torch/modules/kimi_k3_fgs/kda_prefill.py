@@ -8,7 +8,9 @@ twin). Decode is untouched: the mixer calls :func:`forward` only for a prefill-o
 slots: int32 words, one per 128-row block of the producer's output, in ``[pairs, blocks]`` slabs. The qkvg GEMM's
 epilogue publishes each stored q / k / v tile (``cp.async.bulk.wait_group 0``, ``fence.proxy.async.global``,
 ``red.release.gpu.add``); a conv warp acquires the words of the source blocks it reads (halo included) before its
-first load. Each gated-norm CTA publishes after a CTA barrier; o_proj's TMA warp acquires the word of its M tile,
+first load. The GEMM's gate tiles (N index >= 144) count into a second word row that each gated-norm CTA acquires
+before its first ``z`` load: the norm is not the GEMM's PDL dependent, so nothing else implies the gate columns are
+complete. Each gated-norm CTA publishes after a CTA barrier; o_proj's TMA warp acquires the word of its M tile,
 then ``fence.proxy.async.global``, then issues the tile's TMA loads. Coverage is every block: publishing costs one
 thread per tile / CTA, so no last-wave rule is needed. Re-arm: the next layer's qkvg GEMM arm warp zeroes the
 previous pair's slabs (kilobytes). The data buffers are plain (no sentinels, no slot memory), so the window can
@@ -37,7 +39,9 @@ noise-level above, the Lamport slots gain 1.5 % at 1365 and lose 0.5-0.9 % at 81
 order; ``n`` publishes row blocks in order but costs the
 weight-streaming qkvg GEMM 3-21 %, A-02), ``_NORM_CTAS`` (gated norm persistent grid of the FGS roles; 0 = the
 default grid, one CTA per row block), ``_DELAY_NS`` (producer GEMMs spin at entry; hazard tests),
-``_MAX_SPINS`` (consumer rounds before the grid-wait fallback; small values force the slow path).
+``_MAX_SPINS`` (consumer rounds before the grid-wait fallback; small values force the slow path),
+``_QKVG_CTAS`` (cap the qkvg GEMM's persistent grid; with a few CTAs its gate tiles outlive the conv → norm chain,
+the hazard test of the norm's acquire), ``_NORM_GATE=0`` (drop the norm's acquire: that test's negative control).
 """
 
 import atexit
@@ -63,6 +67,8 @@ RASTER = os.environ.get("TLLM_K3_FGS_PREFILL_RASTER", "m")
 NORM_CTAS = int(os.environ.get("TLLM_K3_FGS_PREFILL_NORM_CTAS", "0"))
 DELAY_NS = int(os.environ.get("TLLM_K3_FGS_PREFILL_DELAY_NS", "0"))
 MAX_SPINS = int(os.environ.get("TLLM_K3_FGS_PREFILL_MAX_SPINS", str(1 << 16)))
+QKVG_CTAS = int(os.environ.get("TLLM_K3_FGS_PREFILL_QKVG_CTAS", "0")) or None
+NORM_GATE = os.environ.get("TLLM_K3_FGS_PREFILL_NORM_GATE", "1") != "0"
 # Counter slab words per pair: a word per 64 output rows covers every rubin tactic's CTA tile.
 COUNTER_WORDS = -(-(-(-MAX_ROWS // 64)) // 4) * 4
 
@@ -185,7 +191,9 @@ class _Counters:
         self.dirty: Dict[str, List[int]] = {}
         for edge in (P_QKVG, P_CORE):
             if edge in edges_on():
-                self.slab[edge] = torch.zeros((pairs, COUNTER_WORDS), dtype=torch.int32, device=device)
+                # p_qkvg: row 0 counts the q / k / v tiles (the conv's gate), row 1 the gate tiles (the norm's).
+                shape = (pairs, 2, COUNTER_WORDS) if edge == P_QKVG else (pairs, COUNTER_WORDS)
+                self.slab[edge] = torch.zeros(shape, dtype=torch.int32, device=device)
                 self.dirty[edge] = [0] * pairs
         logger.info(f"{ENV}=1 counter link: {sorted(self.slab)} x {pairs} pairs x {COUNTER_WORDS} words")
 
@@ -204,14 +212,18 @@ class _Counters:
             words = self.dirty[edge][pair]
             if words:
                 self.dirty[edge][pair] = 0
-                regions.append((slab[pair, :words], 0))
+                if slab.dim() == 3:
+                    regions.append((slab[pair, 0, :words], 0))
+                    regions.append((slab[pair, 1, :words], 0))
+                else:
+                    regions.append((slab[pair, :words], 0))
         return tuple(regions)
 
     def fill_dirty(self) -> None:
         for edge, slab in self.slab.items():
             for pair, words in enumerate(self.dirty[edge]):
                 if words:
-                    slab[pair, :words].zero_()
+                    slab[pair][..., :words].zero_()
                     self.dirty[edge][pair] = 0
 
 
@@ -418,6 +430,7 @@ def _forward_counter(mixer, x2d, cu_seqlens, mamba_metadata, num_prefills, conv_
     cta_m, cta_n = kimi_k3_cute_gemm.rubin_tile(4 * d, mixer.hidden_size, T)
     blocks = -(-T // cta_m)
     qkv_tiles = 3 * d // cta_n
+    gate_tiles = 4 * d // cta_n - qkv_tiles
     pk2 = counters.words(P_QKVG, pair, blocks) if P_QKVG in edges_on() else None
 
     from ..kimi_kda.kimi_kda_mixer import _reset_state_rows
@@ -431,6 +444,7 @@ def _forward_counter(mixer, x2d, cu_seqlens, mamba_metadata, num_prefills, conv_
         publish=None if pk2 is None else (pk2, qkv_tiles),
         arm=counters.arm_regions(prev),
         start_delay_ns=DELAY_NS if pk2 is not None else 0,
+        max_ctas=QKVG_CTAS,
     )
     q, k, v = (x2d.new_empty(1, T, H, hd) for _ in range(3))
     conv_mod.fused_prefill_conv(
@@ -446,7 +460,7 @@ def _forward_counter(mixer, x2d, cu_seqlens, mamba_metadata, num_prefills, conv_
         v,
         fgs_max_spins=MAX_SPINS,
         pdl=pk2 is None,
-        fgs_counters=pk2,
+        fgs_counters=None if pk2 is None else pk2[0],
         fgs_counter_rows=cta_m if pk2 is not None else 0,
         fgs_counter_target=qkv_tiles if pk2 is not None else 0,
     )
@@ -468,6 +482,7 @@ def _forward_counter(mixer, x2d, cu_seqlens, mamba_metadata, num_prefills, conv_
         fgs_ctas=NORM_CTAS if pk8 is not None else 0,
         fgs_counters=pk8,
         fgs_counter_rows=o_cta_m * H if pk8 is not None else 0,
+        fgs_gate=(pk2[1], cta_m * H, gate_tiles) if pk2 is not None and NORM_GATE else None,
     )
     gate = None if pk8 is None else (pk8, H, norm_rows_per_cta, MAX_SPINS)
     mixer._k3_prefill_pending = (pair, prev, T, False, gate)

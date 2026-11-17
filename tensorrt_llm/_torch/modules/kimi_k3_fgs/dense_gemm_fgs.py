@@ -154,6 +154,7 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
         gate_spins: int = 1 << 16,
         glu: Optional[Tuple[float, float]] = None,
         fold: int = 0,
+        publish_hi_words: int = 0,
     ):
         super().__init__(
             acc_dtype=acc_dtype,
@@ -194,6 +195,9 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
             self.threads_per_cta += 32
         self.start_delay_ns = start_delay_ns
         self.publish_tiles = publish_tiles
+        # publish_hi_words > 0: tiles with N index >= publish_tiles count into a second word row of the slab, that
+        # many words after the first (the gate columns of the KDA qkvg GEMM, read by the norm, not by the conv).
+        self.publish_hi_words = publish_hi_words
         self.gate = gate
         self.gate_spins = gate_spins
         if gate:
@@ -978,6 +982,16 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
                                 release_add(
                                     cnt_pub + cutlass.Int64(cur_tile_coord[0]) * 4, cutlass.Int32(1)
                                 )
+                    else:
+                        if cutlass.const_expr(self.publish_hi_words > 0):
+                            if warp_idx == self.epilogue_warp_id[0]:
+                                _bulk_wait_all()
+                                fence_proxy_async_global()
+                                with cute.arch.elect_one():
+                                    release_add(
+                                        cnt_pub + cutlass.Int64(self.publish_hi_words + cur_tile_coord[0]) * 4,
+                                        cutlass.Int32(1),
+                                    )
 
                 if cutlass.const_expr(self.timeline):
                     if tidx == 0:
@@ -1420,7 +1434,8 @@ def run_gemm_fgs(
     byte size is a multiple of 16, each a tensor or ``(tensor, 0)`` for a zero fill) are re-armed with bf16 -0.0 pairs
     or zeros by an extra warp after the PDL wait; they must have no live reader. ``start_delay_ns`` spins every warp
     at entry after the trigger (hazard tests). ``publish`` = (int32 slab, tiles): the epilogue adds 1 to
-    ``slab[cta M tile]`` for every stored tile with N index below ``tiles``. ``gate`` = (int32 slab, scale, unit,
+    ``slab[cta M tile]`` for every stored tile with N index below ``tiles``; a ``[2, words]`` slab also counts the
+    tiles at or above ``tiles`` into ``slab[1, cta M tile]``. ``gate`` = (int32 slab, scale, unit,
     max_spins): the TMA warp waits for ``slab[cta M tile] >= ceil(rows_in_tile * scale / unit)`` before a tile's
     loads (no grid wait at entry; after ``max_spins`` rounds it waits for the grid instead). ``glu`` =
     (h [L, M, N / 2], cap, lin): ``out`` is not stored; the weight rows must be interleaved per 32 columns (gate rows
@@ -1480,12 +1495,21 @@ def run_gemm_fgs(
     cnt_pub = cnt_gate = 0
     gate_scale = gate_unit = 0
     gate_spins = 1 << 16
+    publish_hi_words = 0
     if publish is not None:
         slab, publish_tiles = publish
         cta_m = mma_mn[0] // (2 if use_2cta else 1)
-        if slab.dtype != torch.int32 or not slab.is_contiguous() or slab.numel() < -(-m // cta_m):
-            raise ValueError("publish slab must be a contiguous int32 tensor with a word per cta M tile")
+        if (
+            slab.dtype != torch.int32
+            or not slab.is_contiguous()
+            or slab.dim() not in (1, 2)
+            or (slab.dim() == 2 and slab.shape[0] != 2)
+            or slab.shape[-1] < -(-m // cta_m)
+        ):
+            raise ValueError("publish slab must be a contiguous int32 [words] or [2, words], a word per cta M tile")
         cnt_pub = slab.data_ptr()
+        if slab.dim() == 2:
+            publish_hi_words = slab.shape[1]
     if gate is not None:
         slab, gate_scale, gate_unit, gate_spins = gate
         if slab.dtype != torch.int32 or not slab.is_contiguous():
@@ -1534,6 +1558,7 @@ def run_gemm_fgs(
         gate_spins=gate_spins,
         glu=glu_role,
         fold=fold_n,
+        publish_hi_words=publish_hi_words,
     )
     key = (
         "strided",

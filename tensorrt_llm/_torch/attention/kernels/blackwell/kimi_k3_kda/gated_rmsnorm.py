@@ -160,6 +160,22 @@ def _st_global_v4(addr, w0, w1, w2, w3, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _ld_acquire_b32(addr, *, loc=None, ip=None):
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)],
+            "ld.acquire.gpu.global.b32 $0, [$1];",
+            "=r,l,~{memory}",
+            has_side_effects=True,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def _release_add(addr, val, *, loc=None, ip=None):
     llvm.inline_asm(
         None,
@@ -190,6 +206,7 @@ class GatedRmsNorm:
         l1_first_load: bool = False,
         fgs_producer: bool = False,
         fgs_counters: bool = False,
+        fgs_gate: bool = False,
     ):
         self.heads = heads
         self.rows_per_thread = rows_per_thread
@@ -197,6 +214,10 @@ class GatedRmsNorm:
         self.use_pdl = use_pdl
         self.rows_per_cta = warps * ROWS_PER_WARP_STEP * rows_per_thread
         assert not (fgs_consumer or fgs_producer or fgs_counters) or use_pdl
+        assert not (fgs_gate and persistent_ctas)
+        # fgs_gate: thread 0 acquires the counter word of the CTA's row block before any z load (the z producer is
+        # not this grid's PDL predecessor, so its completion is not implied by the grid wait).
+        self.fgs_gate = fgs_gate
         assert fgs_consumer or not (with_stats or weak_first_load or l1_first_load)
         assert not (weak_first_load and l1_first_load)
         self.fgs_consumer = fgs_consumer
@@ -234,13 +255,18 @@ class GatedRmsNorm:
         timeline: cute.Tensor | None,
         cnt: cute.Tensor | None,
         cnt_block_rows: cutlass.Int32,
+        gate: cute.Tensor | None,
+        gate_block_rows: cutlass.Int32,
+        gate_target: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         rows = x.shape[0]
         grid = (rows + self.rows_per_cta - 1) // self.rows_per_cta
         if cutlass.const_expr(self.persistent_ctas > 0):
             grid = cute.min(grid, self.persistent_ctas)
-        self.kernel(x, z, weight, out, eps, stats, timeline, cnt, cnt_block_rows).launch(
+        self.kernel(
+            x, z, weight, out, eps, stats, timeline, cnt, cnt_block_rows, gate, gate_block_rows, gate_target
+        ).launch(
             grid=[grid, 1, 1],
             block=[self.warps * 32, 1, 1],
             stream=stream,
@@ -260,6 +286,9 @@ class GatedRmsNorm:
         timeline: cute.Tensor | None,
         cnt: cute.Tensor | None,
         cnt_block_rows: cutlass.Int32,
+        gate: cute.Tensor | None,
+        gate_block_rows: cutlass.Int32,
+        gate_target: cutlass.Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -288,6 +317,14 @@ class GatedRmsNorm:
         if cutlass.const_expr(self.with_timeline):
             if tidx == 0:
                 cute.arch.atomic_min(timeline.iterator, _globaltimer())
+        if cutlass.const_expr(self.fgs_gate):
+            if tidx == 0:
+                gate_addr = gate.iterator.toint() + cutlass.Int64((bidx * self.rows_per_cta) // gate_block_rows) * 4
+                seen = _ld_acquire_b32(gate_addr)
+                while seen < gate_target:
+                    _nanosleep(cutlass.Int32(128))
+                    seen = _ld_acquire_b32(gate_addr)
+            cute.arch.barrier()
 
         spins = cutlass.Int32(0)
         waited = cutlass.Int32(0)
@@ -455,6 +492,7 @@ def _compile(
     l1_first_load: bool = False,
     fgs_producer: bool = False,
     fgs_counters: bool = False,
+    fgs_gate: bool = False,
 ):
     rows, tokens = cute.sym_int(), cute.sym_int()
     x = make_fake_tensor(
@@ -482,6 +520,9 @@ def _compile(
     cnt = None
     if fgs_counters:
         cnt = make_fake_tensor(cutlass.Int32, (cute.sym_int(),), stride=(1,), assumed_align=16)
+    gate = None
+    if fgs_gate:
+        gate = make_fake_tensor(cutlass.Int32, (cute.sym_int(),), stride=(1,), assumed_align=16)
     op = GatedRmsNorm(
         heads,
         rows_per_thread,
@@ -497,6 +538,7 @@ def _compile(
         l1_first_load,
         fgs_producer,
         fgs_counters,
+        fgs_gate,
     )
     return cute.compile(
         op,
@@ -508,6 +550,9 @@ def _compile(
         stats,
         timeline,
         cnt,
+        cutlass.Int32(1),
+        gate,
+        cutlass.Int32(1),
         cutlass.Int32(1),
         make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
@@ -583,6 +628,7 @@ def kda_gated_rmsnorm(
     fgs_producer: bool = False,
     fgs_counters: torch.Tensor | None = None,
     fgs_counter_rows: int = 0,
+    fgs_gate: tuple | None = None,
 ) -> torch.Tensor:
     """Sigmoid-gated RMSNorm of ``x [T*H, 128]`` with ``z [T, H, 128]``; returns ``[T*H, 128]``.
 
@@ -627,6 +673,20 @@ def kda_gated_rmsnorm(
         if fgs_counters.numel() < -(-rows // fgs_counter_rows):
             raise ValueError("kda_gated_rmsnorm: fgs_counters needs a word per row block")
         use_pdl = True
+    gate_words = None
+    gate_block_rows = gate_target = 1
+    if fgs_gate is not None:
+        # (int32 words, rows per word, target): each CTA waits for words[its first row // rows per word] >= target.
+        gate_words, gate_block_rows, gate_target = fgs_gate
+        if gate_words.dtype != torch.int32 or not gate_words.is_contiguous():
+            raise ValueError("kda_gated_rmsnorm: fgs_gate words must be a contiguous int32 tensor")
+        if gate_block_rows <= 0 or gate_block_rows % (warps * ROWS_PER_WARP_STEP * rows_per_thread):
+            raise ValueError("kda_gated_rmsnorm: fgs_gate rows per word must be a multiple of the CTA's rows")
+        if gate_words.numel() < -(-rows // gate_block_rows):
+            raise ValueError("kda_gated_rmsnorm: fgs_gate needs a word per row block")
+        if fgs_ctas:
+            raise ValueError("kda_gated_rmsnorm: fgs_gate needs the default grid")
+        use_pdl = True
     with_stats = fgs_consumer and fgs_stats is not None
     if with_stats and (fgs_stats.dtype != torch.int32 or fgs_stats.numel() < 2):
         raise ValueError("kda_gated_rmsnorm: fgs_stats must be an int32 tensor of 2 elements")
@@ -649,9 +709,10 @@ def kda_gated_rmsnorm(
         False,
         fgs_producer,
         fgs_counters is not None,
+        gate_words is not None,
     )
     fn(
         x, z, weight, out, eps, fgs_stats if with_stats else None, fgs_timeline, fgs_counters,
-        cutlass.Int32(max(fgs_counter_rows, 1)),
+        cutlass.Int32(max(fgs_counter_rows, 1)), gate_words, cutlass.Int32(gate_block_rows), cutlass.Int32(gate_target),
     )  # fmt: skip
     return out
