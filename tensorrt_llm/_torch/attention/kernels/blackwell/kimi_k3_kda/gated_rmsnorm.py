@@ -234,7 +234,10 @@ def _fence_proxy_async_global(*, loc=None, ip=None):
 def _mbar_expect_tx(mbar, nbytes, *, loc=None, ip=None):
     llvm.inline_asm(
         None,
-        [cutlass.Int32(mbar).ir_value(loc=loc, ip=ip), cutlass.Int32(nbytes).ir_value(loc=loc, ip=ip)],
+        [
+            cutlass.Int32(mbar).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(nbytes).ir_value(loc=loc, ip=ip),
+        ],
         "mbarrier.arrive.expect_tx.shared::cta.b64 _, [$0], $1;",
         "r,r,~{memory}",
         has_side_effects=True,
@@ -533,7 +536,20 @@ class GatedRmsNorm:
                     ROWS_PER_WARP_STEP * self.rows_per_thread
                 ) + (lane // LANES_PER_ROW)
                 spins, waited = self._block(
-                    x, z, out, sX, sZ, sOut, eps, w_reg, copy_x, block_row0, block, col, spins, waited
+                    x,
+                    z,
+                    out,
+                    sX,
+                    sZ,
+                    sOut,
+                    eps,
+                    w_reg,
+                    copy_x,
+                    block_row0,
+                    block,
+                    col,
+                    spins,
+                    waited,
                 )
                 if cutlass.const_expr(self.store_tma):
                     self._tma_store(tma_out, tOsO, tOgO, block, tidx, cnt, cnt_block_rows)
@@ -627,8 +643,12 @@ class GatedRmsNorm:
                 head = r - tok * self.heads
                 if cutlass.const_expr(self.load_tma):
                     lrow = r - block * self.rows_per_cta
-                    cute.copy(copy_x, cute.local_tile(sX[lrow, None, 0], (VEC,), (col // VEC,)), x_reg)
-                    cute.copy(copy_x, cute.local_tile(sZ[lrow, None, 0], (VEC,), (col // VEC,)), z_reg)
+                    cute.copy(
+                        copy_x, cute.local_tile(sX[lrow, None, 0], (VEC,), (col // VEC,)), x_reg
+                    )
+                    cute.copy(
+                        copy_x, cute.local_tile(sZ[lrow, None, 0], (VEC,), (col // VEC,)), z_reg
+                    )
                 else:
                     x_chunk = cute.local_tile(x[r, None], (VEC,), (col // VEC,))
                     if cutlass.const_expr(self.fgs_consumer):
