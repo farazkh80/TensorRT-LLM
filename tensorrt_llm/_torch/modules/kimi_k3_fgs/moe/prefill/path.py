@@ -6,6 +6,8 @@
 (the sync-free reference of the moe_chain routing contract). The permuted buffers are sized for
 ``TLLM_K3_MOE_PREFILL_PAIRS_PER_ROW`` local (row, k) pairs per received row (default twice the rank-balanced
 16 / EP: 2 at EP16, 8 at EP4); the CuTe routing traps on a routing with more local pairs, the torch one drops them.
+``TLLM_K3_MOE_PREFILL_PUSH`` (``push_mode()``) names the FC2 -> combine push the caller wires: ``tiles``
+(``fc2_push``: tile push, finalize, rest push) or ``stream`` (``stream_push``: finalize fused into one push kernel).
 """
 
 from __future__ import annotations
@@ -26,6 +28,15 @@ SF_VEC = 32
 TILE = 128
 ROUTING_ENV = "TLLM_K3_MOE_PREFILL_ROUTING"
 PAIRS_ENV = "TLLM_K3_MOE_PREFILL_PAIRS_PER_ROW"
+PUSH_ENV = "TLLM_K3_MOE_PREFILL_PUSH"
+PUSH_MODES = ("tiles", "stream")
+
+
+def push_mode() -> str:
+    mode = os.environ.get(PUSH_ENV, "tiles")
+    if mode not in PUSH_MODES:
+        raise ValueError(f"{PUSH_ENV}: unknown push {mode!r} (tiles | stream)")
+    return mode
 
 
 @dataclass
@@ -63,7 +74,8 @@ class Workspace:
         self.act = torch.empty(p, INTER, dtype=torch.float8_e4m3fn, device=device)
         self.act_sf = torch.empty(p, INTER // SF_VEC, dtype=torch.uint8, device=device)
         self.y = torch.empty(p, HIDDEN, dtype=torch.bfloat16, device=device)
-        self.tile_done = torch.zeros(p // TILE, dtype=torch.int32, device=device)
+        # One word per m-tile plus the streaming push's row-dealing word, zeroed together per round.
+        self.tile_done = torch.zeros(p // TILE + 1, dtype=torch.int32, device=device)
 
 
 _workspaces: Dict[Tuple[torch.device, int, int], Workspace] = {}
@@ -142,12 +154,17 @@ def run(
     fc2_ctas: Optional[int] = None,
     after_fc2: Optional[Callable] = None,
     after_finalize: Optional[Callable] = None,
+    stream: Optional[Callable] = None,
+    stream_fgs: bool = True,
 ) -> Workspace:
     """Writes ``out`` [R, 3584] bf16: per received row, the top-k weighted sum of its local experts' outputs.
 
     ``after_fc2(out, plan, tile_done)`` is launched right after FC2, which then publishes one count per finished
     (m-tile, n-tile) into ``tile_done``, triggers its dependents at entry and runs on ``fc2_ctas`` CTAs (the FC2 ->
-    combine push edge); ``after_finalize(out, plan)`` is launched after the finalize."""
+    combine push edge); ``after_finalize(out, plan)`` is launched after the finalize.
+    ``stream(out, y, topk_w, plan, tile_done)`` replaces the finalize (``stream_push.push_stream``: the finalize is
+    fused into the push, so ``out`` keeps only the single-pair rows): with ``stream_fgs`` FC2 runs as for
+    ``after_fc2``, else plain on the full grid (the FGS-off twin)."""
     rows = x.shape[0]
     assert x.shape == (rows, HIDDEN) and x.dtype == torch.float8_e4m3fn, (x.shape, x.dtype)
     assert x_sf.shape == (rows, HIDDEN // SF_VEC) and x_sf.dtype == torch.uint8, (x_sf.shape, x_sf.dtype)
@@ -159,11 +176,12 @@ def run(
     _routing(os.environ.get(ROUTING_ENV, "cute"))(
         topk_ids, weights.local_expert_offset, weights.num_local, plan
     )
-    if after_fc2 is not None:
+    publish = after_fc2 is not None or (stream is not None and stream_fgs)
+    if publish or stream is not None:
         ws.tile_done.zero_()
     fc1.run(x, x_sf, weights, plan, ws.act, ws.act_sf)
     # FC2 writes the rows with one local pair; finalize writes the others (zero where no pair is local).
-    if after_fc2 is None:
+    if not publish:
         fc2.run(ws.act, ws.act_sf, weights, plan, ws.y, fin=(out, topk_w))
     else:
         fc2.run(
@@ -177,7 +195,11 @@ def run(
             pdl_trigger="start",
             num_ctas=fc2_ctas,
         )
-        after_fc2(out, plan, ws.tile_done)
+        if after_fc2 is not None:
+            after_fc2(out, plan, ws.tile_done)
+    if stream is not None:
+        stream(out, ws.y, topk_w, plan, ws.tile_done)
+        return ws
     finalize.run(ws.y, topk_w, plan, out, skip_single=True)
     if after_finalize is not None:
         after_finalize(out, plan)
