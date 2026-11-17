@@ -12,6 +12,9 @@ a tile that landed invalid is re-issued until valid; after ``fgs_max_spins`` inv
 grid once and reloads plainly. Dependents are triggered at entry.
 ``fgs_counters``: after its stores each CTA adds 1 to ``counters[first token row // fgs_counter_rows]``
 (``red.release.gpu``); ``fgs_counter_rows * N`` must be a multiple of the tile so no CTA straddles a block.
+``store="tma"``: the gated tile is written back over the o tile in shared memory and stored by one TMA store;
+the counter publish follows ``cp.async.bulk.wait_group 0`` and ``fence.proxy.async.global``, so o_proj's TMA
+loads see the tile. ``store="thread"`` is one 16-byte ``st.global`` per thread and chunk.
 """
 
 from typing import Callable, Optional
@@ -56,9 +59,44 @@ def _release_add(addr, val, *, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def _bulk_wait_all(*, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [],
+        "cp.async.bulk.wait_group 0;",
+        "~{memory}",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _fence_proxy_async_global(*, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [],
+        "fence.proxy.async.global;",
+        "~{memory}",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
 class _Gate:
     def __init__(
-        self, fast: bool, pdl: bool, consumer: bool, max_spins: int, with_stats: bool, publish: bool
+        self,
+        fast: bool,
+        pdl: bool,
+        consumer: bool,
+        max_spins: int,
+        with_stats: bool,
+        publish: bool,
+        store_tma: bool,
     ):
         self.fast = fast
         self.pdl = pdl
@@ -66,6 +104,7 @@ class _Gate:
         self.max_spins = max_spins
         self.with_stats = with_stats
         self.publish = publish
+        self.store_tma = store_tma
 
         @cute.struct
         class SharedStorage:
@@ -92,10 +131,15 @@ class _Gate:
         smem_tile = cute.slice_(smem_layout, (None, None, 0))
         tma_o, mO_tma = cpasync.make_tiled_tma_atom(op, mO, smem_tile, tile)
         tma_g, mG_tma = cpasync.make_tiled_tma_atom(op, mG, smem_tile, tile)
+        tma_out = None
+        if cutlass.const_expr(self.store_tma):
+            tma_out, mOut = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileS2GOp(), mOut, smem_tile, tile
+            )
         rows = mO.shape[0]
         num_ctas = (rows + TILE_ROWS - 1) // TILE_ROWS
         self.kernel(
-            tma_o, mO_tma, tma_g, mG_tma, mOut, stats_ptr, cnt_ptr, cnt_block, smem_layout
+            tma_o, mO_tma, tma_g, mG_tma, mOut, tma_out, stats_ptr, cnt_ptr, cnt_block, smem_layout
         ).launch(
             grid=(num_ctas, 1, 1),
             block=(THREADS, 1, 1),
@@ -128,6 +172,7 @@ class _Gate:
         tma_g: cute.CopyAtom,
         mG: cute.Tensor,
         mOut: cute.Tensor,
+        tma_out: cute.CopyAtom | None,
         stats_ptr: cute.Pointer,
         cnt_ptr: cute.Pointer,
         cnt_block: cutlass.Int64,
@@ -145,6 +190,8 @@ class _Gate:
         if tidx == 0:
             cpasync.prefetch_descriptor(tma_o)
             cpasync.prefetch_descriptor(tma_g)
+            if cutlass.const_expr(self.store_tma):
+                cpasync.prefetch_descriptor(tma_out)
             if cutlass.const_expr(self.consumer):
                 cute.arch.mbarrier_v1_init(bar, 1)
             else:
@@ -161,6 +208,16 @@ class _Gate:
         tGsG, tGgG = cpasync.tma_partition(
             tma_g, 0, cute.make_layout(1), cute.group_modes(sG, 0, 2), cute.group_modes(gG, 0, 2)
         )
+        tOsOut = tOgOut = None
+        if cutlass.const_expr(self.store_tma):
+            gOut = cute.local_tile(mOut, (TILE_ROWS, TILE_COLS), (None, None))
+            tOsOut, tOgOut = cpasync.tma_partition(
+                tma_out,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sO, 0, 2),
+                cute.group_modes(gOut, 0, 2),
+            )
         if cutlass.const_expr(self.pdl and not self.consumer):
             cute.arch.griddepcontrol_wait()
         if warp_idx == 0:
@@ -205,7 +262,8 @@ class _Gate:
         sg = cutlass.make_array_view(
             cute.make_tensor(storage.sG.data_ptr(), cute.make_layout((TILE_ELEMS,)))
         )
-        out = cutlass.make_array_view(mOut)
+        if cutlass.const_expr(not self.store_tma):
+            out = cutlass.make_array_view(mOut)
         row = tidx // (TILE_COLS // PER_THREAD)
         col0 = (tidx % (TILE_COLS // PER_THREAD)) * PER_THREAD
         grow = cutlass.Int64(bidx) * TILE_ROWS + row
@@ -218,14 +276,25 @@ class _Gate:
                 res = []
                 for e in cutlass.range_constexpr(VEC):
                     res.append(o[e] * _sigmoid_bf16_as_f32(g[e], self.fast))
-                out.store(
-                    cutlass.Vector.from_elements(tuple(res), dtype=cutlass.Float32).to(
-                        cutlass.BFloat16
-                    ),
-                    idx=gidx + c * VEC,
-                    vector_size=VEC,
-                    alignment=2 * VEC,
+                vals = cutlass.Vector.from_elements(tuple(res), dtype=cutlass.Float32).to(
+                    cutlass.BFloat16
                 )
+                if cutlass.const_expr(self.store_tma):
+                    # Each thread owns its chunks of the o tile, so the gated values go back in place.
+                    so.store(vals, idx=sidx + c * VEC, vector_size=VEC, alignment=2 * VEC)
+                else:
+                    out.store(vals, idx=gidx + c * VEC, vector_size=VEC, alignment=2 * VEC)
+        if cutlass.const_expr(self.store_tma):
+            cute.arch.fence_view_async_shared()
+            cute.arch.barrier()
+            if warp_idx == 0:
+                cute.copy(tma_out, tOsOut[(None, 0)], tOgOut[(None, bidx, 0)])
+                cute.arch.cp_async_bulk_commit_group()
+                if cutlass.const_expr(self.publish):
+                    _bulk_wait_all()
+                    _fence_proxy_async_global()
+                else:
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
         if cutlass.const_expr(self.publish):
             cute.arch.barrier()
             if tidx == 0:
@@ -270,12 +339,15 @@ def mla_output_gate_tma(
     fgs_stats: Optional[torch.Tensor] = None,
     fgs_counters: Optional[torch.Tensor] = None,
     fgs_counter_rows: int = 0,
+    store: str = "thread",
 ) -> torch.Tensor:
     """out = o * sigmoid(g) for 2-D bf16 o / g (see the module docstring); ``out`` must not alias o or g."""
     if not supported(o, g):
         raise ValueError(
             "mla_output_gate_tma needs contiguous 32B-aligned 2-D bf16 o / g, numel % 256 == 0"
         )
+    if store not in ("thread", "tma"):
+        raise ValueError(f"mla_output_gate_tma: store={store!r}; valid: thread, tma")
     if out is None:
         out = torch.empty_like(o)
     elif (
@@ -303,7 +375,8 @@ def mla_output_gate_tma(
     if rows == 0:
         return out
     max_spins = fgs_max_spins if fgs_consumer else 0
-    key = (fast, pdl, fgs_consumer, max_spins, with_stats, publish)
+    store_tma = store == "tma"
+    key = (fast, pdl, fgs_consumer, max_spins, with_stats, publish, store_tma)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     def arg2d(t):
@@ -320,7 +393,7 @@ def mla_output_gate_tma(
     args = (
         arg2d(o),
         arg2d(g),
-        arg1d(out),
+        arg2d(out) if store_tma else arg1d(out),
         iptr(fgs_stats if with_stats else out),
         iptr(fgs_counters if publish else out),
         cutlass.Int64(cnt_block),
@@ -328,7 +401,9 @@ def mla_output_gate_tma(
     )
     fn = _COMPILED.get(key)
     if fn is None:
-        fn = cute.compile(_Gate(fast, pdl, fgs_consumer, max_spins, with_stats, publish), *args)
+        fn = cute.compile(
+            _Gate(fast, pdl, fgs_consumer, max_spins, with_stats, publish, store_tma), *args
+        )
         _COMPILED[key] = fn
     fn(*args)
     return out
