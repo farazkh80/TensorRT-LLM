@@ -36,9 +36,10 @@ Env (read at import): ``TLLM_K3_FGS_PREFILL`` (shared with ``kda_prefill``), ``T
 ``pm7,pm9,pm11,gproj`` of this chain, default ``pm11,gproj``; KDA ids are ignored here),
 ``TLLM_K3_FGS_PREFILL_MIN_ROWS``, ``TLLM_K3_FGS_MLA_PREFILL_MAX_ROWS`` (slot rows, 72 KB per row per pair),
 ``TLLM_K3_FGS_PREFILL_DELAY_NS`` (the v GEMM spins at entry: hazard tests), ``TLLM_K3_FGS_PREFILL_MAX_SPINS`` (gate /
-o_proj rounds before the grid-wait fallback), ``TLLM_K3_FGS_PREFILL_GATE_STORE=thread|tma`` (the gate's output:
-16-byte thread stores, or one TMA store per tile with the pm11 publish after ``cp.async.bulk.wait_group 0`` and
-``fence.proxy.async.global``; the twin uses the same build).
+o_proj rounds before the grid-wait fallback), ``TLLM_K3_FGS_PREFILL_GATE_STORE=tma|thread`` (the gate's output: one
+TMA store per tile with the pm11 publish after ``cp.async.bulk.wait_group 0`` and ``fence.proxy.async.global``
+(default; it costs the gate 3-7 % on ready inputs, 0.1-0.6 % of the layer), or 16-byte thread stores; the twin uses
+the same build).
 """
 
 import atexit
@@ -61,7 +62,7 @@ MIN_ROWS = int(os.environ.get("TLLM_K3_FGS_PREFILL_MIN_ROWS", "1024"))
 MAX_ROWS = int(os.environ.get("TLLM_K3_FGS_MLA_PREFILL_MAX_ROWS", "4096"))
 DELAY_NS = int(os.environ.get("TLLM_K3_FGS_PREFILL_DELAY_NS", "0"))
 MAX_SPINS = int(os.environ.get("TLLM_K3_FGS_PREFILL_MAX_SPINS", str(1 << 16)))
-GATE_STORE = os.environ.get("TLLM_K3_FGS_PREFILL_GATE_STORE", "thread")
+GATE_STORE = os.environ.get("TLLM_K3_FGS_PREFILL_GATE_STORE", "tma")
 if GATE_STORE not in ("thread", "tma"):
     raise ValueError(f"TLLM_K3_FGS_PREFILL_GATE_STORE={GATE_STORE!r}; valid: thread, tma")
 COUNTER_WORDS = -(-(-(-MAX_ROWS // 64)) // 4) * 4

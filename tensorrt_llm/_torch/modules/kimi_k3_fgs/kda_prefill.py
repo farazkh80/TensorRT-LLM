@@ -44,8 +44,9 @@ default grid, one CTA per row block), ``_DELAY_NS`` (producer GEMMs spin at entr
 the hazard test of the norm's acquire), ``_NORM_GATE=0`` (drop the norm's acquire: that test's negative control),
 ``_CONV=bulk|cpasync`` (the conv's source loads: one ``cp.async.bulk`` per ring slot onto an mbarrier, after the
 counter acquire and a proxy fence, or the per-lane ``cp.async`` ring; the twin uses the same build),
-``_NORM_STORE=v4|tma`` (the gated norm's output: 16-byte thread stores, or one TMA store per CTA tile with the
-counter publish after ``cp.async.bulk.wait_group 0`` and ``fence.proxy.async.global``; the twin uses the same build).
+``_NORM_STORE=tma|v4`` (the gated norm's output: one TMA store per CTA tile with the counter publish after
+``cp.async.bulk.wait_group 0`` and ``fence.proxy.async.global`` (default, the same cost as the thread stores on one
+GPU), or 16-byte thread stores; the twin uses the same build).
 """
 
 import atexit
@@ -78,7 +79,7 @@ NORM_GATE = os.environ.get("TLLM_K3_FGS_PREFILL_NORM_GATE", "1") != "0"
 CONV = os.environ.get("TLLM_K3_FGS_PREFILL_CONV", "bulk")
 if CONV not in ("bulk", "cpasync"):
     raise ValueError(f"TLLM_K3_FGS_PREFILL_CONV={CONV!r}; valid: bulk, cpasync")
-NORM_STORE = os.environ.get("TLLM_K3_FGS_PREFILL_NORM_STORE", "v4")
+NORM_STORE = os.environ.get("TLLM_K3_FGS_PREFILL_NORM_STORE", "tma")
 if NORM_STORE not in ("v4", "tma"):
     raise ValueError(f"TLLM_K3_FGS_PREFILL_NORM_STORE={NORM_STORE!r}; valid: v4, tma")
 # Counter slab words per pair: a word per 64 output rows covers every rubin tactic's CTA tile.
