@@ -33,7 +33,7 @@ Consumer (A is a sentinel-armed edge slot; B, the weights, is never checked):
 - ``retry_poll``: ``"try"`` suspends on each stage's primary phase (bounded by the hardware time limit), ``"test"``
   polls it.
 
-Producer re-arm (``arm_regions``): one extra warp stores the bf16 -0.0 sentinel over up to two flat regions, the
+Producer re-arm (``arm_regions``): one extra warp stores the bf16 -0.0 sentinel over up to four flat regions, the
 slots of an edge's previous use, after ``griddepcontrol.wait`` and while the other warps compute. The caller
 guarantees those regions have no live reader (``kda_prefill``). Without it the kernel never writes sentinels and the
 framework arms the A slot before the producer runs.
@@ -208,6 +208,10 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
         arm0_chunks: cutlass.Int32,
         arm1_base: cutlass.Int64,
         arm1_chunks: cutlass.Int32,
+        arm2_base: cutlass.Int64,
+        arm2_chunks: cutlass.Int32,
+        arm3_base: cutlass.Int64,
+        arm3_chunks: cutlass.Int32,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -293,6 +297,10 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
             arm0_chunks,
             arm1_base,
             arm1_chunks,
+            arm2_base,
+            arm2_chunks,
+            arm3_base,
+            arm3_chunks,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -324,6 +332,10 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
         arm0_chunks: cutlass.Int32,
         arm1_base: cutlass.Int64,
         arm1_chunks: cutlass.Int32,
+        arm2_base: cutlass.Int64,
+        arm2_chunks: cutlass.Int32,
+        arm3_base: cutlass.Int64,
+        arm3_chunks: cutlass.Int32,
     ):
         if cutlass.const_expr(self.early_trigger and self.use_pdl):
             cute.arch.griddepcontrol_launch_dependents()
@@ -620,6 +632,12 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
                 if cutlass.const_expr(self.arm_regions > 1):
                     for chunk in cutlass.range(first, arm1_chunks, lanes, unroll=4):
                         _st_fill_v4(arm1_base + cutlass.Int64(chunk) * 16, cutlass.Int32(ARM_WORD))
+                if cutlass.const_expr(self.arm_regions > 2):
+                    for chunk in cutlass.range(first, arm2_chunks, lanes, unroll=4):
+                        _st_fill_v4(arm2_base + cutlass.Int64(chunk) * 16, cutlass.Int32(ARM_WORD))
+                if cutlass.const_expr(self.arm_regions > 3):
+                    for chunk in cutlass.range(first, arm3_chunks, lanes, unroll=4):
+                        _st_fill_v4(arm3_base + cutlass.Int64(chunk) * 16, cutlass.Int32(ARM_WORD))
 
         if warp_idx == self.mma_warp_id:
             tmem.wait_for_alloc()
@@ -1050,6 +1068,10 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
         arm0_chunks: cutlass.Int32,
         arm1_base: cutlass.Int64,
         arm1_chunks: cutlass.Int32,
+        arm2_base: cutlass.Int64,
+        arm2_chunks: cutlass.Int32,
+        arm3_base: cutlass.Int64,
+        arm3_chunks: cutlass.Int32,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -1061,7 +1083,8 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
         )
         self(
             a_tensor, b_tensor, c_tensor, stamps, retry_count,
-            arm0_base, arm0_chunks, arm1_base, arm1_chunks, max_active_clusters, stream,
+            arm0_base, arm0_chunks, arm1_base, arm1_chunks, arm2_base, arm2_chunks, arm3_base, arm3_chunks,
+            max_active_clusters, stream,
         )  # fmt: skip
 
     @cute.jit
@@ -1084,6 +1107,10 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
         arm0_chunks: cutlass.Int32,
         arm1_base: cutlass.Int64,
         arm1_chunks: cutlass.Int32,
+        arm2_base: cutlass.Int64,
+        arm2_chunks: cutlass.Int32,
+        arm3_base: cutlass.Int64,
+        arm3_chunks: cutlass.Int32,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -1098,7 +1125,8 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
         )
         self(
             a_tensor, b_tensor, c_tensor, stamps, retry_count,
-            arm0_base, arm0_chunks, arm1_base, arm1_chunks, max_active_clusters, stream,
+            arm0_base, arm0_chunks, arm1_base, arm1_chunks, arm2_base, arm2_chunks, arm3_base, arm3_chunks,
+            max_active_clusters, stream,
         )  # fmt: skip
 
 
@@ -1177,7 +1205,7 @@ def run_gemm_fgs(
     Any operand may be a strided view with K (``a``, ``w``) / N (``out``) innermost and 16 B aligned rows, as for the
     in-tree batched runner. Defaults are the report_valid consumer; ``retry_counter`` (int32[``RETRY_COUNTER_SLOTS``])
     accumulates the A re-issues. ``max_ctas`` caps the persistent grid (default: the device's max active clusters).
-    ``n_order`` (heads, h1) is the kernel's head-ordered tile mapping. ``arm`` (up to two contiguous bf16 tensors
+    ``n_order`` (heads, h1) is the kernel's head-ordered tile mapping. ``arm`` (up to four contiguous bf16 tensors
     whose byte size is a multiple of 16) are re-armed with -0.0 by an extra warp after the PDL wait; they must have no
     live reader. ``start_delay_ns`` spins every warp at entry after the trigger (hazard tests).
     """
@@ -1213,15 +1241,15 @@ def run_gemm_fgs(
     retry_tensor = from_dlpack(retry_counter, assumed_align=4)
     stream = cuda.CUstream(torch.cuda.current_stream(a.device).cuda_stream)
     strides = (a.stride(1), a.stride(0), w.stride(1), w.stride(0))
-    if len(arm) > 2:
-        raise ValueError("run_gemm_fgs arms at most two regions")
+    if len(arm) > 4:
+        raise ValueError("run_gemm_fgs arms at most four regions")
     arm_args = []
     for t in arm:
         nbytes = t.numel() * t.element_size()
         if not t.is_contiguous() or nbytes % 16 or t.data_ptr() % 16:
             raise ValueError("arm regions must be contiguous, 16 B aligned, a multiple of 16 B")
         arm_args += [t.data_ptr(), nbytes // 16]
-    arm_args += [0, 0] * (2 - len(arm))
+    arm_args += [0, 0] * (4 - len(arm))
     flags = dict(
         pzo=pzo,
         early_trigger=early_trigger,
@@ -1366,14 +1394,11 @@ def run_dense_fgs(
             c_tensor,
             stamps_tensor,
             retry_tensor,
-            0,
-            0,
-            0,
-            0,
+            *([0] * 8),
             clusters,
             stream,
             options="--opt-level 2",
         )
         _COMPILED[key] = compiled
-    compiled(m, n, k, 1, a_ptr, b_ptr, c_tensor, stamps_tensor, retry_tensor, 0, 0, 0, 0, stream=stream)
+    compiled(m, n, k, 1, a_ptr, b_ptr, c_tensor, stamps_tensor, retry_tensor, *([0] * 8), stream=stream)
     return out

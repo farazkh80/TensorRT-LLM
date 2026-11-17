@@ -10,17 +10,21 @@ twin). Decode is untouched: the mixer calls :func:`forward` only for a prefill-o
 Slots are bf16 ``[pairs, MAX_ROWS, width]`` buffers per edge, allocated on the first eager prefill and armed with
 -0.0 once; the edge workspaces never touch them. KDA layers take pairs in registration order (ordinal mod 2; an odd
 layer count gives the last layer a third pair, so the next forward's first layer never writes the pair it arms).
-Re-arm is producer side, inside the next layer's GEMMs: layer L+1's qkvg GEMM arms p_qkvg / p_o of layer L, its
-o_proj arms p_core / p_attn_o of layer L (the norm produces p_core but is memory-bound without an idle warp, so
-its slot is armed by the next o_proj instead). Every reader of layer L's slots has completed before the MoE's plain
-launches of layer L, which complete before layer L+1 starts, and the arm warp runs after its grid wait. A layer that
+Re-arm is producer side, inside the next layer's o_proj GEMM: its arm warp stores -0.0 over every slot of layer L
+(p_qkvg, p_o, p_core, p_attn_o). o_proj is the chain's one GEMM with DRAM headroom (K = 12288, 1-2 TB/s); the qkvg
+GEMM streams its 704 MB weight per N pass and pays the arm traffic in full (A-02), the norm has no idle warp. Every
+reader of layer L's slots has completed before the MoE's plain launches of layer L, which complete before layer L+1
+starts, and the arm warp runs after its grid wait; the next writer of layer L's pair is layer L+2's qkvg GEMM, after
+o_proj(L+1) in stream order. A layer that
 refuses the chain while a pair is dirty fills it from the host (:func:`rearm_skipped`), so stale data is never read
 as valid.
 
-``TLLM_K3_FGS_PREFILL_EDGES`` (default ``pk2,pk8,pk9``; ``pk7`` needs BT16's decomposition route, i.e. one request
+``TLLM_K3_FGS_PREFILL_EDGES`` (default ``pk2,pk8``; ``pk9`` loses its mix-consumer cost to a tail that is
+not there with raster M (A-03); ``pk7`` needs BT16's decomposition route, i.e. one request
 at 96 heads, and is diagnostic), ``_MIN_ROWS`` / ``_MAX_ROWS`` (1024 / 8256 tokens per rank; the slots are sized to
-``_MAX_ROWS``), ``_RASTER`` (producer GEMM tile order, ``n`` publishes row blocks in order), ``_NORM_CTAS`` (gated
-norm persistent grid, both arms; 0 = one CTA per SM), ``_DELAY_NS`` (producer GEMMs spin at entry; hazard tests),
+``_MAX_ROWS``), ``_RASTER`` (producer GEMM tile order; ``n`` publishes row blocks in order but costs the
+weight-streaming qkvg GEMM 3-21 %, A-02), ``_NORM_CTAS`` (gated norm persistent grid of the FGS roles; 0 = the
+default grid, one CTA per row block), ``_DELAY_NS`` (producer GEMMs spin at entry; hazard tests),
 ``_MAX_SPINS`` (consumer rounds before the grid-wait fallback; small values force the slow path).
 """
 
@@ -39,7 +43,7 @@ from . import edges
 ENV = "TLLM_K3_FGS_PREFILL"
 MIN_ROWS = int(os.environ.get("TLLM_K3_FGS_PREFILL_MIN_ROWS", "1024"))
 MAX_ROWS = int(os.environ.get("TLLM_K3_FGS_PREFILL_MAX_ROWS", "8256"))
-RASTER = os.environ.get("TLLM_K3_FGS_PREFILL_RASTER", "n")
+RASTER = os.environ.get("TLLM_K3_FGS_PREFILL_RASTER", "m")
 NORM_CTAS = int(os.environ.get("TLLM_K3_FGS_PREFILL_NORM_CTAS", "0"))
 DELAY_NS = int(os.environ.get("TLLM_K3_FGS_PREFILL_DELAY_NS", "0"))
 MAX_SPINS = int(os.environ.get("TLLM_K3_FGS_PREFILL_MAX_SPINS", str(1 << 16)))
@@ -66,7 +70,7 @@ def fgs() -> bool:
 
 @functools.lru_cache(maxsize=None)
 def edges_on() -> frozenset:
-    value = os.environ.get("TLLM_K3_FGS_PREFILL_EDGES", "pk2,pk8,pk9")
+    value = os.environ.get("TLLM_K3_FGS_PREFILL_EDGES", "pk2,pk8")
     ids = frozenset(v.strip().lower() for v in value.split(",") if v.strip())
     unknown = ids - set(_EDGE_IDS)
     if unknown:
@@ -257,9 +261,6 @@ def forward(
         ordinal = _layers.index(mixer.layer_idx)
         pair, prev = _pair(ordinal), _pair((ordinal - 1) % len(_layers))
 
-    def arm(*edges_):
-        return tuple(r for r in (slots.arm_region(e, prev) for e in edges_) if r is not None) if live else ()
-
     from ..kimi_kda.kimi_kda_mixer import _reset_state_rows
 
     # Ahead of the GEMM, so the conv is the GEMM's direct PDL dependent.
@@ -271,7 +272,6 @@ def forward(
         qkvg_slot if qkvg_slot is not None else x2d.new_empty(T, 4 * d),
         produce=qkvg_slot is not None,
         raster_along=RASTER if qkvg_slot is not None else "m",
-        arm=arm(P_QKVG, P_O),
         start_delay_ns=DELAY_NS if qkvg_slot is not None else 0,
     )
     if qkvg_slot is not None:
@@ -315,7 +315,7 @@ def forward(
         use_pdl=True,
         fgs_consumer=o_slot is not None,
         fgs_max_spins=MAX_SPINS,
-        fgs_ctas=NORM_CTAS or torch.cuda.get_device_properties(device).multi_processor_count,
+        fgs_ctas=NORM_CTAS if (o_slot is not None or core_slot is not None) else 0,
         fgs_producer=core_slot is not None,
     )
     if core_slot is not None:
@@ -324,7 +324,7 @@ def forward(
     edges.debug(
         "kda.prefill_chain",
         T,
-        f"{mode()} pair {pair} edges {sorted(e for e in edges_on() if live)} norm_ctas {NORM_CTAS or 'sms'}",
+        f"{mode()} pair {pair} edges {sorted(e for e in edges_on() if live)} norm_ctas {NORM_CTAS or 'default'}",
     )
     return core.view(T, H, hd)
 
@@ -384,7 +384,7 @@ def pending(mixer) -> bool:
 
 def o_proj(mixer, core2d: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """``core2d @ weight^T`` closing the chain :func:`forward` opened: consumes p_core, produces p_attn_o (registered
-    for the pre-MoE mix), arms the previous layer's p_core / p_attn_o."""
+    for the pre-MoE mix), arms every slot of the previous layer."""
     pair, prev, T, core_in_slot = mixer._k3_prefill_pending
     mixer._k3_prefill_pending = None
     if core2d.shape[0] != T:
@@ -393,7 +393,9 @@ def o_proj(mixer, core2d: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     out_slot = slots.slot(P_ATTN_O, pair, T) if slots is not None else None
     arm = ()
     if slots is not None:
-        arm = tuple(r for r in (slots.arm_region(e, prev) for e in (P_CORE, P_ATTN_O)) if r is not None)
+        arm = tuple(
+            r for r in (slots.arm_region(e, prev) for e in (P_QKVG, P_O, P_CORE, P_ATTN_O)) if r is not None
+        )
     out = kimi_k3_cute_gemm.linear_fgs(
         core2d,
         weight,
