@@ -1936,11 +1936,23 @@ def install(routed_experts) -> bool:
             if prefill_inbox:
                 pc = _prefill_combine(layer, comm, tokens_per_rank, routed_experts)
                 fgs_push = os.environ.get(PREFILL_FGS_ENV, "") == "fc2_push"
-                if fgs_push:
+                ctas = int(os.environ.get(PREFILL_PUSH_CTAS_ENV, "16"))
+                sms = torch.cuda.get_device_properties(ctx.x.device).multi_processor_count
+                if prefill_path.push_mode() == "stream":
+                    from .moe.prefill.stream_push import push_stream
+
+                    # The finalize is fused into the push. FGS on: FC2 leaves ``ctas`` SMs to the push, whose other
+                    # CTAs become resident as FC2 retires; FGS off: the same kernel after FC2 (grid dependency).
+                    kw = dict(
+                        fc2_ctas=sms - ctas,
+                        stream_fgs=fgs_push,
+                        stream=lambda y, y_perm, w, plan, done: push_stream(
+                            pc, y, y_perm, w, plan, done, fgs=fgs_push, ctas=sms
+                        ),
+                    )
+                elif fgs_push:
                     from .moe.prefill.fc2_push import push_rest, push_tiles
 
-                    ctas = int(os.environ.get(PREFILL_PUSH_CTAS_ENV, "16"))
-                    sms = torch.cuda.get_device_properties(ctx.x.device).multi_processor_count
                     # The tile push ships single-pair rows as FC2 finishes them; push_rest ships the multi-pair rows
                     # after the finalize. Both also push this rank's own rows, so the reduce reads every row from the
                     # inbox and never from ``out`` while FC2 / the finalize still write it.
@@ -1957,7 +1969,8 @@ def install(routed_experts) -> bool:
                 tokens_per_rank,
                 f"token-M expert path, {ctx.x.shape[0]} rows"
                 + (
-                    f", inbox combine, FC2 -> push {'on' if layer.prefill_round[1] else 'off'}"
+                    f", inbox combine, {prefill_path.push_mode()} push, FC2 -> push"
+                    f" {'on' if layer.prefill_round[1] else 'off'}"
                     if prefill_inbox
                     else ""
                 ),
