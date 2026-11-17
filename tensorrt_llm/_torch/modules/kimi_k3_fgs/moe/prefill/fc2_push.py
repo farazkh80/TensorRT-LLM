@@ -15,6 +15,7 @@ dependency, since FC2 still reads the dispatched rows while this kernel runs. FG
 from __future__ import annotations
 
 import functools
+import os
 from typing import Optional
 
 import cutlass
@@ -31,7 +32,6 @@ from ..comm import (
     _bulk_commit,
     _bulk_s2g,
     _bulk_wait_read,
-    _canon,
     _fence_acq_rel_sys,
     _fence_proxy_async_global,
     _fence_proxy_async_shared,
@@ -39,6 +39,7 @@ from ..comm import (
     _ld_acquire_b32,
     _ld_b32,
     _ld_v4,
+    _mbar_init,
     _nanosleep,
     _spin_eq,
     _st_any,
@@ -46,7 +47,18 @@ from ..comm import (
     _st_sys_b32,
     _trap,
 )
-from .combine import _DONE, _DONE_BLOCKS, _HDR, _MAX_RANKS, PUSH_WARPS_ENV, PrefillCombine, _bulk_wait_all, _env_int
+from .combine import (
+    _DONE,
+    _DONE_BLOCKS,
+    _HDR,
+    _MAX_RANKS,
+    PUSH_LOAD_ENV,
+    PUSH_WARPS_ENV,
+    PrefillCombine,
+    _bulk_wait_all,
+    _env_int,
+    _tma_row,
+)
 from .common import HIDDEN, TOP_K
 from .fc2 import M_TILE
 
@@ -78,13 +90,15 @@ class _TilePush:
         wait_counters: bool,
         data_only: bool,
         pdl: bool,
+        tma: bool = False,
     ):
         assert hidden % 512 == 0 and ep <= _MAX_RANKS
         self.ep, self.hidden, self.lpc, self.lay = ep, hidden, lpc, dict(lay)
         self.rows, self.inbox_bytes, self.warps = rows, inbox_bytes, warps
         self.target, self.wait_counters, self.data_only, self.pdl = target, wait_counters, data_only, pdl
+        self.tma = tma
         self.wire = hidden if lpc else 2 * hidden
-        self.smem_bytes = warps * self.wire + 128
+        self.smem_bytes = warps * (2 * hidden + 8) + 128 if tma else warps * self.wire + 128
 
     @cute.jit
     def __call__(
@@ -132,10 +146,10 @@ class _TilePush:
                     dst,
                     stage,
                     (lane + 32 * k) * 16,
-                    _canon(_bf16x4_to_e4m3x4(p[0], p[1]), True),
-                    _canon(_bf16x4_to_e4m3x4(p[2], p[3]), True),
-                    _canon(_bf16x4_to_e4m3x4(q[0], q[1]), True),
-                    _canon(_bf16x4_to_e4m3x4(q[2], q[3]), True),
+                    _bf16x4_to_e4m3x4(p[0], p[1]),
+                    _bf16x4_to_e4m3x4(p[2], p[3]),
+                    _bf16x4_to_e4m3x4(q[0], q[1]),
+                    _bf16x4_to_e4m3x4(q[2], q[3]),
                 )
         else:
             loads = [_ld_v4(row + (lane + 32 * k) * 16) for k in range(per_lane)]
@@ -146,10 +160,10 @@ class _TilePush:
                     dst,
                     stage,
                     (lane + 32 * k) * 16,
-                    _canon(w[0], False),
-                    _canon(w[1], False),
-                    _canon(w[2], False),
-                    _canon(w[3], False),
+                    w[0],
+                    w[1],
+                    w[2],
+                    w[3],
                 )
 
     @cute.kernel
@@ -179,12 +193,25 @@ class _TilePush:
         my_ws = ws_base + Int64(rank) * ws_stride
         nbytes = self.hidden * 2
         smem = SmemAllocator()
-        buf = smem.allocate_array(cutlass.Uint8, self.warps * wire, byte_alignment=128)
-        stage = Int32(buf.toint()) + warp * wire
+        mbar = Int32(0)
+        ph = Int32(0)
+        if cutlass.const_expr(self.tma):
+            buf = smem.allocate_array(cutlass.Uint8, self.warps * 2 * self.hidden, byte_alignment=128)
+            bars = smem.allocate_array(Int64, self.warps, byte_alignment=8)
+            stage = Int32(buf.toint()) + warp * (2 * self.hidden)
+            mbar = Int32(bars.toint()) + warp * 8
+            if lane == 0:
+                _mbar_init(mbar, 1)
+            cute.arch.sync_threads()
+        else:
+            buf = smem.allocate_array(cutlass.Uint8, self.warps * wire, byte_alignment=128)
+            stage = Int32(buf.toint()) + warp * wire
 
         cute.arch.griddepcontrol_launch_dependents()
         if cutlass.const_expr(not self.wait_counters):
             cute.arch.griddepcontrol_wait()
+            if cutlass.const_expr(self.tma):
+                _fence_proxy_async_global()
         f = _ld_b32(my_ws + L["flag"])
         value = ((f - 1) | 1) + 1
         parity = ((f - 1) >> 1) & 1
@@ -195,6 +222,9 @@ class _TilePush:
                 if tidx == 0:
                     _wait_counter(counters + Int64(m) * 4, Int32(self.target), timeout_ns)
             cute.arch.sync_threads()
+            if cutlass.const_expr(self.tma and self.wait_counters):
+                # FC2's generic-proxy stores of this tile, acquired above, must be visible to the TMA reads.
+                _fence_proxy_async_global()
             hi = cutlass.min(_ld_b32(limits + Int64(m) * 4), (m + 1) * M_TILE)
             for p in cutlass.range(m * M_TILE + warp, hi, self.warps, unroll=1):
                 expanded = _ld_b32(p2e + Int64(p) * 4)
@@ -210,16 +240,19 @@ class _TilePush:
                         # read ``out`` directly.
                         source = token // max_tokens
                         slot = token - source * max_tokens
-                        if lane == 0:
-                            _bulk_wait_read()
-                        cute.arch.sync_warp()
                         dst = side_base + Int64(source) * side_stride + box + Int64(slot) * wire
-                        self._store_row(out + Int64(token) * nbytes, dst, stage, lane)
-                        _fence_proxy_async_shared()
-                        cute.arch.sync_warp()
-                        if lane == 0:
-                            _bulk_s2g(dst, stage, Int32(wire))
-                            _bulk_commit()
+                        if cutlass.const_expr(self.tma):
+                            ph = _tma_row(self.lpc, self.hidden, out + Int64(token) * nbytes, dst, stage, mbar, ph, lane)
+                        else:
+                            if lane == 0:
+                                _bulk_wait_read()
+                            cute.arch.sync_warp()
+                            self._store_row(out + Int64(token) * nbytes, dst, stage, lane)
+                            _fence_proxy_async_shared()
+                            cute.arch.sync_warp()
+                            if lane == 0:
+                                _bulk_s2g(dst, stage, Int32(wire))
+                                _bulk_commit()
         if lane == 0:
             if cutlass.const_expr(self.data_only):
                 _bulk_wait_read()
@@ -296,10 +329,23 @@ class _RestPush(_TilePush):
         my_ws = ws_base + Int64(rank) * ws_stride
         nbytes = self.hidden * 2
         smem = SmemAllocator()
-        buf = smem.allocate_array(cutlass.Uint8, self.warps * wire, byte_alignment=128)
-        stage = Int32(buf.toint()) + warp * wire
+        mbar = Int32(0)
+        ph = Int32(0)
+        if cutlass.const_expr(self.tma):
+            buf = smem.allocate_array(cutlass.Uint8, self.warps * 2 * self.hidden, byte_alignment=128)
+            bars = smem.allocate_array(Int64, self.warps, byte_alignment=8)
+            stage = Int32(buf.toint()) + warp * (2 * self.hidden)
+            mbar = Int32(bars.toint()) + warp * 8
+            if lane == 0:
+                _mbar_init(mbar, 1)
+            cute.arch.sync_threads()
+        else:
+            buf = smem.allocate_array(cutlass.Uint8, self.warps * wire, byte_alignment=128)
+            stage = Int32(buf.toint()) + warp * wire
 
         cute.arch.griddepcontrol_wait()
+        if cutlass.const_expr(self.tma):
+            _fence_proxy_async_global()
         cute.arch.griddepcontrol_launch_dependents()
         f = _ld_b32(my_ws + L["flag"])
         parity = ((f - 1) >> 1) & 1
@@ -313,16 +359,19 @@ class _RestPush(_TilePush):
             if npairs >= 2:
                 source = token // max_tokens
                 slot = token - source * max_tokens
-                if lane == 0:
-                    _bulk_wait_read()
-                cute.arch.sync_warp()
                 dst = side_base + Int64(source) * side_stride + box + Int64(slot) * wire
-                self._store_row(out + Int64(token) * nbytes, dst, stage, lane)
-                _fence_proxy_async_shared()
-                cute.arch.sync_warp()
-                if lane == 0:
-                    _bulk_s2g(dst, stage, Int32(wire))
-                    _bulk_commit()
+                if cutlass.const_expr(self.tma):
+                    ph = _tma_row(self.lpc, self.hidden, out + Int64(token) * nbytes, dst, stage, mbar, ph, lane)
+                else:
+                    if lane == 0:
+                        _bulk_wait_read()
+                    cute.arch.sync_warp()
+                    self._store_row(out + Int64(token) * nbytes, dst, stage, lane)
+                    _fence_proxy_async_shared()
+                    cute.arch.sync_warp()
+                    if lane == 0:
+                        _bulk_s2g(dst, stage, Int32(wire))
+                        _bulk_commit()
         if lane == 0:
             _bulk_wait_read()
 
@@ -355,6 +404,7 @@ def push_rest(pc: PrefillCombine, out: torch.Tensor, plan, *, ctas: int = 64, wa
     ws_base, ws_stride = pc._ws()
     _compile_rest(
         pc.ep, pc.hidden, pc.lpc, pc.lay.key(), pc.rows, pc.inbox_bytes, warps, 0, False, True, True,
+        os.environ.get(PUSH_LOAD_ENV, "tma") == "tma",
     )(
         pc.side[pc.rank, :_CACHELINE],
         out.data_ptr(),
@@ -416,6 +466,7 @@ def push_tiles(
     _compile(
         pc.ep, pc.hidden, pc.lpc, pc.lay.key(), pc.rows, pc.inbox_bytes, warps, HIDDEN // tile_n, fgs, data_only,
         _comm._pdl() or fgs,
+        os.environ.get(PUSH_LOAD_ENV, "tma") == "tma",
     )(
         pc.side[pc.rank, :_CACHELINE],
         y.data_ptr(),

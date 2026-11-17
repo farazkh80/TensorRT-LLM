@@ -37,7 +37,7 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import BFloat16, Float32, Int32, Int64
-from cutlass.cutlass_dsl import dsl_user_op
+from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.utils import SmemAllocator
 
 from .. import comm as _comm
@@ -49,10 +49,12 @@ from ..comm import (
     _bf16x2_to_f32,
     _bf16x4_to_e4m3x4,
     _bulk_commit,
+    _bulk_g2s,
     _bulk_s2g,
     _bulk_wait_read,
-    _canon,
-    _dirty,
+    _mbar_expect_tx,
+    _mbar_init,
+    _mbar_wait,
     _e4m3x4_to_f32,
     _f32x2_to_bf16x2,
     _fence_acq_rel_sys,
@@ -75,6 +77,7 @@ from ..comm import (
     _st_v2,
     _st_v4,
     _trap,
+    _v,
 )
 from ..latent import _THREADS_PER_ROW, _VEC
 from ..tail import _st_release_b32
@@ -90,10 +93,12 @@ PUSH_WARPS_ENV = "TLLM_K3_PC_PUSH_WARPS"
 PUSH_BLOCKS_ENV = "TLLM_K3_PC_PUSH_BLOCKS"
 POLL_NS_ENV = "TLLM_K3_PC_POLL_NS"
 REDUCE_MIN_BLOCKS_ENV = "TLLM_K3_PC_REDUCE_MIN_BLOCKS"
+CHECK_ENV = "TLLM_K3_PC_CHECK"
 REARMS = ("consumer", "consumer_st", "producer", "none")
 _REARM_NONE, _REARM_BULK, _REARM_ST = 0, 1, 2
 _WAIT_POLL, _WAIT_DONE, _WAIT_NONE, _WAIT_PULL = 0, 1, 2, 3
 PUSH_ROWS_ENV = "TLLM_K3_PC_PUSH_ROWS"
+PUSH_LOAD_ENV = "TLLM_K3_PC_PUSH_LOAD"
 MODES = {True: "poll", False: "done", "pull": "pull"}
 FGS_WAITS = {"PrefillCombine.reduce_norm": ("recv_norm",)}
 FGS_PUBLISHES = {"PrefillCombine.push": ("recv_norm",), "PrefillCombine.reduce_norm": ("rn_up",)}
@@ -105,7 +110,76 @@ def _bulk_wait_all(*, loc=None, ip=None) -> None:
 
 
 def _sentinel(lpc: bool) -> int:
-    return -0x7F7F7F80 if lpc else -0x7FFF8000
+    # 0xFF per e4m3 byte / 0xFFFF per bf16 half: NaN encodings the saturating / RN casts never produce.
+    return -1
+
+
+@dsl_user_op
+def _dirty(w, lpc: bool, *, loc=None, ip=None) -> Int32:
+    """1 if any element of ``w`` is the all-ones sentinel."""
+    one, high = (0x01010101, 0x80808080) if lpc else (0x00010001, 0x80008000)
+    return Int32(
+        _asm(
+            T.i32(),
+            [_v(w, Int32, loc, ip)],
+            f"{{\n.reg .b32 z, t;\n.reg .pred p;\nnot.b32 z, $1;\nsub.u32 t, z, {one};\nnot.b32 z, z;\n"
+            f"and.b32 t, t, z;\nand.b32 t, t, {high};\nsetp.ne.u32 p, t, 0;\nselp.u32 $0, 1, 0, p;\n}}",
+            "=r,r",
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
+def _ld_shared_v4(addr, *, loc=None, ip=None):
+    from cutlass._mlir.dialects import llvm
+
+    res = _asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [_v(addr, Int32, loc, ip)],
+        "ld.shared.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,r",
+        loc,
+        ip,
+    )
+    return [Int32(llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(4)]
+
+
+@cute.jit
+def _tma_row(lpc: cutlass.Constexpr, hidden: cutlass.Constexpr, row: Int64, dst: Int64, stage: Int32, mbar: Int32, ph: Int32, lane: Int32) -> Int32:
+    """One warp moves a bf16 row to the wire format at ``dst`` through TMA: bulk load onto the warp's mbarrier, the
+    lanes convert in place (every lane's reads precede any write), bulk store. Returns the barrier's next phase."""
+    nbytes = hidden * 2
+    wire = hidden if lpc else 2 * hidden
+    if lane == 0:
+        _bulk_wait_read()
+        _mbar_expect_tx(mbar, Int32(nbytes))
+        _bulk_g2s(stage, row, Int32(nbytes), mbar)
+    cute.arch.sync_warp()
+    _mbar_wait(mbar, ph)
+    if cutlass.const_expr(lpc):
+        per_lane = wire // 16 // 32
+        loads = [
+            (_ld_shared_v4(stage + (lane + 32 * k) * 32), _ld_shared_v4(stage + (lane + 32 * k) * 32 + 16))
+            for k in range(per_lane)
+        ]
+        cute.arch.sync_warp()
+        for k in cutlass.range_constexpr(per_lane):
+            p, q = loads[k]
+            _st_shared_v4(
+                stage + (lane + 32 * k) * 16,
+                _bf16x4_to_e4m3x4(p[0], p[1]),
+                _bf16x4_to_e4m3x4(p[2], p[3]),
+                _bf16x4_to_e4m3x4(q[0], q[1]),
+                _bf16x4_to_e4m3x4(q[2], q[3]),
+            )
+        _fence_proxy_async_shared()
+    cute.arch.sync_warp()
+    if lane == 0:
+        _bulk_s2g(dst, stage, Int32(wire))
+        _bulk_commit()
+    return ph ^ 1
 
 
 @cute.jit
@@ -163,8 +237,11 @@ class _Push:
         pdl: bool,
         local: bool,
         rows_per_store: int,
+        tma: bool = False,
     ):
         assert hidden % 512 == 0 and ep <= _MAX_RANKS
+        assert not (tma and rows_per_store != 1), "the TMA row path moves one row per store"
+        self.tma = tma
         self.ep, self.hidden, self.lpc, self.lay = ep, hidden, lpc, dict(lay)
         self.rows, self.inbox_bytes, self.warps = rows, inbox_bytes, warps
         self.bulk, self.data_only, self.rearm_prev = bulk, data_only, rearm_prev
@@ -174,13 +251,14 @@ class _Push:
         self.local, self.rows_per_store = local, rows_per_store
         self.wire = hidden if lpc else 2 * hidden
         self.smem_bytes = (warps * rows_per_store * self.wire + 128) if bulk else 0
+        if tma:
+            self.smem_bytes = warps * (2 * hidden + 8) + 128
 
     def _e4(self, a0, a1):
-        w = _bf16x4_to_e4m3x4(a0, a1)
-        return w if self.local else _canon(w, True)
+        return _bf16x4_to_e4m3x4(a0, a1)
 
     def _bf(self, w):
-        return w if self.local else _canon(w, False)
+        return w
 
     @cute.jit
     def __call__(
@@ -229,7 +307,18 @@ class _Push:
         nbytes = self.hidden * 2
         sentinel = Int32(_sentinel(self.lpc))
         stage = Int32(0)
-        if cutlass.const_expr(self.bulk):
+        mbar = Int32(0)
+        ph = Int32(0)
+        if cutlass.const_expr(self.tma):
+            smem = SmemAllocator()
+            buf = smem.allocate_array(cutlass.Uint8, self.warps * 2 * self.hidden, byte_alignment=128)
+            bars = smem.allocate_array(Int64, self.warps, byte_alignment=8)
+            stage = Int32(buf.toint()) + warp * (2 * self.hidden)
+            mbar = Int32(bars.toint()) + warp * 8
+            if lane == 0:
+                _mbar_init(mbar, 1)
+            cute.arch.sync_threads()
+        elif cutlass.const_expr(self.bulk):
             smem = SmemAllocator()
             buf = smem.allocate_array(
                 cutlass.Uint8, self.warps * self.rows_per_store * wire, byte_alignment=128
@@ -237,6 +326,8 @@ class _Push:
             stage = Int32(buf.toint()) + warp * (self.rows_per_store * wire)
 
         cute.arch.griddepcontrol_wait()
+        if cutlass.const_expr(self.tma):
+            _fence_proxy_async_global()
         if cutlass.const_expr(self.trigger_entry):
             cute.arch.griddepcontrol_launch_dependents()
         # The round CTA may already have advanced the flag (d -> d + 1, d odd): both give the same values.
@@ -269,11 +360,16 @@ class _Push:
             R = self.rows_per_store
             nchunks = (n + R - 1) // R
             for c in cutlass.range(by * self.warps + warp, nchunks, nby * self.warps, unroll=1):
-                if cutlass.const_expr(self.bulk):
+                if cutlass.const_expr(self.tma):
+                    ph = _tma_row(
+                        self.lpc, self.hidden, y + (Int64(source) * max_tokens + c) * nbytes, box + Int64(c) * wire,
+                        stage, mbar, ph, lane,
+                    )
+                if cutlass.const_expr(self.bulk and not self.tma):
                     if lane == 0:
                         _bulk_wait_read()
                     cute.arch.sync_warp()
-                for r in cutlass.range_constexpr(R):
+                for r in cutlass.range_constexpr(0 if self.tma else R):
                     t = c * R + r
                     if t < n:
                         row = y + (Int64(source) * max_tokens + t) * nbytes
@@ -313,7 +409,7 @@ class _Push:
                                     self._bf(w[2]),
                                     self._bf(w[3]),
                                 )
-                if cutlass.const_expr(self.bulk):
+                if cutlass.const_expr(self.bulk and not self.tma):
                     _fence_proxy_async_shared()
                     cute.arch.sync_warp()
                     if lane == 0:
@@ -852,10 +948,7 @@ class PrefillCombine:
         mine = self.side[self.rank]
         mine[:_HDR].zero_()
         boxes = mine[_HDR : _HDR + 2 * self.inbox_bytes]
-        if self.lpc:
-            boxes.fill_(0x80)
-        else:
-            boxes.view(torch.int16).fill_(-32768)
+        boxes.fill_(0xFF)
         torch.cuda.synchronize()
         MnnvlMemory.get_comm(self.comm.mapping).barrier()
 
@@ -934,6 +1027,7 @@ class PrefillCombine:
             _comm._pdl() or mode != "done",
             mode == "pull",
             _env_int(PUSH_ROWS_ENV, 1, 1, 8),
+            os.environ.get(PUSH_LOAD_ENV, "tma") == "tma",
         )(
             self.side[self.rank, :_CACHELINE],
             y.data_ptr(),
@@ -985,6 +1079,13 @@ class PrefillCombine:
         if ready is not None and (ready.dtype != torch.int32 or ready.numel() < n):
             raise ValueError(f"ready must be int32 [>= {n}]")
         wait = {"poll": _WAIT_POLL, "done": _WAIT_DONE, "pull": _WAIT_PULL}[mode] if check else _WAIT_NONE
+        if mode in ("poll", "done") and check and os.environ.get(CHECK_ENV, "sw") == "hw":
+            from .combine_tma import reduce_norm_tma
+
+            reduce_norm_tma(self, out, norm_weight, eps, ready, n, mt, blocks, y_ptr, rearm, own_in_inbox, wait)
+            self._round = None
+            self.comm.reset_state()
+            return out
         rearm_mode = {
             "consumer": _REARM_BULK,
             "consumer_st": _REARM_ST,
