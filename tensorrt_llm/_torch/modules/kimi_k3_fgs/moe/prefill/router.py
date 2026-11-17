@@ -13,27 +13,29 @@ the test counts.
 
 from __future__ import annotations
 
+import weakref
 from typing import Dict, Optional, Tuple
 
 import torch
 
 # M tiles of 256 (2-CTA), N tiles of 128: 896 experts = 7 N tiles.
 DEFAULT_TACTIC = ("base", True, (256, 128), (2, 1), 0, 1)
-_bf16_weights: Dict[Tuple[int, int], torch.Tensor] = {}
+# id(weight) -> (weak ref to the weight, its version, its bf16 copy). The weak ref guards against a freed weight's
+# id or address being reused by another tensor.
+_bf16_weights: Dict[int, Tuple["weakref.ref[torch.Tensor]", int, torch.Tensor]] = {}
 
 
 def bf16_weight(weight: torch.Tensor) -> torch.Tensor:
-    """The gate weight as bf16; an fp32 weight must hold bf16-exact values (checked once per tensor)."""
+    """The gate weight as bf16; an fp32 weight must hold bf16-exact values (checked once per tensor version)."""
     if weight.dtype == torch.bfloat16:
         return weight
-    key = (weight.data_ptr(), weight._version)
-    w = _bf16_weights.get(key)
-    if w is None:
-        w = weight.detach().to(torch.bfloat16)
-        if not torch.equal(w.to(torch.float32), weight.detach()):
-            raise ValueError("router: the fp32 gate weight is not bf16-exact; the bf16 GEMM would change the logits")
-        _bf16_weights.clear()
-        _bf16_weights[key] = w
+    hit = _bf16_weights.get(id(weight))
+    if hit is not None and hit[0]() is weight and hit[1] == weight._version:
+        return hit[2]
+    w = weight.detach().to(torch.bfloat16)
+    if not torch.equal(w.to(torch.float32), weight.detach()):
+        raise ValueError("router: the fp32 gate weight is not bf16-exact; the bf16 GEMM would change the logits")
+    _bf16_weights[id(weight)] = (weakref.ref(weight), weight._version, w)
     return w
 
 
