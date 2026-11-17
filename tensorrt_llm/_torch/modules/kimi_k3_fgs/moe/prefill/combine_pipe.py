@@ -29,24 +29,40 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.utils import SmemAllocator
 
-from ..comm import _TIMEOUT_NS, _asm, _ld_acquire_b32, _ld_b32, _nanosleep, _v
-from ..comm import _bf16x2_to_f32, _bf16x4_to_e4m3x4, _bulk_g2s, _f32x2_to_bf16x2, _fence_acq_rel_sys
-from ..comm import _fence_proxy_async_global
-from ..comm import _st_shared_v4, _st_v4
-from ..comm import _globaltimer, _mbar_expect_tx, _mbar_init, _mbar_wait, _trap
+from ..comm import (
+    _TIMEOUT_NS,
+    _asm,
+    _bf16x2_to_f32,
+    _bf16x4_to_e4m3x4,
+    _bulk_g2s,
+    _f32x2_to_bf16x2,
+    _fence_acq_rel_sys,
+    _fence_proxy_async_global,
+    _globaltimer,
+    _ld_acquire_b32,
+    _ld_b32,
+    _mbar_expect_tx,
+    _mbar_init,
+    _mbar_wait,
+    _nanosleep,
+    _st_shared_v4,
+    _st_v4,
+    _trap,
+    _v,
+)
 from ..latent import _THREADS_PER_ROW, _VEC
 from ..tail import _st_release_b32
 from .combine import (
     _DONE,
     _DONE_BLOCKS,
     _HDR,
-    _USED,
     _NORM_BARRIER,
     _REARM_BULK,
+    _USED,
     _WAIT_DONE,
     _WAIT_POLL,
-    _ReduceNorm,
     _env_int,
+    _ReduceNorm,
     _sentinel,
 )
 from .combine_tma import _ROW_BOX, _ld_shared_v2, _ld_shared_v4
@@ -77,7 +93,10 @@ def _ld_relaxed_gpu_v4(addr, *, loc=None, ip=None):
         loc,
         ip,
     )
-    return [Int32(cutlass._mlir.dialects.llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(4)]
+    return [
+        Int32(cutlass._mlir.dialects.llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip))
+        for i in range(4)
+    ]
 
 
 @cute.jit
@@ -118,7 +137,9 @@ class _ReduceNormPipe(_ReduceNorm):
         self.own_bytes = 0 if self.own_in_inbox else 2 * self.H
         self.diag = diag
         self.threads = cthreads + _THREADS_PER_ROW + 32
-        self.smem_bytes = _smem_bytes(self.H, self.wire, self.top_k, self.slots, self.own_bytes, stages)
+        self.smem_bytes = _smem_bytes(
+            self.H, self.wire, self.top_k, self.slots, self.own_bytes, stages
+        )
 
     @cute.jit
     def _row_invalid(self, bar, phase):
@@ -162,8 +183,25 @@ class _ReduceNormPipe(_ReduceNorm):
             cpasync.CopyBulkTensorTileG2SOp(), mInbox, row_layout, _ROW_BOX
         )
         self.kernel(
-            mOut, mW, mInbox_tma, tma_atom, ready_addr, ws_base, ws_stride, rank, n_local, max_tokens, own_base,
-            inbox, side_base, side_stride, blocks, eps, timeout_ns, tv_layout, tiler_mn,
+            mOut,
+            mW,
+            mInbox_tma,
+            tma_atom,
+            ready_addr,
+            ws_base,
+            ws_stride,
+            rank,
+            n_local,
+            max_tokens,
+            own_base,
+            inbox,
+            side_base,
+            side_stride,
+            blocks,
+            eps,
+            timeout_ns,
+            tv_layout,
+            tiler_mn,
         ).launch(
             grid=[n_ctas, 1, 1],
             block=[self.threads, 1, 1],
@@ -216,7 +254,9 @@ class _ReduceNormPipe(_ReduceNorm):
         s_n = smem.allocate_tensor(Int32, cute.make_layout((S,)), byte_alignment=16)
         s_has_own = smem.allocate_tensor(Int32, cute.make_layout((S,)), byte_alignment=16)
         partials = smem.allocate_tensor(Float32, cute.make_layout((2, 2)), byte_alignment=16)
-        sX = smem.allocate_tensor(BFloat16, cute.make_layout((2, H), stride=(H, 1)), byte_alignment=16)
+        sX = smem.allocate_tensor(
+            BFloat16, cute.make_layout((2, H), stride=(H, 1)), byte_alignment=16
+        )
         bars = smem.allocate_array(Int64, S * K, byte_alignment=8)
         bars_own = smem.allocate_array(Int64, S, byte_alignment=8)
         full = smem.allocate_array(Int64, S, byte_alignment=8)
@@ -237,10 +277,16 @@ class _ReduceNormPipe(_ReduceNorm):
         free_base = Int32(free.toint())
         sX_base = Int32(sX.iterator.toint())
         dtype = cutlass.Float8E4M3FN if self.lpc else cutlass.BFloat16
-        sRows = cute.make_tensor(cute.recast_ptr(rows_buf, dtype=dtype), cute.make_layout((256, 14, 1, S * NS)))
+        sRows = cute.make_tensor(
+            cute.recast_ptr(rows_buf, dtype=dtype), cute.make_layout((256, 14, 1, S * NS))
+        )
         gI = cute.local_tile(mInbox, _ROW_BOX, (0, 0, None))
         tIsI, tIgI = cpasync.tma_partition(
-            tma_atom, 0, cute.make_layout(1), cute.group_modes(sRows, 0, 3), cute.group_modes(gI, 0, 3)
+            tma_atom,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sRows, 0, 3),
+            cute.group_modes(gI, 0, 3),
         )
         my_ws = ws_base + Int64(rank) * ws_stride
         out_base = Int64(mOut.iterator.toint())
@@ -248,9 +294,13 @@ class _ReduceNormPipe(_ReduceNorm):
         pattern = cpasync.SentinelPattern.PER_ELEMENT_FF
 
         ntid = (tidx - C) & (_THREADS_PER_ROW - 1)
-        copy_x = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), BFloat16, num_bits_per_copy=_VEC * 16)
+        copy_x = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), BFloat16, num_bits_per_copy=_VEC * 16
+        )
         thr = cute.make_tiled_copy(copy_x, tv_layout, tiler_mn).get_slice(ntid)
-        mW_2d = cute.make_tensor(mW.iterator, cute.prepend(mW.layout, cute.make_layout((1,), stride=(0,))))
+        mW_2d = cute.make_tensor(
+            mW.iterator, cute.prepend(mW.layout, cute.make_layout((1,), stride=(0,)))
+        )
         tWgW = thr.partition_S(cute.local_tile(mW_2d, tiler_mn, (0, 0)))
         tWrW = cute.make_fragment_like(tWgW)
         cute.copy(copy_x, tWgW, tWrW)
@@ -285,8 +335,10 @@ class _ReduceNormPipe(_ReduceNorm):
                     c4 = (i % nch) * 4
                     if src != rank:
                         _spin_eq4(
-                            my_side + _DONE + (src * _DONE_BLOCKS + c4) * 4, cutlass.min(Int32(4), blocks - c4),
-                            value, timeout_ns,
+                            my_side + _DONE + (src * _DONE_BLOCKS + c4) * 4,
+                            cutlass.min(Int32(4), blocks - c4),
+                            value,
+                            timeout_ns,
                         )
                 cute.arch.sync_threads()
                 if tidx == 0:
@@ -325,8 +377,23 @@ class _ReduceNormPipe(_ReduceNorm):
                 stage = i % S
                 rnd = i // S
                 if i >= S - 1:
-                    self._wait_stage((i - (S - 1)) % S, tma_atom, tIgI, tIsI, s_row, s_own, s_ph, s_n, s_has_own,
-                                     bars_base, bars_own_base, full_base, lane, timeout_ns, pattern)
+                    self._wait_stage(
+                        (i - (S - 1)) % S,
+                        tma_atom,
+                        tIgI,
+                        tIsI,
+                        s_row,
+                        s_own,
+                        s_ph,
+                        s_n,
+                        s_has_own,
+                        bars_base,
+                        bars_own_base,
+                        full_base,
+                        lane,
+                        timeout_ns,
+                        pattern,
+                    )
                 if i >= S:
                     _mbar_wait(empty_base + stage * 8, (rnd - 1) & 1)
                 if tr < 0:
@@ -358,18 +425,27 @@ class _ReduceNormPipe(_ReduceNorm):
                 count = s_n[stage]
                 for s in cutlass.range(0, count, 1, unroll=1):
                     if s_own[stage * K + s] == 0:
-                        bar = cute.make_ptr(Int64, bars_base + (stage * K + s) * 8, cute.AddressSpace.smem,
-                                            assumed_align=8)
+                        bar = cute.make_ptr(
+                            Int64,
+                            bars_base + (stage * K + s) * 8,
+                            cute.AddressSpace.smem,
+                            assumed_align=8,
+                        )
                         with cute.arch.elect_one():
                             cute.arch.mbarrier_arrive_and_expect_tx(bar, wire)
                         if cutlass.const_expr(self.wait == _WAIT_POLL):
                             cute.copy(
-                                tma_atom, tIgI[(None, s_row[stage * K + s])], tIsI[(None, stage * NS + s)],
-                                tma_bar_ptr=bar, report_valid=pattern,
+                                tma_atom,
+                                tIgI[(None, s_row[stage * K + s])],
+                                tIsI[(None, stage * NS + s)],
+                                tma_bar_ptr=bar,
+                                report_valid=pattern,
                             )
                         else:
                             cute.copy(
-                                tma_atom, tIgI[(None, s_row[stage * K + s])], tIsI[(None, stage * NS + s)],
+                                tma_atom,
+                                tIgI[(None, s_row[stage * K + s])],
+                                tIsI[(None, stage * NS + s)],
                                 tma_bar_ptr=bar,
                             )
                 tr = tr2
@@ -382,8 +458,23 @@ class _ReduceNormPipe(_ReduceNorm):
                         tr2 = _ld_b32(my_ws + L["topk_ranks"] + rec * 4)
                         di2 = _ld_b32(my_ws + L["topk_indices"] + rec * 4)
             for j in cutlass.range(cutlass.max(ntok - (S - 1), Int32(0)), ntok, 1, unroll=1):
-                self._wait_stage(j % S, tma_atom, tIgI, tIsI, s_row, s_own, s_ph, s_n, s_has_own, bars_base,
-                                 bars_own_base, full_base, lane, timeout_ns, pattern)
+                self._wait_stage(
+                    j % S,
+                    tma_atom,
+                    tIgI,
+                    tIsI,
+                    s_row,
+                    s_own,
+                    s_ph,
+                    s_n,
+                    s_has_own,
+                    bars_base,
+                    bars_own_base,
+                    full_base,
+                    lane,
+                    timeout_ns,
+                    pattern,
+                )
         elif warp < C // 32:
             # Reduce warps: the stock-order row sum of a token into sX[i & 1], released to the norm warps.
             for i in cutlass.range(0, ntok, 1, unroll=1):
@@ -396,8 +487,13 @@ class _ReduceNormPipe(_ReduceNorm):
                 if cutlass.const_expr(self.diag != "noreduce"):
                     for q in cutlass.range_constexpr(self.vpt):
                         self._reduce_vec_smem(
-                            sX_base + buf * (2 * H), tidx + q * C, rows_base + stage * (NS * wire),
-                            own_base_s + stage * nbytes_own, s_own, stage * K, count,
+                            sX_base + buf * (2 * H),
+                            tidx + q * C,
+                            rows_base + stage * (NS * wire),
+                            own_base_s + stage * nbytes_own,
+                            s_own,
+                            stage * K,
+                            count,
                         )
                 cute.arch.sync_warp()
                 if lane == 0:
@@ -423,8 +519,18 @@ class _ReduceNormPipe(_ReduceNorm):
                     _mbar_arrive(empty_base + stage * 8)
                 if cutlass.const_expr(self.diag not in ("nonorm", "noreduce")):
                     self._norm_row(
-                        sX_base + buf * (2 * H), out_base + Int64(tok) * (2 * H), nt, warp - C // 32, lane, tWrW,
-                        partials, buf, eps, ready_addr, tok, free_base + buf * 8,
+                        sX_base + buf * (2 * H),
+                        out_base + Int64(tok) * (2 * H),
+                        nt,
+                        warp - C // 32,
+                        lane,
+                        tWrW,
+                        partials,
+                        buf,
+                        eps,
+                        ready_addr,
+                        tok,
+                        free_base + buf * 8,
                     )
                 else:
                     if nt == 0:
@@ -433,15 +539,35 @@ class _ReduceNormPipe(_ReduceNorm):
                     for s in cutlass.range(0, count, 1, unroll=1):
                         r = cute.arch.shuffle_sync(row, s)
                         if r >= 0:
-                            for k in cutlass.range_constexpr((wire // 16 + _THREADS_PER_ROW - 1) // _THREADS_PER_ROW):
+                            for k in cutlass.range_constexpr(
+                                (wire // 16 + _THREADS_PER_ROW - 1) // _THREADS_PER_ROW
+                            ):
                                 c = nt + k * _THREADS_PER_ROW
                                 if c < wire // 16:
-                                    _st_v4(inbox + r + c * 16, sentinel, sentinel, sentinel, sentinel)
+                                    _st_v4(
+                                        inbox + r + c * 16, sentinel, sentinel, sentinel, sentinel
+                                    )
         cute.arch.griddepcontrol_wait()
 
     @cute.jit
-    def _wait_stage(self, stage, tma_atom, tIgI, tIsI, s_row, s_own, s_ph, s_n, s_has_own, bars_base, bars_own_base,
-                    full_base, lane, timeout_ns, pattern):
+    def _wait_stage(
+        self,
+        stage,
+        tma_atom,
+        tIgI,
+        tIsI,
+        s_row,
+        s_own,
+        s_ph,
+        s_n,
+        s_has_own,
+        bars_base,
+        bars_own_base,
+        full_base,
+        lane,
+        timeout_ns,
+        pattern,
+    ):
         """Producer warp: every row of ``stage`` landed (FGS on: and valid, re-issuing invalid rows), then full."""
         K = self.top_k
         S = self.stages
@@ -451,7 +577,9 @@ class _ReduceNormPipe(_ReduceNorm):
         for s in cutlass.range(0, count, 1, unroll=1):
             idx = stage * K + s
             if s_own[idx] == 0:
-                bar = cute.make_ptr(Int64, bars_base + idx * 8, cute.AddressSpace.smem, assumed_align=8)
+                bar = cute.make_ptr(
+                    Int64, bars_base + idx * 8, cute.AddressSpace.smem, assumed_align=8
+                )
                 ph = s_ph[idx]
                 invalid = self._row_invalid(bar, ph)
                 if cutlass.const_expr(self.wait == _WAIT_POLL):
@@ -465,7 +593,10 @@ class _ReduceNormPipe(_ReduceNorm):
                         with cute.arch.elect_one():
                             cute.arch.mbarrier_arrive_and_expect_tx(bar, wire)
                         cute.copy(
-                            tma_atom, tIgI[(None, s_row[idx])], tIsI[(None, stage * NS + s)], tma_bar_ptr=bar,
+                            tma_atom,
+                            tIgI[(None, s_row[idx])],
+                            tIsI[(None, stage * NS + s)],
+                            tma_bar_ptr=bar,
                             report_valid=pattern,
                         )
                         ph = ph ^ 1
@@ -483,7 +614,9 @@ class _ReduceNormPipe(_ReduceNorm):
             _mbar_arrive(full_base + stage * 8)
 
     @cute.jit
-    def _norm_row(self, sx, out_row, nt, nwarp, lane, tWrW, partials, buf, eps, ready_addr, tok, free_bar):
+    def _norm_row(
+        self, sx, out_row, nt, nwarp, lane, tWrW, partials, buf, eps, ready_addr, tok, free_bar
+    ):
         """FlashInfer's RMSNorm on 64 threads (thread t: elements 8 t + 512 j, j < 7) from the bf16 row sum in shared
         memory, element by element so that only the bf16 words stay live: the sum of squares runs in the fragment
         order of ``latent.rmsnorm``, then ``bf16((x * rstd) * (w + 0))`` with one RN cast per element. The sX buffer
@@ -511,8 +644,14 @@ class _ReduceNormPipe(_ReduceNorm):
                 lo, hi = _bf16x2_to_f32(xw[j][q])
                 wlo = tWrW[8 * j + 2 * q].to(Float32)
                 whi = tWrW[8 * j + 2 * q + 1].to(Float32)
-                ys.append(_f32x2_to_bf16x2(lo * rstd * (wlo + Float32(0.0)), hi * rstd * (whi + Float32(0.0))))
-            _st_v4(out_row + nt * 16 + j * (_THREADS_PER_ROW * _VEC * 2), ys[0], ys[1], ys[2], ys[3])
+                ys.append(
+                    _f32x2_to_bf16x2(
+                        lo * rstd * (wlo + Float32(0.0)), hi * rstd * (whi + Float32(0.0))
+                    )
+                )
+            _st_v4(
+                out_row + nt * 16 + j * (_THREADS_PER_ROW * _VEC * 2), ys[0], ys[1], ys[2], ys[3]
+            )
         if ready_addr != 0:
             cute.arch.barrier(barrier_id=_NORM_BARRIER, number_of_threads=_THREADS_PER_ROW)
             if nt == 0:
@@ -600,41 +739,87 @@ def geometry(pc, own_in_inbox: bool):
         raise ValueError(f"{THREADS_ENV}={cthreads}; valid: a multiple of 32 dividing 448")
     stages_env = _env_int(STAGES_ENV, 0, 0, 8)
     ctas_env = _env_int(CTAS_PER_SM_ENV, 0, 0, 4)
-    for ctas in ((ctas_env,) if ctas_env else (2, 1)):
+    for ctas in (ctas_env,) if ctas_env else (2, 1):
         budget = min(_SMEM_PER_CTA, _SMEM_PER_SM // ctas - _SMEM_RESERVED)
         stages = stages_env
         if not stages:
             stages = 4
-            while stages > 2 and _smem_bytes(pc.hidden, pc.wire, pc.top_k, slots, own_bytes, stages) > budget:
+            while (
+                stages > 2
+                and _smem_bytes(pc.hidden, pc.wire, pc.top_k, slots, own_bytes, stages) > budget
+            ):
                 stages -= 1
         if _smem_bytes(pc.hidden, pc.wire, pc.top_k, slots, own_bytes, stages) <= budget:
             return stages, cthreads, ctas
-    raise ValueError(f"the pipelined reduce does not fit shared memory: ep {pc.ep}, wire {pc.wire}, {STAGES_ENV}={stages_env}")
+    raise ValueError(
+        f"the pipelined reduce does not fit shared memory: ep {pc.ep}, wire {pc.wire}, {STAGES_ENV}={stages_env}"
+    )
 
 
 _compiled = {}
 _inbox_tensors = {}
 
 
-def reduce_norm_pipe(pc, out, norm_weight, eps, ready, n, mt, blocks, y_ptr, rearm, own_in_inbox, wait):
-    rearm_mode = {"consumer": _REARM_BULK, "consumer_st": _REARM_BULK, "producer": 0, "none": 0}[rearm]
+def reduce_norm_pipe(
+    pc, out, norm_weight, eps, ready, n, mt, blocks, y_ptr, rearm, own_in_inbox, wait
+):
+    rearm_mode = {"consumer": _REARM_BULK, "consumer_st": _REARM_BULK, "producer": 0, "none": 0}[
+        rearm
+    ]
     stages, cthreads, ctas_per_sm = geometry(pc, own_in_inbox)
     dtype = torch.float8_e4m3fn if pc.lpc else torch.bfloat16
     rows_total = 2 * pc.ep * pc.rows
     # mode 0 contiguous (CuTe's TMA convention): element (c, j, row) at row * 3584 + 256 j + c
-    view = pc.side[pc.rank][_HDR : _HDR + rows_total * pc.wire].view(dtype).view(rows_total, 14, 256).permute(2, 1, 0)
-    key = (pc.ep, pc.top_k, pc.hidden, pc.lpc, pc.lay.key(), pc.rows, pc.inbox_bytes, rearm_mode, own_in_inbox,
-           wait, stages, cthreads, ctas_per_sm, os.environ.get(DIAG_ENV, "none"), tuple(view.shape))
+    view = (
+        pc.side[pc.rank][_HDR : _HDR + rows_total * pc.wire]
+        .view(dtype)
+        .view(rows_total, 14, 256)
+        .permute(2, 1, 0)
+    )
+    key = (
+        pc.ep,
+        pc.top_k,
+        pc.hidden,
+        pc.lpc,
+        pc.lay.key(),
+        pc.rows,
+        pc.inbox_bytes,
+        rearm_mode,
+        own_in_inbox,
+        wait,
+        stages,
+        cthreads,
+        ctas_per_sm,
+        os.environ.get(DIAG_ENV, "none"),
+        tuple(view.shape),
+    )
     fn = _compiled.get(key)
     mInbox = _inbox_tensors.get(view.data_ptr())
     if mInbox is None:
-        mInbox = _inbox_tensors[view.data_ptr()] = cute.runtime.from_dlpack(view, assumed_align=16, enable_tvm_ffi=True)
+        mInbox = _inbox_tensors[view.data_ptr()] = cute.runtime.from_dlpack(
+            view, assumed_align=16, enable_tvm_ffi=True
+        )
     if fn is None:
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         kern = _ReduceNormPipe(
-            pc.ep, pc.top_k, pc.hidden, pc.lpc, pc.lay.key(), pc.rows, pc.inbox_bytes, wait, rearm_mode,
-            wait != _WAIT_POLL, _env_int("TLLM_K3_PC_POLL_NS", 256, 32, 1 << 20), ctas_per_sm, True, own_in_inbox,
-            stages=stages, cthreads=cthreads, ctas_per_sm=ctas_per_sm, diag=os.environ.get(DIAG_ENV, "none"),
+            pc.ep,
+            pc.top_k,
+            pc.hidden,
+            pc.lpc,
+            pc.lay.key(),
+            pc.rows,
+            pc.inbox_bytes,
+            wait,
+            rearm_mode,
+            wait != _WAIT_POLL,
+            _env_int("TLLM_K3_PC_POLL_NS", 256, 32, 1 << 20),
+            ctas_per_sm,
+            True,
+            own_in_inbox,
+            stages=stages,
+            cthreads=cthreads,
+            ctas_per_sm=ctas_per_sm,
+            diag=os.environ.get(DIAG_ENV, "none"),
         )
         fake = cute.runtime.make_fake_compact_tensor
         fn = _compiled[key] = cute.compile(
@@ -642,13 +827,42 @@ def reduce_norm_pipe(pc, out, norm_weight, eps, ready, n, mt, blocks, y_ptr, rea
             fake(BFloat16, (cute.sym_int(), pc.hidden), stride_order=(1, 0), assumed_align=16),
             fake(BFloat16, (pc.hidden,), assumed_align=16),
             mInbox,
-            Int64(0), Int64(0), Int64(0), Int32(0), Int32(1), Int32(1), Int64(0), Int64(0), Int64(0), Int64(0),
-            Int32(1), Int32(1), Float32(1e-6), Int64(0),
+            Int64(0),
+            Int64(0),
+            Int64(0),
+            Int32(0),
+            Int32(1),
+            Int32(1),
+            Int64(0),
+            Int64(0),
+            Int64(0),
+            Int64(0),
+            Int32(1),
+            Int32(1),
+            Float32(1e-6),
+            Int64(0),
             stream,
             options="--enable-tvm-ffi",
         )
     ws_base, ws_stride = pc._ws()
     inbox_base = pc.side.data_ptr() + pc.rank * pc.side.stride(0) + _HDR
     n_ctas = max(1, min(n, ctas_per_sm * num_sms(out.device.index)))
-    fn(out, norm_weight, mInbox, ready.data_ptr() if ready is not None else 0, ws_base, ws_stride, pc.rank, n, mt,
-       y_ptr, inbox_base, pc.side.data_ptr(), pc.side.stride(0), blocks, n_ctas, eps, _TIMEOUT_NS)
+    fn(
+        out,
+        norm_weight,
+        mInbox,
+        ready.data_ptr() if ready is not None else 0,
+        ws_base,
+        ws_stride,
+        pc.rank,
+        n,
+        mt,
+        y_ptr,
+        inbox_base,
+        pc.side.data_ptr(),
+        pc.side.stride(0),
+        blocks,
+        n_ctas,
+        eps,
+        _TIMEOUT_NS,
+    )

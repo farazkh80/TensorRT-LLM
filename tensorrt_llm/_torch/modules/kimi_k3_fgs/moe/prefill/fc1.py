@@ -108,11 +108,15 @@ class Fc1TokenM:
         if gather_issue not in ("lanes", "elect"):
             raise ValueError(f"gather_issue must be lanes or elect, got {gather_issue}")
         if a_path not in ("tma", "cpasync") or sf_path not in ("ld", "cpasync"):
-            raise ValueError(f"a_path must be tma or cpasync, sf_path ld or cpasync, got {a_path} / {sf_path}")
+            raise ValueError(
+                f"a_path must be tma or cpasync, sf_path ld or cpasync, got {a_path} / {sf_path}"
+            )
         if sf_path == "ld" and a_path != "tma":
             raise ValueError("sf_path=ld needs a_path=tma (no cp.async arrivals on the A barrier)")
         if diag not in (None, "nogather", "noepi", "nomma", "nosf", "sfzero"):
-            raise ValueError(f"diag must be None, nogather, noepi, nomma, nosf or sfzero, got {diag}")
+            raise ValueError(
+                f"diag must be None, nogather, noepi, nomma, nosf or sfzero, got {diag}"
+            )
         if tile_n not in (128, 256):
             raise ValueError(f"tile_n must be 128 or 256, got {tile_n}")
         if pdl_trigger not in ("end", "start", "none"):
@@ -160,9 +164,15 @@ class Fc1TokenM:
         self.threads_per_warp = 32
         self.threads_per_cta = 32 * (self.rearm_warp_id + (1 if rearm else 0))
         self.num_epilog_threads = 32 * len(self.epilog_warp_id)
-        self.cta_sync_barrier = pipeline.NamedBarrier(barrier_id=1, num_threads=self.threads_per_cta)
-        self.epilog_sync_barrier = pipeline.NamedBarrier(barrier_id=2, num_threads=self.num_epilog_threads)
-        self.tmem_alloc_barrier = UnalignedBarrier(barrier_id=3, num_threads=32 * (1 + len(self.epilog_warp_id)))
+        self.cta_sync_barrier = pipeline.NamedBarrier(
+            barrier_id=1, num_threads=self.threads_per_cta
+        )
+        self.epilog_sync_barrier = pipeline.NamedBarrier(
+            barrier_id=2, num_threads=self.num_epilog_threads
+        )
+        self.tmem_alloc_barrier = UnalignedBarrier(
+            barrier_id=3, num_threads=32 * (1 + len(self.epilog_warp_id))
+        )
         capacity = utils.get_smem_capacity_in_bytes(SMEM_ARCH)
         self.smem_capacity = capacity if smem_budget is None else min(capacity, smem_budget)
 
@@ -186,8 +196,12 @@ class Fc1TokenM:
         )
         a_one = sm100_utils.make_smem_layout_a(tiled_mma, self.mma_tiler, cutlass.Float8E4M3FN, 1)
         b_one = sm100_utils.make_smem_layout_b(tiled_mma, self.mma_tiler, cutlass.Float4E2M1FN, 1)
-        sfa_one = blockscaled_utils.make_smem_layout_sfa(tiled_mma, self.mma_tiler, self.sf_vec_size, 1)
-        sfb_one = blockscaled_utils.make_smem_layout_sfb(tiled_mma, self.mma_tiler, self.sf_vec_size, 1)
+        sfa_one = blockscaled_utils.make_smem_layout_sfa(
+            tiled_mma, self.mma_tiler, self.sf_vec_size, 1
+        )
+        sfb_one = blockscaled_utils.make_smem_layout_sfb(
+            tiled_mma, self.mma_tiler, self.sf_vec_size, 1
+        )
         self.a_bytes_per_stage = cute.size_in_bytes(cutlass.Float8E4M3FN, a_one)
         self.sfa_bytes_per_stage = cute.size_in_bytes(cutlass.Float8E8M0FNU, sfa_one)
         stage_bytes = (
@@ -213,14 +227,24 @@ class Fc1TokenM:
             tiled_mma, self.mma_tiler, self.sf_vec_size, self.num_ab_stage
         )
         sfa_tmem_layout = blockscaled_utils.make_tmem_layout_sfa(
-            tiled_mma, self.mma_tiler, self.sf_vec_size, cute.slice_(self.sfa_smem_layout_staged, (None, None, None, 0))
+            tiled_mma,
+            self.mma_tiler,
+            self.sf_vec_size,
+            cute.slice_(self.sfa_smem_layout_staged, (None, None, None, 0)),
         )
         sfb_tmem_layout = blockscaled_utils.make_tmem_layout_sfb(
-            tiled_mma, self.mma_tiler, self.sf_vec_size, cute.slice_(self.sfb_smem_layout_staged, (None, None, None, 0))
+            tiled_mma,
+            self.mma_tiler,
+            self.sf_vec_size,
+            cute.slice_(self.sfb_smem_layout_staged, (None, None, None, 0)),
         )
         # TMEM addresses carry the column in the low 16 bits; each SF region starts on a 16-column boundary.
-        self.num_sfa_tmem_cols = cute.round_up(cute.cosize(cute.recast_layout(32, 8, sfa_tmem_layout)) & 0xFFFF, 16)
-        self.num_sfb_tmem_cols = cute.round_up(cute.cosize(cute.recast_layout(32, 8, sfb_tmem_layout)) & 0xFFFF, 16)
+        self.num_sfa_tmem_cols = cute.round_up(
+            cute.cosize(cute.recast_layout(32, 8, sfa_tmem_layout)) & 0xFFFF, 16
+        )
+        self.num_sfb_tmem_cols = cute.round_up(
+            cute.cosize(cute.recast_layout(32, 8, sfb_tmem_layout)) & 0xFFFF, 16
+        )
         self.num_acc_tmem_cols = self.tile_n * self.num_acc_stage
         total = self.num_acc_tmem_cols + self.num_sfa_tmem_cols + self.num_sfb_tmem_cols
         max_cols = cute.arch.get_max_tmem_alloc_cols(SMEM_ARCH)
@@ -264,16 +288,23 @@ class Fc1TokenM:
         rearm_rows = cute.make_tensor(rearm_rows_ptr, cute.make_layout((1,)))
         # Weights [E, 2I, H/2] bytes as E2M1 (2I, H, E), K-major: the MMA N operand.
         b = cute.make_tensor(
-            w_ptr, cute.make_layout((W_ROWS, HIDDEN, num_experts), stride=(HIDDEN, 1, W_ROWS * HIDDEN))
+            w_ptr,
+            cute.make_layout((W_ROWS, HIDDEN, num_experts), stride=(HIDDEN, 1, W_ROWS * HIDDEN)),
         )
         sfb = cute.make_tensor(
-            w_sf_ptr, blockscaled_utils.tile_atom_to_shape_SF((W_ROWS, HIDDEN, num_experts), self.sf_vec_size)
+            w_sf_ptr,
+            blockscaled_utils.tile_atom_to_shape_SF(
+                (W_ROWS, HIDDEN, num_experts), self.sf_vec_size
+            ),
         )
         x = cute.make_tensor(x_ptr, cute.make_layout((num_rows, HIDDEN), stride=(HIDDEN, 1)))
-        x_sf = cute.make_tensor(x_sf_ptr, cute.make_layout((num_rows, HIDDEN // SF_VEC), stride=(HIDDEN // SF_VEC, 1)))
+        x_sf = cute.make_tensor(
+            x_sf_ptr, cute.make_layout((num_rows, HIDDEN // SF_VEC), stride=(HIDDEN // SF_VEC, 1))
+        )
         act = cute.make_tensor(act_ptr, cute.make_layout((num_permuted, INTER), stride=(INTER, 1)))
         act_sf = cute.make_tensor(
-            act_sf_ptr, cute.make_layout((num_permuted, INTER // SF_VEC), stride=(INTER // SF_VEC, 1))
+            act_sf_ptr,
+            cute.make_layout((num_permuted, INTER // SF_VEC), stride=(INTER // SF_VEC, 1)),
         )
         p2e = cute.make_tensor(p2e_ptr, cute.make_layout((num_permuted,)))
         t2e = cute.make_tensor(t2e_ptr, cute.make_layout((num_tiles_cap,)))
@@ -296,14 +327,16 @@ class Fc1TokenM:
             self.cluster_layout_vmnk.shape,
             internal_type=cutlass.Int16,
         )
-        self.num_tma_load_bytes = cute.size_in_bytes(cutlass.Float4E2M1FN, b_smem_layout) + cute.size_in_bytes(
-            cutlass.Float8E8M0FNU, sfb_smem_layout
-        )
+        self.num_tma_load_bytes = cute.size_in_bytes(
+            cutlass.Float4E2M1FN, b_smem_layout
+        ) + cute.size_in_bytes(cutlass.Float8E8M0FNU, sfb_smem_layout)
         # Row gather descriptor: one 128 B K_SW128 line of x per box row; gather4 fetches 4 rows per issue.
         x_gather_layout = cute.make_composed_layout(
             cute.make_swizzle(3, 4, 3), 0, cute.make_layout((1, 128), stride=(128, 1))
         )
-        tma_atom_x, _ = cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileG2SOp(), x, x_gather_layout, (1, 128))
+        tma_atom_x, _ = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(), x, x_gather_layout, (1, 128)
+        )
 
         @cute.struct
         class SharedStorage:
@@ -311,13 +344,29 @@ class Fc1TokenM:
             a_mbar: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
             acc_mbar: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
             tmem_holding_buf: cutlass.Int32
-            sSFA: cute.struct.Align[cute.struct.MemRange[cutlass.Float8E8M0FNU, cute.cosize(self.sfa_smem_layout_staged)], 1024]
-            sSFB: cute.struct.Align[cute.struct.MemRange[cutlass.Float8E8M0FNU, cute.cosize(self.sfb_smem_layout_staged)], 1024]
+            sSFA: cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Float8E8M0FNU, cute.cosize(self.sfa_smem_layout_staged)
+                ],
+                1024,
+            ]
+            sSFB: cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Float8E8M0FNU, cute.cosize(self.sfb_smem_layout_staged)
+                ],
+                1024,
+            ]
             sA: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float8E4M3FN, cute.cosize(self.a_smem_layout_staged.outer)], 1024
+                cute.struct.MemRange[
+                    cutlass.Float8E4M3FN, cute.cosize(self.a_smem_layout_staged.outer)
+                ],
+                1024,
             ]
             sB: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float4E2M1FN, cute.cosize(self.b_smem_layout_staged.outer)], 1024
+                cute.struct.MemRange[
+                    cutlass.Float4E2M1FN, cute.cosize(self.b_smem_layout_staged.outer)
+                ],
+                1024,
             ]
 
         self.shared_storage = SharedStorage
@@ -424,7 +473,9 @@ class Fc1TokenM:
             barrier_storage=storage.acc_mbar.data_ptr(),
             num_stages=self.num_acc_stage,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.num_epilog_threads),
+            consumer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, self.num_epilog_threads
+            ),
             cta_layout_vmnk=cluster_layout_vmnk,
         )
         tmem = utils.TmemAllocator(
@@ -439,8 +490,12 @@ class Fc1TokenM:
         sSFA = storage.sSFA.get_tensor(sfa_smem_layout_staged)
         sSFB = storage.sSFB.get_tensor(sfb_smem_layout_staged)
         # (bN, bK, loopN, loopK, loopL)
-        gB_nkl = cute.local_tile(mB_nkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None))
-        gSFB_nkl = cute.local_tile(mSFB_nkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None))
+        gB_nkl = cute.local_tile(
+            mB_nkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
+        )
+        gSFB_nkl = cute.local_tile(
+            mSFB_nkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
+        )
         thr_mma = tiled_mma.get_slice(0)
         tCgB = thr_mma.partition_B(gB_nkl)
         tCgSFB = thr_mma.partition_B(gSFB_nkl)
@@ -449,7 +504,11 @@ class Fc1TokenM:
             tma_atom_b, 0, b_cta_layout, cute.group_modes(sB, 0, 3), cute.group_modes(tCgB, 0, 3)
         )
         tBsSFB, tBgSFB = cpasync.tma_partition(
-            tma_atom_sfb, 0, b_cta_layout, cute.group_modes(sSFB, 0, 3), cute.group_modes(tCgSFB, 0, 3)
+            tma_atom_sfb,
+            0,
+            b_cta_layout,
+            cute.group_modes(sSFB, 0, 3),
+            cute.group_modes(tCgSFB, 0, 3),
         )
         tBsSFB = cute.filter_zeros(tBsSFB)
         tBgSFB = cute.filter_zeros(tBgSFB)
@@ -467,7 +526,9 @@ class Fc1TokenM:
         total_items = mNumTiles[0] * n_tiles
 
         if warp_idx == self.tma_warp_id:
-            ab_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.num_ab_stage)
+            ab_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.num_ab_stage
+            )
             for item in cutlass.range(bidx, total_items, gdim, unroll=1):
                 m_tile = item // n_tiles
                 n_tile = item - m_tile * n_tiles
@@ -477,9 +538,17 @@ class Fc1TokenM:
                 for k_tile in cutlass.range(self.num_k_tiles, unroll=1):
                     ab_pipeline.producer_acquire(ab_state)
                     tma_bar = ab_pipeline.producer_get_barrier(ab_state)
-                    cute.copy(tma_atom_b, tBgB_t[(None, k_tile)], tBsB[(None, ab_state.index)], tma_bar_ptr=tma_bar)
                     cute.copy(
-                        tma_atom_sfb, tBgSFB_t[(None, k_tile)], tBsSFB[(None, ab_state.index)], tma_bar_ptr=tma_bar
+                        tma_atom_b,
+                        tBgB_t[(None, k_tile)],
+                        tBsB[(None, ab_state.index)],
+                        tma_bar_ptr=tma_bar,
+                    )
+                    cute.copy(
+                        tma_atom_sfb,
+                        tBgSFB_t[(None, k_tile)],
+                        tBsSFB[(None, ab_state.index)],
+                        tma_bar_ptr=tma_bar,
                     )
                     ab_state.advance()
             ab_pipeline.producer_tail(ab_state)
@@ -497,18 +566,24 @@ class Fc1TokenM:
                 a_base = mRearmAct.iterator.toint() + cutlass.Int64(row0) * INTER
                 n_chunks = (row1 - row0) * (INTER // 16)
                 for c in cutlass.range(lane, n_chunks, 32, unroll=4):
-                    st_global_v4(a_base + cutlass.Int64(c) * 16, act_word, act_word, act_word, act_word)
+                    st_global_v4(
+                        a_base + cutlass.Int64(c) * 16, act_word, act_word, act_word, act_word
+                    )
                 s_base = mRearmSf.iterator.toint() + cutlass.Int64(row0) * (INTER // SF_VEC)
                 n_chunks = (row1 - row0) * (INTER // SF_VEC // 16)
                 for c in cutlass.range(lane, n_chunks, 32, unroll=4):
                     st_global_v4(s_base + cutlass.Int64(c) * 16, -1, -1, -1, -1)
                 if cutlass.const_expr(self.counters):
-                    for t in cutlass.range(row0 // M_TILE + lane, (row1 + M_TILE - 1) // M_TILE, 32, unroll=1):
+                    for t in cutlass.range(
+                        row0 // M_TILE + lane, (row1 + M_TILE - 1) // M_TILE, 32, unroll=1
+                    ):
                         mRearmCtr[t] = cutlass.Int32(0)
 
         if (warp_idx >= self.gather_warp_id) & (warp_idx < self.rearm_warp_id):
             gather_sub = warp_idx - self.gather_warp_id
-            a_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.num_ab_stage)
+            a_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.num_ab_stage
+            )
             lane = tidx & 31
             # Logical smem byte of (row, k) in a stage of the SW128 K-major A tile: kt * 128 * 128 + row * 128 +
             # k % 128 (kt = k // 128); the swizzled sA iterator applies the 128 B XOR. SF atom byte of (row,
@@ -527,9 +602,13 @@ class Fc1TokenM:
             issue_kt = lane // n_pass
             issue_i = lane - issue_kt * n_pass
             a_atom_copy = cute.make_copy_atom(
-                cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL), cutlass.Float8E4M3FN, num_bits_per_copy=128
+                cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
+                cutlass.Float8E4M3FN,
+                num_bits_per_copy=128,
             )
-            sf_atom_copy = cute.make_copy_atom(cpasync.CopyG2SOp(), cutlass.Uint8, num_bits_per_copy=32)
+            sf_atom_copy = cute.make_copy_atom(
+                cpasync.CopyG2SOp(), cutlass.Uint8, num_bits_per_copy=32
+            )
             row_src = cute.make_rmem_tensor((n_pass,), cutlass.Int32)
             row_ok = cute.make_rmem_tensor((n_pass,), cutlass.Boolean)
             sf_src = cute.make_rmem_tensor((n_sf,), cutlass.Int32)
@@ -552,7 +631,11 @@ class Fc1TokenM:
                 tile_start = m_tile * M_TILE
                 if cutlass.const_expr(lanes_issue):
                     for j in cutlass.range_constexpr(4):
-                        row = gather_sub * rows_per_warp + 4 * cutlass.min(issue_i, cutlass.Int32(n_pass - 1)) + j
+                        row = (
+                            gather_sub * rows_per_warp
+                            + 4 * cutlass.min(issue_i, cutlass.Int32(n_pass - 1))
+                            + j
+                        )
                         src = mP2e[tile_start + row]
                         ok = (src >= 0) & (tile_start + row < limit)
                         rid4[j] = cutlass.select_(ok, src // TOP_K, cutlass.Int32(-1))
@@ -609,7 +692,14 @@ class Fc1TokenM:
                                 + (gather_sub * rows_per_warp + 4 * issue_i) * 128
                             )
                             tma_gather4(
-                                tma_atom_x, dst, tma_bar, k0 + issue_kt * 128, rid4[0], rid4[1], rid4[2], rid4[3]
+                                tma_atom_x,
+                                dst,
+                                tma_bar,
+                                k0 + issue_kt * 128,
+                                rid4[0],
+                                rid4[1],
+                                rid4[2],
+                                rid4[3],
                             )
                     elif cutlass.const_expr(use_tma):
                         with cute.arch.elect_one():
@@ -632,11 +722,15 @@ class Fc1TokenM:
                                         rid[4 * i + 2],
                                         rid[4 * i + 3],
                                     )
-                    for kt in cutlass.range_constexpr(0 if (self.diag == "nogather" or use_tma) else n_kt):
+                    for kt in cutlass.range_constexpr(
+                        0 if (self.diag == "nogather" or use_tma) else n_kt
+                    ):
                         for i in cutlass.range_constexpr(n_pass):
                             row = gather_sub * rows_per_warp + 4 * i + row_in_pass
                             dst_off = kt * M_TILE * 128 + row * 128 + chunk * 16
-                            src_off = cute.assume(row_src[i] * HIDDEN + k0 + kt * 128 + chunk * 16, divby=16)
+                            src_off = cute.assume(
+                                row_src[i] * HIDDEN + k0 + kt * 128 + chunk * 16, divby=16
+                            )
                             g_a = cute.make_tensor(mX.iterator + src_off, cute.make_layout((16,)))
                             s_a = cute.make_tensor(sA_stage + dst_off, cute.make_layout((16,)))
                             pred1[0] = row_ok[i]
@@ -654,23 +748,33 @@ class Fc1TokenM:
                                     + (row % 32) * 16
                                     + (row // 32) * 4
                                 )
-                                sf_val = sf_words[q * n_sf_words + k_tile * (self.k_blocks // 4) + kt]
+                                sf_val = sf_words[
+                                    q * n_sf_words + k_tile * (self.k_blocks // 4) + kt
+                                ]
                                 if cutlass.const_expr(sf_lane_ok is None):
                                     st_shared_b32(sf_dst, sf_val)
                                 else:
                                     if sf_lane_ok:
                                         st_shared_b32(sf_dst, sf_val)
                         cute.arch.fence_proxy("async.shared", space="cta")
-                    for kt in cutlass.range_constexpr(0 if (self.diag in ("nogather", "nosf") or sf_ld) else n_kt):
+                    for kt in cutlass.range_constexpr(
+                        0 if (self.diag in ("nogather", "nosf") or sf_ld) else n_kt
+                    ):
                         for q in cutlass.range_constexpr(n_sf):
                             row = gather_sub * sf_rows_per_warp + 32 * q + lane
                             sf_src_off = cute.assume(
-                                sf_src[q] * (HIDDEN // SF_VEC) + k_tile * self.k_blocks + kt * 4, divby=4
+                                sf_src[q] * (HIDDEN // SF_VEC) + k_tile * self.k_blocks + kt * 4,
+                                divby=4,
                             )
-                            g_sf = cute.make_tensor(mXsf.iterator + sf_src_off, cute.make_layout((4,)))
+                            g_sf = cute.make_tensor(
+                                mXsf.iterator + sf_src_off, cute.make_layout((4,))
+                            )
                             s_sf = cute.make_tensor(
                                 cute.recast_ptr(
-                                    sSFA_stage + kt * SF_ATOM_BYTES + (row % 32) * 16 + (row // 32) * 4,
+                                    sSFA_stage
+                                    + kt * SF_ATOM_BYTES
+                                    + (row % 32) * 16
+                                    + (row // 32) * 4,
                                     dtype=cutlass.Uint8,
                                 ),
                                 cute.make_layout((4,)),
@@ -685,23 +789,42 @@ class Fc1TokenM:
             tmem.wait_for_alloc()
             acc_tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             tCtAcc_base = cute.make_tensor(acc_tmem_ptr, tCtAcc_fake.layout)
-            sfa_tmem_ptr = cute.recast_ptr(acc_tmem_ptr + self.num_acc_tmem_cols, dtype=cutlass.Float8E8M0FNU)
+            sfa_tmem_ptr = cute.recast_ptr(
+                acc_tmem_ptr + self.num_acc_tmem_cols, dtype=cutlass.Float8E8M0FNU
+            )
             sfb_tmem_ptr = cute.recast_ptr(
-                acc_tmem_ptr + self.num_acc_tmem_cols + self.num_sfa_tmem_cols, dtype=cutlass.Float8E8M0FNU
+                acc_tmem_ptr + self.num_acc_tmem_cols + self.num_sfa_tmem_cols,
+                dtype=cutlass.Float8E8M0FNU,
             )
             tCtSFA_layout = blockscaled_utils.make_tmem_layout_sfa(
-                tiled_mma, self.mma_tiler, self.sf_vec_size, cute.slice_(sfa_smem_layout_staged, (None, None, None, 0))
+                tiled_mma,
+                self.mma_tiler,
+                self.sf_vec_size,
+                cute.slice_(sfa_smem_layout_staged, (None, None, None, 0)),
             )
             tCtSFB_layout = blockscaled_utils.make_tmem_layout_sfb(
-                tiled_mma, self.mma_tiler, self.sf_vec_size, cute.slice_(sfb_smem_layout_staged, (None, None, None, 0))
+                tiled_mma,
+                self.mma_tiler,
+                self.sf_vec_size,
+                cute.slice_(sfb_smem_layout_staged, (None, None, None, 0)),
             )
             tCtSFA = cute.make_tensor(sfa_tmem_ptr, tCtSFA_layout)
             tCtSFB = cute.make_tensor(sfb_tmem_ptr, tCtSFB_layout)
-            copy_s2t_sfa, tCsSFA_s2t, tCtSFA_s2t = s2t_copy_and_partition(self.cta_group, sSFA, tCtSFA)
-            copy_s2t_sfb, tCsSFB_s2t, tCtSFB_s2t = s2t_copy_and_partition(self.cta_group, sSFB, tCtSFB)
-            ab_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_ab_stage)
-            a_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_ab_stage)
-            acc_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.num_acc_stage)
+            copy_s2t_sfa, tCsSFA_s2t, tCtSFA_s2t = s2t_copy_and_partition(
+                self.cta_group, sSFA, tCtSFA
+            )
+            copy_s2t_sfb, tCsSFB_s2t, tCtSFB_s2t = s2t_copy_and_partition(
+                self.cta_group, sSFB, tCtSFB
+            )
+            ab_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.num_ab_stage
+            )
+            a_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.num_ab_stage
+            )
+            acc_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.num_acc_stage
+            )
             num_kblocks = cute.size(tCrA, mode=[2])
             for item in cutlass.range(bidx, total_items, gdim, unroll=1):
                 acc_pipeline.producer_acquire(acc_state)
@@ -713,8 +836,16 @@ class Fc1TokenM:
                     a_pipeline.consumer_wait(a_state)
                     # cp.async (generic proxy) writes -> tcgen05 (async proxy) reads.
                     cute.arch.fence_proxy("async.shared", space="cta")
-                    cute.copy(copy_s2t_sfa, tCsSFA_s2t[(None, None, None, None, a_state.index)], tCtSFA_s2t)
-                    cute.copy(copy_s2t_sfb, tCsSFB_s2t[(None, None, None, None, ab_state.index)], tCtSFB_s2t)
+                    cute.copy(
+                        copy_s2t_sfa,
+                        tCsSFA_s2t[(None, None, None, None, a_state.index)],
+                        tCtSFA_s2t,
+                    )
+                    cute.copy(
+                        copy_s2t_sfb,
+                        tCsSFB_s2t[(None, None, None, None, ab_state.index)],
+                        tCtSFB_s2t,
+                    )
                     if cutlass.const_expr(self.diag != "nomma"):
                         for kblock in cutlass.range_constexpr(num_kblocks):
                             sf_coord = (None, None, kblock)
@@ -739,7 +870,9 @@ class Fc1TokenM:
         if warp_idx <= self.epilog_warp_id[-1]:
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
-            acc_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_acc_stage)
+            acc_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.num_acc_stage
+            )
             quad = warp_idx
             lane = tidx & 31
             tmem_quad = tmem_ptr.toint() + ((32 * quad) << 16)
@@ -760,7 +893,9 @@ class Fc1TokenM:
                 prow = m_tile * M_TILE + 32 * quad + lane
                 valid = prow < limit
                 sf_word = cutlass.Int32(0)
-                row_act = act_base + cutlass.Int64(prow) * INTER + cutlass.Int64(n_tile * ch_per_tile)
+                row_act = (
+                    act_base + cutlass.Int64(prow) * INTER + cutlass.Int64(n_tile * ch_per_tile)
+                )
                 kb0 = n_tile * (ch_per_tile // SF_VEC)
                 if cutlass.const_expr(self.sf_layout == "linear"):
                     row_sf = sf_base + cutlass.Int64(prow) * (INTER // SF_VEC) + cutlass.Int64(kb0)
@@ -768,7 +903,9 @@ class Fc1TokenM:
                     row_sf = (
                         sf_base
                         + cutlass.Int64(m_tile) * (M_TILE * (INTER // SF_VEC))
-                        + cutlass.Int64((kb0 // 4) * SF_ATOM_BYTES + (kb0 % 4) + lane * 16 + quad * 4)
+                        + cutlass.Int64(
+                            (kb0 // 4) * SF_ATOM_BYTES + (kb0 % 4) + lane * 16 + quad * 4
+                        )
                     )
                 acc_pipeline.consumer_wait(acc_state)
                 tcgen05_fence("after")
@@ -800,17 +937,31 @@ class Fc1TokenM:
                     for jb in cutlass.range_constexpr(2):
                         words = []
                         for wq in cutlass.range_constexpr(4):
-                            c0 = e4m3x2(act_v[16 * jb + 4 * wq + 1] * inv_scale, act_v[16 * jb + 4 * wq] * inv_scale)
-                            c1 = e4m3x2(act_v[16 * jb + 4 * wq + 3] * inv_scale, act_v[16 * jb + 4 * wq + 2] * inv_scale)
+                            c0 = e4m3x2(
+                                act_v[16 * jb + 4 * wq + 1] * inv_scale,
+                                act_v[16 * jb + 4 * wq] * inv_scale,
+                            )
+                            c1 = e4m3x2(
+                                act_v[16 * jb + 4 * wq + 3] * inv_scale,
+                                act_v[16 * jb + 4 * wq + 2] * inv_scale,
+                            )
                             if cutlass.const_expr(self.sentinel == "80"):
                                 # E4M3 -0 (0x80) is the slot sentinel: store +0, the same value.
                                 c0 = c0 & ~(
-                                    cutlass.select_((c0 & 0x7F) == 0, cutlass.Int32(0x80), cutlass.Int32(0))
-                                    | cutlass.select_((c0 & 0x7F00) == 0, cutlass.Int32(0x8000), cutlass.Int32(0))
+                                    cutlass.select_(
+                                        (c0 & 0x7F) == 0, cutlass.Int32(0x80), cutlass.Int32(0)
+                                    )
+                                    | cutlass.select_(
+                                        (c0 & 0x7F00) == 0, cutlass.Int32(0x8000), cutlass.Int32(0)
+                                    )
                                 )
                                 c1 = c1 & ~(
-                                    cutlass.select_((c1 & 0x7F) == 0, cutlass.Int32(0x80), cutlass.Int32(0))
-                                    | cutlass.select_((c1 & 0x7F00) == 0, cutlass.Int32(0x8000), cutlass.Int32(0))
+                                    cutlass.select_(
+                                        (c1 & 0x7F) == 0, cutlass.Int32(0x80), cutlass.Int32(0)
+                                    )
+                                    | cutlass.select_(
+                                        (c1 & 0x7F00) == 0, cutlass.Int32(0x8000), cutlass.Int32(0)
+                                    )
                                 )
                             words.append(cutlass.select_(valid, c0 | (c1 << 16), cutlass.Int32(0)))
                         addr = row_act + 32 * h + 16 * jb
@@ -829,7 +980,9 @@ class Fc1TokenM:
                     # FC2 acquires n_tiles of them per m-tile.
                     self.epilog_sync_barrier.arrive_and_wait()
                     if tidx == 0:
-                        red_release_gpu_add(mCtr.iterator.toint() + cutlass.Int64(m_tile) * 4, cutlass.Int32(1))
+                        red_release_gpu_add(
+                            mCtr.iterator.toint() + cutlass.Int64(m_tile) * 4, cutlass.Int32(1)
+                        )
             tmem.relinquish_alloc_permit()
             self.epilog_sync_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
@@ -849,19 +1002,34 @@ def check(x, x_sf, weights, plan, act, act_sf):
     num_experts = weights.w3_w1_weight.shape[0]
     check_tensor("x", x, torch.float8_e4m3fn, (rows, HIDDEN), 16)
     check_tensor("x_sf", x_sf, torch.uint8, (rows, HIDDEN // SF_VEC), 4)
-    check_tensor("w3_w1_weight", weights.w3_w1_weight, torch.uint8, (num_experts, W_ROWS, HIDDEN // 2), 128)
     check_tensor(
-        "w3_w1_weight_scale", weights.w3_w1_weight_scale, torch.uint8, (num_experts, W_ROWS, HIDDEN // SF_VEC), 128
+        "w3_w1_weight", weights.w3_w1_weight, torch.uint8, (num_experts, W_ROWS, HIDDEN // 2), 128
+    )
+    check_tensor(
+        "w3_w1_weight_scale",
+        weights.w3_w1_weight_scale,
+        torch.uint8,
+        (num_experts, W_ROWS, HIDDEN // SF_VEC),
+        128,
     )
     if plan.tile_n != M_TILE:
-        raise ValueError(f"the plan must pad experts to {M_TILE} rows (plan.tile_n = {plan.tile_n})")
+        raise ValueError(
+            f"the plan must pad experts to {M_TILE} rows (plan.tile_n = {plan.tile_n})"
+        )
     num_permuted = plan.permuted_idx_to_expanded_idx.shape[0]
     num_tiles_cap = plan.tile_idx_to_expert_idx.shape[0]
     if num_tiles_cap * M_TILE > num_permuted:
-        raise ValueError("plan: tile_idx_to_expert_idx covers more rows than permuted_idx_to_expanded_idx")
+        raise ValueError(
+            "plan: tile_idx_to_expert_idx covers more rows than permuted_idx_to_expanded_idx"
+        )
     check_tensor("act", act, torch.float8_e4m3fn, (num_permuted, INTER), 16)
     check_tensor("act_sf", act_sf, torch.uint8, (num_permuted, INTER // SF_VEC), 16)
-    for name in ("permuted_idx_to_expanded_idx", "tile_idx_to_expert_idx", "tile_idx_to_mn_limit", "num_non_exiting_tiles"):
+    for name in (
+        "permuted_idx_to_expanded_idx",
+        "tile_idx_to_expert_idx",
+        "tile_idx_to_mn_limit",
+        "num_non_exiting_tiles",
+    ):
         t = getattr(plan, name)
         if t.dtype != torch.int32 or not t.is_contiguous():
             raise ValueError(f"plan.{name} must be a contiguous int32 tensor")
@@ -884,8 +1052,12 @@ def launch_args(x, x_sf, weights, plan, act, act_sf, num_ctas, rearm=None, count
         gmem_ptr(cutlass.Int32, act if rearm is None else rearm[0], 16),
         gmem_ptr(cutlass.Int32, act_sf if rearm is None else rearm[1], 16),
         gmem_ptr(cutlass.Int32, plan.num_non_exiting_tiles if rearm is None else rearm[2], 4),
-        gmem_ptr(cutlass.Int32, plan.tile_idx_to_expert_idx if counters is None else counters[0], 4),
-        gmem_ptr(cutlass.Int32, plan.tile_idx_to_expert_idx if counters is None else counters[1], 4),
+        gmem_ptr(
+            cutlass.Int32, plan.tile_idx_to_expert_idx if counters is None else counters[0], 4
+        ),
+        gmem_ptr(
+            cutlass.Int32, plan.tile_idx_to_expert_idx if counters is None else counters[1], 4
+        ),
         cutlass.Int32(weights.w3_w1_weight.shape[0]),
         cutlass.Int32(x.shape[0]),
         cutlass.Int32(act.shape[0]),
@@ -938,11 +1110,20 @@ def run(
     zeroed before use; ctr[m] is release-added once per (m, n) item after the tile's stores (reaches 6144 / tile_n
     per m-tile), and ctr_prev (the previous use's, finished) is zeroed with the re-arm."""
     check(x, x_sf, weights, plan, act, act_sf)
-    if counters is not None and (counters[0].dtype != torch.int32 or counters[0].numel() < plan.tile_idx_to_expert_idx.shape[0]):
+    if counters is not None and (
+        counters[0].dtype != torch.int32
+        or counters[0].numel() < plan.tile_idx_to_expert_idx.shape[0]
+    ):
         raise ValueError("counters = (ctr int32 [T], ctr_prev int32 [T])")
     if rearm is not None:
-        if rearm[2].dtype != torch.int32 or rearm[0].shape[1] != INTER or rearm[1].shape[1] != INTER // SF_VEC:
-            raise ValueError("rearm = (act_prev [P, 3072], act_sf_prev [P, 96], rows_prev int32 [1])")
+        if (
+            rearm[2].dtype != torch.int32
+            or rearm[0].shape[1] != INTER
+            or rearm[1].shape[1] != INTER // SF_VEC
+        ):
+            raise ValueError(
+                "rearm = (act_prev [P, 3072], act_sf_prev [P, 96], rows_prev int32 [1])"
+            )
     pdl = use_pdl() if enable_pdl is None else enable_pdl
     key = (
         tile_n,

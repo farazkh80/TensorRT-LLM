@@ -44,7 +44,6 @@ from .. import comm as _comm
 from ..comm import (
     _CACHELINE,
     _TIMEOUT_NS,
-    _Layout,
     _asm,
     _bf16x2_to_f32,
     _bf16x4_to_e4m3x4,
@@ -52,20 +51,21 @@ from ..comm import (
     _bulk_g2s,
     _bulk_s2g,
     _bulk_wait_read,
-    _mbar_expect_tx,
-    _mbar_init,
-    _mbar_wait,
     _e4m3x4_to_f32,
     _f32x2_to_bf16x2,
     _fence_acq_rel_sys,
     _fence_proxy_async_global,
     _fence_proxy_async_shared,
     _globaltimer,
+    _Layout,
     _ld_b32,
     _ld_v2,
     _ld_v4,
     _ld_vol_v2,
     _ld_vol_v4,
+    _mbar_expect_tx,
+    _mbar_init,
+    _mbar_wait,
     _nanosleep,
     _sleep_ns,
     _spin_eq,
@@ -148,7 +148,16 @@ def _ld_shared_v4(addr, *, loc=None, ip=None):
 
 
 @cute.jit
-def _tma_row(lpc: cutlass.Constexpr, hidden: cutlass.Constexpr, row: Int64, dst: Int64, stage: Int32, mbar: Int32, ph: Int32, lane: Int32) -> Int32:
+def _tma_row(
+    lpc: cutlass.Constexpr,
+    hidden: cutlass.Constexpr,
+    row: Int64,
+    dst: Int64,
+    stage: Int32,
+    mbar: Int32,
+    ph: Int32,
+    lane: Int32,
+) -> Int32:
     """One warp moves a bf16 row to the wire format at ``dst`` through TMA: bulk load onto the warp's mbarrier, the
     lanes convert in place (every lane's reads precede any write), bulk store. Returns the barrier's next phase."""
     nbytes = hidden * 2
@@ -162,7 +171,10 @@ def _tma_row(lpc: cutlass.Constexpr, hidden: cutlass.Constexpr, row: Int64, dst:
     if cutlass.const_expr(lpc):
         per_lane = wire // 16 // 32
         loads = [
-            (_ld_shared_v4(stage + (lane + 32 * k) * 32), _ld_shared_v4(stage + (lane + 32 * k) * 32 + 16))
+            (
+                _ld_shared_v4(stage + (lane + 32 * k) * 32),
+                _ld_shared_v4(stage + (lane + 32 * k) * 32 + 16),
+            )
             for k in range(per_lane)
         ]
         cute.arch.sync_warp()
@@ -276,7 +288,9 @@ class _Push:
         timeout_ns: Int64,
         stream,
     ):
-        self.kernel(y, ws_base, ws_stride, side_base, side_stride, rank, max_tokens, timeout_ns).launch(
+        self.kernel(
+            y, ws_base, ws_stride, side_base, side_stride, rank, max_tokens, timeout_ns
+        ).launch(
             grid=[self.ep, blocks, 1],
             block=[self.warps * 32, 1, 1],
             smem=self.smem_bytes,
@@ -312,7 +326,9 @@ class _Push:
         ph = Int32(0)
         if cutlass.const_expr(self.tma):
             smem = SmemAllocator()
-            buf = smem.allocate_array(cutlass.Uint8, self.warps * 2 * self.hidden, byte_alignment=128)
+            buf = smem.allocate_array(
+                cutlass.Uint8, self.warps * 2 * self.hidden, byte_alignment=128
+            )
             bars = smem.allocate_array(Int64, self.warps, byte_alignment=8)
             stage = Int32(buf.toint()) + warp * (2 * self.hidden)
             mbar = Int32(bars.toint()) + warp * 8
@@ -338,7 +354,9 @@ class _Push:
         if cutlass.const_expr(not self.local):
             if by == 0:
                 if tidx == 0:
-                    _st_sys_b32(ws_base + Int64(source) * ws_stride + L["combine_flags"] + rank * 4, value)
+                    _st_sys_b32(
+                        ws_base + Int64(source) * ws_stride + L["combine_flags"] + rank * 4, value
+                    )
         if source == rank:
             if by == 0:
                 if warp == 0:
@@ -353,9 +371,16 @@ class _Push:
             n = _spin_ne(
                 my_ws + L["recv_counters"] + (parity * self.ep + source) * 4, Int32(-1), timeout_ns
             )
-            box = dst_side + _HDR + Int64(parity) * self.inbox_bytes + Int64(rank) * self.rows * wire
+            box = (
+                dst_side + _HDR + Int64(parity) * self.inbox_bytes + Int64(rank) * self.rows * wire
+            )
             if cutlass.const_expr(self.local):
-                box = my_side + _HDR + Int64(parity) * self.inbox_bytes + Int64(source) * self.rows * wire
+                box = (
+                    my_side
+                    + _HDR
+                    + Int64(parity) * self.inbox_bytes
+                    + Int64(source) * self.rows * wire
+                )
             if cutlass.const_expr(self.delay_ns > 0):
                 _sleep_ns(self.delay_ns)
             R = self.rows_per_store
@@ -363,8 +388,14 @@ class _Push:
             for c in cutlass.range(by * self.warps + warp, nchunks, nby * self.warps, unroll=1):
                 if cutlass.const_expr(self.tma):
                     ph = _tma_row(
-                        self.lpc, self.hidden, y + (Int64(source) * max_tokens + c) * nbytes, box + Int64(c) * wire,
-                        stage, mbar, ph, lane,
+                        self.lpc,
+                        self.hidden,
+                        y + (Int64(source) * max_tokens + c) * nbytes,
+                        box + Int64(c) * wire,
+                        stage,
+                        mbar,
+                        ph,
+                        lane,
                     )
                 if cutlass.const_expr(self.bulk and not self.tma):
                     if lane == 0:
@@ -426,7 +457,10 @@ class _Push:
                 prev = parity ^ 1
                 n_prev = _ld_b32(my_side + _USED + (prev * _MAX_RANKS + source) * 4)
                 box_prev = (
-                    my_side + _HDR + Int64(prev) * self.inbox_bytes + Int64(source) * self.rows * wire
+                    my_side
+                    + _HDR
+                    + Int64(prev) * self.inbox_bytes
+                    + Int64(source) * self.rows * wire
                 )
                 for t in cutlass.range(by * self.warps + warp, n_prev, nby * self.warps, unroll=1):
                     for k in cutlass.range_constexpr(per_lane):
@@ -491,7 +525,13 @@ class _ReduceNorm:
         self.blocks = hidden // (_VEC * _THREADS_PER_ROW)
         self.threads = hidden // _VEC
         self.smem_bytes = (
-            32 * 8 + 32 * 4 + 16 + 2 * 4 + hidden * 2 + 64 + (self.wire + 128 if rearm == _REARM_BULK else 0)
+            32 * 8
+            + 32 * 4
+            + 16
+            + 2 * 4
+            + hidden * 2
+            + 64
+            + (self.wire + 128 if rearm == _REARM_BULK else 0)
         )
 
     @cute.jit
@@ -622,7 +662,9 @@ class _ReduceNorm:
             for i in cutlass.range(tidx, self.ep * blocks, self.threads, unroll=1):
                 src = i // blocks
                 if src != rank:
-                    _spin_eq(my_side + _DONE + (src * _DONE_BLOCKS + i % blocks) * 4, value, timeout_ns)
+                    _spin_eq(
+                        my_side + _DONE + (src * _DONE_BLOCKS + i % blocks) * 4, value, timeout_ns
+                    )
             if tidx < self.ep * blocks:
                 _fence_acq_rel_sys()
         if cutlass.const_expr(self.wait == _WAIT_PULL):
@@ -772,7 +814,9 @@ class _ReduceNorm:
                                 | _dirty(raw[3, s], False)
                             )
                             if d != 0:
-                                w0, w1, w2, w3 = _poll_v4(s_src[s] + v * 16, self.poll_ns, timeout_ns)
+                                w0, w1, w2, w3 = _poll_v4(
+                                    s_src[s] + v * 16, self.poll_ns, timeout_ns
+                                )
                                 raw[0, s] = w0
                                 raw[1, s] = w1
                                 raw[2, s] = w2
@@ -928,7 +972,9 @@ class PrefillCombine:
         self.rows = rows
         self.inbox_bytes = _align(self.ep * rows * self.wire, _CACHELINE)
         self.warps = _env_int(PUSH_WARPS_ENV, 8, 1, 32) if warps is None else warps
-        self.blocks_cap = _env_int(PUSH_BLOCKS_ENV, 64, 1, _DONE_BLOCKS) if blocks is None else blocks
+        self.blocks_cap = (
+            _env_int(PUSH_BLOCKS_ENV, 64, 1, _DONE_BLOCKS) if blocks is None else blocks
+        )
         self._round: Optional[Tuple] = None
         self._alloc()
 
@@ -978,7 +1024,9 @@ class PrefillCombine:
             or not y.is_contiguous()
             or y.data_ptr() % 16
         ):
-            raise ValueError(f"the combine payload must be contiguous bf16 [{self.ep * mt}, {self.hidden}]")
+            raise ValueError(
+                f"the combine payload must be contiguous bf16 [{self.ep * mt}, {self.hidden}]"
+            )
         return y, n, mt
 
     def inbox(self, max_tokens: int) -> PrefillInbox:
@@ -1063,9 +1111,13 @@ class PrefillCombine:
         if rearm not in REARMS:
             raise ValueError(f"rearm {rearm!r}; valid: {REARMS}")
         if mode == "done" and data_only:
-            raise ValueError("the FGS-off reduce needs a push with completion words (data_only=False)")
+            raise ValueError(
+                "the FGS-off reduce needs a push with completion words (data_only=False)"
+            )
         if (mode == "pull") != (pmode == "pull"):
-            raise ValueError("the pull reduce needs the local cast push of the same round, and only then")
+            raise ValueError(
+                "the pull reduce needs the local cast push of the same round, and only then"
+            )
         if out is None:
             out = torch.empty(n, self.hidden, dtype=torch.bfloat16, device=norm_weight.device)
         if (
@@ -1076,17 +1128,25 @@ class PrefillCombine:
             or norm_weight.dtype != torch.bfloat16
             or norm_weight.numel() != self.hidden
         ):
-            raise ValueError(f"out must be contiguous bf16 [>= {n}, {self.hidden}], weight bf16 [{self.hidden}]")
+            raise ValueError(
+                f"out must be contiguous bf16 [>= {n}, {self.hidden}], weight bf16 [{self.hidden}]"
+            )
         if ready is not None and (ready.dtype != torch.int32 or ready.numel() < n):
             raise ValueError(f"ready must be int32 [>= {n}]")
-        wait = {"poll": _WAIT_POLL, "done": _WAIT_DONE, "pull": _WAIT_PULL}[mode] if check else _WAIT_NONE
+        wait = (
+            {"poll": _WAIT_POLL, "done": _WAIT_DONE, "pull": _WAIT_PULL}[mode]
+            if check
+            else _WAIT_NONE
+        )
         if mode in ("poll", "done") and check and os.environ.get(CHECK_ENV, "hw") == "hw":
             if os.environ.get(REDUCE_ENV, "pipe") == "pipe":
                 from .combine_pipe import reduce_norm_pipe as hw_reduce
             else:
                 from .combine_tma import reduce_norm_tma as hw_reduce
 
-            hw_reduce(self, out, norm_weight, eps, ready, n, mt, blocks, y_ptr, rearm, own_in_inbox, wait)
+            hw_reduce(
+                self, out, norm_weight, eps, ready, n, mt, blocks, y_ptr, rearm, own_in_inbox, wait
+            )
             self._round = None
             self.comm.reset_state()
             return out
@@ -1150,5 +1210,9 @@ class PrefillCombine:
         check: bool = True,
         hazard_delay_ns: int = 0,
     ) -> torch.Tensor:
-        self.push(y, fgs=fgs, rearm=rearm, data_only=data_only, bulk=bulk, hazard_delay_ns=hazard_delay_ns)
-        return self.reduce_norm(norm_weight, eps, out, fgs=fgs, rearm=rearm, ready=ready, check=check)
+        self.push(
+            y, fgs=fgs, rearm=rearm, data_only=data_only, bulk=bulk, hazard_delay_ns=hazard_delay_ns
+        )
+        return self.reduce_norm(
+            norm_weight, eps, out, fgs=fgs, rearm=rearm, ready=ready, check=check
+        )

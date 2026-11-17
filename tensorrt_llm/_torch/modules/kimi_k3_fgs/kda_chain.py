@@ -40,6 +40,8 @@ GATE = "kda.g"
 QKVG = "kda.qkvg"
 CORE = "kda.core_o"
 ATTN_O = "kda.attn_o"
+
+
 def bfa_first() -> bool:
     value = os.environ.get("TLLM_K3_FGS_CHAIN_BFA") or (
         "after" if edges.mode() == "chain_after" else "before"

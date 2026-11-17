@@ -11,8 +11,6 @@ issued by the whole warp (the atom elects internally), never inside ``elect_one`
 
 from __future__ import annotations
 
-import functools
-
 import cutlass
 import cutlass.cute as cute
 import torch
@@ -21,9 +19,24 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.utils import SmemAllocator
 
-from ..comm import _TIMEOUT_NS, _asm, _ld_b32, _ld_v4, _nanosleep, _v
-from ..comm import _bf16x4_to_e4m3x4, _f32x2_to_bf16x2, _fence_proxy_async_shared, _st_shared_v4
-from ..comm import _bulk_commit, _bulk_s2g, _fence_acq_rel_sys, _globaltimer, _spin_eq, _trap
+from ..comm import (
+    _TIMEOUT_NS,
+    _asm,
+    _bf16x4_to_e4m3x4,
+    _bulk_commit,
+    _bulk_s2g,
+    _f32x2_to_bf16x2,
+    _fence_acq_rel_sys,
+    _fence_proxy_async_shared,
+    _globaltimer,
+    _ld_b32,
+    _ld_v4,
+    _nanosleep,
+    _spin_eq,
+    _st_shared_v4,
+    _trap,
+    _v,
+)
 from ..latent import _THREADS_PER_ROW, _VEC
 from ..tail import _st_release_b32
 from .combine import (
@@ -32,14 +45,13 @@ from .combine import (
     _HDR,
     _NORM_BARRIER,
     _REARM_BULK,
-    _REARM_ST,
     _WAIT_DONE,
     _WAIT_POLL,
-    _ReduceNorm,
+    REDUCE_MIN_BLOCKS_ENV,
     _bulk_wait_all,
     _env_int,
+    _ReduceNorm,
     _sentinel,
-    REDUCE_MIN_BLOCKS_ENV,
 )
 
 _ROW_BOX = (256, 14, 1)
@@ -55,7 +67,10 @@ def _ld_shared_v2(addr, *, loc=None, ip=None):
         loc,
         ip,
     )
-    return [Int32(cutlass._mlir.dialects.llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(2)]
+    return [
+        Int32(cutlass._mlir.dialects.llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip))
+        for i in range(2)
+    ]
 
 
 @dsl_user_op
@@ -68,7 +83,10 @@ def _ld_shared_v4(addr, *, loc=None, ip=None):
         loc,
         ip,
     )
-    return [Int32(cutlass._mlir.dialects.llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(4)]
+    return [
+        Int32(cutlass._mlir.dialects.llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip))
+        for i in range(4)
+    ]
 
 
 class _ReduceNormTma(_ReduceNorm):
@@ -118,8 +136,26 @@ class _ReduceNormTma(_ReduceNorm):
             cpasync.CopyBulkTensorTileG2SOp(), mInbox, row_layout, _ROW_BOX
         )
         self.kernel(
-            mOut, mW, mInbox_tma, tma_atom, ready_addr, ws_base, ws_stride, rank, n_local, max_tokens, own_base,
-            inbox, side_base, side_stride, blocks, eps, timeout_ns, tv_layout, tiler_mn, row_layout,
+            mOut,
+            mW,
+            mInbox_tma,
+            tma_atom,
+            ready_addr,
+            ws_base,
+            ws_stride,
+            rank,
+            n_local,
+            max_tokens,
+            own_base,
+            inbox,
+            side_base,
+            side_stride,
+            blocks,
+            eps,
+            timeout_ns,
+            tv_layout,
+            tiler_mn,
+            row_layout,
         ).launch(
             grid=[cutlass.max(n_local, Int32(1)), 1, 1],
             block=[self.threads, 1, 1],
@@ -167,7 +203,9 @@ class _ReduceNormTma(_ReduceNorm):
         s_own = smem.allocate_tensor(Int32, cute.make_layout((32,)), byte_alignment=16)
         s_n = smem.allocate_tensor(Int32, cute.make_layout((4,)), byte_alignment=16)
         partials = smem.allocate_tensor(Float32, cute.make_layout((1, 2)), byte_alignment=16)
-        sX = smem.allocate_tensor(BFloat16, cute.make_layout(tiler_mn, stride=(H, 1)), byte_alignment=16)
+        sX = smem.allocate_tensor(
+            BFloat16, cute.make_layout(tiler_mn, stride=(H, 1)), byte_alignment=16
+        )
         bars = smem.allocate_array(Int64, K, byte_alignment=8)
         rows_buf = smem.allocate_array(cutlass.Uint8, K * wire, byte_alignment=128)
         sent = Int32(0)
@@ -176,19 +214,29 @@ class _ReduceNormTma(_ReduceNorm):
             sent = Int32(sbuf.toint())
         rows_base = Int32(rows_buf.toint())
         dtype = cutlass.Float8E4M3FN if self.lpc else cutlass.BFloat16
-        sRows = cute.make_tensor(cute.recast_ptr(rows_buf, dtype=dtype), cute.make_layout((256, 14, 1, K)))
+        sRows = cute.make_tensor(
+            cute.recast_ptr(rows_buf, dtype=dtype), cute.make_layout((256, 14, 1, K))
+        )
         gI = cute.local_tile(mInbox, _ROW_BOX, (0, 0, None))
         tIsI, tIgI = cpasync.tma_partition(
-            tma_atom, 0, cute.make_layout(1), cute.group_modes(sRows, 0, 3), cute.group_modes(gI, 0, 3)
+            tma_atom,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sRows, 0, 3),
+            cute.group_modes(gI, 0, 3),
         )
         my_ws = ws_base + Int64(rank) * ws_stride
         sentinel = Int32(_sentinel(self.lpc))
         pattern = cpasync.SentinelPattern.PER_ELEMENT_FF
 
         ntid = tidx % _THREADS_PER_ROW
-        copy_x = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), BFloat16, num_bits_per_copy=_VEC * 16)
+        copy_x = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), BFloat16, num_bits_per_copy=_VEC * 16
+        )
         thr = cute.make_tiled_copy(copy_x, tv_layout, tiler_mn).get_slice(ntid)
-        mW_2d = cute.make_tensor(mW.iterator, cute.prepend(mW.layout, cute.make_layout((1,), stride=(0,))))
+        mW_2d = cute.make_tensor(
+            mW.iterator, cute.prepend(mW.layout, cute.make_layout((1,), stride=(0,)))
+        )
         tWgW = thr.partition_S(cute.local_tile(mW_2d, tiler_mn, (0, 0)))
         tWrW = cute.make_fragment_like(tWgW)
         cute.copy(copy_x, tWgW, tWrW)
@@ -216,7 +264,9 @@ class _ReduceNormTma(_ReduceNorm):
             for i in cutlass.range(tidx, self.ep * blocks, self.threads, unroll=1):
                 src = i // blocks
                 if src != rank:
-                    _spin_eq(my_side + _DONE + (src * _DONE_BLOCKS + i % blocks) * 4, value, timeout_ns)
+                    _spin_eq(
+                        my_side + _DONE + (src * _DONE_BLOCKS + i % blocks) * 4, value, timeout_ns
+                    )
             if tidx < self.ep * blocks:
                 _fence_acq_rel_sys()
         if tok < n_local:
@@ -254,11 +304,19 @@ class _ReduceNormTma(_ReduceNorm):
                                 cute.arch.mbarrier_arrive_and_expect_tx(bars + s, wire)
                             if cutlass.const_expr(self.wait == _WAIT_POLL):
                                 cute.copy(
-                                    tma_atom, tIgI[(None, s_row[s])], tIsI[(None, s)], tma_bar_ptr=bars + s,
+                                    tma_atom,
+                                    tIgI[(None, s_row[s])],
+                                    tIsI[(None, s)],
+                                    tma_bar_ptr=bars + s,
                                     report_valid=pattern,
                                 )
                             else:
-                                cute.copy(tma_atom, tIgI[(None, s_row[s])], tIsI[(None, s)], tma_bar_ptr=bars + s)
+                                cute.copy(
+                                    tma_atom,
+                                    tIgI[(None, s_row[s])],
+                                    tIsI[(None, s)],
+                                    tma_bar_ptr=bars + s,
+                                )
                 for s in cutlass.range_constexpr(K):
                     if s < count:
                         if s_own[s] == 0:
@@ -276,7 +334,10 @@ class _ReduceNormTma(_ReduceNorm):
                                 with cute.arch.elect_one():
                                     cute.arch.mbarrier_arrive_and_expect_tx(bars + s, wire)
                                 cute.copy(
-                                    tma_atom, tIgI[(None, s_row[s])], tIsI[(None, s)], tma_bar_ptr=bars + s,
+                                    tma_atom,
+                                    tIgI[(None, s_row[s])],
+                                    tIsI[(None, s)],
+                                    tma_bar_ptr=bars + s,
                                     report_valid=pattern,
                                 )
                                 phase = phase ^ 1
@@ -287,7 +348,9 @@ class _ReduceNormTma(_ReduceNorm):
             if tidx < _THREADS_PER_ROW:
                 cute.copy(copy_x, tXsX, tXrX)
                 x = tXrX.load().to(Float32)
-                local = (x * x).reduce(cute.ReductionOp.ADD, init_val=Float32(0.0), reduction_profile=0)
+                local = (x * x).reduce(
+                    cute.ReductionOp.ADD, init_val=Float32(0.0), reduction_profile=0
+                )
                 for i in cutlass.range_constexpr(5):
                     local = local + cute.arch.shuffle_sync_bfly(local, offset=1 << i)
                 if lane == 0:
@@ -309,9 +372,7 @@ class _ReduceNormTma(_ReduceNorm):
                 if tidx == 0:
                     for s in cutlass.range(0, count, 1, unroll=1):
                         if s_own[s] == 0:
-                            _bulk_s2g(
-                                inbox + Int64(s_row[s]) * wire, sent, Int32(wire)
-                            )
+                            _bulk_s2g(inbox + Int64(s_row[s]) * wire, sent, Int32(wire))
                     _bulk_commit()
         if cutlass.const_expr(self.rearm == _REARM_BULK):
             if tidx == 0:
@@ -352,22 +413,53 @@ class _ReduceNormTma(_ReduceNorm):
 _compiled = {}
 
 
-def reduce_norm_tma(pc, out, norm_weight, eps, ready, n, mt, blocks, y_ptr, rearm, own_in_inbox, wait):
-    rearm_mode = {"consumer": _REARM_BULK, "consumer_st": _REARM_BULK, "producer": 0, "none": 0}[rearm]
+def reduce_norm_tma(
+    pc, out, norm_weight, eps, ready, n, mt, blocks, y_ptr, rearm, own_in_inbox, wait
+):
+    rearm_mode = {"consumer": _REARM_BULK, "consumer_st": _REARM_BULK, "producer": 0, "none": 0}[
+        rearm
+    ]
     dtype = torch.float8_e4m3fn if pc.lpc else torch.bfloat16
     rows_total = 2 * pc.ep * pc.rows
     # mode 0 contiguous (CuTe's TMA convention): element (c, j, row) at row * 3584 + 256 j + c
-    view = pc.side[pc.rank][_HDR : _HDR + rows_total * pc.wire].view(dtype).view(rows_total, 14, 256).permute(2, 1, 0)
-    key = (pc.ep, pc.top_k, pc.hidden, pc.lpc, pc.lay.key(), pc.rows, pc.inbox_bytes, rearm_mode, own_in_inbox,
-           wait, tuple(view.shape))
+    view = (
+        pc.side[pc.rank][_HDR : _HDR + rows_total * pc.wire]
+        .view(dtype)
+        .view(rows_total, 14, 256)
+        .permute(2, 1, 0)
+    )
+    key = (
+        pc.ep,
+        pc.top_k,
+        pc.hidden,
+        pc.lpc,
+        pc.lay.key(),
+        pc.rows,
+        pc.inbox_bytes,
+        rearm_mode,
+        own_in_inbox,
+        wait,
+        tuple(view.shape),
+    )
     fn = _compiled.get(key)
     mInbox = cute.runtime.from_dlpack(view, assumed_align=16, enable_tvm_ffi=True)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     if fn is None:
         kern = _ReduceNormTma(
-            pc.ep, pc.top_k, pc.hidden, pc.lpc, pc.lay.key(), pc.rows, pc.inbox_bytes, wait, rearm_mode,
-            wait != _WAIT_POLL, _env_int("TLLM_K3_PC_POLL_NS", 256, 32, 1 << 20),
-            _env_int(REDUCE_MIN_BLOCKS_ENV, 2, 0, 4), True, own_in_inbox,
+            pc.ep,
+            pc.top_k,
+            pc.hidden,
+            pc.lpc,
+            pc.lay.key(),
+            pc.rows,
+            pc.inbox_bytes,
+            wait,
+            rearm_mode,
+            wait != _WAIT_POLL,
+            _env_int("TLLM_K3_PC_POLL_NS", 256, 32, 1 << 20),
+            _env_int(REDUCE_MIN_BLOCKS_ENV, 2, 0, 4),
+            True,
+            own_in_inbox,
         )
         fake = cute.runtime.make_fake_compact_tensor
         fn = _compiled[key] = cute.compile(
@@ -375,12 +467,39 @@ def reduce_norm_tma(pc, out, norm_weight, eps, ready, n, mt, blocks, y_ptr, rear
             fake(BFloat16, (cute.sym_int(), pc.hidden), stride_order=(1, 0), assumed_align=16),
             fake(BFloat16, (pc.hidden,), assumed_align=16),
             mInbox,
-            Int64(0), Int64(0), Int64(0), Int32(0), Int32(1), Int32(1), Int64(0), Int64(0), Int64(0), Int64(0),
-            Int32(1), Float32(1e-6), Int64(0),
+            Int64(0),
+            Int64(0),
+            Int64(0),
+            Int32(0),
+            Int32(1),
+            Int32(1),
+            Int64(0),
+            Int64(0),
+            Int64(0),
+            Int64(0),
+            Int32(1),
+            Float32(1e-6),
+            Int64(0),
             stream,
             options="--enable-tvm-ffi",
         )
     ws_base, ws_stride = pc._ws()
     inbox_base = pc.side.data_ptr() + pc.rank * pc.side.stride(0) + _HDR
-    fn(out, norm_weight, mInbox, ready.data_ptr() if ready is not None else 0, ws_base, ws_stride, pc.rank, n, mt,
-       y_ptr, inbox_base, pc.side.data_ptr(), pc.side.stride(0), blocks, eps, _TIMEOUT_NS)
+    fn(
+        out,
+        norm_weight,
+        mInbox,
+        ready.data_ptr() if ready is not None else 0,
+        ws_base,
+        ws_stride,
+        pc.rank,
+        n,
+        mt,
+        y_ptr,
+        inbox_base,
+        pc.side.data_ptr(),
+        pc.side.stride(0),
+        blocks,
+        eps,
+        _TIMEOUT_NS,
+    )

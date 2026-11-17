@@ -64,7 +64,9 @@ if SYNC not in ("counter", "lamport"):
     raise ValueError(f"TLLM_K3_FGS_PREFILL_SYNC={SYNC!r}; valid: counter, lamport")
 MIN_ROWS = int(os.environ.get("TLLM_K3_FGS_PREFILL_MIN_ROWS", "1024"))
 # Lamport slots cost 123 KB per token of window; the counter link has no slot memory.
-MAX_ROWS = int(os.environ.get("TLLM_K3_FGS_PREFILL_MAX_ROWS", "262144" if SYNC == "counter" else "4096"))
+MAX_ROWS = int(
+    os.environ.get("TLLM_K3_FGS_PREFILL_MAX_ROWS", "262144" if SYNC == "counter" else "4096")
+)
 RASTER = os.environ.get("TLLM_K3_FGS_PREFILL_RASTER", "m")
 NORM_CTAS = int(os.environ.get("TLLM_K3_FGS_PREFILL_NORM_CTAS", "0"))
 DELAY_NS = int(os.environ.get("TLLM_K3_FGS_PREFILL_DELAY_NS", "0"))
@@ -104,7 +106,9 @@ def edges_on() -> frozenset:
     # pm* ids belong to the MLA prefill chain (``mla_prefill``), which shares the variable.
     unknown = ids - set(_EDGE_IDS) - frozenset(i for i in ids if i.startswith("pm") or i == "gproj")
     if unknown:
-        raise ValueError(f"TLLM_K3_FGS_PREFILL_EDGES: unknown {sorted(unknown)}; valid: {', '.join(_EDGE_IDS)}")
+        raise ValueError(
+            f"TLLM_K3_FGS_PREFILL_EDGES: unknown {sorted(unknown)}; valid: {', '.join(_EDGE_IDS)}"
+        )
     return frozenset(_EDGE_IDS[i] for i in ids if i in _EDGE_IDS)
 
 
@@ -172,7 +176,9 @@ def _slots_of(device: torch.device, widths: Dict[str, int]) -> _Slots:
     slots = _slots.get(device)
     if slots is None:
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(f"{ENV}=1: slots are allocated by an eager prefill, before any capture")
+            raise RuntimeError(
+                f"{ENV}=1: slots are allocated by an eager prefill, before any capture"
+            )
         slots = _slots[device] = _Slots(device, widths, 2 + len(_layers) % 2)
     return slots
 
@@ -200,14 +206,18 @@ class _Counters:
                 shape = (pairs, 2, COUNTER_WORDS) if edge == P_QKVG else (pairs, COUNTER_WORDS)
                 self.slab[edge] = torch.zeros(shape, dtype=torch.int32, device=device)
                 self.dirty[edge] = [0] * pairs
-        logger.info(f"{ENV}=1 counter link: {sorted(self.slab)} x {pairs} pairs x {COUNTER_WORDS} words")
+        logger.info(
+            f"{ENV}=1 counter link: {sorted(self.slab)} x {pairs} pairs x {COUNTER_WORDS} words"
+        )
 
     def words(self, edge: str, pair: int, blocks: int) -> Optional[torch.Tensor]:
         slab = self.slab.get(edge)
         if slab is None:
             return None
         if blocks > COUNTER_WORDS:
-            raise RuntimeError(f"{edge}: {blocks} row blocks above the {COUNTER_WORDS}-word counter slab")
+            raise RuntimeError(
+                f"{edge}: {blocks} row blocks above the {COUNTER_WORDS}-word counter slab"
+            )
         self.dirty[edge][pair] = max(self.dirty[edge][pair], -(-blocks // 4) * 4)
         return slab[pair]
 
@@ -266,7 +276,9 @@ def _counters_of(device: torch.device) -> _Counters:
     counters = _counters.get(device)
     if counters is None:
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(f"{ENV}=1: counter slabs are allocated by an eager prefill, before any capture")
+            raise RuntimeError(
+                f"{ENV}=1: counter slabs are allocated by an eager prefill, before any capture"
+            )
         counters = _counters[device] = _Counters(device, 2 + len(_layers) % 2)
     return counters
 
@@ -279,7 +291,9 @@ STATS_EVERY = 200
 
 def _note(layer_idx: int, refusal: Optional[str]) -> None:
     if not outcomes:
-        atexit.register(lambda: logger.info(f"{ENV}={mode()} KDA prefill layer-forwards: {dict(outcomes)}"))
+        atexit.register(
+            lambda: logger.info(f"{ENV}={mode()} KDA prefill layer-forwards: {dict(outcomes)}")
+        )
     outcome = mode() if refusal is None else f"off: {refusal}"
     if outcome not in outcomes:
         logger.info(f"{ENV}={mode()} KDA prefill chain, first {outcome!r} at KDA layer {layer_idx}")
@@ -287,13 +301,19 @@ def _note(layer_idx: int, refusal: Optional[str]) -> None:
     if sum(outcomes.values()) % LOG_EVERY == 0:
         logger.info(f"{ENV}={mode()} KDA prefill layer-forwards: {dict(outcomes)}")
         if edges.DEBUG and _stats and sum(outcomes.values()) % STATS_EVERY == 0:
-            logger.info(f"{ENV}={mode()} KDA prefill waits (conv rounds/fallbacks, norm rounds/ctas, "
-                        f"o_proj -/rounds/fallbacks): {stats_report()}")
+            logger.info(
+                f"{ENV}={mode()} KDA prefill waits (conv rounds/fallbacks, norm rounds/ctas, "
+                f"o_proj -/rounds/fallbacks): {stats_report()}"
+            )
 
 
 def _kernels():
     try:
-        from ...attention.kernels.blackwell.kimi_k3_kda import fused_prefill_conv, gated_rmsnorm, kda_chunked_bt16
+        from ...attention.kernels.blackwell.kimi_k3_kda import (
+            fused_prefill_conv,
+            gated_rmsnorm,
+            kda_chunked_bt16,
+        )
     except ImportError:  # release-image layout
         from ..kimi_kda.cute_kda import fused_prefill_conv, gated_rmsnorm, kda_chunked_bt16
     return fused_prefill_conv, gated_rmsnorm, kda_chunked_bt16
@@ -327,7 +347,10 @@ def _refusal(mixer, rows: int, num_prefills: int, ssm_pool, layer_cache) -> Opti
         (not kimi_k3_cute_gemm.enabled(), "TLLM_K3_CUTE_GEMM off"),
         (not MIN_ROWS <= rows <= MAX_ROWS, f"{rows} rows outside [{MIN_ROWS}, {MAX_ROWS}]"),
         (active_stream_manager() is not None, "stream manager active"),
-        (mixer._qkvg_proj_weight is None or mixer._bfa_proj_weight is None, "no merged projection weights"),
+        (
+            mixer._qkvg_proj_weight is None or mixer._bfa_proj_weight is None,
+            "no merged projection weights",
+        ),
         (not mixer.use_full_rank_gate, "low-rank output gate"),
         (mixer._o_allreduce is not None, "o_proj TP all-reduce"),
         (
@@ -337,11 +360,20 @@ def _refusal(mixer, rows: int, num_prefills: int, ssm_pool, layer_cache) -> Opti
             "quantized o_proj / f_b_proj",
         ),
         (mixer._has_kda_replay_caches(layer_cache), "replay caches"),
-        (not mixer._fuse_prefill_conv or mixer._dispatch.prefill_kernel_path != "optimized", "stock prefill path"),
-        (mixer._packed_conv_weight is None or mixer._A_log_f32 is None, "prefill constants not built"),
+        (
+            not mixer._fuse_prefill_conv or mixer._dispatch.prefill_kernel_path != "optimized",
+            "stock prefill path",
+        ),
+        (
+            mixer._packed_conv_weight is None or mixer._A_log_f32 is None,
+            "prefill constants not built",
+        ),
         (ssm_pool.dtype != torch.float32, "BF16 state (Small-BH route)"),
         (mixer.layer_idx not in _layers, "layer not registered"),
-        (on(P_O) and 2 * num_prefills * mixer.num_heads > sms, "pk7 needs BT16's decomposition route"),
+        (
+            on(P_O) and 2 * num_prefills * mixer.num_heads > sms,
+            "pk7 needs BT16's decomposition route",
+        ),
     ):
         if refused:
             return reason
@@ -368,7 +400,9 @@ def forward(
             rearm_skipped(x2d.device)
         return None
     if fgs() and SYNC == "counter":
-        return _forward_counter(mixer, x2d, cu_seqlens, mamba_metadata, num_prefills, conv_pool, ssm_pool, layer_cache)
+        return _forward_counter(
+            mixer, x2d, cu_seqlens, mamba_metadata, num_prefills, conv_pool, ssm_pool, layer_cache
+        )
     conv_mod, norm_mod, _ = _kernels()
     d, H, hd = mixer.proj_size, mixer.num_heads, mixer.head_dim
     T = rows
@@ -453,7 +487,9 @@ def forward(
     return core.view(T, H, hd)
 
 
-def _forward_counter(mixer, x2d, cu_seqlens, mamba_metadata, num_prefills, conv_pool, ssm_pool, layer_cache):
+def _forward_counter(
+    mixer, x2d, cu_seqlens, mamba_metadata, num_prefills, conv_pool, ssm_pool, layer_cache
+):
     conv_mod, norm_mod, _ = _kernels()
     d, H, hd = mixer.proj_size, mixer.num_heads, mixer.head_dim
     T = x2d.shape[0]
@@ -507,7 +543,19 @@ def _forward_counter(mixer, x2d, cu_seqlens, mamba_metadata, num_prefills, conv_
     bfa = kimi_k3_cute_gemm.linear(x2d, mixer._bfa_proj_weight)
     g = kimi_k3_cute_gemm.linear(bfa[:, :hd], mixer.f_b_proj.weight)
     beta = bfa[:, hd : hd + H].unsqueeze(0)
-    o = _bt16(mixer, q, k, v, g.view(1, T, H, hd), beta, ssm_pool, slot_indices, cu_seqlens, mamba_metadata, None)
+    o = _bt16(
+        mixer,
+        q,
+        k,
+        v,
+        g.view(1, T, H, hd),
+        beta,
+        ssm_pool,
+        slot_indices,
+        cu_seqlens,
+        mamba_metadata,
+        None,
+    )
     mixer._sync_kda_replay_conv_window(layer_cache, slot_indices, conv_pool)
 
     o_cta_m, _ = kimi_k3_cute_gemm.rubin_tile(mixer.hidden_size, d, T)
@@ -549,7 +597,9 @@ def _bt16(mixer, q, k, v, g, beta, ssm_pool, slot_indices, cu_seqlens, mamba_met
     producer = out is not None
     if producer and not decomp:
         raise RuntimeError("pk7 needs BT16's decomposition route")
-    compiled = _compile_bt16(device, mixer.gate_lower_bound, "decomp" if producer else None, producer)
+    compiled = _compile_bt16(
+        device, mixer.gate_lower_bound, "decomp" if producer else None, producer
+    )
     output = out if out is not None else torch.empty_like(q)
     nonempty = min(q.shape[1], n)
     capacity = nonempty + (q.shape[1] - nonempty) // 16
@@ -595,7 +645,9 @@ def o_proj(mixer, core2d: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     pair, prev, T, core_in_slot, gate = mixer._k3_prefill_pending
     mixer._k3_prefill_pending = None
     if core2d.shape[0] != T:
-        raise RuntimeError(f"KDA prefill chain: o_proj got {core2d.shape[0]} rows for a {T}-row layer")
+        raise RuntimeError(
+            f"KDA prefill chain: o_proj got {core2d.shape[0]} rows for a {T}-row layer"
+        )
     if fgs() and SYNC == "counter":
         return kimi_k3_cute_gemm.linear_fgs(
             core2d, weight, core2d.new_empty(T, weight.shape[0]), early_trigger=False, gate=gate,
@@ -606,7 +658,9 @@ def o_proj(mixer, core2d: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     arm = ()
     if slots is not None:
         arm = tuple(
-            r for r in (slots.arm_region(e, prev) for e in (P_QKVG, P_O, P_CORE, P_ATTN_O)) if r is not None
+            r
+            for r in (slots.arm_region(e, prev) for e in (P_QKVG, P_O, P_CORE, P_ATTN_O))
+            if r is not None
         )
     out = kimi_k3_cute_gemm.linear_fgs(
         core2d,

@@ -408,7 +408,18 @@ def _ptrs(addrs):
 def _compiled(key: tuple, addrs, stream) -> Callable:
     fn = _COMPILED.get(key)
     if fn is None:
-        num_heads, latent, rope, nope, page_size, consumer, producer, spin_limit, with_stats, pdl = key
+        (
+            num_heads,
+            latent,
+            rope,
+            nope,
+            page_size,
+            consumer,
+            producer,
+            spin_limit,
+            with_stats,
+            pdl,
+        ) = key
         one32, eight64 = cutlass.Int32(1), cutlass.Int64(8)
         with BaseDSL.enable_pyir():
             fn = cute.compile(

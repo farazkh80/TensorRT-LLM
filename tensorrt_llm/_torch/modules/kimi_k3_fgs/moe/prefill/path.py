@@ -98,7 +98,9 @@ def routing_torch(topk_ids: torch.Tensor, lo: int, num_local: int, plan: Plan) -
     n = ids.numel()
     local = (ids >= lo) & (ids < lo + num_local)
     le = torch.where(local, ids - lo, torch.full_like(ids, num_local))
-    counts = torch.zeros(num_local + 1, dtype=torch.long, device=dev).scatter_add_(0, le, torch.ones_like(le))
+    counts = torch.zeros(num_local + 1, dtype=torch.long, device=dev).scatter_add_(
+        0, le, torch.ones_like(le)
+    )
     counts = counts[:num_local]
     padded = (counts + tile - 1) // tile * tile
     offsets = torch.zeros(num_local + 1, dtype=torch.long, device=dev)
@@ -127,7 +129,9 @@ def routing_torch(topk_ids: torch.Tensor, lo: int, num_local: int, plan: Plan) -
     plan.expanded_idx_to_permuted_idx.fill_(-1)
     plan.expanded_idx_to_permuted_idx[:n].copy_(e2p)
     plan.tile_idx_to_expert_idx.copy_(t_exp)
-    plan.tile_idx_to_mn_limit.copy_(torch.minimum(tile_start + tile, offsets[t_exp] + counts[t_exp]))
+    plan.tile_idx_to_mn_limit.copy_(
+        torch.minimum(tile_start + tile, offsets[t_exp] + counts[t_exp])
+    )
     plan.num_non_exiting_tiles.copy_((offsets[num_local:] // tile).clamp(max=t_cap))
     plan.total_num_padded_tokens.copy_(offsets[num_local:].clamp(max=p_cap))
 
@@ -167,7 +171,10 @@ def run(
     ``after_fc2``, else plain on the full grid (the FGS-off twin)."""
     rows = x.shape[0]
     assert x.shape == (rows, HIDDEN) and x.dtype == torch.float8_e4m3fn, (x.shape, x.dtype)
-    assert x_sf.shape == (rows, HIDDEN // SF_VEC) and x_sf.dtype == torch.uint8, (x_sf.shape, x_sf.dtype)
+    assert x_sf.shape == (rows, HIDDEN // SF_VEC) and x_sf.dtype == torch.uint8, (
+        x_sf.shape,
+        x_sf.dtype,
+    )
     assert topk_ids.shape == (rows, TOP_K) and topk_ids.dtype == torch.int32
     assert topk_w.shape == (rows, TOP_K) and topk_w.dtype == torch.bfloat16
     assert out.shape == (rows, HIDDEN) and out.dtype == torch.bfloat16 and out.is_contiguous()

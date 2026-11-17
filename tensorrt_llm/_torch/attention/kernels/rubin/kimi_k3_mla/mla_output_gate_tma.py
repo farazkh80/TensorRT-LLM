@@ -57,7 +57,9 @@ def _release_add(addr, val, *, loc=None, ip=None):
 
 
 class _Gate:
-    def __init__(self, fast: bool, pdl: bool, consumer: bool, max_spins: int, with_stats: bool, publish: bool):
+    def __init__(
+        self, fast: bool, pdl: bool, consumer: bool, max_spins: int, with_stats: bool, publish: bool
+    ):
         self.fast = fast
         self.pdl = pdl
         self.consumer = consumer
@@ -92,7 +94,9 @@ class _Gate:
         tma_g, mG_tma = cpasync.make_tiled_tma_atom(op, mG, smem_tile, tile)
         rows = mO.shape[0]
         num_ctas = (rows + TILE_ROWS - 1) // TILE_ROWS
-        self.kernel(tma_o, mO_tma, tma_g, mG_tma, mOut, stats_ptr, cnt_ptr, cnt_block, smem_layout).launch(
+        self.kernel(
+            tma_o, mO_tma, tma_g, mG_tma, mOut, stats_ptr, cnt_ptr, cnt_block, smem_layout
+        ).launch(
             grid=(num_ctas, 1, 1),
             block=(THREADS, 1, 1),
             smem=self.shared_storage.size_in_bytes(),
@@ -106,8 +110,12 @@ class _Gate:
         with cute.arch.elect_one():
             cute.arch.mbarrier_arrive_and_expect_tx(bar, 2 * TILE_BYTES)
         if cutlass.const_expr(check):
-            cute.copy(tma_o, tOgO[(None, bidx, 0)], tOsO[(None, 0)], tma_bar_ptr=bar, report_valid=True)
-            cute.copy(tma_g, tGgG[(None, bidx, 0)], tGsG[(None, 0)], tma_bar_ptr=bar, report_valid=True)
+            cute.copy(
+                tma_o, tOgO[(None, bidx, 0)], tOsO[(None, 0)], tma_bar_ptr=bar, report_valid=True
+            )
+            cute.copy(
+                tma_g, tGgG[(None, bidx, 0)], tGsG[(None, 0)], tma_bar_ptr=bar, report_valid=True
+            )
         else:
             cute.copy(tma_o, tOgO[(None, bidx, 0)], tOsO[(None, 0)], tma_bar_ptr=bar)
             cute.copy(tma_g, tGgG[(None, bidx, 0)], tGsG[(None, 0)], tma_bar_ptr=bar)
@@ -187,10 +195,16 @@ class _Gate:
         else:
             done = cutlass.Int32(0)
             while done == 0:
-                done = cutlass.select_(cute.arch.mbarrier_try_wait(bar, phase), cutlass.Int32(1), cutlass.Int32(0))
+                done = cutlass.select_(
+                    cute.arch.mbarrier_try_wait(bar, phase), cutlass.Int32(1), cutlass.Int32(0)
+                )
 
-        so = cutlass.make_array_view(cute.make_tensor(storage.sO.data_ptr(), cute.make_layout((TILE_ELEMS,))))
-        sg = cutlass.make_array_view(cute.make_tensor(storage.sG.data_ptr(), cute.make_layout((TILE_ELEMS,))))
+        so = cutlass.make_array_view(
+            cute.make_tensor(storage.sO.data_ptr(), cute.make_layout((TILE_ELEMS,)))
+        )
+        sg = cutlass.make_array_view(
+            cute.make_tensor(storage.sG.data_ptr(), cute.make_layout((TILE_ELEMS,)))
+        )
         out = cutlass.make_array_view(mOut)
         row = tidx // (TILE_COLS // PER_THREAD)
         col0 = (tidx % (TILE_COLS // PER_THREAD)) * PER_THREAD
@@ -205,7 +219,9 @@ class _Gate:
                 for e in cutlass.range_constexpr(VEC):
                     res.append(o[e] * _sigmoid_bf16_as_f32(g[e], self.fast))
                 out.store(
-                    cutlass.Vector.from_elements(tuple(res), dtype=cutlass.Float32).to(cutlass.BFloat16),
+                    cutlass.Vector.from_elements(tuple(res), dtype=cutlass.Float32).to(
+                        cutlass.BFloat16
+                    ),
                     idx=gidx + c * VEC,
                     vector_size=VEC,
                     alignment=2 * VEC,
@@ -257,10 +273,17 @@ def mla_output_gate_tma(
 ) -> torch.Tensor:
     """out = o * sigmoid(g) for 2-D bf16 o / g (see the module docstring); ``out`` must not alias o or g."""
     if not supported(o, g):
-        raise ValueError("mla_output_gate_tma needs contiguous 32B-aligned 2-D bf16 o / g, numel % 256 == 0")
+        raise ValueError(
+            "mla_output_gate_tma needs contiguous 32B-aligned 2-D bf16 o / g, numel % 256 == 0"
+        )
     if out is None:
         out = torch.empty_like(o)
-    elif out.shape != o.shape or out.dtype != o.dtype or not out.is_contiguous() or out.data_ptr() % 32:
+    elif (
+        out.shape != o.shape
+        or out.dtype != o.dtype
+        or not out.is_contiguous()
+        or out.data_ptr() % 32
+    ):
         raise ValueError("out must be a contiguous, 32B-aligned bf16 tensor shaped like o")
     T, N = o.shape
     rows = T * N // TILE_COLS
@@ -284,7 +307,9 @@ def mla_output_gate_tma(
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     def arg2d(t):
-        return from_dlpack(t.view(rows, TILE_COLS), assumed_align=32).mark_layout_dynamic(leading_dim=1)
+        return from_dlpack(t.view(rows, TILE_COLS), assumed_align=32).mark_layout_dynamic(
+            leading_dim=1
+        )
 
     def arg1d(t):
         return from_dlpack(t.view(-1), assumed_align=32).mark_layout_dynamic()

@@ -20,7 +20,7 @@ loads, warp layout (4, 1)), so a 32-column block's amax is thread-local: one pas
 from __future__ import annotations
 
 import functools
-from typing import Dict, Optional, Tuple, Type
+from typing import Dict, Tuple, Type
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -35,16 +35,29 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 try:
-    from tensorrt_llm._torch.kernels.blackwell.custom_pipeline import PipelineTmaUmma, PipelineUmmaAsync
-    from tensorrt_llm._torch.kernels.blackwell.utils import griddepcontrol_launch_dependents, griddepcontrol_wait
-    from tensorrt_llm._torch.kernels.rubin.dense_bf16_gemm_persistent import PersistentDenseGemmKernel
+    from tensorrt_llm._torch.kernels.blackwell.custom_pipeline import (
+        PipelineTmaUmma,
+        PipelineUmmaAsync,
+    )
+    from tensorrt_llm._torch.kernels.blackwell.utils import (
+        griddepcontrol_launch_dependents,
+        griddepcontrol_wait,
+    )
+    from tensorrt_llm._torch.kernels.rubin.dense_bf16_gemm_persistent import (
+        PersistentDenseGemmKernel,
+    )
 except ImportError:  # the release image installs the kernels package as cute_dsl_kernels
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.custom_pipeline import PipelineTmaUmma, PipelineUmmaAsync
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.custom_pipeline import (
+        PipelineTmaUmma,
+        PipelineUmmaAsync,
+    )
     from tensorrt_llm._torch.cute_dsl_kernels.blackwell.utils import (
         griddepcontrol_launch_dependents,
         griddepcontrol_wait,
     )
-    from tensorrt_llm._torch.cute_dsl_kernels.rubin.dense_bf16_gemm_persistent import PersistentDenseGemmKernel
+    from tensorrt_llm._torch.cute_dsl_kernels.rubin.dense_bf16_gemm_persistent import (
+        PersistentDenseGemmKernel,
+    )
 
 SF_VEC = 32
 EPILOGUES = ("mxfp8",)
@@ -248,7 +261,9 @@ class EpiDenseGemmKernel(PersistentDenseGemmKernel):
 
         ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         num_tma_producer = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
-        ab_pipeline_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, num_tma_producer)
+        ab_pipeline_consumer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, num_tma_producer
+        )
         ab_producer, ab_consumer = PipelineTmaUmma.create(
             barrier_storage=storage.ab_full_mbar_ptr.data_ptr(),
             num_stages=self.num_ab_stage,
@@ -308,11 +323,19 @@ class EpiDenseGemmKernel(PersistentDenseGemmKernel):
                 cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=1
             )
 
-        gA_mkl = cute.local_tile(mA_mkl, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None))
-        gB_nkl = cute.local_tile(mB_nkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None))
-        gC_mnl = cute.local_tile(mC_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None))
+        gA_mkl = cute.local_tile(
+            mA_mkl, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None)
+        )
+        gB_nkl = cute.local_tile(
+            mB_nkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
+        )
+        gC_mnl = cute.local_tile(
+            mC_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
+        )
         cC_mnl = cute.make_identity_tensor(mC_mnl.shape)
-        cC_mnl = cute.local_tile(cC_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None))
+        cC_mnl = cute.local_tile(
+            cC_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
+        )
         k_tile_cnt = cute.size(gA_mkl, mode=[3])
 
         thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
@@ -443,7 +466,12 @@ class EpiDenseGemmKernel(PersistentDenseGemmKernel):
             )
 
             copy_atom_t2r = utils.sm100.get_tmem_load_op(
-                self.cta_tile_shape_mnk, self.c_layout, self.c_dtype, self.acc_dtype, epi_tile, use_2cta_instrs
+                self.cta_tile_shape_mnk,
+                self.c_layout,
+                self.c_dtype,
+                self.acc_dtype,
+                epi_tile,
+                use_2cta_instrs,
             )
             tAcc_epi = cute.flat_divide(tCtAcc_base[((None, None), 0, 0, None)], epi_tile)
             tiled_copy_t2r = tcgen05.make_tmem_copy(copy_atom_t2r, tAcc_epi[(None, None, 0, 0, 0)])
@@ -454,7 +482,9 @@ class EpiDenseGemmKernel(PersistentDenseGemmKernel):
             tTR_gC = thr_copy_t2r.partition_D(gC_mnl_epi)
             cC_mnl_epi = cute.flat_divide(tCcC[((None, None), 0, 0, None, None, None)], epi_tile)
             tTR_cC = thr_copy_t2r.partition_D(cC_mnl_epi)
-            tTR_rAcc = cute.make_rmem_tensor(tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype)
+            tTR_rAcc = cute.make_rmem_tensor(
+                tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype
+            )
 
             copy_atom_r2s = utils.sm100.get_smem_store_op(
                 self.c_layout, self.c_dtype, self.acc_dtype, tiled_copy_t2r
@@ -471,7 +501,9 @@ class EpiDenseGemmKernel(PersistentDenseGemmKernel):
                 tma_atom_c, 0, cute.make_layout(1), sC_for_tma, gC_for_tma
             )
 
-            c_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 32 * len(self.epilogue_warp_id))
+            c_producer_group = pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, 32 * len(self.epilogue_warp_id)
+            )
             c_pipeline = pipeline.PipelineTmaStore.create(
                 num_stages=self.num_c_stage, producer_group=c_producer_group
             )
@@ -513,7 +545,9 @@ class EpiDenseGemmKernel(PersistentDenseGemmKernel):
                     acc_vec = tTR_rAcc.load()
                     quantized = cute.make_rmem_tensor(acc_vec.shape, self.c_dtype)
                     for g in cutlass.range_constexpr(vals_per_thread // SF_VEC):
-                        rounded = cute.make_rmem_tensor(cute.make_layout((SF_VEC,)), cutlass.Float32)
+                        rounded = cute.make_rmem_tensor(
+                            cute.make_layout((SF_VEC,)), cutlass.Float32
+                        )
                         amax = cutlass.Float32(0.0)
                         for i in cutlass.range_constexpr(SF_VEC):
                             v = cutlass.Float32(acc_vec[g * SF_VEC + i].to(cutlass.BFloat16))
@@ -537,12 +571,16 @@ class EpiDenseGemmKernel(PersistentDenseGemmKernel):
                     c_buffer = (num_prev_subtiles + subtile_idx) % self.num_c_stage
                     cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, c_buffer)])
                     cute.arch.fence_proxy("async.shared", space="cta")
-                    cute.arch.barrier(barrier_id=self.epilog_sync_bar_id, number_of_threads=epilog_threads)
+                    cute.arch.barrier(
+                        barrier_id=self.epilog_sync_bar_id, number_of_threads=epilog_threads
+                    )
                     if warp_idx == self.epilogue_warp_id[0]:
                         cute.copy(tma_atom_c, bSG_sC[(None, c_buffer)], bSG_gC[(None, subtile_idx)])
                         c_pipeline.producer_commit()
                         c_pipeline.producer_acquire()
-                    cute.arch.barrier(barrier_id=self.epilog_sync_bar_id, number_of_threads=epilog_threads)
+                    cute.arch.barrier(
+                        barrier_id=self.epilog_sync_bar_id, number_of_threads=epilog_threads
+                    )
 
                 with cute.arch.elect_one():
                     acc_pipeline.consumer_release(acc_consumer_state)
@@ -568,8 +606,12 @@ class EpiDenseGemmKernel(PersistentDenseGemmKernel):
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
-        a_tensor = cute.make_tensor(a_ptr, layout=cute.make_ordered_layout((m, k, 1), order=(1, 0, 2)))
-        b_tensor = cute.make_tensor(b_ptr, layout=cute.make_ordered_layout((n, k, 1), order=(1, 0, 2)))
+        a_tensor = cute.make_tensor(
+            a_ptr, layout=cute.make_ordered_layout((m, k, 1), order=(1, 0, 2))
+        )
+        b_tensor = cute.make_tensor(
+            b_ptr, layout=cute.make_ordered_layout((n, k, 1), order=(1, 0, 2))
+        )
         self(a_tensor, b_tensor, c_tensor, sf_tensor, max_active_clusters, stream)
 
 
@@ -619,10 +661,21 @@ def gemm_mxfp8(
     if m == 0:
         return q, sf
     use_2cta, mma_tiler_mn, cluster_shape_mn, max_num_ab_stage = _parse_tactic(tactic)
-    max_active_clusters = _max_active_clusters(x.device.index, cluster_shape_mn[0] * cluster_shape_mn[1])
+    max_active_clusters = _max_active_clusters(
+        x.device.index, cluster_shape_mn[0] * cluster_shape_mn[1]
+    )
     c_tmp = q.unsqueeze(-1)
-    key = (use_2cta, mma_tiler_mn, cluster_shape_mn, max_num_ab_stage, early_trigger, enable_pdl,
-           max_active_clusters, tuple(c_tmp.stride()), sf.stride())
+    key = (
+        use_2cta,
+        mma_tiler_mn,
+        cluster_shape_mn,
+        max_num_ab_stage,
+        early_trigger,
+        enable_pdl,
+        max_active_clusters,
+        tuple(c_tmp.stride()),
+        sf.stride(),
+    )
     fn = _compiled.get(key)
     if fn is None:
         kernel = EpiDenseGemmKernel(
@@ -636,7 +689,9 @@ def gemm_mxfp8(
             use_pdl=enable_pdl,
         )
         a_ptr = make_ptr(cutlass.BFloat16, x.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
-        b_ptr = make_ptr(cutlass.BFloat16, weight.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+        b_ptr = make_ptr(
+            cutlass.BFloat16, weight.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+        )
         c_cute = from_dlpack(c_tmp).mark_layout_dynamic(leading_dim=1)
         sf_cute = from_dlpack(sf).mark_layout_dynamic(leading_dim=1)
         fn = _compiled[key] = cute.compile(

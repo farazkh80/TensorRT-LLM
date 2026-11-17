@@ -70,7 +70,10 @@ def bf16x2(hi, lo, *, loc=None, ip=None):
     return cutlass.Int32(
         llvm.inline_asm(
             T.i32(),
-            [cutlass.Float32(hi).ir_value(loc=loc, ip=ip), cutlass.Float32(lo).ir_value(loc=loc, ip=ip)],
+            [
+                cutlass.Float32(hi).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(lo).ir_value(loc=loc, ip=ip),
+            ],
             "cvt.rn.bf16x2.f32 $0, $1, $2;",
             "=r,f,f",
             has_side_effects=False,
@@ -101,7 +104,9 @@ class Fc2TokenM:
         publish: bool = False,
     ):
         if sync not in (None, "lamport", "counter") or sentinel not in ("80", "ff"):
-            raise ValueError(f"sync must be None, lamport or counter, sentinel 80 or ff, got {sync} / {sentinel}")
+            raise ValueError(
+                f"sync must be None, lamport or counter, sentinel 80 or ff, got {sync} / {sentinel}"
+            )
         if tile_n not in (128, 256):
             raise ValueError(f"tile_n must be 128 or 256, got {tile_n}")
         if pdl_trigger not in ("end", "start", "none"):
@@ -133,9 +138,15 @@ class Fc2TokenM:
         self.threads_per_warp = 32
         self.threads_per_cta = 32 * 6
         self.num_epilog_threads = 32 * len(self.epilog_warp_id)
-        self.cta_sync_barrier = pipeline.NamedBarrier(barrier_id=1, num_threads=self.threads_per_cta)
-        self.epilog_sync_barrier = pipeline.NamedBarrier(barrier_id=2, num_threads=self.num_epilog_threads)
-        self.tmem_alloc_barrier = UnalignedBarrier(barrier_id=3, num_threads=32 * (1 + len(self.epilog_warp_id)))
+        self.cta_sync_barrier = pipeline.NamedBarrier(
+            barrier_id=1, num_threads=self.threads_per_cta
+        )
+        self.epilog_sync_barrier = pipeline.NamedBarrier(
+            barrier_id=2, num_threads=self.num_epilog_threads
+        )
+        self.tmem_alloc_barrier = UnalignedBarrier(
+            barrier_id=3, num_threads=32 * (1 + len(self.epilog_warp_id))
+        )
         capacity = utils.get_smem_capacity_in_bytes(SMEM_ARCH)
         self.smem_capacity = capacity if smem_budget is None else min(capacity, smem_budget)
 
@@ -159,8 +170,12 @@ class Fc2TokenM:
         )
         a_one = sm100_utils.make_smem_layout_a(tiled_mma, self.mma_tiler, cutlass.Float8E4M3FN, 1)
         b_one = sm100_utils.make_smem_layout_b(tiled_mma, self.mma_tiler, cutlass.Float4E2M1FN, 1)
-        sfa_one = blockscaled_utils.make_smem_layout_sfa(tiled_mma, self.mma_tiler, self.sf_vec_size, 1)
-        sfb_one = blockscaled_utils.make_smem_layout_sfb(tiled_mma, self.mma_tiler, self.sf_vec_size, 1)
+        sfa_one = blockscaled_utils.make_smem_layout_sfa(
+            tiled_mma, self.mma_tiler, self.sf_vec_size, 1
+        )
+        sfb_one = blockscaled_utils.make_smem_layout_sfb(
+            tiled_mma, self.mma_tiler, self.sf_vec_size, 1
+        )
         stage_bytes = (
             cute.size_in_bytes(cutlass.Float8E4M3FN, a_one)
             + cute.size_in_bytes(cutlass.Float4E2M1FN, b_one)
@@ -184,14 +199,24 @@ class Fc2TokenM:
             tiled_mma, self.mma_tiler, self.sf_vec_size, self.num_ab_stage
         )
         sfa_tmem_layout = blockscaled_utils.make_tmem_layout_sfa(
-            tiled_mma, self.mma_tiler, self.sf_vec_size, cute.slice_(self.sfa_smem_layout_staged, (None, None, None, 0))
+            tiled_mma,
+            self.mma_tiler,
+            self.sf_vec_size,
+            cute.slice_(self.sfa_smem_layout_staged, (None, None, None, 0)),
         )
         sfb_tmem_layout = blockscaled_utils.make_tmem_layout_sfb(
-            tiled_mma, self.mma_tiler, self.sf_vec_size, cute.slice_(self.sfb_smem_layout_staged, (None, None, None, 0))
+            tiled_mma,
+            self.mma_tiler,
+            self.sf_vec_size,
+            cute.slice_(self.sfb_smem_layout_staged, (None, None, None, 0)),
         )
         # TMEM addresses carry the column in the low 16 bits; each SF region starts on a 16-column boundary.
-        self.num_sfa_tmem_cols = cute.round_up(cute.cosize(cute.recast_layout(32, 8, sfa_tmem_layout)) & 0xFFFF, 16)
-        self.num_sfb_tmem_cols = cute.round_up(cute.cosize(cute.recast_layout(32, 8, sfb_tmem_layout)) & 0xFFFF, 16)
+        self.num_sfa_tmem_cols = cute.round_up(
+            cute.cosize(cute.recast_layout(32, 8, sfa_tmem_layout)) & 0xFFFF, 16
+        )
+        self.num_sfb_tmem_cols = cute.round_up(
+            cute.cosize(cute.recast_layout(32, 8, sfb_tmem_layout)) & 0xFFFF, 16
+        )
         self.num_acc_tmem_cols = self.tile_n * self.num_acc_stage
         total = self.num_acc_tmem_cols + self.num_sfa_tmem_cols + self.num_sfb_tmem_cols
         max_cols = cute.arch.get_max_tmem_alloc_cols(SMEM_ARCH)
@@ -230,14 +255,20 @@ class Fc2TokenM:
         self._setup_attributes()
         ctr = cute.make_tensor(ctr_ptr, cute.make_layout((num_tiles_cap,)))
         pub = cute.make_tensor(pub_ptr, cute.make_layout((num_tiles_cap,)))
-        a = cute.make_tensor(act_ptr, cute.make_layout((num_permuted, INTER, 1), stride=(INTER, 1, 0)))
+        a = cute.make_tensor(
+            act_ptr, cute.make_layout((num_permuted, INTER, 1), stride=(INTER, 1, 0))
+        )
         sfa = cute.make_tensor(
-            act_sf_ptr, blockscaled_utils.tile_atom_to_shape_SF((num_permuted, INTER, 1), self.sf_vec_size)
+            act_sf_ptr,
+            blockscaled_utils.tile_atom_to_shape_SF((num_permuted, INTER, 1), self.sf_vec_size),
         )
         # Weights [E, H, I/2] bytes as E2M1 (H, I, E), K-major.
-        b = cute.make_tensor(w_ptr, cute.make_layout((HIDDEN, INTER, num_experts), stride=(INTER, 1, HIDDEN * INTER)))
+        b = cute.make_tensor(
+            w_ptr, cute.make_layout((HIDDEN, INTER, num_experts), stride=(INTER, 1, HIDDEN * INTER))
+        )
         sfb = cute.make_tensor(
-            w_sf_ptr, blockscaled_utils.tile_atom_to_shape_SF((HIDDEN, INTER, num_experts), self.sf_vec_size)
+            w_sf_ptr,
+            blockscaled_utils.tile_atom_to_shape_SF((HIDDEN, INTER, num_experts), self.sf_vec_size),
         )
         y = cute.make_tensor(y_ptr, cute.make_layout((num_permuted, HIDDEN), stride=(HIDDEN, 1)))
         out = cute.make_tensor(out_ptr, cute.make_layout((num_rows, HIDDEN), stride=(HIDDEN, 1)))
@@ -259,21 +290,35 @@ class Fc2TokenM:
             a_op, a, a_smem_layout, self.mma_tiler, tiled_mma, self.cluster_layout_vmnk.shape
         )
         tma_atom_sfa, tma_tensor_sfa = cute.nvgpu.make_tiled_tma_atom_A(
-            a_op, sfa, sfa_smem_layout, self.mma_tiler, tiled_mma, self.cluster_layout_vmnk.shape, internal_type=cutlass.Int16
+            a_op,
+            sfa,
+            sfa_smem_layout,
+            self.mma_tiler,
+            tiled_mma,
+            self.cluster_layout_vmnk.shape,
+            internal_type=cutlass.Int16,
         )
         tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
             b_op, b, b_smem_layout, self.mma_tiler, tiled_mma, self.cluster_layout_vmnk.shape
         )
         tma_atom_sfb, tma_tensor_sfb = cute.nvgpu.make_tiled_tma_atom_B(
-            b_op, sfb, sfb_smem_layout, self.mma_tiler, tiled_mma, self.cluster_layout_vmnk.shape, internal_type=cutlass.Int16
+            b_op,
+            sfb,
+            sfb_smem_layout,
+            self.mma_tiler,
+            tiled_mma,
+            self.cluster_layout_vmnk.shape,
+            internal_type=cutlass.Int16,
         )
-        self.num_act_load_bytes = cute.size_in_bytes(cutlass.Float8E4M3FN, a_smem_layout) + cute.size_in_bytes(
-            cutlass.Float8E8M0FNU, sfa_smem_layout
+        self.num_act_load_bytes = cute.size_in_bytes(
+            cutlass.Float8E4M3FN, a_smem_layout
+        ) + cute.size_in_bytes(cutlass.Float8E8M0FNU, sfa_smem_layout)
+        self.num_b_load_bytes = cute.size_in_bytes(
+            cutlass.Float4E2M1FN, b_smem_layout
+        ) + cute.size_in_bytes(cutlass.Float8E8M0FNU, sfb_smem_layout)
+        self.num_tma_load_bytes = self.num_b_load_bytes + (
+            0 if self.lamport else self.num_act_load_bytes
         )
-        self.num_b_load_bytes = cute.size_in_bytes(cutlass.Float4E2M1FN, b_smem_layout) + cute.size_in_bytes(
-            cutlass.Float8E8M0FNU, sfb_smem_layout
-        )
-        self.num_tma_load_bytes = self.num_b_load_bytes + (0 if self.lamport else self.num_act_load_bytes)
 
         @cute.struct
         class SharedStorage:
@@ -281,13 +326,29 @@ class Fc2TokenM:
             act_mbar: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage + 1]
             acc_mbar: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
             tmem_holding_buf: cutlass.Int32
-            sSFA: cute.struct.Align[cute.struct.MemRange[cutlass.Float8E8M0FNU, cute.cosize(self.sfa_smem_layout_staged)], 1024]
-            sSFB: cute.struct.Align[cute.struct.MemRange[cutlass.Float8E8M0FNU, cute.cosize(self.sfb_smem_layout_staged)], 1024]
+            sSFA: cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Float8E8M0FNU, cute.cosize(self.sfa_smem_layout_staged)
+                ],
+                1024,
+            ]
+            sSFB: cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Float8E8M0FNU, cute.cosize(self.sfb_smem_layout_staged)
+                ],
+                1024,
+            ]
             sA: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float8E4M3FN, cute.cosize(self.a_smem_layout_staged.outer)], 1024
+                cute.struct.MemRange[
+                    cutlass.Float8E4M3FN, cute.cosize(self.a_smem_layout_staged.outer)
+                ],
+                1024,
             ]
             sB: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float4E2M1FN, cute.cosize(self.b_smem_layout_staged.outer)], 1024
+                cute.struct.MemRange[
+                    cutlass.Float4E2M1FN, cute.cosize(self.b_smem_layout_staged.outer)
+                ],
+                1024,
             ]
 
         self.shared_storage = SharedStorage
@@ -327,7 +388,9 @@ class Fc2TokenM:
             use_pdl=self.use_pdl,
         )
 
-    def _load_act_stage(self, tma_atom_a, tAgA_k, tAsA_s, tma_atom_sfa, tAgSFA_k, tAsSFA_s, tma_bar, check=False):
+    def _load_act_stage(
+        self, tma_atom_a, tAgA_k, tAsA_s, tma_atom_sfa, tAgSFA_k, tAsSFA_s, tma_bar, check=False
+    ):
         if cutlass.const_expr(check):
             act_pattern = (
                 cpasync.SentinelPattern.PER_ELEMENT_FF
@@ -336,7 +399,11 @@ class Fc2TokenM:
             )
             cute.copy(tma_atom_a, tAgA_k, tAsA_s, tma_bar_ptr=tma_bar, report_valid=act_pattern)
             cute.copy(
-                tma_atom_sfa, tAgSFA_k, tAsSFA_s, tma_bar_ptr=tma_bar, report_valid=cpasync.SentinelPattern.PER_ELEMENT_FF
+                tma_atom_sfa,
+                tAgSFA_k,
+                tAsSFA_s,
+                tma_bar_ptr=tma_bar,
+                report_valid=cpasync.SentinelPattern.PER_ELEMENT_FF,
             )
         else:
             cute.copy(tma_atom_a, tAgA_k, tAsA_s, tma_bar_ptr=tma_bar)
@@ -408,7 +475,9 @@ class Fc2TokenM:
             barrier_storage=storage.acc_mbar.data_ptr(),
             num_stages=self.num_acc_stage,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.num_epilog_threads),
+            consumer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, self.num_epilog_threads
+            ),
             cta_layout_vmnk=cluster_layout_vmnk,
         )
         tmem = utils.TmemAllocator(
@@ -433,10 +502,18 @@ class Fc2TokenM:
         sSFB = storage.sSFB.get_tensor(sfb_smem_layout_staged)
         thr_mma = tiled_mma.get_slice(0)
         # (bM, bK, loopM, loopK, loopL) / (bN, bK, loopN, loopK, loopL)
-        gA_mkl = cute.local_tile(mA_mkl, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None))
-        gSFA_mkl = cute.local_tile(mSFA_mkl, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None))
-        gB_nkl = cute.local_tile(mB_nkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None))
-        gSFB_nkl = cute.local_tile(mSFB_nkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None))
+        gA_mkl = cute.local_tile(
+            mA_mkl, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None)
+        )
+        gSFA_mkl = cute.local_tile(
+            mSFA_mkl, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None)
+        )
+        gB_nkl = cute.local_tile(
+            mB_nkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
+        )
+        gSFB_nkl = cute.local_tile(
+            mSFB_nkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
+        )
         tCgA = thr_mma.partition_A(gA_mkl)
         tCgSFA = thr_mma.partition_A(gSFA_mkl)
         tCgB = thr_mma.partition_B(gB_nkl)
@@ -447,13 +524,21 @@ class Fc2TokenM:
             tma_atom_a, 0, a_cta_layout, cute.group_modes(sA, 0, 3), cute.group_modes(tCgA, 0, 3)
         )
         tAsSFA, tAgSFA = cpasync.tma_partition(
-            tma_atom_sfa, 0, a_cta_layout, cute.group_modes(sSFA, 0, 3), cute.group_modes(tCgSFA, 0, 3)
+            tma_atom_sfa,
+            0,
+            a_cta_layout,
+            cute.group_modes(sSFA, 0, 3),
+            cute.group_modes(tCgSFA, 0, 3),
         )
         tBsB, tBgB = cpasync.tma_partition(
             tma_atom_b, 0, b_cta_layout, cute.group_modes(sB, 0, 3), cute.group_modes(tCgB, 0, 3)
         )
         tBsSFB, tBgSFB = cpasync.tma_partition(
-            tma_atom_sfb, 0, b_cta_layout, cute.group_modes(sSFB, 0, 3), cute.group_modes(tCgSFB, 0, 3)
+            tma_atom_sfb,
+            0,
+            b_cta_layout,
+            cute.group_modes(sSFB, 0, 3),
+            cute.group_modes(tCgSFB, 0, 3),
         )
         tAsSFA = cute.filter_zeros(tAsSFA)
         tAgSFA = cute.filter_zeros(tAgSFA)
@@ -474,7 +559,9 @@ class Fc2TokenM:
         total_items = mNumTiles[0] * n_tiles
 
         if warp_idx == self.tma_warp_id:
-            ab_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.num_ab_stage)
+            ab_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.num_ab_stage
+            )
             for item in cutlass.range(bidx, total_items, gdim, unroll=1):
                 m_tile = item // n_tiles
                 n_tile = item - m_tile * n_tiles
@@ -493,13 +580,22 @@ class Fc2TokenM:
                     ab_pipeline.producer_acquire(ab_state)
                     tma_bar = ab_pipeline.producer_get_barrier(ab_state)
                     s = ab_state.index
-                    cute.copy(tma_atom_b, tBgB_t[(None, k_tile)], tBsB[(None, s)], tma_bar_ptr=tma_bar)
-                    cute.copy(tma_atom_sfb, tBgSFB_t[(None, k_tile)], tBsSFB[(None, s)], tma_bar_ptr=tma_bar)
+                    cute.copy(
+                        tma_atom_b, tBgB_t[(None, k_tile)], tBsB[(None, s)], tma_bar_ptr=tma_bar
+                    )
+                    cute.copy(
+                        tma_atom_sfb,
+                        tBgSFB_t[(None, k_tile)],
+                        tBsSFB[(None, s)],
+                        tma_bar_ptr=tma_bar,
+                    )
                     act_bar = tma_bar
                     if cutlass.const_expr(self.lamport):
                         act_bar = act_mbar + s
                         with cute.arch.elect_one():
-                            cute.arch.mbarrier_arrive_and_expect_tx(act_bar, self.num_act_load_bytes)
+                            cute.arch.mbarrier_arrive_and_expect_tx(
+                                act_bar, self.num_act_load_bytes
+                            )
                     self._load_act_stage(
                         tma_atom_a,
                         tAgA_t[(None, k_tile)],
@@ -517,22 +613,39 @@ class Fc2TokenM:
             tmem.wait_for_alloc()
             acc_tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             tCtAcc_base = cute.make_tensor(acc_tmem_ptr, tCtAcc_fake.layout)
-            sfa_tmem_ptr = cute.recast_ptr(acc_tmem_ptr + self.num_acc_tmem_cols, dtype=cutlass.Float8E8M0FNU)
+            sfa_tmem_ptr = cute.recast_ptr(
+                acc_tmem_ptr + self.num_acc_tmem_cols, dtype=cutlass.Float8E8M0FNU
+            )
             sfb_tmem_ptr = cute.recast_ptr(
-                acc_tmem_ptr + self.num_acc_tmem_cols + self.num_sfa_tmem_cols, dtype=cutlass.Float8E8M0FNU
+                acc_tmem_ptr + self.num_acc_tmem_cols + self.num_sfa_tmem_cols,
+                dtype=cutlass.Float8E8M0FNU,
             )
             tCtSFA_layout = blockscaled_utils.make_tmem_layout_sfa(
-                tiled_mma, self.mma_tiler, self.sf_vec_size, cute.slice_(sfa_smem_layout_staged, (None, None, None, 0))
+                tiled_mma,
+                self.mma_tiler,
+                self.sf_vec_size,
+                cute.slice_(sfa_smem_layout_staged, (None, None, None, 0)),
             )
             tCtSFB_layout = blockscaled_utils.make_tmem_layout_sfb(
-                tiled_mma, self.mma_tiler, self.sf_vec_size, cute.slice_(sfb_smem_layout_staged, (None, None, None, 0))
+                tiled_mma,
+                self.mma_tiler,
+                self.sf_vec_size,
+                cute.slice_(sfb_smem_layout_staged, (None, None, None, 0)),
             )
             tCtSFA = cute.make_tensor(sfa_tmem_ptr, tCtSFA_layout)
             tCtSFB = cute.make_tensor(sfb_tmem_ptr, tCtSFB_layout)
-            copy_s2t_sfa, tCsSFA_s2t, tCtSFA_s2t = s2t_copy_and_partition(self.cta_group, sSFA, tCtSFA)
-            copy_s2t_sfb, tCsSFB_s2t, tCtSFB_s2t = s2t_copy_and_partition(self.cta_group, sSFB, tCtSFB)
-            ab_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_ab_stage)
-            acc_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.num_acc_stage)
+            copy_s2t_sfa, tCsSFA_s2t, tCtSFA_s2t = s2t_copy_and_partition(
+                self.cta_group, sSFA, tCtSFA
+            )
+            copy_s2t_sfb, tCsSFB_s2t, tCtSFB_s2t = s2t_copy_and_partition(
+                self.cta_group, sSFB, tCtSFB
+            )
+            ab_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.num_ab_stage
+            )
+            acc_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.num_acc_stage
+            )
             num_kblocks = cute.size(tCrA, mode=[2])
             waited = cute.make_rmem_tensor((2,), cutlass.Int32)
             waited[0] = cutlass.Int32(0)
@@ -559,7 +672,9 @@ class Fc2TokenM:
                                 cute.arch.griddepcontrol_wait()
                                 waited[0] = cutlass.Int32(1)
                             with cute.arch.elect_one():
-                                cute.arch.mbarrier_arrive_and_expect_tx(redo_bar, self.num_act_load_bytes)
+                                cute.arch.mbarrier_arrive_and_expect_tx(
+                                    redo_bar, self.num_act_load_bytes
+                                )
                             self._load_act_stage(
                                 tma_atom_a,
                                 tAgA_t[(None, k_tile)],
@@ -578,7 +693,11 @@ class Fc2TokenM:
                         tiled_mma.set(tcgen05.Field.SFA, tCtSFA[sf_coord].iterator)
                         tiled_mma.set(tcgen05.Field.SFB, tCtSFB[sf_coord].iterator)
                         cute.gemm(
-                            tiled_mma, tCtAcc, tCrA[(None, None, kblock, s)], tCrB[(None, None, kblock, s)], tCtAcc
+                            tiled_mma,
+                            tCtAcc,
+                            tCrA[(None, None, kblock, s)],
+                            tCrB[(None, None, kblock, s)],
+                            tCtAcc,
                         )
                         tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
                     ab_pipeline.consumer_release(ab_state)
@@ -590,7 +709,9 @@ class Fc2TokenM:
         if warp_idx <= self.epilog_warp_id[-1]:
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
-            acc_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_acc_stage)
+            acc_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.num_acc_stage
+            )
             quad = warp_idx
             lane = tidx & 31
             tmem_quad = tmem_ptr.toint() + ((32 * quad) << 16)
@@ -606,7 +727,9 @@ class Fc2TokenM:
                 dst = y_base + cutlass.Int64(prow) * (HIDDEN * 2)
                 scale = cutlass.Float32(1.0)
                 if cutlass.const_expr(self.fin):
-                    expanded = cutlass.max(mP2e[cutlass.min(prow, mP2e.shape[0] - 1)], cutlass.Int32(0))
+                    expanded = cutlass.max(
+                        mP2e[cutlass.min(prow, mP2e.shape[0] - 1)], cutlass.Int32(0)
+                    )
                     token = expanded // TOP_K
                     npairs = cutlass.Int32(0)
                     for k in cutlass.range_constexpr(TOP_K):
@@ -615,7 +738,9 @@ class Fc2TokenM:
                         )
                     single = npairs == 1
                     w = bits_f32(cutlass.Int32(mTopkW[expanded]) << 16)
-                    dst = cutlass.select_(single, out_base + cutlass.Int64(token) * (HIDDEN * 2), dst)
+                    dst = cutlass.select_(
+                        single, out_base + cutlass.Int64(token) * (HIDDEN * 2), dst
+                    )
                     scale = cutlass.select_(single, w, cutlass.Float32(1.0))
                 acc_pipeline.consumer_wait(acc_state)
                 tcgen05_fence("after")
@@ -641,13 +766,21 @@ class Fc2TokenM:
                     if valid:
                         addr = dst + cutlass.Int64(n_tile * (tile_n * 2) + j * 64)
                         for v in cutlass.range_constexpr(4):
-                            st_global_v4(addr + 16 * v, words[4 * v], words[4 * v + 1], words[4 * v + 2], words[4 * v + 3])
+                            st_global_v4(
+                                addr + 16 * v,
+                                words[4 * v],
+                                words[4 * v + 1],
+                                words[4 * v + 2],
+                                words[4 * v + 3],
+                            )
                 if cutlass.const_expr(self.publish):
                     # Once all four epilogue warps stored this (m, n) item, one release-add on the m-tile's word;
                     # the m-tile's out / y rows are complete when it reaches the number of n-tiles.
                     self.epilog_sync_barrier.arrive_and_wait()
                     if tidx == 0:
-                        red_release_gpu_add(mPub.iterator.toint() + cutlass.Int64(m_tile) * 4, cutlass.Int32(1))
+                        red_release_gpu_add(
+                            mPub.iterator.toint() + cutlass.Int64(m_tile) * 4, cutlass.Int32(1)
+                        )
             tmem.relinquish_alloc_permit()
             self.epilog_sync_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
@@ -667,15 +800,30 @@ def check(act, act_sf, weights, plan, y, fin):
     num_permuted = plan.permuted_idx_to_expanded_idx.shape[0]
     num_tiles_cap = plan.tile_idx_to_expert_idx.shape[0]
     if plan.tile_n != M_TILE:
-        raise ValueError(f"the plan must pad experts to {M_TILE} rows (plan.tile_n = {plan.tile_n})")
+        raise ValueError(
+            f"the plan must pad experts to {M_TILE} rows (plan.tile_n = {plan.tile_n})"
+        )
     if num_tiles_cap * M_TILE > num_permuted or num_permuted % M_TILE:
         raise ValueError("plan: permuted rows must be a multiple of 128 covering every tile")
     check_tensor("act", act, torch.float8_e4m3fn, (num_permuted, INTER), 16)
     check_tensor("act_sf", act_sf, torch.uint8, (num_permuted, INTER // SF_VEC), 128)
-    check_tensor("w2_weight", weights.w2_weight, torch.uint8, (num_experts, HIDDEN, INTER // 2), 128)
-    check_tensor("w2_weight_scale", weights.w2_weight_scale, torch.uint8, (num_experts, HIDDEN, INTER // SF_VEC), 128)
+    check_tensor(
+        "w2_weight", weights.w2_weight, torch.uint8, (num_experts, HIDDEN, INTER // 2), 128
+    )
+    check_tensor(
+        "w2_weight_scale",
+        weights.w2_weight_scale,
+        torch.uint8,
+        (num_experts, HIDDEN, INTER // SF_VEC),
+        128,
+    )
     check_tensor("y", y, torch.bfloat16, (num_permuted, HIDDEN), 16)
-    for name in ("permuted_idx_to_expanded_idx", "tile_idx_to_expert_idx", "tile_idx_to_mn_limit", "num_non_exiting_tiles"):
+    for name in (
+        "permuted_idx_to_expanded_idx",
+        "tile_idx_to_expert_idx",
+        "tile_idx_to_mn_limit",
+        "num_non_exiting_tiles",
+    ):
         t = getattr(plan, name)
         if t.dtype != torch.int32 or not t.is_contiguous():
             raise ValueError(f"plan.{name} must be a contiguous int32 tensor")
@@ -686,7 +834,9 @@ def check(act, act_sf, weights, plan, y, fin):
         check_tensor("out", out, torch.bfloat16, (rows, HIDDEN), 16)
         e2p = plan.expanded_idx_to_permuted_idx
         if e2p.dtype != torch.int32 or not e2p.is_contiguous() or e2p.shape[0] < rows * TOP_K:
-            raise ValueError("plan.expanded_idx_to_permuted_idx must be int32 with rows * 16 entries")
+            raise ValueError(
+                "plan.expanded_idx_to_permuted_idx must be int32 with rows * 16 entries"
+            )
 
 
 def launch_args(act, act_sf, weights, plan, y, fin, num_ctas, counters=None, publish=None):
@@ -705,7 +855,9 @@ def launch_args(act, act_sf, weights, plan, y, fin, num_ctas, counters=None, pub
         gmem_ptr(cutlass.Int32, plan.tile_idx_to_expert_idx, 4),
         gmem_ptr(cutlass.Int32, plan.tile_idx_to_mn_limit, 4),
         gmem_ptr(cutlass.Int32, plan.num_non_exiting_tiles, 4),
-        gmem_ptr(cutlass.Int32, plan.tile_idx_to_expert_idx if counters is None else counters[0], 4),
+        gmem_ptr(
+            cutlass.Int32, plan.tile_idx_to_expert_idx if counters is None else counters[0], 4
+        ),
         gmem_ptr(cutlass.Int32, plan.tile_idx_to_expert_idx if publish is None else publish, 4),
         cutlass.Int32(weights.w2_weight.shape[0]),
         cutlass.Int32(rows),
@@ -749,8 +901,23 @@ def run(
     (acquire) and a proxy fence instead of the grid wait."""
     check(act, act_sf, weights, plan, y, fin)
     pdl = use_pdl() if enable_pdl is None else enable_pdl
-    key = (tile_n, pdl, fin is not None, pdl_trigger, k_blocks, num_acc_stages, max_ab_stages, smem_budget, sync, sentinel, force_slow, publish is not None)
-    if publish is not None and (publish.dtype != torch.int32 or publish.numel() < plan.tile_idx_to_expert_idx.shape[0]):
+    key = (
+        tile_n,
+        pdl,
+        fin is not None,
+        pdl_trigger,
+        k_blocks,
+        num_acc_stages,
+        max_ab_stages,
+        smem_budget,
+        sync,
+        sentinel,
+        force_slow,
+        publish is not None,
+    )
+    if publish is not None and (
+        publish.dtype != torch.int32 or publish.numel() < plan.tile_idx_to_expert_idx.shape[0]
+    ):
         raise ValueError("publish must be int32 with one word per tile")
     if sync in ("lamport", "counter") and not pdl:
         raise ValueError("sync=lamport/counter needs PDL")

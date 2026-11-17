@@ -269,12 +269,16 @@ class KimiK3MLAAttention(MLA):
             if o is not None:
                 attn_output[0] = o
                 return
-        super().forward_impl(position_ids, hidden_states, attn_metadata, attn_output, latent_cache_gen)
+        super().forward_impl(
+            position_ids, hidden_states, attn_metadata, attn_output, latent_cache_gen
+        )
 
     def _project_output_impl(self, attn_output, position_ids, attn_metadata, all_reduce_params):
         if k3_mla_prefill is not None and k3_mla_prefill.pending(self):
             return k3_mla_prefill.o_proj(self, attn_output, self.o_proj.weight)
-        return super()._project_output_impl(attn_output, position_ids, attn_metadata, all_reduce_params)
+        return super()._project_output_impl(
+            attn_output, position_ids, attn_metadata, all_reduce_params
+        )
 
     def _apply_output_gate(
         self,
@@ -283,7 +287,10 @@ class KimiK3MLAAttention(MLA):
     ) -> torch.Tensor:
         if k3_mla_prefill is not None and k3_mla_prefill.pending(self):
             return k3_mla_prefill.output_gate(
-                self, k3_mla_prefill.weights_of(self), hidden_states[: attn_output.shape[0]], attn_output
+                self,
+                k3_mla_prefill.weights_of(self),
+                hidden_states[: attn_output.shape[0]],
+                attn_output,
             )
         # Sigmoid gate on o_proj's input. g_proj matches o_proj's input
         # sharding, so the multiply composes with the helix-CP output

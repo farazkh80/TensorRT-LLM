@@ -266,7 +266,18 @@ class GatedRmsNorm:
         if cutlass.const_expr(self.persistent_ctas > 0):
             grid = cute.min(grid, self.persistent_ctas)
         self.kernel(
-            x, z, weight, out, eps, stats, timeline, cnt, cnt_block_rows, gate, gate_block_rows, gate_target
+            x,
+            z,
+            weight,
+            out,
+            eps,
+            stats,
+            timeline,
+            cnt,
+            cnt_block_rows,
+            gate,
+            gate_block_rows,
+            gate_target,
         ).launch(
             grid=[grid, 1, 1],
             block=[self.warps * 32, 1, 1],
@@ -322,7 +333,10 @@ class GatedRmsNorm:
         waited = cutlass.Int32(0)
         if cutlass.const_expr(self.fgs_gate):
             if tidx == 0:
-                gate_addr = gate.iterator.toint() + cutlass.Int64((bidx * self.rows_per_cta) // gate_block_rows) * 4
+                gate_addr = (
+                    gate.iterator.toint()
+                    + cutlass.Int64((bidx * self.rows_per_cta) // gate_block_rows) * 4
+                )
                 seen = _ld_acquire_b32(gate_addr)
                 while seen < gate_target:
                     _nanosleep(cutlass.Int32(128))
@@ -672,8 +686,12 @@ def kda_gated_rmsnorm(
     if fgs_counters is not None:
         if fgs_counters.dtype != torch.int32 or not fgs_counters.is_contiguous():
             raise ValueError("kda_gated_rmsnorm: fgs_counters must be a contiguous int32 tensor")
-        if fgs_counter_rows <= 0 or fgs_counter_rows % (warps * ROWS_PER_WARP_STEP * rows_per_thread):
-            raise ValueError("kda_gated_rmsnorm: fgs_counter_rows must be a multiple of the CTA's rows")
+        if fgs_counter_rows <= 0 or fgs_counter_rows % (
+            warps * ROWS_PER_WARP_STEP * rows_per_thread
+        ):
+            raise ValueError(
+                "kda_gated_rmsnorm: fgs_counter_rows must be a multiple of the CTA's rows"
+            )
         if fgs_counters.numel() < -(-rows // fgs_counter_rows):
             raise ValueError("kda_gated_rmsnorm: fgs_counters needs a word per row block")
         use_pdl = True
@@ -685,7 +703,9 @@ def kda_gated_rmsnorm(
         if gate_words.dtype != torch.int32 or not gate_words.is_contiguous():
             raise ValueError("kda_gated_rmsnorm: fgs_gate words must be a contiguous int32 tensor")
         if gate_block_rows <= 0 or gate_block_rows % (warps * ROWS_PER_WARP_STEP * rows_per_thread):
-            raise ValueError("kda_gated_rmsnorm: fgs_gate rows per word must be a multiple of the CTA's rows")
+            raise ValueError(
+                "kda_gated_rmsnorm: fgs_gate rows per word must be a multiple of the CTA's rows"
+            )
         if gate_words.numel() < -(-rows // gate_block_rows):
             raise ValueError("kda_gated_rmsnorm: fgs_gate needs a word per row block")
         if fgs_ctas:

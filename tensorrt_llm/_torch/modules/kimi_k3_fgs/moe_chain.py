@@ -1890,7 +1890,9 @@ def install(routed_experts) -> bool:
     prefill_inbox = prefill and switched(PREFILL_COMBINE_ENV, "inbox")
     if prefill_inbox:
         if comm is None or not tail_enabled():
-            raise ValueError(f"{PREFILL_COMBINE_ENV}=inbox needs the NVLinkOneSided comm and {TAIL_ENV}")
+            raise ValueError(
+                f"{PREFILL_COMBINE_ENV}=inbox needs the NVLinkOneSided comm and {TAIL_ENV}"
+            )
         _install_prefill_combine(comm, layer)
     stock_run_moe = backend.run_moe
     checked = []
@@ -1958,7 +1960,9 @@ def install(routed_experts) -> bool:
                     # inbox and never from ``out`` while FC2 / the finalize still write it.
                     kw = dict(
                         fc2_ctas=sms - ctas,
-                        after_fc2=lambda y, plan, done: push_tiles(pc, y, plan, done, fgs=True, ctas=ctas),
+                        after_fc2=lambda y, plan, done: push_tiles(
+                            pc, y, plan, done, fgs=True, ctas=ctas
+                        ),
                         after_finalize=lambda y, plan: push_rest(pc, y, plan),
                     )
                 else:

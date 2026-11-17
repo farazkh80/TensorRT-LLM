@@ -43,7 +43,9 @@ def gate_up(x: torch.Tensor, w_interleaved: torch.Tensor, cap: float, lin: float
     inter = n // 2
     cta_m, cta_n = kimi_k3_cute_gemm.rubin_tile(n, k, m)
     if cta_n % (2 * EPI_N) or 4096 // cta_m != EPI_N:
-        raise ValueError(f"shared gate_up: epilogue tile {cta_m}x{EPI_N} does not pair the interleaved rows")
+        raise ValueError(
+            f"shared gate_up: epilogue tile {cta_m}x{EPI_N} does not pair the interleaved rows"
+        )
     # One spare row lets a [T, 2I]-shaped view over the half-width buffer stand in for the GEMM's unused C.
     h = torch.empty(m + 1, inter, dtype=torch.bfloat16, device=x.device)
     c_virtual = h.as_strided((1, m, n), (m * inter, inter, 1))
@@ -69,11 +71,15 @@ def down(h: torch.Tensor, w_down: torch.Tensor) -> torch.Tensor:
     )
 
 
-def forward(x: torch.Tensor, w_gate_up: torch.Tensor, w_down: torch.Tensor, cap: float, lin: float) -> torch.Tensor:
+def forward(
+    x: torch.Tensor, w_gate_up: torch.Tensor, w_down: torch.Tensor, cap: float, lin: float
+) -> torch.Tensor:
     return down(gate_up(x, interleave_gate_up(w_gate_up), cap, lin), w_down)
 
 
-def reference(x: torch.Tensor, w_gate_up: torch.Tensor, w_down: torch.Tensor, cap: float, lin: float):
+def reference(
+    x: torch.Tensor, w_gate_up: torch.Tensor, w_down: torch.Tensor, cap: float, lin: float
+):
     """Stock path: cuBLAS gate_up, Triton ``situ_and_mul``, cuBLAS down; returns (h, y)."""
     from .... import situ  # noqa: F401  (registers trtllm::situ_and_mul)
 

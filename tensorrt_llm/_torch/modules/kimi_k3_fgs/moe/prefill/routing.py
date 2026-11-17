@@ -304,8 +304,12 @@ if _CUTE_AVAILABLE:
             sTot = smem.allocate_tensor(Int32, cute.make_layout((EM,)), byte_alignment=16)
             sOff = smem.allocate_tensor(Int32, cute.make_layout((EM + 16,)), byte_alignment=16)
             sFlag = smem.allocate_tensor(Int32, cute.make_layout((16,)), byte_alignment=16)
-            sItems = smem.allocate_tensor(Int32, cute.make_layout((32 * TOP_K, W)), byte_alignment=16)
-            sStage = smem.allocate_tensor(Int32, cute.make_layout((32 * _PITCH, W)), byte_alignment=16)
+            sItems = smem.allocate_tensor(
+                Int32, cute.make_layout((32 * TOP_K, W)), byte_alignment=16
+            )
+            sStage = smem.allocate_tensor(
+                Int32, cute.make_layout((32 * _PITCH, W)), byte_alignment=16
+            )
             items = sItems[None, warp]
             stage = sStage[None, warp]
             ids = mIds.iterator.toint()
@@ -480,8 +484,12 @@ if _CUTE_AVAILABLE:
             sTot = smem.allocate_tensor(Int32, cute.make_layout((EM,)), byte_alignment=16)
             sPre = smem.allocate_tensor(Int32, cute.make_layout((EM,)), byte_alignment=16)
             sOff = smem.allocate_tensor(Int32, cute.make_layout((EM + 16,)), byte_alignment=16)
-            sItems = smem.allocate_tensor(Int32, cute.make_layout((32 * TOP_K, W)), byte_alignment=16)
-            sStage = smem.allocate_tensor(Int32, cute.make_layout((32 * _PITCH, W)), byte_alignment=16)
+            sItems = smem.allocate_tensor(
+                Int32, cute.make_layout((32 * TOP_K, W)), byte_alignment=16
+            )
+            sStage = smem.allocate_tensor(
+                Int32, cute.make_layout((32 * _PITCH, W)), byte_alignment=16
+            )
             items = sItems[None, warp]
             stage = sStage[None, warp]
             ids = mIds.iterator.toint()
@@ -618,7 +626,9 @@ def workspace(device: torch.device, num_local: int, warps: int, max_ctas: int) -
 @functools.lru_cache(maxsize=None)
 def default_max_ctas(device_index: int, warps: int) -> int:
     """One resident wave: the CTAs per SM the thread count allows (shared memory allows at least as many)."""
-    return torch.cuda.get_device_properties(device_index).multi_processor_count * max(1, 64 // warps)
+    return torch.cuda.get_device_properties(device_index).multi_processor_count * max(
+        1, 64 // warps
+    )
 
 
 def num_ctas_for(rows: int, warps: int, max_ctas: int) -> int:
@@ -705,7 +715,11 @@ def run(
     (``place`` alone reuses the workspace of the previous full run).
     """
     rows = topk_ids.shape[0]
-    if topk_ids.dtype != torch.int32 or tuple(topk_ids.shape[1:]) != (TOP_K,) or not topk_ids.is_contiguous():
+    if (
+        topk_ids.dtype != torch.int32
+        or tuple(topk_ids.shape[1:]) != (TOP_K,)
+        or not topk_ids.is_contiguous()
+    ):
         raise ValueError(
             f"routing: topk_ids must be contiguous int32 [rows, {TOP_K}], got {topk_ids.dtype} {tuple(topk_ids.shape)}"
         )
@@ -716,19 +730,33 @@ def run(
             f"routing: plan holds {plan.expert_counts.numel()} experts, asked {num_local} (at most {_MAX_LOCAL})"
         )
     if not 4 <= warps <= 32 or warps * 32 < _em(num_local):
-        raise ValueError(f"routing: {warps} warps cannot own {num_local} experts (4..32, a lane per expert slot)")
+        raise ValueError(
+            f"routing: {warps} warps cannot own {num_local} experts (4..32, a lane per expert slot)"
+        )
     p_cap = plan.permuted_idx_to_expanded_idx.numel()
     if plan.tile_idx_to_expert_idx.numel() * plan.tile_n < p_cap:
         p_cap = plan.tile_idx_to_expert_idx.numel() * plan.tile_n
     if token_idx is not None:
-        if token_idx.dtype != torch.int32 or token_idx.numel() < plan.permuted_idx_to_expanded_idx.numel():
-            raise ValueError("routing: token_idx must be int32 with at least as many entries as the permuted map")
+        if (
+            token_idx.dtype != torch.int32
+            or token_idx.numel() < plan.permuted_idx_to_expanded_idx.numel()
+        ):
+            raise ValueError(
+                "routing: token_idx must be int32 with at least as many entries as the permuted map"
+            )
     if max_ctas is None:
         max_ctas = default_max_ctas(topk_ids.device.index, warps)
     ws = workspace(topk_ids.device, num_local, warps, max_ctas)
     num_ctas = num_ctas_for(rows, warps, max_ctas)
     count, place = _compiled(
-        num_local, plan.tile_n, warps, max_ctas, enable_pdl, trigger, token_idx is not None, mn_limit
+        num_local,
+        plan.tile_n,
+        warps,
+        max_ctas,
+        enable_pdl,
+        trigger,
+        token_idx is not None,
+        mn_limit,
     )
     if "count" in phases:
         count(

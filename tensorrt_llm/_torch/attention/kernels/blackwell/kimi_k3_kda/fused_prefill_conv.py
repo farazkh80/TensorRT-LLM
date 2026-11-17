@@ -404,14 +404,25 @@ def mbar_init(mbar, *, loc=None, ip=None):
 
 @dsl_user_op
 def mbar_init_fence(*, loc=None, ip=None):
-    _asm(T.i32(), [], "fence.mbarrier_init.release.cluster;\n\tmov.b32 $0, 0;", "=r", side=True, loc=loc, ip=ip)
+    _asm(
+        T.i32(),
+        [],
+        "fence.mbarrier_init.release.cluster;\n\tmov.b32 $0, 0;",
+        "=r",
+        side=True,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op
 def mbar_expect_tx(mbar, nbytes, *, loc=None, ip=None):
     _asm(
         T.i32(),
-        [cutlass.Int32(mbar).ir_value(loc=loc, ip=ip), cutlass.Int32(nbytes).ir_value(loc=loc, ip=ip)],
+        [
+            cutlass.Int32(mbar).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(nbytes).ir_value(loc=loc, ip=ip),
+        ],
         "mbarrier.arrive.expect_tx.shared::cta.b64 _, [$1], $2;\n\tmov.b32 $0, 0;",
         "=r,r,r",
         side=True,
@@ -425,7 +436,10 @@ def mbar_try_wait(mbar, parity, *, loc=None, ip=None):
     return cutlass.Int32(
         _asm(
             T.i32(),
-            [cutlass.Int32(mbar).ir_value(loc=loc, ip=ip), cutlass.Int32(parity).ir_value(loc=loc, ip=ip)],
+            [
+                cutlass.Int32(mbar).ir_value(loc=loc, ip=ip),
+                cutlass.Int32(parity).ir_value(loc=loc, ip=ip),
+            ],
             "{\n\t.reg .pred p;\n\tmbarrier.try_wait.parity.shared::cta.b64 p, [$1], $2;\n\tselp.b32 $0, 1, 0, p;\n\t}",
             "=r,r,r",
             side=True,
@@ -437,17 +451,29 @@ def mbar_try_wait(mbar, parity, *, loc=None, ip=None):
 
 @dsl_user_op
 def fence_async_shared(*, loc=None, ip=None):
-    _asm(T.i32(), [], "fence.proxy.async.shared::cta;\n\tmov.b32 $0, 0;", "=r", side=True, loc=loc, ip=ip)
+    _asm(
+        T.i32(),
+        [],
+        "fence.proxy.async.shared::cta;\n\tmov.b32 $0, 0;",
+        "=r",
+        side=True,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op
 def fence_async_global(*, loc=None, ip=None):
-    _asm(T.i32(), [], "fence.proxy.async.global;\n\tmov.b32 $0, 0;", "=r", side=True, loc=loc, ip=ip)
+    _asm(
+        T.i32(), [], "fence.proxy.async.global;\n\tmov.b32 $0, 0;", "=r", side=True, loc=loc, ip=ip
+    )
 
 
 @dsl_user_op
 def warp_sync(*, loc=None, ip=None):
-    _asm(T.i32(), [], "bar.warp.sync 0xffffffff;\n\tmov.b32 $0, 0;", "=r", side=True, loc=loc, ip=ip)
+    _asm(
+        T.i32(), [], "bar.warp.sync 0xffffffff;\n\tmov.b32 $0, 0;", "=r", side=True, loc=loc, ip=ip
+    )
 
 
 @dsl_user_op
@@ -695,7 +721,22 @@ class KdaConv:
                     v[0, row64, h, d + 2 * j + e] = val
 
     @cute.kernel
-    def kernel(self, src, weight, state, starts, slots, has_init, q, k, v, stats, gcnt, gcnt_rpb, gcnt_target):
+    def kernel(
+        self,
+        src,
+        weight,
+        state,
+        starts,
+        slots,
+        has_init,
+        q,
+        k,
+        v,
+        stats,
+        gcnt,
+        gcnt_rpb,
+        gcnt_target,
+    ):
         tid, _, _ = cute.arch.thread_idx()
         if cutlass.const_expr(self.fgs_producer):
             # The q/k/v consumer validates its input per 16 B instead of waiting for this grid.
@@ -874,7 +915,12 @@ class KdaConv:
         for pe in cutlass.range_constexpr(ASYNC_GROUP):
             r = first + pe
             if r < count:
-                bulk_g2s(ring_warp + (r % self.D) * SLOT, gbase + cutlass.Int64(r) * (self.SR * 2), SLOT, bar)
+                bulk_g2s(
+                    ring_warp + (r % self.D) * SLOT,
+                    gbase + cutlass.Int64(r) * (self.SR * 2),
+                    SLOT,
+                    bar,
+                )
 
     @cute.jit
     def bulk_refill(self, first, count, lane, ring_warp, bar_warp, gbase):
@@ -886,7 +932,12 @@ class KdaConv:
             n = cutlass.min(cutlass.max(count - (first + self.D), 0), ASYNC_GROUP)
             if n > 0:
                 self.bulk_issue(
-                    first + self.D, n, bar_warp + ((first // ASYNC_GROUP) % self.NB) * 8, ring_warp, gbase, count
+                    first + self.D,
+                    n,
+                    bar_warp + ((first // ASYNC_GROUP) % self.NB) * 8,
+                    ring_warp,
+                    gbase,
+                    count,
                 )
 
     @cute.jit
@@ -1104,7 +1155,9 @@ class KdaConv:
                                 sg,
                             )
                         if cutlass.const_expr(self.bulk):
-                            self.bulk_refill(g * U + ASYNC_GROUP * p, count, lane, ring_warp, bar_warp, gbase)
+                            self.bulk_refill(
+                                g * U + ASYNC_GROUP * p, count, lane, ring_warp, bar_warp, gbase
+                            )
                         elif cutlass.const_expr(self.src_vec):
                             cute.arch.cp_async_commit_group()
                     deep = cute.arch.vote_any_sync(hm[0] < FAST_MIN_H)
@@ -1817,20 +1870,26 @@ def fused_prefill_conv(
     if (fgs_consumer or fgs_producer) and not (src_vec and out_vec):
         raise ValueError("KDA convolution FGS modes need 16-byte aligned source rows and outputs")
     if bulk_src and (not src_vec or fgs_consumer or (3 * heads * 128) % WARP_CH):
-        raise ValueError("bulk_src needs 16-byte aligned source rows, no fgs_consumer, and 256 | 3 * heads * 128")
+        raise ValueError(
+            "bulk_src needs 16-byte aligned source rows, no fgs_consumer, and 256 | 3 * heads * 128"
+        )
     gate = fgs_counters is not None
     with_stats = (fgs_consumer or gate) and fgs_stats is not None
     if with_stats and (fgs_stats.dtype != torch.int32 or fgs_stats.numel() < 2):
         raise ValueError("fgs_stats must be an int32 tensor of 2 elements")
     if gate:
         if fgs_consumer or fgs_counter_rows <= 0 or fgs_counter_target <= 0:
-            raise ValueError("fgs_counters needs fgs_counter_rows and fgs_counter_target, without fgs_consumer")
+            raise ValueError(
+                "fgs_counters needs fgs_counter_rows and fgs_counter_target, without fgs_consumer"
+            )
         if (
             fgs_counters.dtype != torch.int32
             or not fgs_counters.is_contiguous()
             or fgs_counters.numel() < -(-src.shape[0] // fgs_counter_rows)
         ):
-            raise ValueError("fgs_counters must be a contiguous int32 tensor with a word per source row block")
+            raise ValueError(
+                "fgs_counters must be a contiguous int32 tensor with a word per source row block"
+            )
     stream = cuda.CUstream(torch.cuda.current_stream(src.device).cuda_stream)
     # grid.y only sets parallelism (CTAs loop over the device-side run count): no
     # sequence is longer than T, so a looser bound only adds idle CTAs and an

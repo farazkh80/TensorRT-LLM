@@ -92,7 +92,10 @@ ARM_WORD = 0x80008000 - (1 << 32)
 def _st_fill_v4(addr, word, *, loc=None, ip=None):
     llvm.inline_asm(
         None,
-        [cutlass.Int64(addr).ir_value(loc=loc, ip=ip), cutlass.Int32(word).ir_value(loc=loc, ip=ip)],
+        [
+            cutlass.Int64(addr).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(word).ir_value(loc=loc, ip=ip),
+        ],
         "st.global.v4.b32 [$0], {$1, $1, $1, $1};",
         "l,r",
         has_side_effects=True,
@@ -641,7 +644,9 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
                     # Rows of this CTA tile must be published before its A loads (TMA: async proxy, hence the
                     # proxy fence after the acquire).
                     cta_m = self.cta_tile_shape_mnk[0]
-                    rows = cutlass.min(cutlass.Int32(cta_m), mA_mkl.shape[0] - cur_tile_coord[0] * cta_m)
+                    rows = cutlass.min(
+                        cutlass.Int32(cta_m), mA_mkl.shape[0] - cur_tile_coord[0] * cta_m
+                    )
                     target = (rows * gate_scale + gate_unit - 1) // gate_unit
                     gate_addr = cnt_gate + cutlass.Int64(cur_tile_coord[0]) * 4
                     seen = ld_acquire(gate_addr)
@@ -865,7 +870,11 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
                 gO_mnl = cute.local_tile(mO_mnl, (cta_m, cta_n // 2, 1), (None, None, None))
                 gO_mnl_epi = cute.flat_divide(gO_mnl[(None, None, 0, None, None, None)], epi_tile)
                 _, bSG_gO_partitioned = cpasync.tma_partition(
-                    tma_atom_o, 0, cute.make_layout(1), sC_for_tma, cute.group_modes(gO_mnl_epi, 0, 2)
+                    tma_atom_o,
+                    0,
+                    cute.make_layout(1),
+                    sC_for_tma,
+                    cute.group_modes(gO_mnl_epi, 0, 2),
                 )
             tTR_gS = tTR_gP = None
             tTR_rS = tTR_rP = None
@@ -878,7 +887,9 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
                     mS_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
                 )
                 tCgS = thr_mma.partition_C(gS_mnl)
-                gS_mnl_epi = cute.flat_divide(tCgS[((None, None), 0, 0, None, None, None)], epi_tile)
+                gS_mnl_epi = cute.flat_divide(
+                    tCgS[((None, None), 0, 0, None, None, None)], epi_tile
+                )
                 tTR_gS = thr_copy_t2r.partition_D(gS_mnl_epi)
                 tTR_rS = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype)
             if cutlass.const_expr(self.fold >= 2):
@@ -886,7 +897,9 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
                     mP_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
                 )
                 tCgP = thr_mma.partition_C(gP_mnl)
-                gP_mnl_epi = cute.flat_divide(tCgP[((None, None), 0, 0, None, None, None)], epi_tile)
+                gP_mnl_epi = cute.flat_divide(
+                    tCgP[((None, None), 0, 0, None, None, None)], epi_tile
+                )
                 tTR_gP = thr_copy_t2r.partition_D(gP_mnl_epi)
                 tTR_rP = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype)
             tTR_rG = None
@@ -930,11 +943,15 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
                 epilog_threads = 32 * len(self.epilogue_warp_id)
                 if cutlass.const_expr(self.glu is not None):
                     cap, lin = self.glu
-                    bSG_gO = bSG_gO_partitioned[(None, None, None, cur_tile_coord[0], n_tile, cur_tile_coord[2])]
+                    bSG_gO = bSG_gO_partitioned[
+                        (None, None, None, cur_tile_coord[0], n_tile, cur_tile_coord[2])
+                    ]
                     bSG_gO = cute.group_modes(bSG_gO, 1, cute.rank(bSG_gO))
                     num_prev_stores = (num_tiles_executed - 1) * (subtile_cnt // 2)
                     for subtile_idx in cutlass.range_constexpr(subtile_cnt):
-                        cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, subtile_idx)], tTR_rAcc)
+                        cute.copy(
+                            tiled_copy_t2r, tTR_tAcc[(None, None, None, subtile_idx)], tTR_rAcc
+                        )
                         if subtile_idx % 2 == 0:
                             for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
                                 tTR_rG[i] = tTR_rAcc[i].to(self.c_dtype).to(self.acc_dtype)
@@ -952,7 +969,9 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
                             )
                             if warp_idx == self.epilogue_warp_id[0]:
                                 cute.copy(
-                                    tma_atom_o, bSG_sC[(None, c_buffer)], bSG_gO[(None, subtile_idx // 2)]
+                                    tma_atom_o,
+                                    bSG_sC[(None, c_buffer)],
+                                    bSG_gO[(None, subtile_idx // 2)],
                                 )
                                 c_pipeline.producer_commit()
                                 c_pipeline.producer_acquire()
@@ -968,13 +987,21 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
                         if cutlass.const_expr(self.fold >= 1):
                             tTR_gS_t = tTR_gS[(None, None, None, None, None, *mma_tile_coord_mnl)]
                             tTR_gS_t = cute.group_modes(tTR_gS_t, 3, cute.rank(tTR_gS_t))
-                            cute.copy(copy_atom_g2r, tTR_gS_t[(None, None, None, subtile_idx)], tTR_rS)
+                            cute.copy(
+                                copy_atom_g2r, tTR_gS_t[(None, None, None, subtile_idx)], tTR_rS
+                            )
                             s_vec = tiled_copy_r2s.retile(tTR_rS).load().to(self.acc_dtype)
-                            acc_vec = (acc_vec.to(self.c_dtype).to(self.acc_dtype) + s_vec).to(self.c_dtype)
+                            acc_vec = (acc_vec.to(self.c_dtype).to(self.acc_dtype) + s_vec).to(
+                                self.c_dtype
+                            )
                             if cutlass.const_expr(self.fold >= 2):
-                                tTR_gP_t = tTR_gP[(None, None, None, None, None, *mma_tile_coord_mnl)]
+                                tTR_gP_t = tTR_gP[
+                                    (None, None, None, None, None, *mma_tile_coord_mnl)
+                                ]
                                 tTR_gP_t = cute.group_modes(tTR_gP_t, 3, cute.rank(tTR_gP_t))
-                                cute.copy(copy_atom_g2r, tTR_gP_t[(None, None, None, subtile_idx)], tTR_rP)
+                                cute.copy(
+                                    copy_atom_g2r, tTR_gP_t[(None, None, None, subtile_idx)], tTR_rP
+                                )
                                 p_vec = tiled_copy_r2s.retile(tTR_rP).load().to(self.acc_dtype)
                                 acc_vec = (p_vec + acc_vec.to(self.acc_dtype)).to(self.c_dtype)
                         elif cutlass.const_expr(self.pzo):
@@ -993,7 +1020,9 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
                         )
 
                         if warp_idx == self.epilogue_warp_id[0]:
-                            cute.copy(tma_atom_c, bSG_sC[(None, c_buffer)], bSG_gC[(None, subtile_idx)])
+                            cute.copy(
+                                tma_atom_c, bSG_sC[(None, c_buffer)], bSG_gC[(None, subtile_idx)]
+                            )
                             c_pipeline.producer_commit()
                             c_pipeline.producer_acquire()
                         cute.arch.barrier(
@@ -1017,7 +1046,9 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
                                 fence_proxy_async_global()
                                 with cute.arch.elect_one():
                                     release_add(
-                                        cnt_pub + cutlass.Int64(self.publish_hi_words + cur_tile_coord[0]) * 4,
+                                        cnt_pub
+                                        + cutlass.Int64(self.publish_hi_words + cur_tile_coord[0])
+                                        * 4,
                                         cutlass.Int32(1),
                                     )
 
@@ -1369,13 +1400,16 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
         stream: cuda.CUstream,
     ):
         a_tensor = cute.make_tensor(
-            a_ptr, layout=cute.make_layout((m, k, batch_size), stride=(a_stride_m, 1, a_stride_batch))
+            a_ptr,
+            layout=cute.make_layout((m, k, batch_size), stride=(a_stride_m, 1, a_stride_batch)),
         )
         b_tensor = cute.make_tensor(
-            b_ptr, layout=cute.make_layout((n, k, batch_size), stride=(b_stride_n, 1, b_stride_batch))
+            b_ptr,
+            layout=cute.make_layout((n, k, batch_size), stride=(b_stride_n, 1, b_stride_batch)),
         )
         c_tensor = cute.make_tensor(
-            c_ptr, layout=cute.make_layout((m, n, batch_size), stride=(c_stride_m, 1, c_stride_batch))
+            c_ptr,
+            layout=cute.make_layout((m, n, batch_size), stride=(c_stride_m, 1, c_stride_batch)),
         )
         stamps = cute.make_tensor(stamps_ptr, layout=cute.make_layout((TIMELINE_MAX_CTAS,)))
         retry_count = cute.make_tensor(retry_ptr, layout=cute.make_layout((RETRY_COUNTER_SLOTS,)))
@@ -1438,14 +1472,16 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
             s = cute.make_tensor(
                 s_ptr,
                 layout=cute.make_layout(
-                    (m, n, batch_size), stride=(cute.assume(n, divby=8), 1, cute.assume(m * n, divby=8))
+                    (m, n, batch_size),
+                    stride=(cute.assume(n, divby=8), 1, cute.assume(m * n, divby=8)),
                 ),
             )
         if cutlass.const_expr(p_ptr is not None):
             p = cute.make_tensor(
                 p_ptr,
                 layout=cute.make_layout(
-                    (m, n, batch_size), stride=(cute.assume(n, divby=8), 1, cute.assume(m * n, divby=8))
+                    (m, n, batch_size),
+                    stride=(cute.assume(n, divby=8), 1, cute.assume(m * n, divby=8)),
                 ),
             )
         self(
@@ -1483,7 +1519,9 @@ def _params(device: torch.device, values: tuple) -> torch.Tensor:
     key = (index, values)
     buf = _PARAMS.get(key)
     if buf is None:
-        buf = torch.tensor(list(values) + [0] * (PARAMS_LEN - len(values)), dtype=torch.int64, device=device)
+        buf = torch.tensor(
+            list(values) + [0] * (PARAMS_LEN - len(values)), dtype=torch.int64, device=device
+        )
         _PARAMS[key] = buf
     return buf
 
@@ -1589,7 +1627,9 @@ def run_gemm_fgs(
         a.stride(1) == k
         and w.stride(1) == k
         and out.stride(1) == n
-        and (batch == 1 or (a.stride(0) == m * k and w.stride(0) == n * k and out.stride(0) == m * n))
+        and (
+            batch == 1 or (a.stride(0) == m * k and w.stride(0) == n * k and out.stride(0) == m * n)
+        )
     )
     if not packed:
         c_tensor = from_dlpack(c_mnl).mark_layout_dynamic(leading_dim=1)
@@ -1628,7 +1668,9 @@ def run_gemm_fgs(
             or (slab.dim() == 2 and slab.shape[0] != 2)
             or slab.shape[-1] < -(-m // cta_m)
         ):
-            raise ValueError("publish slab must be a contiguous int32 [words] or [2, words], a word per cta M tile")
+            raise ValueError(
+                "publish slab must be a contiguous int32 [words] or [2, words], a word per cta M tile"
+            )
         cnt_pub = slab.data_ptr()
         if slab.dim() == 2:
             publish_hi_words = slab.shape[1]
@@ -1647,7 +1689,9 @@ def run_gemm_fgs(
         if n % (2 * mma_mn[1]) or h.stride(1) % 8:
             raise ValueError("glu needs N a multiple of two CTA tiles and 16 B aligned output rows")
         glu_role = (float(cap), float(lin))
-        o_tensor = from_dlpack(h.permute(1, 2, 0), assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        o_tensor = from_dlpack(h.permute(1, 2, 0), assumed_align=16).mark_layout_dynamic(
+            leading_dim=1
+        )
     fold_n = 0
     if fold is not None:
         s_t, p_t = fold
@@ -1658,11 +1702,17 @@ def run_gemm_fgs(
                 or t.stride() != out.stride()
                 or t.data_ptr() % 16
             ):
-                raise ValueError("fold addends must be 16 B aligned bf16 tensors with out's shape and strides")
+                raise ValueError(
+                    "fold addends must be 16 B aligned bf16 tensors with out's shape and strides"
+                )
         fold_n = 1 if p_t is None else 2
-        s_tensor = make_ptr(cutlass.BFloat16, s_t.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+        s_tensor = make_ptr(
+            cutlass.BFloat16, s_t.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+        )
         if p_t is not None:
-            p_tensor = make_ptr(cutlass.BFloat16, p_t.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+            p_tensor = make_ptr(
+                cutlass.BFloat16, p_t.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+            )
     flags = dict(
         pzo=pzo,
         early_trigger=early_trigger,
@@ -1697,12 +1747,20 @@ def run_gemm_fgs(
             clusters,
         )
         c_ptr = make_ptr(cutlass.BFloat16, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
-        ptrs = (a_ptr, b_ptr, c_ptr) + (
-            () if dense else (*strides, out.stride(1), out.stride(0))
-        ) + (
-            make_ptr(cutlass.Int32, stamps.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-            make_ptr(cutlass.Int32, retry_counter.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
-            make_ptr(cutlass.Int64, params.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+        ptrs = (
+            (a_ptr, b_ptr, c_ptr)
+            + (() if dense else (*strides, out.stride(1), out.stride(0)))
+            + (
+                make_ptr(
+                    cutlass.Int32, stamps.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+                ),
+                make_ptr(
+                    cutlass.Int32, retry_counter.data_ptr(), cute.AddressSpace.gmem, assumed_align=4
+                ),
+                make_ptr(
+                    cutlass.Int64, params.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+                ),
+            )
         )
         compiled = _COMPILED.get(key)
         if compiled is None:
@@ -1717,7 +1775,9 @@ def run_gemm_fgs(
                 **flags,
             )
             wrapper = gemm.wrapper_packed_fgs if dense else gemm.wrapper_packed_strided_fgs
-            compiled = cute.compile(wrapper, m, n, k, batch, *ptrs, clusters, stream, options="--opt-level 2")
+            compiled = cute.compile(
+                wrapper, m, n, k, batch, *ptrs, clusters, stream, options="--opt-level 2"
+            )
             _COMPILED[key] = compiled
         compiled(m, n, k, batch, *ptrs, stream=stream)
         return out
@@ -1861,5 +1921,7 @@ def run_dense_fgs(
             options="--opt-level 2",
         )
         _COMPILED[key] = compiled
-    compiled(m, n, k, 1, a_ptr, b_ptr, c_tensor, stamps_tensor, retry_tensor, *([0] * 13), stream=stream)
+    compiled(
+        m, n, k, 1, a_ptr, b_ptr, c_tensor, stamps_tensor, retry_tensor, *([0] * 13), stream=stream
+    )
     return out

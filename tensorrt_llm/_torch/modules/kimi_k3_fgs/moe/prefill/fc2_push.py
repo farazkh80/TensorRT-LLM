@@ -95,7 +95,12 @@ class _TilePush:
         assert hidden % 512 == 0 and ep <= _MAX_RANKS
         self.ep, self.hidden, self.lpc, self.lay = ep, hidden, lpc, dict(lay)
         self.rows, self.inbox_bytes, self.warps = rows, inbox_bytes, warps
-        self.target, self.wait_counters, self.data_only, self.pdl = target, wait_counters, data_only, pdl
+        self.target, self.wait_counters, self.data_only, self.pdl = (
+            target,
+            wait_counters,
+            data_only,
+            pdl,
+        )
         self.tma = tma
         self.wire = hidden if lpc else 2 * hidden
         self.smem_bytes = warps * (2 * hidden + 8) + 128 if tma else warps * self.wire + 128
@@ -121,7 +126,18 @@ class _TilePush:
         stream,
     ):
         self.kernel(
-            out, p2e, e2p, limits, ntiles, counters, ws_base, ws_stride, side_base, side_stride, rank, max_tokens,
+            out,
+            p2e,
+            e2p,
+            limits,
+            ntiles,
+            counters,
+            ws_base,
+            ws_stride,
+            side_base,
+            side_stride,
+            rank,
+            max_tokens,
             timeout_ns,
         ).launch(
             grid=[ctas, 1, 1],
@@ -196,7 +212,9 @@ class _TilePush:
         mbar = Int32(0)
         ph = Int32(0)
         if cutlass.const_expr(self.tma):
-            buf = smem.allocate_array(cutlass.Uint8, self.warps * 2 * self.hidden, byte_alignment=128)
+            buf = smem.allocate_array(
+                cutlass.Uint8, self.warps * 2 * self.hidden, byte_alignment=128
+            )
             bars = smem.allocate_array(Int64, self.warps, byte_alignment=8)
             stage = Int32(buf.toint()) + warp * (2 * self.hidden)
             mbar = Int32(bars.toint()) + warp * 8
@@ -242,7 +260,16 @@ class _TilePush:
                         slot = token - source * max_tokens
                         dst = side_base + Int64(source) * side_stride + box + Int64(slot) * wire
                         if cutlass.const_expr(self.tma):
-                            ph = _tma_row(self.lpc, self.hidden, out + Int64(token) * nbytes, dst, stage, mbar, ph, lane)
+                            ph = _tma_row(
+                                self.lpc,
+                                self.hidden,
+                                out + Int64(token) * nbytes,
+                                dst,
+                                stage,
+                                mbar,
+                                ph,
+                                lane,
+                            )
                         else:
                             if lane == 0:
                                 _bulk_wait_read()
@@ -268,10 +295,16 @@ class _TilePush:
                     _fence_acq_rel_sys()
                     if lane != rank:
                         _st_sys_b32(
-                            side_base + Int64(lane) * side_stride + _DONE + (rank * _DONE_BLOCKS + cta) * 4, value
+                            side_base
+                            + Int64(lane) * side_stride
+                            + _DONE
+                            + (rank * _DONE_BLOCKS + cta) * 4,
+                            value,
                         )
                 if cta == 0:
-                    _st_sys_b32(ws_base + Int64(lane) * ws_stride + L["combine_flags"] + rank * 4, value)
+                    _st_sys_b32(
+                        ws_base + Int64(lane) * ws_stride + L["combine_flags"] + rank * 4, value
+                    )
                     _spin_eq(my_ws + L["combine_flags"] + lane * 4, value, timeout_ns)
             cute.arch.sync_warp()
             if cta == 0:
@@ -299,7 +332,9 @@ class _RestPush(_TilePush):
         ctas: Int32,
         stream,
     ):
-        self.kernel(out, e2p, ws_base, ws_stride, side_base, side_stride, rank, max_tokens, n_tokens).launch(
+        self.kernel(
+            out, e2p, ws_base, ws_stride, side_base, side_stride, rank, max_tokens, n_tokens
+        ).launch(
             grid=[ctas, 1, 1],
             block=[self.warps * 32, 1, 1],
             smem=self.smem_bytes,
@@ -332,7 +367,9 @@ class _RestPush(_TilePush):
         mbar = Int32(0)
         ph = Int32(0)
         if cutlass.const_expr(self.tma):
-            buf = smem.allocate_array(cutlass.Uint8, self.warps * 2 * self.hidden, byte_alignment=128)
+            buf = smem.allocate_array(
+                cutlass.Uint8, self.warps * 2 * self.hidden, byte_alignment=128
+            )
             bars = smem.allocate_array(Int64, self.warps, byte_alignment=8)
             stage = Int32(buf.toint()) + warp * (2 * self.hidden)
             mbar = Int32(bars.toint()) + warp * 8
@@ -361,7 +398,16 @@ class _RestPush(_TilePush):
                 slot = token - source * max_tokens
                 dst = side_base + Int64(source) * side_stride + box + Int64(slot) * wire
                 if cutlass.const_expr(self.tma):
-                    ph = _tma_row(self.lpc, self.hidden, out + Int64(token) * nbytes, dst, stage, mbar, ph, lane)
+                    ph = _tma_row(
+                        self.lpc,
+                        self.hidden,
+                        out + Int64(token) * nbytes,
+                        dst,
+                        stage,
+                        mbar,
+                        ph,
+                        lane,
+                    )
                 else:
                     if lane == 0:
                         _bulk_wait_read()
@@ -393,7 +439,9 @@ def _compile_rest(*cfg):
     )
 
 
-def push_rest(pc: PrefillCombine, out: torch.Tensor, plan, *, ctas: int = 64, warps: Optional[int] = None) -> None:
+def push_rest(
+    pc: PrefillCombine, out: torch.Tensor, plan, *, ctas: int = 64, warps: Optional[int] = None
+) -> None:
     """After the finalize of the same round (``out`` rows of multi-pair tokens complete): push the rows of tokens
     with two or more local pairs (own rows included) into the round's inboxes; then ``pc.reduce_norm(fgs=True)``.
     Must follow ``push_tiles(fgs=True)`` of the round (which did the round duties and set the reduce's mode)."""
@@ -403,7 +451,17 @@ def push_rest(pc: PrefillCombine, out: torch.Tensor, plan, *, ctas: int = 64, wa
     warps = _env_int(PUSH_WARPS_ENV, 8, 1, 32) if warps is None else warps
     ws_base, ws_stride = pc._ws()
     _compile_rest(
-        pc.ep, pc.hidden, pc.lpc, pc.lay.key(), pc.rows, pc.inbox_bytes, warps, 0, False, True, True,
+        pc.ep,
+        pc.hidden,
+        pc.lpc,
+        pc.lay.key(),
+        pc.rows,
+        pc.inbox_bytes,
+        warps,
+        0,
+        False,
+        True,
+        True,
         os.environ.get(PUSH_LOAD_ENV, "tma") == "tma",
     )(
         pc.side[pc.rank, :_CACHELINE],
@@ -464,7 +522,16 @@ def push_tiles(
         raise ValueError("counters must be int32 with one word per m-tile")
     ws_base, ws_stride = pc._ws()
     _compile(
-        pc.ep, pc.hidden, pc.lpc, pc.lay.key(), pc.rows, pc.inbox_bytes, warps, HIDDEN // tile_n, fgs, data_only,
+        pc.ep,
+        pc.hidden,
+        pc.lpc,
+        pc.lay.key(),
+        pc.rows,
+        pc.inbox_bytes,
+        warps,
+        HIDDEN // tile_n,
+        fgs,
+        data_only,
         _comm._pdl() or fgs,
         os.environ.get(PUSH_LOAD_ENV, "tma") == "tma",
     )(

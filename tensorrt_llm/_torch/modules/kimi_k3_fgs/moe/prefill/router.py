@@ -34,7 +34,9 @@ def bf16_weight(weight: torch.Tensor) -> torch.Tensor:
         return hit[2]
     w = weight.detach().to(torch.bfloat16)
     if not torch.equal(w.to(torch.float32), weight.detach()):
-        raise ValueError("router: the fp32 gate weight is not bf16-exact; the bf16 GEMM would change the logits")
+        raise ValueError(
+            "router: the fp32 gate weight is not bf16-exact; the bf16 GEMM would change the logits"
+        )
     _bf16_weights[id(weight)] = (weakref.ref(weight), weight._version, w)
     return w
 
@@ -55,7 +57,9 @@ def logits(
     m, k = x.shape
     if out is None:
         out = torch.empty(m, w.shape[0], dtype=torch.float32, device=x.device)
-    elif out.dtype != torch.float32 or tuple(out.shape) != (m, w.shape[0]) or not out.is_contiguous():
+    elif (
+        out.dtype != torch.float32 or tuple(out.shape) != (m, w.shape[0]) or not out.is_contiguous()
+    ):
         raise ValueError(f"router: out must be contiguous fp32 [{m}, {w.shape[0]}]")
     if m == 0:
         return out

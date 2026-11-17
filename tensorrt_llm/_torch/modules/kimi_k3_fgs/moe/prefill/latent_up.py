@@ -51,7 +51,9 @@ def latent_up(
     return out
 
 
-def reference(latent: torch.Tensor, w_up: torch.Tensor, shared: torch.Tensor, prefix: Optional[torch.Tensor]):
+def reference(
+    latent: torch.Tensor, w_up: torch.Tensor, shared: torch.Tensor, prefix: Optional[torch.Tensor]
+):
     """Stock path: cuBLAS GEMM + ATen adds."""
     y = torch.matmul(latent, w_up.t()) + shared
     return y if prefix is None else prefix + y

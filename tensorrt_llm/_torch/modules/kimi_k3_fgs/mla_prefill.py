@@ -88,7 +88,9 @@ def edges_on() -> frozenset:
     value = os.environ.get("TLLM_K3_FGS_PREFILL_EDGES")
     if value is None:
         return _DEFAULT_EDGES
-    return frozenset(v.strip().lower() for v in value.split(",") if v.strip()) & frozenset(_EDGE_IDS)
+    return frozenset(v.strip().lower() for v in value.split(",") if v.strip()) & frozenset(
+        _EDGE_IDS
+    )
 
 
 def on(edge: str) -> bool:
@@ -191,7 +193,9 @@ class _Slots:
         if self.cnt is None:
             return None
         if blocks > COUNTER_WORDS:
-            raise RuntimeError(f"pm11: {blocks} row blocks above the {COUNTER_WORDS}-word counter slab")
+            raise RuntimeError(
+                f"pm11: {blocks} row blocks above the {COUNTER_WORDS}-word counter slab"
+            )
         self.dirty["cnt"][pair] = max(self.dirty["cnt"][pair], -(-blocks // 4) * 4)
         return self.cnt[pair]
 
@@ -254,7 +258,9 @@ def _slots_of(device: torch.device, width: int) -> _Slots:
     slots = _slots.get(device)
     if slots is None:
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(f"{ENV}=1: MLA prefill slots are allocated by an eager prefill, before any capture")
+            raise RuntimeError(
+                f"{ENV}=1: MLA prefill slots are allocated by an eager prefill, before any capture"
+            )
         slots = _slots[device] = _Slots(device, width, 2 + len(_layers) % 2)
     return slots
 
@@ -274,7 +280,9 @@ STATS_EVERY = 200
 
 def _note(layer_idx: int, refusal: Optional[str]) -> None:
     if not outcomes:
-        atexit.register(lambda: logger.info(f"{ENV}={mode()} MLA prefill layer-forwards: {dict(outcomes)}"))
+        atexit.register(
+            lambda: logger.info(f"{ENV}={mode()} MLA prefill layer-forwards: {dict(outcomes)}")
+        )
     outcome = mode() if refusal is None else f"off: {refusal}"
     if outcome not in outcomes:
         logger.info(f"{ENV}={mode()} MLA prefill chain, first {outcome!r} at MLA layer {layer_idx}")
@@ -282,8 +290,10 @@ def _note(layer_idx: int, refusal: Optional[str]) -> None:
     if sum(outcomes.values()) % LOG_EVERY == 0:
         logger.info(f"{ENV}={mode()} MLA prefill layer-forwards: {dict(outcomes)}")
         if edges.DEBUG and _stats and sum(outcomes.values()) % STATS_EVERY == 0:
-            logger.info(f"{ENV}={mode()} MLA prefill waits (gate re-issues/ctas, o_proj -/rounds/fallbacks): "
-                        f"{stats_report()}")
+            logger.info(
+                f"{ENV}={mode()} MLA prefill waits (gate re-issues/ctas, o_proj -/rounds/fallbacks): "
+                f"{stats_report()}"
+            )
 
 
 def _kernels():
@@ -353,9 +363,15 @@ def forward(
     pair, prev = _pair(ordinal), _pair((ordinal - 1) % len(_layers))
 
     qkv_a = kimi_k3_cute_gemm.linear(x, w.fused_a)
-    q_a_n = rmsnorm(qkv_a[:, :q_lora], w.q_a_norm, x.new_empty(T, q_lora), w.q_a_eps, enable_pdl=True)
+    q_a_n = rmsnorm(
+        qkv_a[:, :q_lora], w.q_a_norm, x.new_empty(T, q_lora), w.q_a_eps, enable_pdl=True
+    )
     kv_c = rmsnorm(
-        qkv_a[:, q_lora : q_lora + kv_lora], w.kv_a_norm, x.new_empty(T, kv_lora), w.kv_a_eps, enable_pdl=True
+        qkv_a[:, q_lora : q_lora + kv_lora],
+        w.kv_a_norm,
+        x.new_empty(T, kv_lora),
+        w.kv_a_eps,
+        enable_pdl=True,
     )
     k_pe = qkv_a[:, q_lora + kv_lora :]
     # pzo on q, k and v: the FMHA consumer checks every operand against -0.0, Q and K included.
@@ -367,7 +383,18 @@ def forward(
         kv_c.unsqueeze(0).expand(heads, T, kv_lora), w.w_k, k[..., :nope].transpose(0, 1), produce=live,
         early_trigger=False,
     )  # fmt: skip
-    append(kv_c, k_pe, k, kv_pool, page_rows, kv_lens, cu_seqlens, max_seqlen, fgs_producer=live, pdl=not live)
+    append(
+        kv_c,
+        k_pe,
+        k,
+        kv_pool,
+        page_rows,
+        kv_lens,
+        cu_seqlens,
+        max_seqlen,
+        fgs_producer=live,
+        pdl=not live,
+    )
     v_slot = slots.slot("v", pair, T) if live else None
     v = v_slot if v_slot is not None else x.new_empty(T, heads * v_dim)
     kimi_k3_cute_gemm.linear_fgs(
@@ -437,7 +464,9 @@ def o_proj(owner, gated: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     pair, prev, T, live, link = owner._k3_prefill_pending
     owner._k3_prefill_pending = None
     if gated.shape[0] != T:
-        raise RuntimeError(f"MLA prefill chain: o_proj got {gated.shape[0]} rows for a {T}-row layer")
+        raise RuntimeError(
+            f"MLA prefill chain: o_proj got {gated.shape[0]} rows for a {T}-row layer"
+        )
     arm = _slots_of(gated.device, gated.shape[1]).arm_regions(prev) if live else ()
     return kimi_k3_cute_gemm.linear_fgs(
         gated, weight, gated.new_empty(T, weight.shape[0]), early_trigger=False, gate=link, arm=arm,
