@@ -21,8 +21,10 @@ as valid.
 
 ``TLLM_K3_FGS_PREFILL_EDGES`` (default ``pk2,pk8``; ``pk9`` loses its mix-consumer cost to a tail that is
 not there with raster M (A-03); ``pk7`` needs BT16's decomposition route, i.e. one request
-at 96 heads, and is diagnostic), ``_MIN_ROWS`` / ``_MAX_ROWS`` (1024 / 8256 tokens per rank; the slots are sized to
-``_MAX_ROWS``), ``_RASTER`` (producer GEMM tile order; ``n`` publishes row blocks in order but costs the
+at 96 heads, and is diagnostic), ``_MIN_ROWS`` / ``_MAX_ROWS`` (1024 / 4096 tokens per rank; the slots are sized to
+``_MAX_ROWS``; on one GPU the chain gains 1.3-1.5 % of the layer at 1365 tokens and loses 0.5-0.9 % at 8192, where
+the per-layer re-arm of 0.8-1 GB outweighs the producers' last tile round), ``_RASTER`` (producer GEMM tile
+order; ``n`` publishes row blocks in order but costs the
 weight-streaming qkvg GEMM 3-21 %, A-02), ``_NORM_CTAS`` (gated norm persistent grid of the FGS roles; 0 = the
 default grid, one CTA per row block), ``_DELAY_NS`` (producer GEMMs spin at entry; hazard tests),
 ``_MAX_SPINS`` (consumer rounds before the grid-wait fallback; small values force the slow path).
@@ -42,7 +44,7 @@ from . import edges
 
 ENV = "TLLM_K3_FGS_PREFILL"
 MIN_ROWS = int(os.environ.get("TLLM_K3_FGS_PREFILL_MIN_ROWS", "1024"))
-MAX_ROWS = int(os.environ.get("TLLM_K3_FGS_PREFILL_MAX_ROWS", "8256"))
+MAX_ROWS = int(os.environ.get("TLLM_K3_FGS_PREFILL_MAX_ROWS", "4096"))
 RASTER = os.environ.get("TLLM_K3_FGS_PREFILL_RASTER", "m")
 NORM_CTAS = int(os.environ.get("TLLM_K3_FGS_PREFILL_NORM_CTAS", "0"))
 DELAY_NS = int(os.environ.get("TLLM_K3_FGS_PREFILL_DELAY_NS", "0"))
