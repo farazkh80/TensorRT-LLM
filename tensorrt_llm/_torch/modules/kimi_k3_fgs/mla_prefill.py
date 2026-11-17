@@ -5,12 +5,17 @@ standard PDL (``TLLM_K3_FGS_PREFILL=pdl``, the FGS-off twin). Decode is untouche
 :func:`forward` only for a context-only batch.
 
   fused q_a | kv_a GEMM -> q_a norm -> kv_a norm -> q_b GEMM -> k_nope BMM -> latent append -> v GEMM
-  --pm7 (v slot)--> context FMHA --pm9 (o slot)--> output gate --pm11 (counters)--> o_proj
-                                 \\--gproj--> g_proj (no grid wait, fills the FMHA tail) --> output gate
+  --pm7 (v slot)--> context FMHA (entry trigger) --gproj--> g_proj (no grid wait, fills the FMHA tail)
+  --> TMA output gate (grid wait) --pm11 (counters)--> o_proj
 
-Every consumer loads with TMA. pm7 and pm9 are Lamport edges checked by the hardware (TMA ``report_valid`` on the
-bf16 -0.0 sentinel: the FMHA on V, the TMA output gate on o); pm11 is a counter link (word per o_proj M tile; the
-gate CTAs ``red.release`` after their stores, o_proj's TMA warp acquires, ``fence.proxy.async.global``, then loads).
+Every consumer loads with TMA. pm11 is a counter link (word per o_proj M tile; the gate CTAs ``red.release`` after
+their stores, o_proj's TMA warp acquires, ``fence.proxy.async.global``, then loads). gproj is the FMHA's entry
+trigger plus a g_proj without grid wait: its tiles fill the FMHA's ragged causal tail; the gate then waits at
+entry, so it launches after g_proj completes and, completion being stream-ordered, after the FMHA. pm7 and pm9 are
+Lamport edges checked by the hardware (TMA ``report_valid`` on the bf16 -0.0 sentinel: the FMHA on V, the gate on
+o and g); both are opt-in. **pm9 is diagnostic only**: a gate that skips its grid wait fills every SM with resident
+CTAs (six per SM at 33 KB) while the FMHA's remaining CTAs need a whole SM (214 KB), so the producer starves and
+the gate re-issues until its spin limit (DEP4 R2: 0.3-1.4e9 re-issues per 200 layer-forwards, the step 2.6x).
 
 Chain invariant (``griddepcontrol.wait`` is not transitive: it waits for the immediate predecessor's completion
 only, and a predecessor's trigger says nothing about its own stores): a kernel that skips its grid wait reads its
@@ -19,8 +24,7 @@ that producer up to and including the predecessor waits at entry (the predecesso
 the producer is complete and flushed). Hence the FMHA (no wait) reads Q and K plainly: q_b, the BMM and the append
 wait at entry and the v GEMM waits before it triggers; they run their pzo builds because the FMHA still checks every
 operand against -0.0. The gate (no wait) checks both o and g. g_proj (no wait with ``gproj``) reads x_norm, complete
-since the fused GEMM. ``gproj`` needs ``pm9`` (the gate must check what a g_proj that did not wait may still be
-writing, and the FMHA output).
+since the fused GEMM (the FMHA launched after the v GEMM completed).
 
 Slots: v, o and g of each pair, bf16 ``[pairs, MAX_ROWS, heads * v_dim]`` armed with -0.0, plus the pm11 counter slab;
 re-armed producer-side by the next MLA layer's o_proj arm warp (its DRAM headroom, as the KDA chain; rows used only).
@@ -29,7 +33,7 @@ entry on o_proj L, whose counter gate covered every gate CTA, whose report_valid
 refuses the chain while a pair is dirty fills it from the host (:func:`rearm_skipped`).
 
 Env (read at import): ``TLLM_K3_FGS_PREFILL`` (shared with ``kda_prefill``), ``TLLM_K3_FGS_PREFILL_EDGES`` (ids
-``pm7,pm9,pm11,gproj`` of this chain, default ``pm9,pm11,gproj``; KDA ids are ignored here),
+``pm7,pm9,pm11,gproj`` of this chain, default ``pm11,gproj``; KDA ids are ignored here),
 ``TLLM_K3_FGS_PREFILL_MIN_ROWS``, ``TLLM_K3_FGS_MLA_PREFILL_MAX_ROWS`` (slot rows, 72 KB per row per pair),
 ``TLLM_K3_FGS_PREFILL_DELAY_NS`` (the v GEMM spins at entry: hazard tests), ``TLLM_K3_FGS_PREFILL_MAX_SPINS`` (gate /
 o_proj rounds before the grid-wait fallback).
@@ -59,8 +63,8 @@ COUNTER_WORDS = -(-(-(-MAX_ROWS // 64)) // 4) * 4
 
 PM7, PM9, PM11, GPROJ = "pm7", "pm9", "pm11", "gproj"
 _EDGE_IDS = (PM7, PM9, PM11, GPROJ)
-# pm7 (v GEMM -> FMHA) is opt-in: the FMHA consumer build costs 7 % of the FMHA and a K = 512 GEMM has no tail (A-11).
-_DEFAULT_EDGES = frozenset((PM9, PM11, GPROJ))
+# pm7 (v GEMM -> FMHA) costs 7 % of the FMHA for a K = 512 GEMM's tail (A-11); pm9 starves the FMHA (see above).
+_DEFAULT_EDGES = frozenset((PM11, GPROJ))
 NEG0 = -0x8000
 
 
@@ -84,10 +88,7 @@ def edges_on() -> frozenset:
     value = os.environ.get("TLLM_K3_FGS_PREFILL_EDGES")
     if value is None:
         return _DEFAULT_EDGES
-    ids = frozenset(v.strip().lower() for v in value.split(",") if v.strip()) & frozenset(_EDGE_IDS)
-    if GPROJ in ids and PM9 not in ids:
-        raise ValueError("TLLM_K3_FGS_PREFILL_EDGES: gproj needs pm9 (the gate must check the FMHA output)")
-    return ids
+    return frozenset(v.strip().lower() for v in value.split(",") if v.strip()) & frozenset(_EDGE_IDS)
 
 
 def on(edge: str) -> bool:
@@ -375,10 +376,11 @@ def forward(
     )  # fmt: skip
     o_slot = slots.slot("o", pair, T) if live else None
     o = o_slot if o_slot is not None else x.new_empty(T, heads * v_dim)
+    trigger = o_slot is not None or on(GPROJ)
     fmha(
         q.view(T, heads, nope + rope), k, v.view(T, heads, v_dim), o.view(T, heads, v_dim), cu_seqlens, max_seqlen,
-        w.softmax_scale, fgs_consumer=v_slot is not None, fgs_producer=o_slot is not None,
-        pdl=v_slot is None and o_slot is None, fgs_stats=fgs_stats if v_slot is not None else None,
+        w.softmax_scale, fgs_consumer=v_slot is not None, fgs_producer=trigger,
+        pdl=v_slot is None and not trigger, fgs_stats=fgs_stats if v_slot is not None else None,
     )  # fmt: skip
     owner._k3_prefill_pending = (pair, prev, T, o_slot is not None)
     if trace is not None:
