@@ -8,6 +8,11 @@
 16 / EP: 2 at EP16, 8 at EP4); the CuTe routing traps on a routing with more local pairs, the torch one drops them.
 ``TLLM_K3_MOE_PREFILL_PUSH`` (``push_mode()``) names the FC2 -> combine push the caller wires: ``tiles``
 (``fc2_push``: tile push, finalize, rest push) or ``stream`` (``stream_push``: finalize fused into one push kernel).
+``TLLM_K3_MOE_PREFILL_FC1_STORE`` / ``TLLM_K3_MOE_PREFILL_FC2_STORE`` (``v4`` | ``tma``) pick the kernels' output
+store path. ``TLLM_K3_MOE_PREFILL_FC12`` is the FC1 -> FC2 edge: ``off`` (FC2 waits for the FC1 grid, standard PDL),
+``B`` (act slots armed 0x80, FC2 checks each 16 B chunk's first byte by TMA ``report_valid``, scales per element
+against 0xFF), ``A`` (slots armed 0xFF, every element checked) or ``counter`` (FC1 publishes per (m, n) item, FC2
+acquires per m-tile). B and A keep two slot pairs that alternate per use; FC1 re-arms the other pair.
 """
 
 from __future__ import annotations
@@ -26,17 +31,40 @@ INTER = 3072
 TOP_K = 16
 SF_VEC = 32
 TILE = 128
+FC1_TILE_N = 256
 ROUTING_ENV = "TLLM_K3_MOE_PREFILL_ROUTING"
 PAIRS_ENV = "TLLM_K3_MOE_PREFILL_PAIRS_PER_ROW"
 PUSH_ENV = "TLLM_K3_MOE_PREFILL_PUSH"
 PUSH_MODES = ("tiles", "stream")
+FC1_STORE_ENV = "TLLM_K3_MOE_PREFILL_FC1_STORE"
+FC2_STORE_ENV = "TLLM_K3_MOE_PREFILL_FC2_STORE"
+STORES = ("v4", "tma")
+FC12_ENV = "TLLM_K3_MOE_PREFILL_FC12"
+FC12_MODES = ("off", "B", "A", "counter")
+FC12_SENTINEL = {"B": "80", "A": "ff"}
+
+
+def _choice(env: str, default: str, choices) -> str:
+    value = os.environ.get(env, default)
+    if value not in choices:
+        raise ValueError(f"{env}: unknown value {value!r} ({' | '.join(choices)})")
+    return value
 
 
 def push_mode() -> str:
-    mode = os.environ.get(PUSH_ENV, "tiles")
-    if mode not in PUSH_MODES:
-        raise ValueError(f"{PUSH_ENV}: unknown push {mode!r} (tiles | stream)")
-    return mode
+    return _choice(PUSH_ENV, "tiles", PUSH_MODES)
+
+
+def fc1_store() -> str:
+    return _choice(FC1_STORE_ENV, "v4", STORES)
+
+
+def fc2_store() -> str:
+    return _choice(FC2_STORE_ENV, "v4", STORES)
+
+
+def fc12_mode() -> str:
+    return _choice(FC12_ENV, "off", FC12_MODES)
 
 
 @dataclass
@@ -71,8 +99,26 @@ class Workspace:
             torch.zeros(1, **kw),
             torch.zeros(1, **kw),
         )
-        self.act = torch.empty(p, INTER, dtype=torch.float8_e4m3fn, device=device)
-        self.act_sf = torch.empty(p, INTER // SF_VEC, dtype=torch.uint8, device=device)
+        self.fc12 = fc12_mode()
+        if self.fc12 in FC12_SENTINEL:
+            fill = 0x80 if self.fc12 == "B" else 0xFF
+            self.slots = [
+                (
+                    torch.full((p, INTER), fill, dtype=torch.uint8, device=device).view(
+                        torch.float8_e4m3fn
+                    ),
+                    torch.full((p, INTER // SF_VEC), 0xFF, dtype=torch.uint8, device=device),
+                )
+                for _ in range(2)
+            ]
+            # Rows FC1 wrote into each slot in its last use: what the next FC1 on the other slot re-arms.
+            self.rows_used = torch.zeros(2, **kw)
+            self.use = 0
+        else:
+            self.act = torch.empty(p, INTER, dtype=torch.float8_e4m3fn, device=device)
+            self.act_sf = torch.empty(p, INTER // SF_VEC, dtype=torch.uint8, device=device)
+        if self.fc12 == "counter":
+            self.fc1_done = torch.zeros(p // TILE, **kw)
         self.y = torch.empty(p, HIDDEN, dtype=torch.bfloat16, device=device)
         # One word per m-tile plus the streaming push's row-dealing word, zeroed together per round.
         self.tile_done = torch.zeros(p // TILE + 1, dtype=torch.int32, device=device)
@@ -186,24 +232,35 @@ def run(
     publish = after_fc2 is not None or (stream is not None and stream_fgs)
     if publish or stream is not None:
         ws.tile_done.zero_()
-    fc1.run(x, x_sf, weights, plan, ws.act, ws.act_sf)
+    fc1_kw = dict(store=fc1_store())
     # FC2 writes the rows with one local pair; finalize writes the others (zero where no pair is local).
-    if not publish:
-        fc2.run(ws.act, ws.act_sf, weights, plan, ws.y, fin=(out, topk_w))
+    fc2_kw = dict(store=fc2_store(), fin=(out, topk_w))
+    lamport = ws.fc12 in FC12_SENTINEL
+    if lamport:
+        # The pair this use writes alternates; FC1 re-arms the other pair over the rows its last use wrote (that
+        # pair's reader, the previous FC2, completed before FC1's grid wait returned), and FC2 checks its loads
+        # instead of waiting for the FC1 grid.
+        s = ws.use & 1
+        ws.use += 1
+        act, act_sf = ws.slots[s]
+        prev_act, prev_sf = ws.slots[1 - s]
+        sentinel = FC12_SENTINEL[ws.fc12]
+        fc1_kw.update(sentinel=sentinel, rearm=(prev_act, prev_sf, ws.rows_used[1 - s : 2 - s]))
+        fc2_kw.update(sync="lamport", sentinel=sentinel)
     else:
-        fc2.run(
-            ws.act,
-            ws.act_sf,
-            weights,
-            plan,
-            ws.y,
-            fin=(out, topk_w),
-            publish=ws.tile_done,
-            pdl_trigger="start",
-            num_ctas=fc2_ctas,
-        )
-        if after_fc2 is not None:
-            after_fc2(out, plan, ws.tile_done)
+        act, act_sf = ws.act, ws.act_sf
+        if ws.fc12 == "counter":
+            ws.fc1_done.zero_()
+            fc1_kw.update(counters=(ws.fc1_done, ws.fc1_done))
+            fc2_kw.update(sync="counter", counters=(ws.fc1_done, 2 * INTER // FC1_TILE_N))
+    if publish:
+        fc2_kw.update(publish=ws.tile_done, pdl_trigger="start", num_ctas=fc2_ctas)
+    fc1.run(x, x_sf, weights, plan, act, act_sf, tile_n=FC1_TILE_N, **fc1_kw)
+    if lamport:
+        ws.rows_used[s : s + 1].copy_(plan.total_num_padded_tokens)
+    fc2.run(act, act_sf, weights, plan, ws.y, **fc2_kw)
+    if after_fc2 is not None:
+        after_fc2(out, plan, ws.tile_done)
     if stream is not None:
         stream(out, ws.y, topk_w, plan, ws.tile_done)
         return ws
