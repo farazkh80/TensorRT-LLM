@@ -16,8 +16,11 @@ stored as ``out[token] = bf16(f32(bf16(acc)) * topk_w[token, k])`` (the stock fi
 go to ``y`` for a finalize pass over multi-pair rows (decode ``finalize.run(..., skip_single=True)``). Padding rows
 (at or past the tile's ``tile_idx_to_mn_limit``) are not written.
 
-The per-K-stage activation load is ``_load_act_stage``: the single place a TMA ``report_valid`` load replaces the
-plain TMA load in the Lamport FC1 -> FC2 designs.
+The per-K-stage activation load is ``_load_act_stage``. ``sync="lamport"`` is the Lamport FC1 -> FC2 edge: no
+grid wait at entry; act and act_sf are loaded with TMA ``report_valid`` onto a v1 mbarrier per stage (sentinel 0x80
+checked per 16 B chunk for ``sentinel="80"``, 0xFF per element for ``"ff"``; act_sf always 0xFF per element since
+four threads write each 16 B chunk of its atom layout); a stage that landed with a sentinel waits for the FC1 grid
+once and is re-loaded plainly on a redo barrier. ``force_slow`` takes the slow path on every stage (test only).
 """
 
 from __future__ import annotations
@@ -46,8 +49,11 @@ from .common import (
     UnalignedBarrier,
     bits_f32,
     check_tensor,
+    fence_proxy_async_global,
     gmem_ptr,
+    ld_acquire_gpu_b32,
     num_sms,
+    red_release_gpu_add,
     s2t_copy_and_partition,
     st_global_v4,
     tcgen05_fence,
@@ -89,7 +95,13 @@ class Fc2TokenM:
         num_acc_stages: int = 2,
         max_ab_stages: int = 3,
         smem_budget: Optional[int] = None,
+        sync: Optional[str] = None,
+        sentinel: str = "80",
+        force_slow: bool = False,
+        publish: bool = False,
     ):
+        if sync not in (None, "lamport", "counter") or sentinel not in ("80", "ff"):
+            raise ValueError(f"sync must be None, lamport or counter, sentinel 80 or ff, got {sync} / {sentinel}")
         if tile_n not in (128, 256):
             raise ValueError(f"tile_n must be 128 or 256, got {tile_n}")
         if pdl_trigger not in ("end", "start", "none"):
@@ -100,6 +112,11 @@ class Fc2TokenM:
         self.num_n_tiles = HIDDEN // tile_n
         self.use_pdl = use_pdl
         self.fin = fin
+        self.lamport = sync == "lamport"
+        self.counter = sync == "counter"
+        self.publish = publish
+        self.sentinel = sentinel
+        self.force_slow = force_slow
         self.pdl_trigger = pdl_trigger
         self.k_blocks = k_blocks
         self.k_stage = SF_VEC * k_blocks
@@ -200,14 +217,19 @@ class Fc2TokenM:
         t2e_ptr: cute.Pointer,
         t2l_ptr: cute.Pointer,
         ntiles_ptr: cute.Pointer,
+        ctr_ptr: cute.Pointer,
+        pub_ptr: cute.Pointer,
         num_experts: cutlass.Int32,
         num_rows: cutlass.Int32,
         num_permuted: cutlass.Int32,
         num_tiles_cap: cutlass.Int32,
         num_ctas: cutlass.Int32,
+        counter_target: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         self._setup_attributes()
+        ctr = cute.make_tensor(ctr_ptr, cute.make_layout((num_tiles_cap,)))
+        pub = cute.make_tensor(pub_ptr, cute.make_layout((num_tiles_cap,)))
         a = cute.make_tensor(act_ptr, cute.make_layout((num_permuted, INTER, 1), stride=(INTER, 1, 0)))
         sfa = cute.make_tensor(
             act_sf_ptr, blockscaled_utils.tile_atom_to_shape_SF((num_permuted, INTER, 1), self.sf_vec_size)
@@ -245,16 +267,18 @@ class Fc2TokenM:
         tma_atom_sfb, tma_tensor_sfb = cute.nvgpu.make_tiled_tma_atom_B(
             b_op, sfb, sfb_smem_layout, self.mma_tiler, tiled_mma, self.cluster_layout_vmnk.shape, internal_type=cutlass.Int16
         )
-        self.num_tma_load_bytes = (
-            cute.size_in_bytes(cutlass.Float8E4M3FN, a_smem_layout)
-            + cute.size_in_bytes(cutlass.Float8E8M0FNU, sfa_smem_layout)
-            + cute.size_in_bytes(cutlass.Float4E2M1FN, b_smem_layout)
-            + cute.size_in_bytes(cutlass.Float8E8M0FNU, sfb_smem_layout)
+        self.num_act_load_bytes = cute.size_in_bytes(cutlass.Float8E4M3FN, a_smem_layout) + cute.size_in_bytes(
+            cutlass.Float8E8M0FNU, sfa_smem_layout
         )
+        self.num_b_load_bytes = cute.size_in_bytes(cutlass.Float4E2M1FN, b_smem_layout) + cute.size_in_bytes(
+            cutlass.Float8E8M0FNU, sfb_smem_layout
+        )
+        self.num_tma_load_bytes = self.num_b_load_bytes + (0 if self.lamport else self.num_act_load_bytes)
 
         @cute.struct
         class SharedStorage:
             ab_mbar: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
+            act_mbar: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage + 1]
             acc_mbar: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
             tmem_holding_buf: cutlass.Int32
             sSFA: cute.struct.Align[cute.struct.MemRange[cutlass.Float8E8M0FNU, cute.cosize(self.sfa_smem_layout_staged)], 1024]
@@ -285,6 +309,9 @@ class Fc2TokenM:
             t2e,
             t2l,
             ntiles,
+            ctr,
+            pub,
+            counter_target,
             self.cluster_layout_vmnk,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
@@ -300,9 +327,32 @@ class Fc2TokenM:
             use_pdl=self.use_pdl,
         )
 
-    def _load_act_stage(self, tma_atom_a, tAgA_k, tAsA_s, tma_atom_sfa, tAgSFA_k, tAsSFA_s, tma_bar):
-        cute.copy(tma_atom_a, tAgA_k, tAsA_s, tma_bar_ptr=tma_bar)
-        cute.copy(tma_atom_sfa, tAgSFA_k, tAsSFA_s, tma_bar_ptr=tma_bar)
+    def _load_act_stage(self, tma_atom_a, tAgA_k, tAsA_s, tma_atom_sfa, tAgSFA_k, tAsSFA_s, tma_bar, check=False):
+        if cutlass.const_expr(check):
+            act_pattern = (
+                cpasync.SentinelPattern.PER_ELEMENT_FF
+                if self.sentinel == "ff"
+                else cpasync.SentinelPattern.PER_16BYTES_80
+            )
+            cute.copy(tma_atom_a, tAgA_k, tAsA_s, tma_bar_ptr=tma_bar, report_valid=act_pattern)
+            cute.copy(
+                tma_atom_sfa, tAgSFA_k, tAsSFA_s, tma_bar_ptr=tma_bar, report_valid=cpasync.SentinelPattern.PER_ELEMENT_FF
+            )
+        else:
+            cute.copy(tma_atom_a, tAgA_k, tAsA_s, tma_bar_ptr=tma_bar)
+            cute.copy(tma_atom_sfa, tAgSFA_k, tAsSFA_s, tma_bar_ptr=tma_bar)
+
+    @cute.jit
+    def _stage_invalid(self, bar, phase):
+        """Wait for a v1 barrier's primary phase; 1 when a report_valid load on it saw a sentinel (DSL 4.9's blocking
+        ``mbarrier_wait_primary`` never returns on SM107, hence the try-wait loop)."""
+        done = cutlass.Int32(0)
+        invalid = cutlass.Int32(0)
+        while done == 0:
+            res = cute.arch.mbarrier_try_wait_primary(bar, phase)
+            done = cutlass.select_(res[0], cutlass.Int32(1), cutlass.Int32(0))
+            invalid = cutlass.select_(res[1], cutlass.Int32(1), cutlass.Int32(0))
+        return invalid
 
     @cute.kernel
     def kernel(
@@ -324,6 +374,9 @@ class Fc2TokenM:
         mT2e: cute.Tensor,
         mT2l: cute.Tensor,
         mNumTiles: cute.Tensor,
+        mCtr: cute.Tensor,
+        mPub: cute.Tensor,
+        counter_target: cutlass.Int32,
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
@@ -365,6 +418,15 @@ class Fc2TokenM:
             arch=SMEM_ARCH,
         )
         tmem.allocate(self.num_tmem_alloc_cols)
+        act_mbar = storage.act_mbar.data_ptr()
+        redo_bar = act_mbar + self.num_ab_stage
+        if cutlass.const_expr(self.lamport):
+            if warp_idx == self.tma_warp_id:
+                with cute.arch.elect_one():
+                    for st in cutlass.range_constexpr(self.num_ab_stage):
+                        cute.arch.mbarrier_v1_init(act_mbar + st, 1)
+                    cute.arch.mbarrier_init(redo_bar, 1)
+                cute.arch.mbarrier_init_fence()
         sA = storage.sA.get_tensor(a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner)
         sB = storage.sB.get_tensor(b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner)
         sSFA = storage.sSFA.get_tensor(sfa_smem_layout_staged)
@@ -402,8 +464,9 @@ class Fc2TokenM:
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
         tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.num_acc_stage))
 
-        # Every read of FC1's output and of the plan comes after this wait.
-        if cutlass.const_expr(self.use_pdl):
+        # Every read of FC1's output comes after this wait; with the Lamport edge the data loads themselves are the
+        # wait (the plan was complete before FC1 started), and only an invalid stage waits for the FC1 grid.
+        if cutlass.const_expr(self.use_pdl and not (self.lamport or self.counter)):
             cute.arch.griddepcontrol_wait()
         self.cta_sync_barrier.arrive_and_wait()
         if cutlass.const_expr(self.use_pdl and self.pdl_trigger == "start"):
@@ -420,12 +483,23 @@ class Fc2TokenM:
                 tAgSFA_t = tAgSFA[(None, m_tile, None, 0)]
                 tBgB_t = tBgB[(None, n_tile, None, expert)]
                 tBgSFB_t = tBgSFB[(None, n_tile, None, expert)]
+                if cutlass.const_expr(self.counter):
+                    # Counter link: FC1's release-adds for this m-tile, then the proxy fence before the TMA reads.
+                    ctr_addr = mCtr.iterator.toint() + cutlass.Int64(m_tile) * 4
+                    while ld_acquire_gpu_b32(ctr_addr) < counter_target:
+                        pass
+                    fence_proxy_async_global()
                 for k_tile in cutlass.range(self.num_k_tiles, unroll=1):
                     ab_pipeline.producer_acquire(ab_state)
                     tma_bar = ab_pipeline.producer_get_barrier(ab_state)
                     s = ab_state.index
                     cute.copy(tma_atom_b, tBgB_t[(None, k_tile)], tBsB[(None, s)], tma_bar_ptr=tma_bar)
                     cute.copy(tma_atom_sfb, tBgSFB_t[(None, k_tile)], tBsSFB[(None, s)], tma_bar_ptr=tma_bar)
+                    act_bar = tma_bar
+                    if cutlass.const_expr(self.lamport):
+                        act_bar = act_mbar + s
+                        with cute.arch.elect_one():
+                            cute.arch.mbarrier_arrive_and_expect_tx(act_bar, self.num_act_load_bytes)
                     self._load_act_stage(
                         tma_atom_a,
                         tAgA_t[(None, k_tile)],
@@ -433,7 +507,8 @@ class Fc2TokenM:
                         tma_atom_sfa,
                         tAgSFA_t[(None, k_tile)],
                         tAsSFA[(None, s)],
-                        tma_bar,
+                        act_bar,
+                        check=self.lamport,
                     )
                     ab_state.advance()
             ab_pipeline.producer_tail(ab_state)
@@ -459,14 +534,43 @@ class Fc2TokenM:
             ab_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_ab_stage)
             acc_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.num_acc_stage)
             num_kblocks = cute.size(tCrA, mode=[2])
+            waited = cute.make_rmem_tensor((2,), cutlass.Int32)
+            waited[0] = cutlass.Int32(0)
+            waited[1] = cutlass.Int32(0)
             for item in cutlass.range(bidx, total_items, gdim, unroll=1):
                 acc_pipeline.producer_acquire(acc_state)
                 tcgen05_fence("after")
                 tCtAcc = tCtAcc_base[(None, None, None, acc_state.index)]
                 tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+                m_tile = item // n_tiles
+                tAgA_t = tAgA[(None, m_tile, None, 0)]
+                tAgSFA_t = tAgSFA[(None, m_tile, None, 0)]
                 for k_tile in cutlass.range(self.num_k_tiles, unroll=1):
                     ab_pipeline.consumer_wait(ab_state)
                     s = ab_state.index
+                    if cutlass.const_expr(self.lamport):
+                        invalid = self._stage_invalid(act_mbar + s, ab_state.phase)
+                        if cutlass.const_expr(self.force_slow):
+                            invalid = cutlass.Int32(1)
+                        # FC2 ran ahead of FC1 on this stage (rare): after the FC1 grid every store is visible, so
+                        # the stage is loaded once more, plainly, on the redo barrier.
+                        if invalid != 0:
+                            if waited[0] == 0:
+                                cute.arch.griddepcontrol_wait()
+                                waited[0] = cutlass.Int32(1)
+                            with cute.arch.elect_one():
+                                cute.arch.mbarrier_arrive_and_expect_tx(redo_bar, self.num_act_load_bytes)
+                            self._load_act_stage(
+                                tma_atom_a,
+                                tAgA_t[(None, k_tile)],
+                                tAsA[(None, s)],
+                                tma_atom_sfa,
+                                tAgSFA_t[(None, k_tile)],
+                                tAsSFA[(None, s)],
+                                redo_bar,
+                            )
+                            cute.arch.mbarrier_wait(redo_bar, waited[1])
+                            waited[1] = waited[1] ^ 1
                     cute.copy(copy_s2t_sfa, tCsSFA_s2t[(None, None, None, None, s)], tCtSFA_s2t)
                     cute.copy(copy_s2t_sfb, tCsSFB_s2t[(None, None, None, None, s)], tCtSFB_s2t)
                     for kblock in cutlass.range_constexpr(num_kblocks):
@@ -538,6 +642,12 @@ class Fc2TokenM:
                         addr = dst + cutlass.Int64(n_tile * (tile_n * 2) + j * 64)
                         for v in cutlass.range_constexpr(4):
                             st_global_v4(addr + 16 * v, words[4 * v], words[4 * v + 1], words[4 * v + 2], words[4 * v + 3])
+                if cutlass.const_expr(self.publish):
+                    # Once all four epilogue warps stored this (m, n) item, one release-add on the m-tile's word;
+                    # the m-tile's out / y rows are complete when it reaches the number of n-tiles.
+                    self.epilog_sync_barrier.arrive_and_wait()
+                    if tidx == 0:
+                        red_release_gpu_add(mPub.iterator.toint() + cutlass.Int64(m_tile) * 4, cutlass.Int32(1))
             tmem.relinquish_alloc_permit()
             self.epilog_sync_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
@@ -579,7 +689,7 @@ def check(act, act_sf, weights, plan, y, fin):
             raise ValueError("plan.expanded_idx_to_permuted_idx must be int32 with rows * 16 entries")
 
 
-def launch_args(act, act_sf, weights, plan, y, fin, num_ctas):
+def launch_args(act, act_sf, weights, plan, y, fin, num_ctas, counters=None, publish=None):
     out, topk_w = fin if fin is not None else (y, y)
     rows = topk_w.shape[0] if fin is not None else 1
     return (
@@ -595,11 +705,14 @@ def launch_args(act, act_sf, weights, plan, y, fin, num_ctas):
         gmem_ptr(cutlass.Int32, plan.tile_idx_to_expert_idx, 4),
         gmem_ptr(cutlass.Int32, plan.tile_idx_to_mn_limit, 4),
         gmem_ptr(cutlass.Int32, plan.num_non_exiting_tiles, 4),
+        gmem_ptr(cutlass.Int32, plan.tile_idx_to_expert_idx if counters is None else counters[0], 4),
+        gmem_ptr(cutlass.Int32, plan.tile_idx_to_expert_idx if publish is None else publish, 4),
         cutlass.Int32(weights.w2_weight.shape[0]),
         cutlass.Int32(rows),
         cutlass.Int32(act.shape[0]),
         cutlass.Int32(plan.tile_idx_to_expert_idx.shape[0]),
         cutlass.Int32(num_ctas),
+        cutlass.Int32(0 if counters is None else counters[1]),
     )
 
 
@@ -619,17 +732,32 @@ def run(
     num_acc_stages: int = 2,
     enable_pdl: Optional[bool] = None,
     num_ctas: Optional[int] = None,
+    sync: Optional[str] = None,
+    sentinel: str = "80",
+    force_slow: bool = False,
+    counters=None,
+    publish=None,
 ):
     """y[p] = bf16(dequant(act[p]) @ W2[e]^T) for every valid permuted row p of expert e (``act`` e4m3 [P, 3072],
     ``act_sf`` uint8 [P, 96] in the 128x4 atom layout, ``weights.w2_weight`` uint8 [E, 3584, 1536] +
     ``w2_weight_scale`` uint8 [E, 3584, 96] in the TRTLLM-Gen layout, ``plan`` with tile_n = 128, ``y`` bf16
     [P, 3584]). ``fin = (out bf16 [R, 3584], topk_w bf16 [R, 16])``: rows of tokens with exactly one local pair are
-    written scaled into ``out[token]`` instead of ``y`` (see the module docstring). One kernel on the current stream."""
+    written scaled into ``out[token]`` instead of ``y`` (see the module docstring). One kernel on the current stream.
+    ``publish``: int32 [T] device words (zeroed by the caller); publish[m] is release-added once per (m, n) item after
+    the item's out / y stores, so m-tile m's rows are complete when publish[m] == 3584 // tile_n (14 for tile_n 256).
+    ``counters=(ctr int32 [T], target)``: with ``sync="counter"`` the loads of m-tile m wait for ctr[m] >= target
+    (acquire) and a proxy fence instead of the grid wait."""
     check(act, act_sf, weights, plan, y, fin)
     pdl = use_pdl() if enable_pdl is None else enable_pdl
-    key = (tile_n, pdl, fin is not None, pdl_trigger, k_blocks, num_acc_stages, max_ab_stages, smem_budget)
+    key = (tile_n, pdl, fin is not None, pdl_trigger, k_blocks, num_acc_stages, max_ab_stages, smem_budget, sync, sentinel, force_slow, publish is not None)
+    if publish is not None and (publish.dtype != torch.int32 or publish.numel() < plan.tile_idx_to_expert_idx.shape[0]):
+        raise ValueError("publish must be int32 with one word per tile")
+    if sync in ("lamport", "counter") and not pdl:
+        raise ValueError("sync=lamport/counter needs PDL")
+    if (sync == "counter") != (counters is not None):
+        raise ValueError("sync=counter needs counters=(ctr int32 [T], target per m-tile)")
     ctas = num_ctas_for(act, plan, tile_n) if num_ctas is None else num_ctas
-    args = launch_args(act, act_sf, weights, plan, y, fin, ctas)
+    args = launch_args(act, act_sf, weights, plan, y, fin, ctas, counters, publish)
     stream = cuda.CUstream(torch.cuda.current_stream(act.device).cuda_stream)
     compiled = _compiled.get(key)
     if compiled is None:
@@ -642,6 +770,10 @@ def run(
             num_acc_stages=num_acc_stages,
             max_ab_stages=max_ab_stages,
             smem_budget=smem_budget,
+            sync=sync,
+            sentinel=sentinel,
+            force_slow=force_slow,
+            publish=publish is not None,
         )
         compiled = _compiled[key] = cute.compile(kernel, *args, stream)
     compiled(*args, stream)

@@ -140,6 +140,52 @@ def st_global_v4(addr, w0, w1, w2, w3, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def red_release_gpu_add(addr, v, *, loc=None, ip=None):
+    _asm(
+        None,
+        [cutlass.Int64(addr).ir_value(loc=loc, ip=ip), cutlass.Int32(v).ir_value(loc=loc, ip=ip)],
+        "red.release.gpu.global.add.s32 [$0], $1;",
+        "l,r",
+        side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def ld_acquire_gpu_b32(addr, *, loc=None, ip=None):
+    return cutlass.Int32(
+        _asm(
+            T.i32(),
+            [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)],
+            "ld.acquire.gpu.global.b32 $0, [$1];",
+            "=r,l",
+            side_effects=True,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def fence_proxy_async_global(*, loc=None, ip=None):
+    _asm(None, [], "fence.proxy.async.global;", "", side_effects=True, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def st_global_b32(addr, w, *, loc=None, ip=None):
+    _asm(
+        None,
+        [cutlass.Int64(addr).ir_value(loc=loc, ip=ip), cutlass.Int32(w).ir_value(loc=loc, ip=ip)],
+        "st.global.b32 [$0], $1;",
+        "l,r",
+        side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def st_global_b16(addr, w, *, loc=None, ip=None):
     _asm(
         None,

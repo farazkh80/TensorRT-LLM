@@ -40,6 +40,7 @@ import cutlass.utils.rubin_helpers as sm107_utils
 import torch
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
+from ..sync import spin_ns
 from .common import (
     HIDDEN,
     INTER,
@@ -54,10 +55,11 @@ from .common import (
     gmem_ptr,
     ld_global_cg_v4,
     num_sms,
+    red_release_gpu_add,
     s2t_copy_and_partition,
     sigmoid_accurate,
-    st_global_b8,
     st_global_b16,
+    st_global_b32,
     st_global_v4,
     st_shared_b32,
     tanh_accurate,
@@ -96,7 +98,13 @@ class Fc1TokenM:
         a_path: str = "tma",
         sf_path: str = "ld",
         gather_issue: str = "elect",
+        sentinel: Optional[str] = None,
+        rearm: bool = False,
+        hazard_delay_ns: int = 0,
+        counters: bool = False,
     ):
+        if sentinel not in (None, "80", "ff"):
+            raise ValueError(f"sentinel must be None, 80 or ff, got {sentinel}")
         if gather_issue not in ("lanes", "elect"):
             raise ValueError(f"gather_issue must be lanes or elect, got {gather_issue}")
         if a_path not in ("tma", "cpasync") or sf_path not in ("ld", "cpasync"):
@@ -130,6 +138,10 @@ class Fc1TokenM:
         self.a_path = a_path
         self.sf_path = sf_path
         self.gather_issue = gather_issue
+        self.sentinel = sentinel
+        self.rearm = rearm
+        self.hazard_delay_ns = hazard_delay_ns
+        self.counters = counters
         self.k_blocks = k_blocks
         self.k_stage = SF_VEC * k_blocks
         self.num_k_tiles = HIDDEN // self.k_stage
@@ -144,8 +156,9 @@ class Fc1TokenM:
         self.mma_warp_id = 4
         self.tma_warp_id = 5
         self.gather_warp_id = 6
+        self.rearm_warp_id = 6 + num_gather_warps
         self.threads_per_warp = 32
-        self.threads_per_cta = 32 * (self.gather_warp_id + num_gather_warps)
+        self.threads_per_cta = 32 * (self.rearm_warp_id + (1 if rearm else 0))
         self.num_epilog_threads = 32 * len(self.epilog_warp_id)
         self.cta_sync_barrier = pipeline.NamedBarrier(barrier_id=1, num_threads=self.threads_per_cta)
         self.epilog_sync_barrier = pipeline.NamedBarrier(barrier_id=2, num_threads=self.num_epilog_threads)
@@ -231,6 +244,11 @@ class Fc1TokenM:
         t2e_ptr: cute.Pointer,
         t2l_ptr: cute.Pointer,
         ntiles_ptr: cute.Pointer,
+        rearm_act_ptr: cute.Pointer,
+        rearm_sf_ptr: cute.Pointer,
+        rearm_rows_ptr: cute.Pointer,
+        ctr_ptr: cute.Pointer,
+        rearm_ctr_ptr: cute.Pointer,
         num_experts: cutlass.Int32,
         num_rows: cutlass.Int32,
         num_permuted: cutlass.Int32,
@@ -239,6 +257,11 @@ class Fc1TokenM:
         stream: cuda.CUstream,
     ):
         self._setup_attributes()
+        ctr = cute.make_tensor(ctr_ptr, cute.make_layout((num_tiles_cap,)))
+        rearm_ctr = cute.make_tensor(rearm_ctr_ptr, cute.make_layout((num_tiles_cap,)))
+        rearm_act = cute.make_tensor(rearm_act_ptr, cute.make_layout((1,)))
+        rearm_sf = cute.make_tensor(rearm_sf_ptr, cute.make_layout((1,)))
+        rearm_rows = cute.make_tensor(rearm_rows_ptr, cute.make_layout((1,)))
         # Weights [E, 2I, H/2] bytes as E2M1 (2I, H, E), K-major: the MMA N operand.
         b = cute.make_tensor(
             w_ptr, cute.make_layout((W_ROWS, HIDDEN, num_experts), stride=(HIDDEN, 1, W_ROWS * HIDDEN))
@@ -313,6 +336,11 @@ class Fc1TokenM:
             t2e,
             t2l,
             ntiles,
+            rearm_act,
+            rearm_sf,
+            rearm_rows,
+            ctr,
+            rearm_ctr,
             self.cluster_layout_vmnk,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
@@ -354,6 +382,11 @@ class Fc1TokenM:
         mT2e: cute.Tensor,
         mT2l: cute.Tensor,
         mNumTiles: cute.Tensor,
+        mRearmAct: cute.Tensor,
+        mRearmSf: cute.Tensor,
+        mRearmRows: cute.Tensor,
+        mCtr: cute.Tensor,
+        mRearmCtr: cute.Tensor,
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
@@ -451,7 +484,29 @@ class Fc1TokenM:
                     ab_state.advance()
             ab_pipeline.producer_tail(ab_state)
 
-        if warp_idx >= self.gather_warp_id:
+        if cutlass.const_expr(self.rearm):
+            # Producer re-arm of the previous use's slot pair (its reader, the previous FC2, finished before this
+            # kernel's grid wait returned): sentinel words over the rows that use wrote, a slice per CTA.
+            if warp_idx == self.rearm_warp_id:
+                lane = tidx & 31
+                rows_prev = mRearmRows[0]
+                per_cta = (rows_prev + gdim - 1) // gdim
+                row0 = cutlass.min(bidx * per_cta, rows_prev)
+                row1 = cutlass.min(row0 + per_cta, rows_prev)
+                act_word = cutlass.Int32(-1) if self.sentinel == "ff" else cutlass.Int32(0x80808080)
+                a_base = mRearmAct.iterator.toint() + cutlass.Int64(row0) * INTER
+                n_chunks = (row1 - row0) * (INTER // 16)
+                for c in cutlass.range(lane, n_chunks, 32, unroll=4):
+                    st_global_v4(a_base + cutlass.Int64(c) * 16, act_word, act_word, act_word, act_word)
+                s_base = mRearmSf.iterator.toint() + cutlass.Int64(row0) * (INTER // SF_VEC)
+                n_chunks = (row1 - row0) * (INTER // SF_VEC // 16)
+                for c in cutlass.range(lane, n_chunks, 32, unroll=4):
+                    st_global_v4(s_base + cutlass.Int64(c) * 16, -1, -1, -1, -1)
+                if cutlass.const_expr(self.counters):
+                    for t in cutlass.range(row0 // M_TILE + lane, (row1 + M_TILE - 1) // M_TILE, 32, unroll=1):
+                        mRearmCtr[t] = cutlass.Int32(0)
+
+        if (warp_idx >= self.gather_warp_id) & (warp_idx < self.rearm_warp_id):
             gather_sub = warp_idx - self.gather_warp_id
             a_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.num_ab_stage)
             lane = tidx & 31
@@ -696,12 +751,15 @@ class Fc1TokenM:
             inv_linear_cap = cutlass.Float32(1.0 / self.linear_cap)
             n_groups = tile_n // 64
             ch_per_tile = tile_n // 2
+            if cutlass.const_expr(self.hazard_delay_ns > 0):
+                spin_ns(cutlass.Int64(self.hazard_delay_ns))
             for item in cutlass.range(bidx, total_items, gdim, unroll=1):
                 m_tile = item // n_tiles
                 n_tile = item - m_tile * n_tiles
                 limit = mT2l[m_tile]
                 prow = m_tile * M_TILE + 32 * quad + lane
                 valid = prow < limit
+                sf_word = cutlass.Int32(0)
                 row_act = act_base + cutlass.Int64(prow) * INTER + cutlass.Int64(n_tile * ch_per_tile)
                 kb0 = n_tile * (ch_per_tile // SF_VEC)
                 if cutlass.const_expr(self.sf_layout == "linear"):
@@ -738,11 +796,22 @@ class Fc1TokenM:
                         amax = cute.arch.fmax(amax, cute.arch.fmax(act_v[c], -act_v[c]))
                     sf_byte, inv_scale = ue8m0_scale(amax)
                     sf_byte = cutlass.select_(valid, sf_byte, cutlass.Int32(0))
+                    sf_word = sf_word | (sf_byte << (8 * h))
                     for jb in cutlass.range_constexpr(2):
                         words = []
                         for wq in cutlass.range_constexpr(4):
                             c0 = e4m3x2(act_v[16 * jb + 4 * wq + 1] * inv_scale, act_v[16 * jb + 4 * wq] * inv_scale)
                             c1 = e4m3x2(act_v[16 * jb + 4 * wq + 3] * inv_scale, act_v[16 * jb + 4 * wq + 2] * inv_scale)
+                            if cutlass.const_expr(self.sentinel == "80"):
+                                # E4M3 -0 (0x80) is the slot sentinel: store +0, the same value.
+                                c0 = c0 & ~(
+                                    cutlass.select_((c0 & 0x7F) == 0, cutlass.Int32(0x80), cutlass.Int32(0))
+                                    | cutlass.select_((c0 & 0x7F00) == 0, cutlass.Int32(0x8000), cutlass.Int32(0))
+                                )
+                                c1 = c1 & ~(
+                                    cutlass.select_((c1 & 0x7F) == 0, cutlass.Int32(0x80), cutlass.Int32(0))
+                                    | cutlass.select_((c1 & 0x7F00) == 0, cutlass.Int32(0x8000), cutlass.Int32(0))
+                                )
                             words.append(cutlass.select_(valid, c0 | (c1 << 16), cutlass.Int32(0)))
                         addr = row_act + 32 * h + 16 * jb
                         if cutlass.const_expr(self.store == "v4"):
@@ -751,7 +820,16 @@ class Fc1TokenM:
                             for wq in cutlass.range_constexpr(4):
                                 st_global_b16(addr + 4 * wq, words[wq])
                                 st_global_b16(addr + 4 * wq + 2, words[wq] >> 16)
-                    st_global_b8(row_sf + h, sf_byte)
+                if cutlass.const_expr(n_groups == 4):
+                    st_global_b32(row_sf, sf_word)
+                else:
+                    st_global_b16(row_sf, sf_word)
+                if cutlass.const_expr(self.counters):
+                    # Counter link: once all four epilogue warps stored this tile, one release-add per (m, n) item;
+                    # FC2 acquires n_tiles of them per m-tile.
+                    self.epilog_sync_barrier.arrive_and_wait()
+                    if tidx == 0:
+                        red_release_gpu_add(mCtr.iterator.toint() + cutlass.Int64(m_tile) * 4, cutlass.Int32(1))
             tmem.relinquish_alloc_permit()
             self.epilog_sync_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
@@ -791,7 +869,7 @@ def check(x, x_sf, weights, plan, act, act_sf):
         raise ValueError("plan: tile_idx_to_mn_limit and tile_idx_to_expert_idx differ in length")
 
 
-def launch_args(x, x_sf, weights, plan, act, act_sf, num_ctas):
+def launch_args(x, x_sf, weights, plan, act, act_sf, num_ctas, rearm=None, counters=None):
     return (
         gmem_ptr(cutlass.Float4E2M1FN, weights.w3_w1_weight, 128),
         gmem_ptr(cutlass.Float8E8M0FNU, weights.w3_w1_weight_scale, 128),
@@ -803,6 +881,11 @@ def launch_args(x, x_sf, weights, plan, act, act_sf, num_ctas):
         gmem_ptr(cutlass.Int32, plan.tile_idx_to_expert_idx, 4),
         gmem_ptr(cutlass.Int32, plan.tile_idx_to_mn_limit, 4),
         gmem_ptr(cutlass.Int32, plan.num_non_exiting_tiles, 4),
+        gmem_ptr(cutlass.Int32, act if rearm is None else rearm[0], 16),
+        gmem_ptr(cutlass.Int32, act_sf if rearm is None else rearm[1], 16),
+        gmem_ptr(cutlass.Int32, plan.num_non_exiting_tiles if rearm is None else rearm[2], 4),
+        gmem_ptr(cutlass.Int32, plan.tile_idx_to_expert_idx if counters is None else counters[0], 4),
+        gmem_ptr(cutlass.Int32, plan.tile_idx_to_expert_idx if counters is None else counters[1], 4),
         cutlass.Int32(weights.w3_w1_weight.shape[0]),
         cutlass.Int32(x.shape[0]),
         cutlass.Int32(act.shape[0]),
@@ -835,6 +918,10 @@ def run(
     a_path: str = "tma",
     sf_path: str = "ld",
     gather_issue: str = "elect",
+    sentinel: Optional[str] = None,
+    rearm=None,
+    hazard_delay_ns: int = 0,
+    counters=None,
 ):
     """act[p], act_sf[p] = MXFP8(SiTU-GLU(x[p2e[p] // 16] @ W31[e]^T)) for every row p of every valid 128-row tile of
     the plan (rows at or past the tile's mn_limit get zeros). ``x`` e4m3 [R, 3584], ``x_sf`` uint8 [R, 112] (linear
@@ -843,8 +930,19 @@ def run(
     RoutingPlan tensors (``permuted_idx_to_expanded_idx`` int32 [P], ``tile_idx_to_expert_idx`` /
     ``tile_idx_to_mn_limit`` int32 [T], ``num_non_exiting_tiles`` int32 [1]); ``act`` e4m3 [P, 3072], ``act_sf``
     uint8 [P, 96] (``sf_layout`` linear or the 128x4 atom layout, see the module docstring) with P >= 128 T. One
-    kernel on the current stream; no allocation, no host synchronization."""
+    kernel on the current stream; no allocation, no host synchronization.
+    Lamport FC1 -> FC2 edge: ``sentinel="80"`` stores E4M3 -0 as +0 (the act slot sentinel; scale bytes never reach
+    the 0xFF scale sentinel), ``"ff"`` needs no fix-up; ``rearm=(act_prev, act_sf_prev, rows_prev)`` re-arms the
+    previous use's slot pair over its first ``rows_prev[0]`` rows (int32 device word) after the grid wait;
+    ``hazard_delay_ns`` delays every store (tests). Counter link: ``counters=(ctr, ctr_prev)``, int32 [T] words
+    zeroed before use; ctr[m] is release-added once per (m, n) item after the tile's stores (reaches 6144 / tile_n
+    per m-tile), and ctr_prev (the previous use's, finished) is zeroed with the re-arm."""
     check(x, x_sf, weights, plan, act, act_sf)
+    if counters is not None and (counters[0].dtype != torch.int32 or counters[0].numel() < plan.tile_idx_to_expert_idx.shape[0]):
+        raise ValueError("counters = (ctr int32 [T], ctr_prev int32 [T])")
+    if rearm is not None:
+        if rearm[2].dtype != torch.int32 or rearm[0].shape[1] != INTER or rearm[1].shape[1] != INTER // SF_VEC:
+            raise ValueError("rearm = (act_prev [P, 3072], act_sf_prev [P, 96], rows_prev int32 [1])")
     pdl = use_pdl() if enable_pdl is None else enable_pdl
     key = (
         tile_n,
@@ -864,9 +962,13 @@ def run(
         a_path,
         sf_path,
         gather_issue,
+        sentinel,
+        rearm is not None,
+        hazard_delay_ns,
+        counters is not None,
     )
     ctas = num_ctas_for(x, plan, tile_n) if num_ctas is None else num_ctas
-    args = launch_args(x, x_sf, weights, plan, act, act_sf, ctas)
+    args = launch_args(x, x_sf, weights, plan, act, act_sf, ctas, rearm, counters)
     stream = cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
     compiled = _compiled.get(key)
     if compiled is None:
@@ -888,6 +990,10 @@ def run(
             a_path=a_path,
             sf_path=sf_path,
             gather_issue=gather_issue,
+            sentinel=sentinel,
+            rearm=rearm is not None,
+            hazard_delay_ns=hazard_delay_ns,
+            counters=counters is not None,
         )
         compiled = _compiled[key] = cute.compile(kernel, *args, stream)
     compiled(*args, stream)
