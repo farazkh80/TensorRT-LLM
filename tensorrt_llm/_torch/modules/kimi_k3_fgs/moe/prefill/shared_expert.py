@@ -13,8 +13,6 @@ kernel's ``_situ`` (the stock Triton instruction sequence on the bf16-rounded GE
 values the output is bitwise the stock one; the GEMM itself differs from cuBLAS in its K-reduction order.
 """
 
-from typing import Dict, Tuple
-
 import torch
 
 from .... import kimi_k3_cute_gemm
@@ -25,24 +23,17 @@ INTER = 6144
 # Epilogue subtile columns of the rubin 2-CTA 256x256 tactic for a 16-bit output (4096 elements / 128 rows).
 EPI_N = 32
 
-_interleaved: Dict[Tuple[int, int], torch.Tensor] = {}
-
 
 def interleave_gate_up(w: torch.Tensor) -> torch.Tensor:
-    """``[Wg; Wu]`` [2I, K] -> rows ordered (32 gate, 32 up) per 32 output columns; cached per weight."""
-    key = (w.data_ptr(), w._version)
-    cached = _interleaved.get(key)
-    if cached is not None:
-        return cached
+    """``[Wg; Wu]`` [2I, K] -> rows ordered (32 gate, 32 up) per 32 output columns. Done once per weight by the
+    caller (a module keeps the result); not cached here, a freed weight's address can be reused."""
     rows, k = w.shape
     inter = rows // 2
     if rows % (2 * EPI_N):
         raise ValueError(f"gate_up weight rows {rows} must be a multiple of {2 * EPI_N}")
     wg = w[:inter].reshape(inter // EPI_N, EPI_N, k)
     wu = w[inter:].reshape(inter // EPI_N, EPI_N, k)
-    out = torch.stack((wg, wu), dim=1).reshape(rows, k).contiguous()
-    _interleaved[key] = out
-    return out
+    return torch.stack((wg, wu), dim=1).reshape(rows, k).contiguous()
 
 
 def gate_up(x: torch.Tensor, w_interleaved: torch.Tensor, cap: float, lin: float) -> torch.Tensor:

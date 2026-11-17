@@ -7,6 +7,8 @@
 latent [T, 3584] (the routed experts' combined and normalized output), W_up [7168, 3584], shared [T, 7168] (the
 shared expert), prefix [T, 7168] (the layer's running residual; optional). Stock: cuBLAS GEMM, ATen add, ATen add.
 The folded adds keep the stock rounding sequence, so for equal GEMM values the output is bitwise the stock one.
+The epilogue loads the addend fragments without row predication, so T must be a multiple of the GEMM's 128-row
+CTA tile (a partial last tile would read past the addends); other T take the stock path.
 """
 
 from typing import Optional
@@ -26,6 +28,12 @@ def latent_up(
 ) -> torch.Tensor:
     m, k = latent.shape
     n = w_up.shape[0]
+    cta_m, _ = kimi_k3_cute_gemm.rubin_tile(n, k, m)
+    if m % cta_m:
+        y = reference(latent, w_up, shared, prefix)
+        if out is None:
+            return y
+        return out.copy_(y)
     if out is None:
         out = torch.empty(m, n, dtype=torch.bfloat16, device=latent.device)
     _, tactic = kimi_k3_cute_gemm._select(kimi_k3_cute_gemm._GEMM_TABLE.get((n, k)), m)
