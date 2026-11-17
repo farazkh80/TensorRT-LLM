@@ -105,7 +105,7 @@ def edges_on() -> frozenset:
     unknown = ids - set(_EDGE_IDS) - frozenset(i for i in ids if i.startswith("pm") or i == "gproj")
     if unknown:
         raise ValueError(f"TLLM_K3_FGS_PREFILL_EDGES: unknown {sorted(unknown)}; valid: {', '.join(_EDGE_IDS)}")
-    return frozenset(_EDGE_IDS[i] for i in ids)
+    return frozenset(_EDGE_IDS[i] for i in ids if i in _EDGE_IDS)
 
 
 def on(edge: str) -> bool:
