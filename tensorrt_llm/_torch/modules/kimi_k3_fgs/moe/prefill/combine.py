@@ -381,6 +381,7 @@ class _ReduceNorm:
         poll_ns: int,
         min_blocks: int,
         pdl: bool,
+        own_in_inbox: bool = False,
     ):
         assert top_k <= 32 and ep <= _MAX_RANKS
         assert hidden % (_VEC * _THREADS_PER_ROW) == 0
@@ -388,6 +389,7 @@ class _ReduceNorm:
         self.rows, self.inbox_bytes = rows, inbox_bytes
         self.wait, self.rearm, self.grid_wait, self.pdl = wait, rearm, grid_wait, pdl
         self.poll_ns, self.min_blocks = poll_ns, min_blocks
+        self.own_in_inbox = own_in_inbox
         self.wire = hidden if lpc else 2 * hidden
         self.blocks = hidden // (_VEC * _THREADS_PER_ROW)
         self.threads = hidden // _VEC
@@ -562,9 +564,10 @@ class _ReduceNorm:
                             + Int64(parity) * self.inbox_bytes
                             + (Int64(rank) * self.rows + di) * wire
                         )
-                    if tr == rank:
-                        row = own_base + (Int64(rank) * max_tokens + di) * (H * 2)
-                        own = Int32(1)
+                    if cutlass.const_expr(not self.own_in_inbox):
+                        if tr == rank:
+                            row = own_base + (Int64(rank) * max_tokens + di) * (H * 2)
+                            own = Int32(1)
                     s_src[at] = row
                     s_own[at] = own
         cute.arch.sync_threads()
@@ -943,7 +946,7 @@ class PrefillCombine:
             blocks,
             _TIMEOUT_NS,
         )
-        self._round = (n, mt, y.data_ptr(), blocks, mode, data_only, rearm)
+        self._round = (n, mt, y.data_ptr(), blocks, mode, data_only, rearm, False)
         return self.inbox(mt)
 
     def reduce_norm(
@@ -959,7 +962,7 @@ class PrefillCombine:
     ) -> torch.Tensor:
         if self._round is None:
             raise RuntimeError("PrefillCombine.reduce_norm needs the round's push first")
-        n, mt, y_ptr, blocks, pmode, data_only, prearm = self._round
+        n, mt, y_ptr, blocks, pmode, data_only, prearm, own_in_inbox = self._round
         mode = pmode if fgs is None else MODES[fgs]
         rearm = prearm if rearm is None else rearm
         if rearm not in REARMS:
@@ -1006,6 +1009,7 @@ class PrefillCombine:
             _env_int(POLL_NS_ENV, 256, 32, 1 << 20),
             _env_int(REDUCE_MIN_BLOCKS_ENV, 2, 0, 4),
             _comm._pdl() or mode != "done",
+            own_in_inbox,
         )(
             out,
             norm_weight,

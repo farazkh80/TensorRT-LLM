@@ -206,19 +206,20 @@ class _TilePush:
                             pair = Int32(1)
                     npairs = cute.arch.popc(cute.arch.vote_ballot_sync(pair != 0))
                     if npairs == 1:
+                        # Own rows go into this rank's inbox too: the polling reduce starts under FC2 and may not
+                        # read ``out`` directly.
                         source = token // max_tokens
-                        if source != rank:
-                            slot = token - source * max_tokens
-                            if lane == 0:
-                                _bulk_wait_read()
-                            cute.arch.sync_warp()
-                            dst = side_base + Int64(source) * side_stride + box + Int64(slot) * wire
-                            self._store_row(out + Int64(token) * nbytes, dst, stage, lane)
-                            _fence_proxy_async_shared()
-                            cute.arch.sync_warp()
-                            if lane == 0:
-                                _bulk_s2g(dst, stage, Int32(wire))
-                                _bulk_commit()
+                        slot = token - source * max_tokens
+                        if lane == 0:
+                            _bulk_wait_read()
+                        cute.arch.sync_warp()
+                        dst = side_base + Int64(source) * side_stride + box + Int64(slot) * wire
+                        self._store_row(out + Int64(token) * nbytes, dst, stage, lane)
+                        _fence_proxy_async_shared()
+                        cute.arch.sync_warp()
+                        if lane == 0:
+                            _bulk_s2g(dst, stage, Int32(wire))
+                            _bulk_commit()
         if lane == 0:
             if cutlass.const_expr(self.data_only):
                 _bulk_wait_read()
@@ -243,6 +244,130 @@ class _TilePush:
             if cta == 0:
                 if lane == 0:
                     _st_b32(my_ws + L["flag"], value)
+
+
+class _RestPush(_TilePush):
+    """After the finalize: the rows of tokens with two or more local pairs (the tile push skipped them), own rows
+    included, into the same round's inboxes. No round duties: the tile push did them."""
+
+    @cute.jit
+    def __call__(
+        self,
+        mDummy: cute.Tensor,
+        out: Int64,
+        e2p: Int64,
+        ws_base: Int64,
+        ws_stride: Int64,
+        side_base: Int64,
+        side_stride: Int64,
+        rank: Int32,
+        max_tokens: Int32,
+        n_tokens: Int32,
+        ctas: Int32,
+        stream,
+    ):
+        self.kernel(out, e2p, ws_base, ws_stride, side_base, side_stride, rank, max_tokens, n_tokens).launch(
+            grid=[ctas, 1, 1],
+            block=[self.warps * 32, 1, 1],
+            smem=self.smem_bytes,
+            stream=stream,
+            use_pdl=self.pdl,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        out: Int64,
+        e2p: Int64,
+        ws_base: Int64,
+        ws_stride: Int64,
+        side_base: Int64,
+        side_stride: Int64,
+        rank: Int32,
+        max_tokens: Int32,
+        n_tokens: Int32,
+    ):
+        L = self.lay
+        wire = self.wire
+        cta, _, _ = cute.arch.block_idx()
+        ncta, _, _ = cute.arch.grid_dim()
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        lane = cute.arch.lane_idx()
+        my_ws = ws_base + Int64(rank) * ws_stride
+        nbytes = self.hidden * 2
+        smem = SmemAllocator()
+        buf = smem.allocate_array(cutlass.Uint8, self.warps * wire, byte_alignment=128)
+        stage = Int32(buf.toint()) + warp * wire
+
+        cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_launch_dependents()
+        f = _ld_b32(my_ws + L["flag"])
+        parity = ((f - 1) >> 1) & 1
+        box = _HDR + Int64(parity) * self.inbox_bytes + Int64(rank) * self.rows * wire
+        for token in cutlass.range(cta * self.warps + warp, n_tokens, ncta * self.warps, unroll=1):
+            pair = Int32(0)
+            if lane < TOP_K:
+                if _ld_b32(e2p + (Int64(token) * TOP_K + lane) * 4) >= 0:
+                    pair = Int32(1)
+            npairs = cute.arch.popc(cute.arch.vote_ballot_sync(pair != 0))
+            if npairs >= 2:
+                source = token // max_tokens
+                slot = token - source * max_tokens
+                if lane == 0:
+                    _bulk_wait_read()
+                cute.arch.sync_warp()
+                dst = side_base + Int64(source) * side_stride + box + Int64(slot) * wire
+                self._store_row(out + Int64(token) * nbytes, dst, stage, lane)
+                _fence_proxy_async_shared()
+                cute.arch.sync_warp()
+                if lane == 0:
+                    _bulk_s2g(dst, stage, Int32(wire))
+                    _bulk_commit()
+        if lane == 0:
+            _bulk_wait_read()
+
+
+@functools.lru_cache(maxsize=None)
+def _compile_rest(*cfg):
+    stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    i64, i32 = Int64(0), Int32(0)
+    return cute.compile(
+        _RestPush(*cfg),
+        cute.runtime.make_fake_compact_tensor(cutlass.Uint8, (cute.sym_int(),), assumed_align=16),
+        *([i64] * 6),
+        i32,
+        Int32(1),
+        Int32(1),
+        Int32(1),
+        stream,
+        options="--enable-tvm-ffi",
+    )
+
+
+def push_rest(pc: PrefillCombine, out: torch.Tensor, plan, *, ctas: int = 64, warps: Optional[int] = None) -> None:
+    """After the finalize of the same round (``out`` rows of multi-pair tokens complete): push the rows of tokens
+    with two or more local pairs (own rows included) into the round's inboxes; then ``pc.reduce_norm(fgs=True)``.
+    Must follow ``push_tiles(fgs=True)`` of the round (which did the round duties and set the reduce's mode)."""
+    if pc._round is None or pc._round[4] != "poll" or not pc._round[7]:
+        raise RuntimeError("push_rest follows push_tiles(fgs=True) of the same round")
+    n, mt = pc._round[0], pc._round[1]
+    warps = _env_int(PUSH_WARPS_ENV, 8, 1, 32) if warps is None else warps
+    ws_base, ws_stride = pc._ws()
+    _compile_rest(
+        pc.ep, pc.hidden, pc.lpc, pc.lay.key(), pc.rows, pc.inbox_bytes, warps, 0, False, True, True,
+    )(
+        pc.side[pc.rank, :_CACHELINE],
+        out.data_ptr(),
+        plan.expanded_idx_to_permuted_idx.data_ptr(),
+        ws_base,
+        ws_stride,
+        pc.side.data_ptr(),
+        pc.side.stride(0),
+        pc.rank,
+        mt,
+        pc.ep * mt,
+        ctas,
+    )
 
 
 @functools.lru_cache(maxsize=None)
@@ -308,5 +433,5 @@ def push_tiles(
         ctas,
         _TIMEOUT_NS,
     )
-    pc._round = (n, mt, y.data_ptr(), ctas, "poll" if fgs else "done", data_only, "consumer")
+    pc._round = (n, mt, y.data_ptr(), ctas, "poll" if fgs else "done", data_only, "consumer", fgs)
     return ctas
