@@ -233,6 +233,33 @@ class _Counters:
 
 
 _counters: Dict[torch.device, _Counters] = {}
+# Wait statistics of the counter-link consumers: conv (gate rounds, grid-wait fallbacks), norm (acquire rounds,
+# CTAs that waited), o_proj (retry slots: [1] gate rounds, [2] fallbacks); zeroed after each report.
+_stats: Dict[torch.device, Dict[str, torch.Tensor]] = {}
+
+
+def _stats_of(device: torch.device) -> Dict[str, torch.Tensor]:
+    stats = _stats.get(device)
+    if stats is None:
+        from .dense_gemm_fgs import RETRY_COUNTER_SLOTS
+
+        stats = _stats[device] = {
+            "conv": torch.zeros(2, dtype=torch.int32, device=device),
+            "norm": torch.zeros(2, dtype=torch.int32, device=device),
+            "o_proj": torch.zeros(RETRY_COUNTER_SLOTS, dtype=torch.int32, device=device),
+        }
+    return stats
+
+
+def stats_report(reset: bool = True) -> Dict[str, list]:
+    """The consumers' wait counters since the last report (synchronizes the device)."""
+    report = {}
+    for device, stats in _stats.items():
+        for name, t in stats.items():
+            report[f"{name}@{device.index}"] = t.tolist()
+            if reset:
+                t.zero_()
+    return report
 
 
 def _counters_of(device: torch.device) -> _Counters:
@@ -246,6 +273,8 @@ def _counters_of(device: torch.device) -> _Counters:
 
 outcomes: collections.Counter = collections.Counter()
 LOG_EVERY = 20
+# The wait report synchronizes the device (``tolist``), so it is rarer than the outcome log.
+STATS_EVERY = 200
 
 
 def _note(layer_idx: int, refusal: Optional[str]) -> None:
@@ -257,6 +286,9 @@ def _note(layer_idx: int, refusal: Optional[str]) -> None:
     outcomes[outcome] += 1
     if sum(outcomes.values()) % LOG_EVERY == 0:
         logger.info(f"{ENV}={mode()} KDA prefill layer-forwards: {dict(outcomes)}")
+        if edges.DEBUG and _stats and sum(outcomes.values()) % STATS_EVERY == 0:
+            logger.info(f"{ENV}={mode()} KDA prefill waits (conv rounds/fallbacks, norm rounds/ctas, "
+                        f"o_proj -/rounds/fallbacks): {stats_report()}")
 
 
 def _kernels():
@@ -430,6 +462,7 @@ def _forward_counter(mixer, x2d, cu_seqlens, mamba_metadata, num_prefills, conv_
     has_init = mamba_metadata.has_initial_states[:num_prefills]
     starts = mamba_metadata.query_start_loc[: num_prefills + 1]
     counters = _counters_of(device)
+    stats = _stats_of(device)
     ordinal = _layers.index(mixer.layer_idx)
     pair, prev = _pair(ordinal), _pair((ordinal - 1) % len(_layers))
     cta_m, cta_n = kimi_k3_cute_gemm.rubin_tile(4 * d, mixer.hidden_size, T)
@@ -469,6 +502,7 @@ def _forward_counter(mixer, x2d, cu_seqlens, mamba_metadata, num_prefills, conv_
         fgs_counter_rows=cta_m if pk2 is not None else 0,
         fgs_counter_target=qkv_tiles if pk2 is not None else 0,
         bulk_src=CONV == "bulk",
+        fgs_stats=stats["conv"] if pk2 is not None else None,
     )
     bfa = kimi_k3_cute_gemm.linear(x2d, mixer._bfa_proj_weight)
     g = kimi_k3_cute_gemm.linear(bfa[:, :hd], mixer.f_b_proj.weight)
@@ -489,6 +523,7 @@ def _forward_counter(mixer, x2d, cu_seqlens, mamba_metadata, num_prefills, conv_
         fgs_counters=pk8,
         fgs_counter_rows=o_cta_m * H if pk8 is not None else 0,
         fgs_gate=(pk2[1], cta_m * H, gate_tiles) if pk2 is not None and NORM_GATE else None,
+        fgs_stats=stats["norm"] if pk2 is not None and NORM_GATE else None,
     )
     gate = None if pk8 is None else (pk8, H, norm_rows_per_cta, MAX_SPINS)
     mixer._k3_prefill_pending = (pair, prev, T, False, gate)
@@ -563,8 +598,9 @@ def o_proj(mixer, core2d: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         raise RuntimeError(f"KDA prefill chain: o_proj got {core2d.shape[0]} rows for a {T}-row layer")
     if fgs() and SYNC == "counter":
         return kimi_k3_cute_gemm.linear_fgs(
-            core2d, weight, core2d.new_empty(T, weight.shape[0]), early_trigger=False, gate=gate
-        )
+            core2d, weight, core2d.new_empty(T, weight.shape[0]), early_trigger=False, gate=gate,
+            retry_counter=_stats_of(core2d.device)["o_proj"] if gate is not None else None,
+        )  # fmt: skip
     slots = _slots.get(core2d.device) if fgs() else None
     out_slot = slots.slot(P_ATTN_O, pair, T) if slots is not None else None
     arm = ()

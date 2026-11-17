@@ -218,7 +218,8 @@ class GatedRmsNorm:
         # fgs_gate: thread 0 acquires the counter word of the CTA's row block before any z load (the z producer is
         # not this grid's PDL predecessor, so its completion is not implied by the grid wait).
         self.fgs_gate = fgs_gate
-        assert fgs_consumer or not (with_stats or weak_first_load or l1_first_load)
+        assert (fgs_consumer or fgs_gate) or not with_stats
+        assert fgs_consumer or not (weak_first_load or l1_first_load)
         assert not (weak_first_load and l1_first_load)
         self.fgs_consumer = fgs_consumer
         # fgs_producer: dependents are released at entry and every 16 B of ``out`` is one store that never holds
@@ -317,17 +318,20 @@ class GatedRmsNorm:
         if cutlass.const_expr(self.with_timeline):
             if tidx == 0:
                 cute.arch.atomic_min(timeline.iterator, _globaltimer())
+        spins = cutlass.Int32(0)
+        waited = cutlass.Int32(0)
         if cutlass.const_expr(self.fgs_gate):
             if tidx == 0:
                 gate_addr = gate.iterator.toint() + cutlass.Int64((bidx * self.rows_per_cta) // gate_block_rows) * 4
                 seen = _ld_acquire_b32(gate_addr)
                 while seen < gate_target:
                     _nanosleep(cutlass.Int32(128))
+                    spins = spins + 1
                     seen = _ld_acquire_b32(gate_addr)
+                if spins > 0:
+                    waited = cutlass.Int32(1)
             cute.arch.barrier()
 
-        spins = cutlass.Int32(0)
-        waited = cutlass.Int32(0)
         if cutlass.const_expr(self.persistent_ctas > 0):
             grid_x, _, _ = cute.arch.grid_dim()
             blocks = (rows + self.rows_per_cta - 1) // self.rows_per_cta
@@ -687,7 +691,7 @@ def kda_gated_rmsnorm(
         if fgs_ctas:
             raise ValueError("kda_gated_rmsnorm: fgs_gate needs the default grid")
         use_pdl = True
-    with_stats = fgs_consumer and fgs_stats is not None
+    with_stats = (fgs_consumer or fgs_gate is not None) and fgs_stats is not None
     if with_stats and (fgs_stats.dtype != torch.int32 or fgs_stats.numel() < 2):
         raise ValueError("kda_gated_rmsnorm: fgs_stats must be an int32 tensor of 2 elements")
     with_timeline = fgs_timeline is not None

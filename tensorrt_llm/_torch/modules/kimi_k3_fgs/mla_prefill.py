@@ -221,6 +221,32 @@ class _Slots:
 
 
 _slots: Dict[torch.device, _Slots] = {}
+# Wait statistics: gate (TMA re-issues, CTAs that re-issued), o_proj (retry slots: [1] gate rounds, [2] grid-wait
+# fallbacks); zeroed after each report.
+_stats: Dict[torch.device, Dict[str, torch.Tensor]] = {}
+
+
+def _stats_of(device: torch.device) -> Dict[str, torch.Tensor]:
+    stats = _stats.get(device)
+    if stats is None:
+        from .dense_gemm_fgs import RETRY_COUNTER_SLOTS
+
+        stats = _stats[device] = {
+            "gate": torch.zeros(4, dtype=torch.int32, device=device),
+            "o_proj": torch.zeros(RETRY_COUNTER_SLOTS, dtype=torch.int32, device=device),
+        }
+    return stats
+
+
+def stats_report(reset: bool = True) -> Dict[str, list]:
+    """The consumers' wait counters since the last report (synchronizes the device)."""
+    report = {}
+    for device, stats in _stats.items():
+        for name, t in stats.items():
+            report[f"{name}@{device.index}"] = t.tolist()
+            if reset:
+                t.zero_()
+    return report
 
 
 def _slots_of(device: torch.device, width: int) -> _Slots:
@@ -241,6 +267,8 @@ def rearm_skipped(device: torch.device) -> None:
 
 outcomes: collections.Counter = collections.Counter()
 LOG_EVERY = 20
+# The wait report synchronizes the device (``tolist``), so it is rarer than the outcome log.
+STATS_EVERY = 200
 
 
 def _note(layer_idx: int, refusal: Optional[str]) -> None:
@@ -252,6 +280,9 @@ def _note(layer_idx: int, refusal: Optional[str]) -> None:
     outcomes[outcome] += 1
     if sum(outcomes.values()) % LOG_EVERY == 0:
         logger.info(f"{ENV}={mode()} MLA prefill layer-forwards: {dict(outcomes)}")
+        if edges.DEBUG and _stats and sum(outcomes.values()) % STATS_EVERY == 0:
+            logger.info(f"{ENV}={mode()} MLA prefill waits (gate re-issues/ctas, o_proj -/rounds/fallbacks): "
+                        f"{stats_report()}")
 
 
 def _kernels():
@@ -389,7 +420,8 @@ def output_gate(
         words = _slots_of(o.device, o.shape[1]).words(pair, -(-T // cta_m))
     gated = gate(
         o, g, pdl=not o_in_slot, fgs_consumer=o_in_slot, fgs_max_spins=MAX_SPINS,
-        fgs_stats=fgs_stats if o_in_slot else None, fgs_counters=words, fgs_counter_rows=cta_m,
+        fgs_stats=(fgs_stats if fgs_stats is not None else _stats_of(o.device)["gate"]) if o_in_slot else None,
+        fgs_counters=words, fgs_counter_rows=cta_m,
     )  # fmt: skip
     link = None if words is None else (words, o.shape[1], 32 * 256, MAX_SPINS)
     owner._k3_prefill_pending = (pair, prev, T, live, link)
@@ -406,8 +438,9 @@ def o_proj(owner, gated: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         raise RuntimeError(f"MLA prefill chain: o_proj got {gated.shape[0]} rows for a {T}-row layer")
     arm = _slots_of(gated.device, gated.shape[1]).arm_regions(prev) if live else ()
     return kimi_k3_cute_gemm.linear_fgs(
-        gated, weight, gated.new_empty(T, weight.shape[0]), early_trigger=False, gate=link, arm=arm
-    )
+        gated, weight, gated.new_empty(T, weight.shape[0]), early_trigger=False, gate=link, arm=arm,
+        retry_counter=_stats_of(gated.device)["o_proj"] if link is not None else None,
+    )  # fmt: skip
 
 
 def forward_from_module(mla, hidden_states: torch.Tensor, attn_metadata) -> Optional[torch.Tensor]:

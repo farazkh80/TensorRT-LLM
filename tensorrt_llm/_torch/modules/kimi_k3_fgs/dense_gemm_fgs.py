@@ -117,7 +117,8 @@ QKVG_DECODE_TACTIC = ("base", False, (128, 128), (1, 1), 0, 1)
 # Upper bound on persistent CTAs recorded by the timeline build.
 TIMELINE_MAX_CTAS = 1024
 # int32 elements of the retry counter: A re-issues.
-RETRY_COUNTER_SLOTS = 1
+# [0] A re-issues (report_valid), [1] counter-gate rounds, [2] counter-gate grid-wait fallbacks.
+RETRY_COUNTER_SLOTS = 3
 # Packed launch: the 13 arm / counter / gate scalars live in a cached int64 device buffer the kernel reads at
 # entry, so the host marshals 11 arguments instead of 28 (each costs ~2 us in the DSL executor).
 PARAMS_LEN = 16
@@ -645,15 +646,22 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
                     gate_addr = cnt_gate + cutlass.Int64(cur_tile_coord[0]) * 4
                     seen = ld_acquire(gate_addr)
                     rounds = cutlass.Int32(0)
+                    fell = cutlass.Int32(0)
                     while seen < target:
                         if rounds >= self.gate_spins:
                             cute.arch.griddepcontrol_wait()
                             seen = target
+                            fell = cutlass.Int32(1)
                         else:
                             nanosleep(cutlass.Int32(128))
                             rounds = rounds + 1
                             seen = ld_acquire(gate_addr)
                     fence_proxy_async_global()
+                    with cute.arch.elect_one():
+                        if rounds > 0:
+                            cute.arch.atomic_add(retry_count.iterator + 1, rounds)
+                        if fell > 0:
+                            cute.arch.atomic_add(retry_count.iterator + 2, fell)
                 mma_tile_coord_mnl = (
                     cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
                     cur_tile_coord[1],

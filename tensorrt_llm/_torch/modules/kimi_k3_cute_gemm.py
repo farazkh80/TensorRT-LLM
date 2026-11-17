@@ -396,6 +396,7 @@ def linear_fgs(
     publish: Optional[Tuple[torch.Tensor, int]] = None,
     gate: Optional[Tuple[torch.Tensor, int, int, int]] = None,
     wait: bool = True,
+    retry_counter: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """``out[M, N] = x[M, K] @ weight[N, K]^T`` with the table's ``rubin`` persistent GEMM in its fine-grained-sync
     build, roles given explicitly (the prefill chains hand their own slots in, which are not edge leases):
@@ -439,6 +440,7 @@ def linear_fgs(
         start_delay_ns=start_delay_ns,
         publish=publish,
         gate=gate,
+        retry_counter=retry_counter,
     )
     return out
 

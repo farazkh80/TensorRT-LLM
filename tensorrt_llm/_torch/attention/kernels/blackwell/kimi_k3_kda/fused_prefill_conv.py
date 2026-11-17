@@ -637,7 +637,7 @@ class KdaConv:
         assert self.RUN == 1 << self.RUN_LOG2
         assert self.D % ASYNC_GROUP == 0 and self.U % ASYNC_GROUP == 0
         assert not (fgs_consumer or fgs_producer) or (src_vec and out_vec)
-        assert fgs_consumer or not with_stats
+        assert (fgs_consumer or gate_counters) or not with_stats
         assert not bulk_src or (src_vec and not fgs_consumer and self.C % WARP_CH == 0)
         self.fgs_consumer = fgs_consumer
         self.fgs_producer = fgs_producer
@@ -720,7 +720,7 @@ class KdaConv:
             warp_sync()
         # Reload rounds and fallbacks of this thread (warp-uniform).
         cnt = None
-        if cutlass.const_expr(self.fgs_consumer):
+        if cutlass.const_expr(self.fgs_consumer or self.with_stats):
             cnt = cute.make_rmem_tensor(cute.make_layout(2), cutlass.Int32)
             cnt[0] = cutlass.Int32(0)
             cnt[1] = cutlass.Int32(0)
@@ -931,14 +931,19 @@ class KdaConv:
                     gate_addr = gcnt + cutlass.Int64(blk) * 4
                     seen = ld_acquire_b32(gate_addr)
                     rounds = cutlass.Int32(0)
+                    fell = cutlass.Int32(0)
                     while seen < gcnt_target:
                         if rounds >= self.max_spins:
                             cute.arch.griddepcontrol_wait()
                             seen = gcnt_target
+                            fell = cutlass.Int32(1)
                         else:
                             nanosleep(cutlass.Int32(128))
                             rounds = rounds + 1
                             seen = ld_acquire_b32(gate_addr)
+                    if cutlass.const_expr(self.with_stats):
+                        cnt[0] = cnt[0] + rounds
+                        cnt[1] = cnt[1] + fell
             ring_lane = ring_warp + lane * 16
             # Halo rows t0-3..t0-1 (needed by token 0) are requested before the ring prologue.
             hw = cute.make_rmem_tensor(cute.make_layout(4 * (WIDTH - 1)), cutlass.Int32)
@@ -1813,10 +1818,10 @@ def fused_prefill_conv(
         raise ValueError("KDA convolution FGS modes need 16-byte aligned source rows and outputs")
     if bulk_src and (not src_vec or fgs_consumer or (3 * heads * 128) % WARP_CH):
         raise ValueError("bulk_src needs 16-byte aligned source rows, no fgs_consumer, and 256 | 3 * heads * 128")
-    with_stats = fgs_consumer and fgs_stats is not None
+    gate = fgs_counters is not None
+    with_stats = (fgs_consumer or gate) and fgs_stats is not None
     if with_stats and (fgs_stats.dtype != torch.int32 or fgs_stats.numel() < 2):
         raise ValueError("fgs_stats must be an int32 tensor of 2 elements")
-    gate = fgs_counters is not None
     if gate:
         if fgs_consumer or fgs_counter_rows <= 0 or fgs_counter_target <= 0:
             raise ValueError("fgs_counters needs fgs_counter_rows and fgs_counter_target, without fgs_consumer")
