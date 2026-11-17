@@ -990,25 +990,13 @@ class Fc1TokenM:
                                 act_v[16 * jb + 4 * wq + 3] * inv_scale,
                                 act_v[16 * jb + 4 * wq + 2] * inv_scale,
                             )
+                            w = c0 | (c1 << 16)
                             if cutlass.const_expr(self.sentinel == "80"):
-                                # E4M3 -0 (0x80) is the slot sentinel: store +0, the same value.
-                                c0 = c0 & ~(
-                                    cutlass.select_(
-                                        (c0 & 0x7F) == 0, cutlass.Int32(0x80), cutlass.Int32(0)
-                                    )
-                                    | cutlass.select_(
-                                        (c0 & 0x7F00) == 0, cutlass.Int32(0x8000), cutlass.Int32(0)
-                                    )
-                                )
-                                c1 = c1 & ~(
-                                    cutlass.select_(
-                                        (c1 & 0x7F) == 0, cutlass.Int32(0x80), cutlass.Int32(0)
-                                    )
-                                    | cutlass.select_(
-                                        (c1 & 0x7F00) == 0, cutlass.Int32(0x8000), cutlass.Int32(0)
-                                    )
-                                )
-                            words.append(cutlass.select_(valid, c0 | (c1 << 16), cutlass.Int32(0)))
+                                # E4M3 -0 (0x80) is the slot sentinel: store +0, the same value. With bit 7 set on
+                                # every byte the decrement cannot borrow: bit 7 of (byte - 1) is clear iff |code| == 0.
+                                dec = ((w & 0x7F7F7F7F) | cutlass.Int32(-0x7F7F7F80)) - 0x01010101
+                                w = w & ~(~dec & cutlass.Int32(-0x7F7F7F80))
+                            words.append(cutlass.select_(valid, w, cutlass.Int32(0)))
                         if cutlass.const_expr(tma_out):
                             st_shared_v4(
                                 out_stage + out_row + ((jb ^ out_swz) << 4),
