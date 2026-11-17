@@ -48,6 +48,9 @@ from .common import (
     TOP_K,
     UnalignedBarrier,
     bits_f32,
+    bulk_commit_group,
+    bulk_wait_group,
+    bulk_wait_group_read,
     check_tensor,
     fence_proxy_async_global,
     gmem_ptr,
@@ -56,12 +59,19 @@ from .common import (
     red_release_gpu_add,
     s2t_copy_and_partition,
     st_global_v4,
+    st_shared_v4,
     tcgen05_fence,
+    tma_scatter4_2d,
+    tma_store_2d,
     tmem_load_32x32b_x32,
     use_pdl,
 )
 
 M_TILE = 128
+# TMA-store epilogue: per epilogue warp two 32-row x 64 B stages (one 32-channel block of each row), SW64-swizzled.
+OUT_COLS = 32
+OUT_STAGE_BYTES = 32 * OUT_COLS * 2
+OUT_STAGES = 2
 
 
 @dsl_user_op
@@ -102,6 +112,7 @@ class Fc2TokenM:
         sentinel: str = "80",
         force_slow: bool = False,
         publish: bool = False,
+        store: str = "v4",
     ):
         if sync not in (None, "lamport", "counter") or sentinel not in ("80", "ff"):
             raise ValueError(
@@ -113,6 +124,8 @@ class Fc2TokenM:
             raise ValueError(f"pdl_trigger must be end, start or none, got {pdl_trigger}")
         if k_blocks not in (4, 8, 16):
             raise ValueError("k_blocks must be 4, 8 or 16")
+        if store not in ("v4", "tma"):
+            raise ValueError(f"store must be v4 or tma, got {store}")
         self.tile_n = tile_n
         self.num_n_tiles = HIDDEN // tile_n
         self.use_pdl = use_pdl
@@ -120,6 +133,7 @@ class Fc2TokenM:
         self.lamport = sync == "lamport"
         self.counter = sync == "counter"
         self.publish = publish
+        self.store = store
         self.sentinel = sentinel
         self.force_slow = force_slow
         self.pdl_trigger = pdl_trigger
@@ -138,6 +152,9 @@ class Fc2TokenM:
         self.threads_per_warp = 32
         self.threads_per_cta = 32 * 6
         self.num_epilog_threads = 32 * len(self.epilog_warp_id)
+        self.out_smem_bytes = (
+            len(self.epilog_warp_id) * OUT_STAGES * OUT_STAGE_BYTES if store == "tma" else 0
+        )
         self.cta_sync_barrier = pipeline.NamedBarrier(
             barrier_id=1, num_threads=self.threads_per_cta
         )
@@ -182,7 +199,7 @@ class Fc2TokenM:
             + cute.size_in_bytes(cutlass.Float8E8M0FNU, sfa_one)
             + cute.size_in_bytes(cutlass.Float8E8M0FNU, sfb_one)
         )
-        reserved = 1024 + 4 * 1024 + 1024
+        reserved = 1024 + 4 * 1024 + 1024 + self.out_smem_bytes
         self.num_ab_stage = min((self.smem_capacity - reserved) // stage_bytes, self.max_ab_stages)
         if self.num_ab_stage < 2:
             raise ValueError("not enough shared memory for two mainloop stages")
@@ -319,6 +336,25 @@ class Fc2TokenM:
         self.num_tma_load_bytes = self.num_b_load_bytes + (
             0 if self.lamport else self.num_act_load_bytes
         )
+        tma_atom_y = tma_atom_out = tma_atom_a
+        if cutlass.const_expr(self.store == "tma"):
+            # y rows: a (32 rows x 32 bf16) box; out rows: a one-row box scattered four rows at a time.
+            y_store_layout = cute.make_composed_layout(
+                cute.make_swizzle(2, 4, 3),
+                0,
+                cute.make_layout((32, OUT_COLS), stride=(OUT_COLS, 1)),
+            )
+            tma_atom_y, _ = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileS2GOp(), y, y_store_layout, (32, OUT_COLS)
+            )
+            out_store_layout = cute.make_composed_layout(
+                cute.make_swizzle(2, 4, 3),
+                0,
+                cute.make_layout((1, OUT_COLS), stride=(OUT_COLS, 1)),
+            )
+            tma_atom_out, _ = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileS2GOp(), out, out_store_layout, (1, OUT_COLS)
+            )
 
         @cute.struct
         class SharedStorage:
@@ -362,6 +398,8 @@ class Fc2TokenM:
             tma_tensor_b,
             tma_atom_sfb,
             tma_tensor_sfb,
+            tma_atom_y,
+            tma_atom_out,
             y,
             out,
             topk_w,
@@ -382,7 +420,8 @@ class Fc2TokenM:
             grid=[num_ctas, 1, 1],
             block=[self.threads_per_cta, 1, 1],
             cluster=(1, 1, 1),
-            smem=self.shared_storage.size_in_bytes(),
+            smem=self.shared_storage.size_in_bytes()
+            + (self.out_smem_bytes + 1024 if self.out_smem_bytes else 0),
             stream=stream,
             min_blocks_per_mp=1,
             use_pdl=self.use_pdl,
@@ -433,6 +472,8 @@ class Fc2TokenM:
         mB_nkl: cute.Tensor,
         tma_atom_sfb: cute.CopyAtom,
         mSFB_nkl: cute.Tensor,
+        tma_atom_y: cute.CopyAtom,
+        tma_atom_out: cute.CopyAtom,
         mY: cute.Tensor,
         mOut: cute.Tensor,
         mTopkW: cute.Tensor,
@@ -463,6 +504,8 @@ class Fc2TokenM:
             cpasync.prefetch_descriptor(tma_atom_sfb)
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
+        if cutlass.const_expr(self.store == "tma"):
+            out_smem = smem.allocate(self.out_smem_bytes, 1024)
         ab_pipeline = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.ab_mbar.data_ptr(),
             num_stages=self.num_ab_stage,
@@ -717,7 +760,19 @@ class Fc2TokenM:
             tmem_quad = tmem_ptr.toint() + ((32 * quad) << 16)
             y_base = mY.iterator.toint()
             out_base = mOut.iterator.toint()
-            n_blocks = tile_n // 32
+            n_blocks = tile_n // OUT_COLS
+            tma_out = self.store == "tma"
+            if cutlass.const_expr(tma_out):
+                # Stage (j & 1) holds this warp's 32 rows x 64 B of block j; SW64 (16 B chunk ^= row bits 1-2)
+                # keeps the row writes bank-conflict-free and matches both store descriptors' swizzle. Lane 0 issues
+                # the y tile box, lanes 4 g the scatter4 of rows 4 g .. 4 g + 3 into out; every lane tracks its own
+                # bulk groups, one per block.
+                out_warp = out_smem.toint() + quad * (OUT_STAGES * OUT_STAGE_BYTES)
+                out_row = lane * (OUT_COLS * 2)
+                out_swz = (lane >> 1) & 3
+                grp = lane & ~3
+                grp_lead = (lane & 3) == 0
+                num_rows = mOut.shape[0]
             for item in cutlass.range(bidx, total_items, gdim, unroll=1):
                 m_tile = item // n_tiles
                 n_tile = item - m_tile * n_tiles
@@ -736,12 +791,26 @@ class Fc2TokenM:
                         npairs = npairs + cutlass.select_(
                             mE2p[token * TOP_K + k] >= 0, cutlass.Int32(1), cutlass.Int32(0)
                         )
-                    single = npairs == 1
+                    single = valid & (npairs == 1)
+                    multi = valid & (npairs != 1)
                     w = bits_f32(cutlass.Int32(mTopkW[expanded]) << 16)
                     dst = cutlass.select_(
                         single, out_base + cutlass.Int64(token) * (HIDDEN * 2), dst
                     )
                     scale = cutlass.select_(single, w, cutlass.Float32(1.0))
+                if cutlass.const_expr(tma_out):
+                    if cutlass.const_expr(self.fin):
+                        # Rows not bound for out (multi-pair, padding) scatter to row num_rows: out of bounds, dropped.
+                        tok_or_oob = cutlass.select_(single, token, num_rows)
+                        tok0 = cute.arch.shuffle_sync(tok_or_oob, grp)
+                        tok1 = cute.arch.shuffle_sync(tok_or_oob, grp + 1)
+                        tok2 = cute.arch.shuffle_sync(tok_or_oob, grp + 2)
+                        tok3 = cute.arch.shuffle_sync(tok_or_oob, grp + 3)
+                        single_mask = cute.arch.vote_ballot_sync(single)
+                        store_out = grp_lead & (((single_mask >> grp) & 0xF) != 0)
+                        store_y = (lane == 0) & (cute.arch.vote_ballot_sync(multi) != 0)
+                    else:
+                        store_y = (lane == 0) & (cute.arch.vote_ballot_sync(valid) != 0)
                 acc_pipeline.consumer_wait(acc_state)
                 tcgen05_fence("after")
                 tmem_stage = tmem_quad + acc_state.index * tile_n
@@ -763,24 +832,55 @@ class Fc2TokenM:
                             words.append(bf16x2(hi, lo))
                         else:
                             words.append(bf16x2(cols[c + 8], cols[c]))
-                    if valid:
-                        addr = dst + cutlass.Int64(n_tile * (tile_n * 2) + j * 64)
+                    if cutlass.const_expr(tma_out):
+                        out_stage = out_warp + (j & 1) * OUT_STAGE_BYTES
+                        # The group issued two blocks ago read this stage; one group may stay in flight.
+                        bulk_wait_group_read(1)
+                        cute.arch.sync_warp()
                         for v in cutlass.range_constexpr(4):
-                            st_global_v4(
-                                addr + 16 * v,
-                                words[4 * v],
-                                words[4 * v + 1],
-                                words[4 * v + 2],
-                                words[4 * v + 3],
+                            st_shared_v4(
+                                out_stage + out_row + ((v ^ out_swz) << 4),
+                                cutlass.select_(valid, words[4 * v], cutlass.Int32(0)),
+                                cutlass.select_(valid, words[4 * v + 1], cutlass.Int32(0)),
+                                cutlass.select_(valid, words[4 * v + 2], cutlass.Int32(0)),
+                                cutlass.select_(valid, words[4 * v + 3], cutlass.Int32(0)),
                             )
+                        cute.arch.fence_proxy("async.shared", space="cta")
+                        cute.arch.sync_warp()
+                        col = n_tile * tile_n + OUT_COLS * j
+                        if store_y:
+                            tma_store_2d(tma_atom_y, out_stage, col, m_tile * M_TILE + 32 * quad)
+                        if cutlass.const_expr(self.fin):
+                            if store_out:
+                                tma_scatter4_2d(
+                                    tma_atom_out, out_stage + out_row, col, tok0, tok1, tok2, tok3
+                                )
+                        bulk_commit_group()
+                    else:
+                        if valid:
+                            addr = dst + cutlass.Int64(n_tile * (tile_n * 2) + j * 64)
+                            for v in cutlass.range_constexpr(4):
+                                st_global_v4(
+                                    addr + 16 * v,
+                                    words[4 * v],
+                                    words[4 * v + 1],
+                                    words[4 * v + 2],
+                                    words[4 * v + 3],
+                                )
                 if cutlass.const_expr(self.publish):
                     # Once all four epilogue warps stored this (m, n) item, one release-add on the m-tile's word;
-                    # the m-tile's out / y rows are complete when it reaches the number of n-tiles.
+                    # the m-tile's out / y rows are complete when it reaches the number of n-tiles. TMA stores must
+                    # have completed and crossed the proxy boundary before the release.
+                    if cutlass.const_expr(tma_out):
+                        bulk_wait_group(0)
+                        fence_proxy_async_global()
                     self.epilog_sync_barrier.arrive_and_wait()
                     if tidx == 0:
                         red_release_gpu_add(
                             mPub.iterator.toint() + cutlass.Int64(m_tile) * 4, cutlass.Int32(1)
                         )
+            if cutlass.const_expr(tma_out):
+                bulk_wait_group(0)
             tmem.relinquish_alloc_permit()
             self.epilog_sync_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
@@ -889,6 +989,7 @@ def run(
     force_slow: bool = False,
     counters=None,
     publish=None,
+    store: str = "v4",
 ):
     """y[p] = bf16(dequant(act[p]) @ W2[e]^T) for every valid permuted row p of expert e (``act`` e4m3 [P, 3072],
     ``act_sf`` uint8 [P, 96] in the 128x4 atom layout, ``weights.w2_weight`` uint8 [E, 3584, 1536] +
@@ -898,7 +999,10 @@ def run(
     ``publish``: int32 [T] device words (zeroed by the caller); publish[m] is release-added once per (m, n) item after
     the item's out / y stores, so m-tile m's rows are complete when publish[m] == 3584 // tile_n (14 for tile_n 256).
     ``counters=(ctr int32 [T], target)``: with ``sync="counter"`` the loads of m-tile m wait for ctr[m] >= target
-    (acquire) and a proxy fence instead of the grid wait."""
+    (acquire) and a proxy fence instead of the grid wait. ``store="tma"``: 32-row x 64 B TMA tile stores into ``y``
+    and scatter4 row stores into ``out`` from two shared stages per epilogue warp; a 32-row group with any row bound
+    for ``y`` is stored whole, so ``y`` rows of single-pair tokens and padding rows (never read) hold the staged
+    values, zeros for padding."""
     check(act, act_sf, weights, plan, y, fin)
     pdl = use_pdl() if enable_pdl is None else enable_pdl
     key = (
@@ -914,6 +1018,7 @@ def run(
         sentinel,
         force_slow,
         publish is not None,
+        store,
     )
     if publish is not None and (
         publish.dtype != torch.int32 or publish.numel() < plan.tile_idx_to_expert_idx.shape[0]
@@ -941,6 +1046,7 @@ def run(
             sentinel=sentinel,
             force_slow=force_slow,
             publish=publish is not None,
+            store=store,
         )
         compiled = _compiled[key] = cute.compile(kernel, *args, stream)
     compiled(*args, stream)
