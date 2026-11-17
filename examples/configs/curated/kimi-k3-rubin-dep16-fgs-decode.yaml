@@ -57,7 +57,9 @@ fine_grained_sync_config:
     # the shared-expert down that runs beside it.
     TLLM_K3_COMM_INBOX_DATA_ONLY: "1"
     TLLM_K3_COMM_INBOX_BLOCKS: "4"
-    # FC1 -> FC2 as a Lamport edge instead of fc1_done counters: FC1 writes into slots armed with E4M3 -0 / 0xFF and
-    # FC2 checks every byte it reads. Under the step policy each MoE layer holds its own slot, sized for worst-case
-    # routing; the step-end fill re-arms only the rows each layer used.
+    # FC1 -> FC2 as a Lamport edge instead of fc1_done counters: FC1 stores whole 16 B chunks into slots armed with
+    # 0x80, and FC2's TMA report_valid loads check element 0 of each chunk. Under the step policy each MoE layer holds
+    # its own slot, sized for worst-case routing; the step-end fill re-arms only the rows each layer used.
     TLLM_K3_MOE_FC1_FC2_SYNC: lamport
+    TLLM_K3_MOE_FC1_FC2_LAMPORT_CHECK: tma
+    TLLM_K3_MOE_FC1_ACT_STORE: v4
