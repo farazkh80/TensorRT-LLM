@@ -1,5 +1,5 @@
 diff --git a/fmha.py b/fmha.py
-index 5c2866ad1647d3daf34f49a9c8f38c0825e083b4..68e56f165cce464ba4d994ee1dea1fa3add270fb 100644
+index 5c2866ad1647d3daf34f49a9c8f38c0825e083b4..b08fdff367301c60c36bf9615c42ff9663b2ceac 100644
 --- a/fmha.py
 +++ b/fmha.py
 @@ -48,6 +48,14 @@ from cutlass.cutlass_dsl import BaseDSL
@@ -7,9 +7,9 @@ index 5c2866ad1647d3daf34f49a9c8f38c0825e083b4..68e56f165cce464ba4d994ee1dea1fa3
  from .helpers import fmha_helpers as fmha_utils
  
 +try:
-+    from ..mla_fgs import bf16x2_pzo, trap
++    from ..mla_fgs import bf16x2_pzo, st_global_v4, trap
 +except ImportError:
-+    from mla_fgs import bf16x2_pzo, trap
++    from mla_fgs import bf16x2_pzo, st_global_v4, trap
 +
 +# fgs_stats slots: re-issued loads, CTAs that re-issued, of which Q loads, of which K loads.
 +FGS_STATS_LEN = 4
@@ -537,7 +537,7 @@ index 5c2866ad1647d3daf34f49a9c8f38c0825e083b4..68e56f165cce464ba4d994ee1dea1fa3
      def get_skip_softmax_flag(self, tiled_tmem_load_v, tTMEM_LOADtS_v, tTMEM_LOADrS_v):
          cute.copy(tiled_tmem_load_v, tTMEM_LOADtS_v, tTMEM_LOADrS_v)
          tTMEM_LOADrS_v_i32 = cute.recast_tensor(tTMEM_LOADrS_v, dtype=cutlass.Int32)
-@@ -3082,8 +3417,16 @@ class BlackwellFusedMultiHeadAttentionForward:
+@@ -3082,15 +3417,34 @@ class BlackwellFusedMultiHeadAttentionForward:
                      (scale, scale),
                  )
              tDMrO = cute.make_rmem_tensor(tTMrO.shape, self.o_dtype)
@@ -545,7 +545,6 @@ index 5c2866ad1647d3daf34f49a9c8f38c0825e083b4..68e56f165cce464ba4d994ee1dea1fa3
 -            tDMrO.store(o_vec.to(self.o_dtype))
 +            if cutlass.const_expr(self.fgs_producer):
 +                # cvt.rn.pzo: same rounding as the default convert except that -0.0 (the sentinel) becomes +0.0.
-+                # The store stays the default one: the consumer (output gate) checks every element of a chunk.
 +                assert cutlass.const_expr(self.o_dtype == cutlass.BFloat16)
 +                o_words = cute.recast_tensor(tDMrO, Int32)
 +                for e in cutlass.range_constexpr(cute.size(tTMrO) // 2):
@@ -556,6 +555,26 @@ index 5c2866ad1647d3daf34f49a9c8f38c0825e083b4..68e56f165cce464ba4d994ee1dea1fa3
              if cutlass.const_expr(self.use_tma_store):
                  # TMA store path: write to shared memory
                  cute.copy(tiled_smem_store, tDMrO, tTMEM_LOADdO_i)
+             else:
+                 # st.global path: write directly to global memory with bounds check
+                 if row_idx < seqlen_q:
+-                    cute.autovec_copy(tDMrO, tTMEM_LOADdO_i)
++                    if cutlass.const_expr(self.fgs_producer):
++                        # One 16-B store per chunk: a TMA report_valid consumer checks a chunk by its first element.
++                        o_base = tTMEM_LOADdO_i.iterator.toint()
++                        for c in cutlass.range_constexpr(cute.size(tTMrO) // 8):
++                            st_global_v4(
++                                o_base + c * 16,
++                                o_words[4 * c],
++                                o_words[4 * c + 1],
++                                o_words[4 * c + 2],
++                                o_words[4 * c + 3],
++                            )
++                    else:
++                        cute.autovec_copy(tDMrO, tTMEM_LOADdO_i)
+ 
+         if cutlass.const_expr(mLSE is not None):
+             scaled_tmp = scale_softmax * tTMEM_LOAD_VECrS[1]
 diff --git a/helpers/fmha_helpers.py b/helpers/fmha_helpers.py
 index f2034556e1d8040e440252bc3088bfb96e6d3f72..f4afa90d274d487a7eb8e39b37a28639475f1f33 100644
 --- a/helpers/fmha_helpers.py

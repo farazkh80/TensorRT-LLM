@@ -11,8 +11,8 @@ vendors:
     - fmha.py
     - helpers/*.py
     patch: 3rdparty/vendor_patches/flashinfer-cute-dsl-fmha.patch
-    patch_digest: sha256:efa07dd2bdf21810598be41eb85ee26e7c2eade2a094b604945d4f9f839ffaed
-    digest: sha256-tree-v1:e64cd93960c748b4b5b3cf368719938c7e83e1b244628ba14542e42c6453713b
+    patch_digest: sha256:31a7c26a8c7be98a1fb1502de1dd867b793493fdae9ad4277e751cf707225e84
+    digest: sha256-tree-v1:1c2d8d69a02f57d3645c359d1ad89c7729f73c17c30ae3840c37c3ff9cd0ba77
   flashinfer-kda-bt16:
     url: https://github.com/flashinfer-ai/flashinfer.git
     branch: main
