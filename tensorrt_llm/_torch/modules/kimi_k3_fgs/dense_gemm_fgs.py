@@ -118,6 +118,9 @@ QKVG_DECODE_TACTIC = ("base", False, (128, 128), (1, 1), 0, 1)
 TIMELINE_MAX_CTAS = 1024
 # int32 elements of the retry counter: A re-issues.
 RETRY_COUNTER_SLOTS = 1
+# Packed launch: the 13 arm / counter / gate scalars live in a cached int64 device buffer the kernel reads at
+# entry, so the host marshals 11 arguments instead of 28 (each costs ~2 us in the DSL executor).
+PARAMS_LEN = 16
 
 
 class _Stage:
@@ -260,6 +263,7 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
         p: Optional[cute.Tensor],
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
+        params: Optional[cute.Tensor] = None,
     ):
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
         self.b_dtype: Type[cutlass.Numeric] = b.element_type
@@ -363,6 +367,7 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
             cnt_gate,
             gate_scale,
             gate_unit,
+            params,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -407,7 +412,22 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
         cnt_gate: cutlass.Int64,
         gate_scale: cutlass.Int32,
         gate_unit: cutlass.Int32,
+        params: Optional[cute.Tensor],
     ):
+        if cutlass.const_expr(params is not None):
+            arm0_base = params[0]
+            arm0_chunks = cutlass.Int32(params[1])
+            arm1_base = params[2]
+            arm1_chunks = cutlass.Int32(params[3])
+            arm2_base = params[4]
+            arm2_chunks = cutlass.Int32(params[5])
+            arm3_base = params[6]
+            arm3_chunks = cutlass.Int32(params[7])
+            arm_words = cutlass.Int32(params[8])
+            cnt_pub = params[9]
+            cnt_gate = params[10]
+            gate_scale = cutlass.Int32(params[11])
+            gate_unit = cutlass.Int32(params[12])
         if cutlass.const_expr(self.early_trigger and self.use_pdl):
             cute.arch.griddepcontrol_launch_dependents()
         if cutlass.const_expr(self.start_delay_ns > 0):
@@ -1284,6 +1304,82 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
         )  # fmt: skip
 
     @cute.jit
+    def wrapper_packed_fgs(
+        self,
+        m: cutlass.Int32,
+        n: cutlass.Int32,
+        k: cutlass.Int32,
+        batch_size: cutlass.Int32,
+        a_ptr: cute.Pointer,
+        b_ptr: cute.Pointer,
+        c_ptr: cute.Pointer,
+        stamps_ptr: cute.Pointer,
+        retry_ptr: cute.Pointer,
+        params_ptr: cute.Pointer,
+        max_active_clusters: cutlass.Constexpr,
+        stream: cuda.CUstream,
+    ):
+        a_tensor = cute.make_tensor(
+            a_ptr, layout=cute.make_ordered_layout((m, k, batch_size), order=(1, 0, 2))
+        )
+        b_tensor = cute.make_tensor(
+            b_ptr, layout=cute.make_ordered_layout((n, k, batch_size), order=(1, 0, 2))
+        )
+        c_tensor = cute.make_tensor(
+            c_ptr, layout=cute.make_ordered_layout((m, n, batch_size), order=(1, 0, 2))
+        )
+        stamps = cute.make_tensor(stamps_ptr, layout=cute.make_layout((TIMELINE_MAX_CTAS,)))
+        retry_count = cute.make_tensor(retry_ptr, layout=cute.make_layout((RETRY_COUNTER_SLOTS,)))
+        params = cute.make_tensor(params_ptr, layout=cute.make_layout((PARAMS_LEN,)))
+        z64, z32 = cutlass.Int64(0), cutlass.Int32(0)
+        self(
+            a_tensor, b_tensor, c_tensor, stamps, retry_count,
+            z64, z32, z64, z32, z64, z32, z64, z32, z32, z64, z64, z32, z32, None, None, None,
+            max_active_clusters, stream, params=params,
+        )  # fmt: skip
+
+    @cute.jit
+    def wrapper_packed_strided_fgs(
+        self,
+        m: cutlass.Int32,
+        n: cutlass.Int32,
+        k: cutlass.Int32,
+        batch_size: cutlass.Int32,
+        a_ptr: cute.Pointer,
+        b_ptr: cute.Pointer,
+        c_ptr: cute.Pointer,
+        a_stride_m: cutlass.Int64,
+        a_stride_batch: cutlass.Int64,
+        b_stride_n: cutlass.Int64,
+        b_stride_batch: cutlass.Int64,
+        c_stride_m: cutlass.Int64,
+        c_stride_batch: cutlass.Int64,
+        stamps_ptr: cute.Pointer,
+        retry_ptr: cute.Pointer,
+        params_ptr: cute.Pointer,
+        max_active_clusters: cutlass.Constexpr,
+        stream: cuda.CUstream,
+    ):
+        a_tensor = cute.make_tensor(
+            a_ptr, layout=cute.make_layout((m, k, batch_size), stride=(a_stride_m, 1, a_stride_batch))
+        )
+        b_tensor = cute.make_tensor(
+            b_ptr, layout=cute.make_layout((n, k, batch_size), stride=(b_stride_n, 1, b_stride_batch))
+        )
+        c_tensor = cute.make_tensor(
+            c_ptr, layout=cute.make_layout((m, n, batch_size), stride=(c_stride_m, 1, c_stride_batch))
+        )
+        stamps = cute.make_tensor(stamps_ptr, layout=cute.make_layout((TIMELINE_MAX_CTAS,)))
+        retry_count = cute.make_tensor(retry_ptr, layout=cute.make_layout((RETRY_COUNTER_SLOTS,)))
+        params = cute.make_tensor(params_ptr, layout=cute.make_layout((PARAMS_LEN,)))
+        z64, z32 = cutlass.Int64(0), cutlass.Int32(0)
+        self(
+            a_tensor, b_tensor, c_tensor, stamps, retry_count,
+            z64, z32, z64, z32, z64, z32, z64, z32, z32, z64, z64, z32, z32, None, None, None,
+            max_active_clusters, stream, params=params,
+        )  # fmt: skip
+
+    @cute.jit
     def wrapper_strided_fgs(
         self,
         m: cutlass.Int32,
@@ -1371,6 +1467,17 @@ def _max_active_clusters(device_index: int, cluster_size: int) -> int:
 
 _COMPILED = {}
 _SCRATCH = {}
+_PARAMS = {}
+
+
+def _params(device: torch.device, values: tuple) -> torch.Tensor:
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    key = (index, values)
+    buf = _PARAMS.get(key)
+    if buf is None:
+        buf = torch.tensor(list(values) + [0] * (PARAMS_LEN - len(values)), dtype=torch.int64, device=device)
+        _PARAMS[key] = buf
+    return buf
 
 
 def _scratch(device: torch.device, name: str, numel: int) -> torch.Tensor:
@@ -1468,11 +1575,18 @@ def run_gemm_fgs(
     a_ptr = make_ptr(cutlass.BFloat16, a.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
     b_ptr = make_ptr(cutlass.BFloat16, w.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
     c_mnl = out.permute(1, 2, 0)
-    c_tensor = from_dlpack(c_mnl).mark_layout_dynamic(leading_dim=1)
-    stamps_tensor = from_dlpack(
-        _scratch(a.device, "stamps", TIMELINE_MAX_CTAS)
-    ).mark_layout_dynamic()
-    retry_tensor = from_dlpack(retry_counter, assumed_align=4)
+    stamps = _scratch(a.device, "stamps", TIMELINE_MAX_CTAS)
+    packed = glu is None and fold is None
+    dense = packed and (
+        a.stride(1) == k
+        and w.stride(1) == k
+        and out.stride(1) == n
+        and (batch == 1 or (a.stride(0) == m * k and w.stride(0) == n * k and out.stride(0) == m * n))
+    )
+    if not packed:
+        c_tensor = from_dlpack(c_mnl).mark_layout_dynamic(leading_dim=1)
+        stamps_tensor = from_dlpack(stamps).mark_layout_dynamic()
+        retry_tensor = from_dlpack(retry_counter, assumed_align=4)
     stream = cuda.CUstream(torch.cuda.current_stream(a.device).cuda_stream)
     strides = (a.stride(1), a.stride(0), w.stride(1), w.stride(0))
     if len(arm) > 4:
@@ -1560,6 +1674,45 @@ def run_gemm_fgs(
         fold=fold_n,
         publish_hi_words=publish_hi_words,
     )
+    if packed:
+        params = _params(a.device, tuple(arm_args))
+        key = (
+            "packed" if dense else "packed_strided",
+            device_index,
+            use_2cta,
+            mma_mn,
+            cluster_mn,
+            max_stage,
+            raster_along,
+            swizzle_size,
+            tuple(sorted(flags.items())),
+            clusters,
+        )
+        c_ptr = make_ptr(cutlass.BFloat16, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+        ptrs = (a_ptr, b_ptr, c_ptr) + (
+            () if dense else (*strides, out.stride(1), out.stride(0))
+        ) + (
+            make_ptr(cutlass.Int32, stamps.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(cutlass.Int32, retry_counter.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
+            make_ptr(cutlass.Int64, params.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+        )
+        compiled = _COMPILED.get(key)
+        if compiled is None:
+            gemm = FgsDenseGemmKernel(
+                cutlass.Float32,
+                use_2cta,
+                mma_mn,
+                cluster_mn,
+                swizzle_size=swizzle_size,
+                raster_along=raster_along,
+                max_num_ab_stage=max_stage,
+                **flags,
+            )
+            wrapper = gemm.wrapper_packed_fgs if dense else gemm.wrapper_packed_strided_fgs
+            compiled = cute.compile(wrapper, m, n, k, batch, *ptrs, clusters, stream, options="--opt-level 2")
+            _COMPILED[key] = compiled
+        compiled(m, n, k, batch, *ptrs, stream=stream)
+        return out
     key = (
         "strided",
         device_index,
