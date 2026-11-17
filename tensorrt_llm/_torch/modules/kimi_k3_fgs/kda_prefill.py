@@ -43,7 +43,9 @@ default grid, one CTA per row block), ``_DELAY_NS`` (producer GEMMs spin at entr
 ``_QKVG_CTAS`` (cap the qkvg GEMM's persistent grid; with a few CTAs its gate tiles outlive the conv → norm chain,
 the hazard test of the norm's acquire), ``_NORM_GATE=0`` (drop the norm's acquire: that test's negative control),
 ``_CONV=bulk|cpasync`` (the conv's source loads: one ``cp.async.bulk`` per ring slot onto an mbarrier, after the
-counter acquire and a proxy fence, or the per-lane ``cp.async`` ring; the twin uses the same build).
+counter acquire and a proxy fence, or the per-lane ``cp.async`` ring; the twin uses the same build),
+``_NORM_STORE=v4|tma`` (the gated norm's output: 16-byte thread stores, or one TMA store per CTA tile with the
+counter publish after ``cp.async.bulk.wait_group 0`` and ``fence.proxy.async.global``; the twin uses the same build).
 """
 
 import atexit
@@ -76,6 +78,9 @@ NORM_GATE = os.environ.get("TLLM_K3_FGS_PREFILL_NORM_GATE", "1") != "0"
 CONV = os.environ.get("TLLM_K3_FGS_PREFILL_CONV", "bulk")
 if CONV not in ("bulk", "cpasync"):
     raise ValueError(f"TLLM_K3_FGS_PREFILL_CONV={CONV!r}; valid: bulk, cpasync")
+NORM_STORE = os.environ.get("TLLM_K3_FGS_PREFILL_NORM_STORE", "v4")
+if NORM_STORE not in ("v4", "tma"):
+    raise ValueError(f"TLLM_K3_FGS_PREFILL_NORM_STORE={NORM_STORE!r}; valid: v4, tma")
 # Counter slab words per pair: a word per 64 output rows covers every rubin tactic's CTA tile.
 COUNTER_WORDS = -(-(-(-MAX_ROWS // 64)) // 4) * 4
 
@@ -572,6 +577,7 @@ def _forward_counter(
         fgs_counter_rows=o_cta_m * H if pk8 is not None else 0,
         fgs_gate=(pk2[1], cta_m * H, gate_tiles) if pk2 is not None and NORM_GATE else None,
         fgs_stats=stats["norm"] if pk2 is not None and NORM_GATE else None,
+        store=NORM_STORE,
     )
     gate = None if pk8 is None else (pk8, H, norm_rows_per_cta, MAX_SPINS)
     mixer._k3_prefill_pending = (pair, prev, T, False, gate)
@@ -579,7 +585,8 @@ def _forward_counter(
         "kda.prefill_chain",
         T,
         f"{mode()} counter link pair {pair} edges {sorted(e for e in edges_on() if e in (P_QKVG, P_CORE))} "
-        f"blocks {blocks} x {cta_m} rows, qkv tiles {qkv_tiles}, norm rows/cta {norm_rows_per_cta}",
+        f"blocks {blocks} x {cta_m} rows, qkv tiles {qkv_tiles}, norm rows/cta {norm_rows_per_cta}, "
+        f"norm store {NORM_STORE}",
     )
     return core.view(T, H, hd)
 

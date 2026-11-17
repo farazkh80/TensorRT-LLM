@@ -23,6 +23,11 @@ together, so the shuffles that follow see a converged warp. After ``max_spins``
 rounds the warp falls back to ``griddepcontrol.wait`` (producer grid complete) and
 takes the values it then reads. Optional ``stats`` (int32 [2]) accumulates reload
 rounds per thread and fallbacks per thread.
+
+``store="tma"`` stages each CTA's rows in shared memory and writes them with one TMA
+store; a counter publish then follows ``cp.async.bulk.wait_group 0`` and
+``fence.proxy.async.global``, so a consumer that acquires the word and loads by TMA
+sees the rows. ``store="v4"`` is one 16-byte ``st.global`` per thread and row.
 """
 
 from functools import cache
@@ -33,8 +38,10 @@ import cutlass.cute as cute
 import torch
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
+from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
 from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass.utils import SmemAllocator
 
 F32 = cutlass.Float32
 BF16 = cutlass.BFloat16
@@ -189,6 +196,34 @@ def _release_add(addr, val, *, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def _bulk_wait_all(*, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [],
+        "cp.async.bulk.wait_group 0;",
+        "~{memory}",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _fence_proxy_async_global(*, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [],
+        "fence.proxy.async.global;",
+        "~{memory}",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
 class GatedRmsNorm:
     def __init__(
         self,
@@ -207,6 +242,7 @@ class GatedRmsNorm:
         fgs_producer: bool = False,
         fgs_counters: bool = False,
         fgs_gate: bool = False,
+        store_tma: bool = False,
     ):
         self.heads = heads
         self.rows_per_thread = rows_per_thread
@@ -215,6 +251,18 @@ class GatedRmsNorm:
         self.rows_per_cta = warps * ROWS_PER_WARP_STEP * rows_per_thread
         assert not (fgs_consumer or fgs_producer or fgs_counters) or use_pdl
         assert not (fgs_gate and persistent_ctas)
+        # store_tma: the CTA's rows are staged in shared memory and written by one TMA store (the last CTA's box
+        # is clipped at the tensor's end); a counter publish follows ``cp.async.bulk.wait_group 0`` and
+        # ``fence.proxy.async.global`` so the rows are visible to the consumer's TMA loads.
+        self.store_tma = store_tma
+        if store_tma:
+            tile_elems = self.rows_per_cta * HEAD_DIM
+
+            @cute.struct
+            class SharedStorage:
+                sOut: cute.struct.Align[cute.struct.MemRange[BF16, tile_elems], 128]
+
+            self.shared_storage = SharedStorage
         # fgs_gate: thread 0 acquires the counter word of the CTA's row block before any z load (the z producer is
         # not this grid's PDL predecessor, so its completion is not implied by the grid wait).
         self.fgs_gate = fgs_gate
@@ -265,6 +313,20 @@ class GatedRmsNorm:
         grid = (rows + self.rows_per_cta - 1) // self.rows_per_cta
         if cutlass.const_expr(self.persistent_ctas > 0):
             grid = cute.min(grid, self.persistent_ctas)
+        tma_out = out_tma = smem_layout = None
+        smem_bytes = 0
+        if cutlass.const_expr(self.store_tma):
+            tile = (self.rows_per_cta, HEAD_DIM)
+            smem_layout = cute.make_layout(
+                (*tile, 1), stride=(HEAD_DIM, 1, self.rows_per_cta * HEAD_DIM)
+            )
+            tma_out, out_tma = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileS2GOp(),
+                out,
+                cute.slice_(smem_layout, (None, None, 0)),
+                tile,
+            )
+            smem_bytes = self.shared_storage.size_in_bytes()
         self.kernel(
             x,
             z,
@@ -278,9 +340,13 @@ class GatedRmsNorm:
             gate,
             gate_block_rows,
             gate_target,
+            tma_out,
+            out_tma,
+            smem_layout,
         ).launch(
             grid=[grid, 1, 1],
             block=[self.warps * 32, 1, 1],
+            smem=smem_bytes,
             stream=stream,
             use_pdl=self.use_pdl,
             min_blocks_per_mp=self.min_blocks,
@@ -301,6 +367,9 @@ class GatedRmsNorm:
         gate: cute.Tensor | None,
         gate_block_rows: cutlass.Int32,
         gate_target: cutlass.Int32,
+        tma_out: cute.CopyAtom | None,
+        out_tma: cute.Tensor | None,
+        smem_layout: cute.Layout | None,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -321,6 +390,22 @@ class GatedRmsNorm:
 
         w_reg = cute.make_rmem_tensor((VEC,), weight.element_type)
         cute.copy(copy_w, cute.local_tile(weight, (VEC,), (col // VEC,)), w_reg)
+
+        sOut = tOsO = tOgO = None
+        if cutlass.const_expr(self.store_tma):
+            if tidx == 0:
+                cpasync.prefetch_descriptor(tma_out)
+            smem = SmemAllocator()
+            storage = smem.allocate(self.shared_storage)
+            sOut = storage.sOut.get_tensor(smem_layout)
+            gOut = cute.local_tile(out_tma, (self.rows_per_cta, HEAD_DIM), (None, None))
+            tOsO, tOgO = cpasync.tma_partition(
+                tma_out,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sOut, 0, 2),
+                cute.group_modes(gOut, 0, 2),
+            )
 
         if cutlass.const_expr(self.use_pdl and not self.fgs_consumer):
             cute.arch.griddepcontrol_wait()
@@ -354,13 +439,19 @@ class GatedRmsNorm:
                     ROWS_PER_WARP_STEP * self.rows_per_thread
                 ) + (lane // LANES_PER_ROW)
                 spins, waited = self._block(
-                    x, z, out, eps, w_reg, copy_x, block_row0, col, spins, waited
+                    x, z, out, sOut, eps, w_reg, copy_x, block_row0, block, col, spins, waited
                 )
-                if cutlass.const_expr(self.fgs_counters):
+                if cutlass.const_expr(self.store_tma):
+                    self._tma_store(tma_out, tOsO, tOgO, block, tidx, cnt, cnt_block_rows)
+                elif cutlass.const_expr(self.fgs_counters):
                     self._publish(cnt, (block * self.rows_per_cta) // cnt_block_rows, tidx)
         else:
-            spins, waited = self._block(x, z, out, eps, w_reg, copy_x, row0, col, spins, waited)
-            if cutlass.const_expr(self.fgs_counters):
+            spins, waited = self._block(
+                x, z, out, sOut, eps, w_reg, copy_x, row0, bidx, col, spins, waited
+            )
+            if cutlass.const_expr(self.store_tma):
+                self._tma_store(tma_out, tOsO, tOgO, bidx, tidx, cnt, cnt_block_rows)
+            elif cutlass.const_expr(self.fgs_counters):
                 self._publish(cnt, (bidx * self.rows_per_cta) // cnt_block_rows, tidx)
 
         if cutlass.const_expr(self.with_stats):
@@ -382,20 +473,44 @@ class GatedRmsNorm:
             _release_add(cnt.iterator.toint() + cutlass.Int64(block) * 4, cutlass.Int32(1))
 
     @cute.jit
+    def _tma_store(self, tma_out, tOsO, tOgO, block, tidx, cnt, cnt_block_rows):
+        """Warp 0 stores the staged tile of row block ``block``; the staging buffer is free again on return."""
+        cute.arch.fence_view_async_shared()
+        cute.arch.barrier()
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        if warp == 0:
+            cute.copy(tma_out, tOsO[(None, 0)], tOgO[(None, block, 0)])
+            cute.arch.cp_async_bulk_commit_group()
+            if cutlass.const_expr(self.fgs_counters):
+                _bulk_wait_all()
+                _fence_proxy_async_global()
+            else:
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
+        # Orders warp 0's completed store before thread 0's release and before the next block's staging writes.
+        if cutlass.const_expr(self.fgs_counters or self.persistent_ctas > 0):
+            cute.arch.barrier()
+        if cutlass.const_expr(self.fgs_counters):
+            if tidx == 0:
+                word = cutlass.Int64((block * self.rows_per_cta) // cnt_block_rows)
+                _release_add(cnt.iterator.toint() + word * 4, cutlass.Int32(1))
+
+    @cute.jit
     def _block(
         self,
         x: cute.Tensor,
         z: cute.Tensor,
         out: cute.Tensor,
+        sOut,
         eps: F32,
         w_reg: cute.Tensor,
         copy_x,
         row0,
+        block,
         col,
         spins,
         waited,
     ):
-        """This thread's rows from ``row0``; returns the updated (reloads, fallback) counts."""
+        """This thread's rows from ``row0`` (row block ``block``); returns the updated (reloads, fallback) counts."""
         rows = x.shape[0]
         x_regs = []
         z_regs = []
@@ -481,10 +596,21 @@ class GatedRmsNorm:
                 ys.append(y)
                 y_reg[c] = y.to(BF16)
             if r < rows:
-                out_chunk = cute.local_tile(out[r, None], (VEC,), (col // VEC,))
+                if cutlass.const_expr(self.store_tma):
+                    out_chunk = cute.local_tile(
+                        sOut[r - block * self.rows_per_cta, None, 0], (VEC,), (col // VEC,)
+                    )
+                else:
+                    out_chunk = cute.local_tile(out[r, None], (VEC,), (col // VEC,))
                 if cutlass.const_expr(self.fgs_producer):
                     words = [_pack_bf16x2_pzo(ys[2 * w], ys[2 * w + 1]) for w in range(4)]
-                    _st_global_v4(out_chunk.iterator.toint(), *words)
+                    if cutlass.const_expr(self.store_tma):
+                        y_bits = cute.recast_tensor(y_reg, cutlass.Int32)
+                        for w in cutlass.range_constexpr(4):
+                            y_bits[w] = words[w]
+                        cute.copy(copy_x, y_reg, out_chunk)
+                    else:
+                        _st_global_v4(out_chunk.iterator.toint(), *words)
                 else:
                     cute.copy(copy_x, y_reg, out_chunk)
         return spins, waited
@@ -511,6 +637,7 @@ def _compile(
     fgs_producer: bool = False,
     fgs_counters: bool = False,
     fgs_gate: bool = False,
+    store_tma: bool = False,
 ):
     rows, tokens = cute.sym_int(), cute.sym_int()
     x = make_fake_tensor(
@@ -557,6 +684,7 @@ def _compile(
         fgs_producer,
         fgs_counters,
         fgs_gate,
+        store_tma,
     )
     return cute.compile(
         op,
@@ -647,11 +775,13 @@ def kda_gated_rmsnorm(
     fgs_counters: torch.Tensor | None = None,
     fgs_counter_rows: int = 0,
     fgs_gate: tuple | None = None,
+    store: str = "v4",
 ) -> torch.Tensor:
     """Sigmoid-gated RMSNorm of ``x [T*H, 128]`` with ``z [T, H, 128]``; returns ``[T*H, 128]``.
 
     ``out`` may be any ``[T*H, 128]`` BF16 view with 16-byte aligned rows (for example the
-    caller's graph-owned core buffer), which removes the separate copy.
+    caller's graph-owned core buffer), which removes the separate copy. ``store`` is ``v4``
+    (16-byte thread stores) or ``tma`` (one TMA store per CTA tile, see the module docstring).
 
     ``fgs_consumer`` reads ``x`` as a fine-grained-sync slot (see the module docstring):
     the kernel launches with PDL and does not wait for the producer grid; ``x`` must be
@@ -666,6 +796,8 @@ def kda_gated_rmsnorm(
         raise ValueError(
             "kda_gated_rmsnorm needs BF16 x/out [T*H, 128] and z [T, H, 128] with 16-byte aligned rows"
         )
+    if store not in ("v4", "tma"):
+        raise ValueError(f"kda_gated_rmsnorm: store={store!r}; valid: v4, tma")
     if out is None:
         out = torch.empty_like(x)
     rows = x.shape[0]
@@ -734,6 +866,7 @@ def kda_gated_rmsnorm(
         fgs_producer,
         fgs_counters is not None,
         gate_words is not None,
+        store == "tma",
     )
     fn(
         x, z, weight, out, eps, fgs_stats if with_stats else None, fgs_timeline, fgs_counters,
