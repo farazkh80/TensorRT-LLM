@@ -159,6 +159,20 @@ def _st_global_v4(addr, w0, w1, w2, w3, *, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def _release_add(addr, val, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [cutlass.Int64(addr).ir_value(loc=loc, ip=ip), cutlass.Int32(val).ir_value(loc=loc, ip=ip)],
+        "red.release.gpu.global.add.s32 [$0], $1;",
+        "l,r,~{memory}",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
 class GatedRmsNorm:
     def __init__(
         self,
@@ -175,19 +189,23 @@ class GatedRmsNorm:
         with_timeline: bool = False,
         l1_first_load: bool = False,
         fgs_producer: bool = False,
+        fgs_counters: bool = False,
     ):
         self.heads = heads
         self.rows_per_thread = rows_per_thread
         self.warps = warps
         self.use_pdl = use_pdl
         self.rows_per_cta = warps * ROWS_PER_WARP_STEP * rows_per_thread
-        assert not (fgs_consumer or fgs_producer) or use_pdl
+        assert not (fgs_consumer or fgs_producer or fgs_counters) or use_pdl
         assert fgs_consumer or not (with_stats or weak_first_load or l1_first_load)
         assert not (weak_first_load and l1_first_load)
         self.fgs_consumer = fgs_consumer
         # fgs_producer: dependents are released at entry and every 16 B of ``out`` is one store that never holds
         # -0.0, so a report_valid consumer can read ``out`` while this grid runs.
         self.fgs_producer = fgs_producer
+        # fgs_counters: dependents are released at entry; after its rows are stored each CTA adds 1 to the counter
+        # word of the row block (``cnt_block_rows`` rows, a multiple of the CTA's rows) they fall in.
+        self.fgs_counters = fgs_counters
         self.max_spins = max_spins
         self.with_stats = with_stats
         # persistent_ctas > 0: at most that many CTAs, each walking row blocks in order (the
@@ -214,13 +232,15 @@ class GatedRmsNorm:
         eps: F32,
         stats: cute.Tensor | None,
         timeline: cute.Tensor | None,
+        cnt: cute.Tensor | None,
+        cnt_block_rows: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         rows = x.shape[0]
         grid = (rows + self.rows_per_cta - 1) // self.rows_per_cta
         if cutlass.const_expr(self.persistent_ctas > 0):
             grid = cute.min(grid, self.persistent_ctas)
-        self.kernel(x, z, weight, out, eps, stats, timeline).launch(
+        self.kernel(x, z, weight, out, eps, stats, timeline, cnt, cnt_block_rows).launch(
             grid=[grid, 1, 1],
             block=[self.warps * 32, 1, 1],
             stream=stream,
@@ -238,6 +258,8 @@ class GatedRmsNorm:
         eps: F32,
         stats: cute.Tensor | None,
         timeline: cute.Tensor | None,
+        cnt: cute.Tensor | None,
+        cnt_block_rows: cutlass.Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -261,7 +283,7 @@ class GatedRmsNorm:
 
         if cutlass.const_expr(self.use_pdl and not self.fgs_consumer):
             cute.arch.griddepcontrol_wait()
-        if cutlass.const_expr(self.use_pdl and self.fgs_producer):
+        if cutlass.const_expr(self.use_pdl and (self.fgs_producer or self.fgs_counters)):
             cute.arch.griddepcontrol_launch_dependents()
         if cutlass.const_expr(self.with_timeline):
             if tidx == 0:
@@ -279,8 +301,12 @@ class GatedRmsNorm:
                 spins, waited = self._block(
                     x, z, out, eps, w_reg, copy_x, block_row0, col, spins, waited
                 )
+                if cutlass.const_expr(self.fgs_counters):
+                    self._publish(cnt, (block * self.rows_per_cta) // cnt_block_rows, tidx)
         else:
             spins, waited = self._block(x, z, out, eps, w_reg, copy_x, row0, col, spins, waited)
+            if cutlass.const_expr(self.fgs_counters):
+                self._publish(cnt, (bidx * self.rows_per_cta) // cnt_block_rows, tidx)
 
         if cutlass.const_expr(self.with_stats):
             if spins > 0:
@@ -291,8 +317,14 @@ class GatedRmsNorm:
             cute.arch.barrier()
             if tidx == 0:
                 cute.arch.atomic_max(timeline.iterator + 1, _globaltimer())
-        if cutlass.const_expr(self.use_pdl and not self.fgs_producer):
+        if cutlass.const_expr(self.use_pdl and not (self.fgs_producer or self.fgs_counters)):
             cute.arch.griddepcontrol_launch_dependents()
+
+    @cute.jit
+    def _publish(self, cnt: cute.Tensor, block, tidx):
+        cute.arch.barrier()
+        if tidx == 0:
+            _release_add(cnt.iterator.toint() + cutlass.Int64(block) * 4, cutlass.Int32(1))
 
     @cute.jit
     def _block(
@@ -422,6 +454,7 @@ def _compile(
     with_timeline: bool = False,
     l1_first_load: bool = False,
     fgs_producer: bool = False,
+    fgs_counters: bool = False,
 ):
     rows, tokens = cute.sym_int(), cute.sym_int()
     x = make_fake_tensor(
@@ -446,6 +479,9 @@ def _compile(
     timeline = None
     if with_timeline:
         timeline = make_fake_tensor(cutlass.Int64, (2,), stride=(1,), assumed_align=16)
+    cnt = None
+    if fgs_counters:
+        cnt = make_fake_tensor(cutlass.Int32, (cute.sym_int(),), stride=(1,), assumed_align=16)
     op = GatedRmsNorm(
         heads,
         rows_per_thread,
@@ -460,6 +496,7 @@ def _compile(
         with_timeline,
         l1_first_load,
         fgs_producer,
+        fgs_counters,
     )
     return cute.compile(
         op,
@@ -470,6 +507,8 @@ def _compile(
         F32(1e-5),
         stats,
         timeline,
+        cnt,
+        cutlass.Int32(1),
         make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
@@ -487,6 +526,12 @@ def _pick_config(rows: int, device_index: int) -> tuple[int, int]:
     if rows >= 16 * _num_sms(device_index):
         return 2, 4
     return 1, 2
+
+
+def rows_per_cta(rows: int, device_index: int) -> int:
+    """Rows one CTA of the default configuration at ``rows`` normalizes (the counter link's publish unit)."""
+    rows_per_thread, warps = _pick_config(rows, device_index)
+    return warps * ROWS_PER_WARP_STEP * rows_per_thread
 
 
 def _rows_ok(t: torch.Tensor) -> bool:
@@ -536,6 +581,8 @@ def kda_gated_rmsnorm(
     fgs_ctas: int | None = None,
     fgs_timeline: torch.Tensor | None = None,
     fgs_producer: bool = False,
+    fgs_counters: torch.Tensor | None = None,
+    fgs_counter_rows: int = 0,
 ) -> torch.Tensor:
     """Sigmoid-gated RMSNorm of ``x [T*H, 128]`` with ``z [T, H, 128]``; returns ``[T*H, 128]``.
 
@@ -572,6 +619,14 @@ def kda_gated_rmsnorm(
         use_pdl = True
     if fgs_producer:
         use_pdl = True
+    if fgs_counters is not None:
+        if fgs_counters.dtype != torch.int32 or not fgs_counters.is_contiguous():
+            raise ValueError("kda_gated_rmsnorm: fgs_counters must be a contiguous int32 tensor")
+        if fgs_counter_rows <= 0 or fgs_counter_rows % (warps * ROWS_PER_WARP_STEP * rows_per_thread):
+            raise ValueError("kda_gated_rmsnorm: fgs_counter_rows must be a multiple of the CTA's rows")
+        if fgs_counters.numel() < -(-rows // fgs_counter_rows):
+            raise ValueError("kda_gated_rmsnorm: fgs_counters needs a word per row block")
+        use_pdl = True
     with_stats = fgs_consumer and fgs_stats is not None
     if with_stats and (fgs_stats.dtype != torch.int32 or fgs_stats.numel() < 2):
         raise ValueError("kda_gated_rmsnorm: fgs_stats must be an int32 tensor of 2 elements")
@@ -593,6 +648,10 @@ def kda_gated_rmsnorm(
         with_timeline,
         False,
         fgs_producer,
+        fgs_counters is not None,
     )
-    fn(x, z, weight, out, eps, fgs_stats if with_stats else None, fgs_timeline)
+    fn(
+        x, z, weight, out, eps, fgs_stats if with_stats else None, fgs_timeline, fgs_counters,
+        cutlass.Int32(max(fgs_counter_rows, 1)),
+    )  # fmt: skip
     return out

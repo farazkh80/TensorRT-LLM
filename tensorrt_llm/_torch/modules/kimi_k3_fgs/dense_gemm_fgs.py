@@ -38,6 +38,12 @@ slots of an edge's previous use, after ``griddepcontrol.wait`` and while the oth
 guarantees those regions have no live reader (``kda_prefill``). Without it the kernel never writes sentinels and the
 framework arms the A slot before the producer runs.
 
+Counter link (``publish_tiles``, ``gate``): the epilogue warp publishes each stored tile with N index below
+``publish_tiles`` into ``cnt_pub[cta M tile]`` (``cp.async.bulk.wait_group 0``, ``fence.proxy.async.global``,
+``red.release.gpu.add``); a gated TMA warp waits for ``cnt_gate[cta M tile]`` to reach its target before a tile's
+loads, then issues ``fence.proxy.async.global`` and the TMA loads (no grid wait at entry; the grid wait is the
+fallback after ``gate_spins`` rounds).
+
 Diagnostic: ``timeline`` stores ``%globaltimer_lo`` when each CTA starts and when each CTA tile's last TMA store is
 issued (see :func:`timeline_slots`); ``retry_count[0]`` accumulates the A re-issues of report_valid builds;
 ``start_delay_ns`` spins every warp at entry after the trigger (hazard tests).
@@ -68,7 +74,7 @@ except ImportError:  # CuTe DSL < 4.9: the consumer roles cannot be built.
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
 
-from .moe.sync import spin_ns
+from .moe.sync import fence_proxy_async_global, ld_acquire, nanosleep, release_add, spin_ns
 
 # bf16 -0.0 pair: the sentinel the arm warp writes.
 ARM_WORD = 0x80008000 - (1 << 32)
@@ -87,6 +93,14 @@ def _st_fill_v4(addr, word, *, loc=None, ip=None):
         loc=loc,
         ip=ip,
     )
+
+
+@dsl_user_op
+def _bulk_wait_all(*, loc=None, ip=None):
+    llvm.inline_asm(
+        None, [], "cp.async.bulk.wait_group 0;", "~{memory}", has_side_effects=True,
+        is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )  # fmt: skip
 
 
 # kimi_k3_cute_gemm table entries.
@@ -127,6 +141,9 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
         n_order: Optional[Tuple[int, int]] = None,
         arm_regions: int = 0,
         start_delay_ns: int = 0,
+        publish_tiles: int = 0,
+        gate: bool = False,
+        gate_spins: int = 1 << 16,
     ):
         super().__init__(
             acc_dtype=acc_dtype,
@@ -166,6 +183,11 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
         if arm_regions:
             self.threads_per_cta += 32
         self.start_delay_ns = start_delay_ns
+        self.publish_tiles = publish_tiles
+        self.gate = gate
+        self.gate_spins = gate_spins
+        if gate:
+            self.wait_input = False
 
     def _shared_storage(self):
         stages = self.num_ab_stage
@@ -212,6 +234,11 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
         arm2_chunks: cutlass.Int32,
         arm3_base: cutlass.Int64,
         arm3_chunks: cutlass.Int32,
+        arm_words: cutlass.Int32,
+        cnt_pub: cutlass.Int64,
+        cnt_gate: cutlass.Int64,
+        gate_scale: cutlass.Int32,
+        gate_unit: cutlass.Int32,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -301,6 +328,11 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
             arm2_chunks,
             arm3_base,
             arm3_chunks,
+            arm_words,
+            cnt_pub,
+            cnt_gate,
+            gate_scale,
+            gate_unit,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -336,6 +368,11 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
         arm2_chunks: cutlass.Int32,
         arm3_base: cutlass.Int64,
         arm3_chunks: cutlass.Int32,
+        arm_words: cutlass.Int32,
+        cnt_pub: cutlass.Int64,
+        cnt_gate: cutlass.Int64,
+        gate_scale: cutlass.Int32,
+        gate_unit: cutlass.Int32,
     ):
         if cutlass.const_expr(self.early_trigger and self.use_pdl):
             cute.arch.griddepcontrol_launch_dependents()
@@ -545,6 +582,24 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
         if warp_idx == self.tma_warp_id:
             while work_tile.is_valid_tile:
                 cur_tile_coord = work_tile.tile_idx
+                if cutlass.const_expr(self.gate):
+                    # Rows of this CTA tile must be published before its A loads (TMA: async proxy, hence the
+                    # proxy fence after the acquire).
+                    cta_m = self.cta_tile_shape_mnk[0]
+                    rows = cutlass.min(cutlass.Int32(cta_m), mA_mkl.shape[0] - cur_tile_coord[0] * cta_m)
+                    target = (rows * gate_scale + gate_unit - 1) // gate_unit
+                    gate_addr = cnt_gate + cutlass.Int64(cur_tile_coord[0]) * 4
+                    seen = ld_acquire(gate_addr)
+                    rounds = cutlass.Int32(0)
+                    while seen < target:
+                        if rounds >= self.gate_spins:
+                            cute.arch.griddepcontrol_wait()
+                            seen = target
+                        else:
+                            nanosleep(cutlass.Int32(128))
+                            rounds = rounds + 1
+                            seen = ld_acquire(gate_addr)
+                    fence_proxy_async_global()
                 mma_tile_coord_mnl = (
                     cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
                     cur_tile_coord[1],
@@ -627,17 +682,21 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
                 gdx, gdy, gdz = cute.arch.grid_dim()
                 lanes = gdx * gdy * gdz * 32
                 first = (bidx + bidy * gdx + bidz * gdx * gdy) * 32 + tidx % 32
+                w0 = cutlass.Int32(0) if (arm_words & 1) != 0 else cutlass.Int32(ARM_WORD)
                 for chunk in cutlass.range(first, arm0_chunks, lanes, unroll=4):
-                    _st_fill_v4(arm0_base + cutlass.Int64(chunk) * 16, cutlass.Int32(ARM_WORD))
+                    _st_fill_v4(arm0_base + cutlass.Int64(chunk) * 16, w0)
                 if cutlass.const_expr(self.arm_regions > 1):
+                    w1 = cutlass.Int32(0) if (arm_words & 2) != 0 else cutlass.Int32(ARM_WORD)
                     for chunk in cutlass.range(first, arm1_chunks, lanes, unroll=4):
-                        _st_fill_v4(arm1_base + cutlass.Int64(chunk) * 16, cutlass.Int32(ARM_WORD))
+                        _st_fill_v4(arm1_base + cutlass.Int64(chunk) * 16, w1)
                 if cutlass.const_expr(self.arm_regions > 2):
+                    w2 = cutlass.Int32(0) if (arm_words & 4) != 0 else cutlass.Int32(ARM_WORD)
                     for chunk in cutlass.range(first, arm2_chunks, lanes, unroll=4):
-                        _st_fill_v4(arm2_base + cutlass.Int64(chunk) * 16, cutlass.Int32(ARM_WORD))
+                        _st_fill_v4(arm2_base + cutlass.Int64(chunk) * 16, w2)
                 if cutlass.const_expr(self.arm_regions > 3):
+                    w3 = cutlass.Int32(0) if (arm_words & 8) != 0 else cutlass.Int32(ARM_WORD)
                     for chunk in cutlass.range(first, arm3_chunks, lanes, unroll=4):
-                        _st_fill_v4(arm3_base + cutlass.Int64(chunk) * 16, cutlass.Int32(ARM_WORD))
+                        _st_fill_v4(arm3_base + cutlass.Int64(chunk) * 16, w3)
 
         if warp_idx == self.mma_warp_id:
             tmem.wait_for_alloc()
@@ -801,6 +860,16 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
                         barrier_id=self.epilog_sync_bar_id,
                         number_of_threads=epilog_threads,
                     )
+
+                if cutlass.const_expr(self.publish_tiles > 0):
+                    if n_tile < self.publish_tiles:
+                        if warp_idx == self.epilogue_warp_id[0]:
+                            _bulk_wait_all()
+                            fence_proxy_async_global()
+                            with cute.arch.elect_one():
+                                release_add(
+                                    cnt_pub + cutlass.Int64(cur_tile_coord[0]) * 4, cutlass.Int32(1)
+                                )
 
                 if cutlass.const_expr(self.timeline):
                     if tidx == 0:
@@ -1072,6 +1141,11 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
         arm2_chunks: cutlass.Int32,
         arm3_base: cutlass.Int64,
         arm3_chunks: cutlass.Int32,
+        arm_words: cutlass.Int32,
+        cnt_pub: cutlass.Int64,
+        cnt_gate: cutlass.Int64,
+        gate_scale: cutlass.Int32,
+        gate_unit: cutlass.Int32,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -1084,7 +1158,7 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
         self(
             a_tensor, b_tensor, c_tensor, stamps, retry_count,
             arm0_base, arm0_chunks, arm1_base, arm1_chunks, arm2_base, arm2_chunks, arm3_base, arm3_chunks,
-            max_active_clusters, stream,
+            arm_words, cnt_pub, cnt_gate, gate_scale, gate_unit, max_active_clusters, stream,
         )  # fmt: skip
 
     @cute.jit
@@ -1111,6 +1185,11 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
         arm2_chunks: cutlass.Int32,
         arm3_base: cutlass.Int64,
         arm3_chunks: cutlass.Int32,
+        arm_words: cutlass.Int32,
+        cnt_pub: cutlass.Int64,
+        cnt_gate: cutlass.Int64,
+        gate_scale: cutlass.Int32,
+        gate_unit: cutlass.Int32,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -1126,7 +1205,7 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
         self(
             a_tensor, b_tensor, c_tensor, stamps, retry_count,
             arm0_base, arm0_chunks, arm1_base, arm1_chunks, arm2_base, arm2_chunks, arm3_base, arm3_chunks,
-            max_active_clusters, stream,
+            arm_words, cnt_pub, cnt_gate, gate_scale, gate_unit, max_active_clusters, stream,
         )  # fmt: skip
 
 
@@ -1197,17 +1276,23 @@ def run_gemm_fgs(
     retry_counter: Optional[torch.Tensor] = None,
     max_ctas: Optional[int] = None,
     n_order: Optional[Tuple[int, int]] = None,
-    arm: Tuple[torch.Tensor, ...] = (),
+    arm: Tuple = (),
     start_delay_ns: int = 0,
+    publish: Optional[Tuple[torch.Tensor, int]] = None,
+    gate: Optional[Tuple[torch.Tensor, int, int, int]] = None,
 ) -> torch.Tensor:
     """``out[L, M, N] = a[L, M, K] @ w[L, N, K]^T`` in BF16 at an in-tree ``base`` tactic.
 
     Any operand may be a strided view with K (``a``, ``w``) / N (``out``) innermost and 16 B aligned rows, as for the
     in-tree batched runner. Defaults are the report_valid consumer; ``retry_counter`` (int32[``RETRY_COUNTER_SLOTS``])
     accumulates the A re-issues. ``max_ctas`` caps the persistent grid (default: the device's max active clusters).
-    ``n_order`` (heads, h1) is the kernel's head-ordered tile mapping. ``arm`` (up to four contiguous bf16 tensors
-    whose byte size is a multiple of 16) are re-armed with -0.0 by an extra warp after the PDL wait; they must have no
-    live reader. ``start_delay_ns`` spins every warp at entry after the trigger (hazard tests).
+    ``n_order`` (heads, h1) is the kernel's head-ordered tile mapping. ``arm`` (up to four contiguous tensors whose
+    byte size is a multiple of 16, each a tensor or ``(tensor, 0)`` for a zero fill) are re-armed with bf16 -0.0 pairs
+    or zeros by an extra warp after the PDL wait; they must have no live reader. ``start_delay_ns`` spins every warp
+    at entry after the trigger (hazard tests). ``publish`` = (int32 slab, tiles): the epilogue adds 1 to
+    ``slab[cta M tile]`` for every stored tile with N index below ``tiles``. ``gate`` = (int32 slab, scale, unit,
+    max_spins): the TMA warp waits for ``slab[cta M tile] >= ceil(rows_in_tile * scale / unit)`` before a tile's
+    loads (no grid wait at entry; after ``max_spins`` rounds it waits for the grid instead).
     """
     if a.dim() != 3 or w.dim() != 3 or out.dim() != 3:
         raise ValueError("run_gemm_fgs takes [L, M, K], [L, N, K], [L, M, N] operands")
@@ -1244,12 +1329,35 @@ def run_gemm_fgs(
     if len(arm) > 4:
         raise ValueError("run_gemm_fgs arms at most four regions")
     arm_args = []
-    for t in arm:
+    arm_words = 0
+    for i, region in enumerate(arm):
+        t, word = region if isinstance(region, tuple) else (region, ARM_WORD)
         nbytes = t.numel() * t.element_size()
         if not t.is_contiguous() or nbytes % 16 or t.data_ptr() % 16:
             raise ValueError("arm regions must be contiguous, 16 B aligned, a multiple of 16 B")
+        if word == 0:
+            arm_words |= 1 << i
+        elif word != ARM_WORD:
+            raise ValueError("arm fill words: bf16 -0.0 pairs or zero")
         arm_args += [t.data_ptr(), nbytes // 16]
     arm_args += [0, 0] * (4 - len(arm))
+    arm_args.append(arm_words)
+    publish_tiles = 0
+    cnt_pub = cnt_gate = 0
+    gate_scale = gate_unit = 0
+    gate_spins = 1 << 16
+    if publish is not None:
+        slab, publish_tiles = publish
+        cta_m = mma_mn[0] // (2 if use_2cta else 1)
+        if slab.dtype != torch.int32 or not slab.is_contiguous() or slab.numel() < -(-m // cta_m):
+            raise ValueError("publish slab must be a contiguous int32 tensor with a word per cta M tile")
+        cnt_pub = slab.data_ptr()
+    if gate is not None:
+        slab, gate_scale, gate_unit, gate_spins = gate
+        if slab.dtype != torch.int32 or not slab.is_contiguous():
+            raise ValueError("gate slab must be a contiguous int32 tensor")
+        cnt_gate = slab.data_ptr()
+    arm_args += [cnt_pub, cnt_gate, gate_scale, gate_unit]
     flags = dict(
         pzo=pzo,
         early_trigger=early_trigger,
@@ -1262,6 +1370,9 @@ def run_gemm_fgs(
         n_order=n_order,
         arm_regions=len(arm),
         start_delay_ns=start_delay_ns,
+        publish_tiles=publish_tiles,
+        gate=gate is not None,
+        gate_spins=gate_spins,
     )
     key = (
         "strided",
@@ -1394,11 +1505,11 @@ def run_dense_fgs(
             c_tensor,
             stamps_tensor,
             retry_tensor,
-            *([0] * 8),
+            *([0] * 13),
             clusters,
             stream,
             options="--opt-level 2",
         )
         _COMPILED[key] = compiled
-    compiled(m, n, k, 1, a_ptr, b_ptr, c_tensor, stamps_tensor, retry_tensor, *([0] * 8), stream=stream)
+    compiled(m, n, k, 1, a_ptr, b_ptr, c_tensor, stamps_tensor, retry_tensor, *([0] * 13), stream=stream)
     return out

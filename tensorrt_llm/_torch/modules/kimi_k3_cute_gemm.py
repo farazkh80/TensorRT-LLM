@@ -389,15 +389,19 @@ def linear_fgs(
     consume: bool = False,
     produce: bool = False,
     raster_along: str = "m",
-    arm: Tuple[torch.Tensor, ...] = (),
+    arm: Tuple = (),
     max_ctas: Optional[int] = None,
     start_delay_ns: int = 0,
+    early_trigger: Optional[bool] = None,
+    publish: Optional[Tuple[torch.Tensor, int]] = None,
+    gate: Optional[Tuple[torch.Tensor, int, int, int]] = None,
 ) -> torch.Tensor:
     """``out[M, N] = x[M, K] @ weight[N, K]^T`` with the table's ``rubin`` persistent GEMM in its fine-grained-sync
     build, roles given explicitly (the prefill chains hand their own slots in, which are not edge leases):
     ``consume`` checks ``x`` per 16 B (report_valid, no grid wait), ``produce`` stores ``out`` -0.0-free and triggers
-    its dependents at entry, ``raster_along="n"`` completes output row blocks in order, ``arm`` regions are re-armed
-    with -0.0 by the kernel's extra warp. With every role off it is the same kernel chained by standard PDL."""
+    its dependents at entry (``early_trigger`` alone triggers without pzo), ``raster_along="n"`` completes output row
+    blocks in order, ``arm`` regions are re-armed by the kernel's extra warp, ``publish`` / ``gate`` are the counter
+    link (``run_gemm_fgs``). With every role off it is the same kernel chained by standard PDL."""
     from .kimi_k3_fgs.dense_gemm_fgs import run_gemm_fgs
 
     m, k = x.shape
@@ -413,7 +417,8 @@ def linear_fgs(
     _debug(
         f"linear N={n} K={k}",
         m,
-        f"fgs rubin {tuple(tactic)} consume={consume} produce={produce} raster={raster_along} arm={len(arm)}",
+        f"fgs rubin {tuple(tactic)} consume={consume} produce={produce} raster={raster_along} arm={len(arm)} "
+        f"publish={publish is not None} gate={gate is not None}",
     )
     run_gemm_fgs(
         x.unsqueeze(0),
@@ -424,14 +429,27 @@ def linear_fgs(
         retry_warp=consume,
         wait_input=not consume,
         pzo=produce,
-        early_trigger=produce,
+        early_trigger=produce if early_trigger is None else early_trigger,
         use_pdl=_pdl(),
         raster_along=raster_along,
         max_ctas=max_ctas,
         arm=arm,
         start_delay_ns=start_delay_ns,
+        publish=publish,
+        gate=gate,
     )
     return out
+
+
+def rubin_tile(n: int, k: int, m: int) -> Tuple[int, int]:
+    """(cta rows, cta columns) of the table's ``rubin`` GEMM at this shape: the counter link's row block."""
+    backend, tactic = _select(_GEMM_TABLE.get((n, k)), m)
+    if backend != "rubin":
+        raise ValueError(f"rubin_tile: N={n} K={k} at M={m} selects {backend}")
+    if tactic is None:
+        tactic = _FGS_LARGE_TACTIC
+    _, use_2cta, mma_mn, _, _, _ = tactic
+    return mma_mn[0] // (2 if use_2cta else 1), mma_mn[1]
 
 
 def _fgs_direct(

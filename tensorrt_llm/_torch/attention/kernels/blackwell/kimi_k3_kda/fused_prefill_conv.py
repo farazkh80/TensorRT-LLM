@@ -206,6 +206,22 @@ def sts_v4(saddr, a, b, c, d, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def ld_acquire_b32(addr, *, loc=None, ip=None):
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)],
+            "ld.acquire.gpu.global.b32 $0, [$1];",
+            "=r,l,~{memory}",
+            has_side_effects=True,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def nanosleep(ns, *, loc=None, ip=None):
     _asm(
         T.i32(),
@@ -509,10 +525,14 @@ class KdaConv:
         max_spins=0,
         with_stats=False,
         pdl=False,
+        gate_counters=False,
     ):
         self.W = warps
         self.MB = FORCE_MB
         self.pdl = pdl
+        # gate_counters: PDL launch without a grid wait; a warp waits for the counter word of every source row
+        # block it reads (``gcnt[row // gcnt_rpb] >= gcnt_target``) before its first load.
+        self.gate_counters = gate_counters
         self.heads = heads
         self.P = heads * 128
         self.C = 3 * heads * 128
@@ -589,12 +609,12 @@ class KdaConv:
                     v[0, row64, h, d + 2 * j + e] = val
 
     @cute.kernel
-    def kernel(self, src, weight, state, starts, slots, has_init, q, k, v, stats):
+    def kernel(self, src, weight, state, starts, slots, has_init, q, k, v, stats, gcnt, gcnt_rpb, gcnt_target):
         tid, _, _ = cute.arch.thread_idx()
         if cutlass.const_expr(self.fgs_producer):
             # The q/k/v consumer validates its input per 16 B instead of waiting for this grid.
             cute.arch.griddepcontrol_launch_dependents()
-        if cutlass.const_expr(self.pdl and not self.fgs_consumer):
+        if cutlass.const_expr(self.pdl and not (self.fgs_consumer or self.gate_counters)):
             cute.arch.griddepcontrol_wait()
         b0, b1, b2 = cute.arch.block_idx()
         _, gdy, gdz = cute.arch.grid_dim()
@@ -628,6 +648,9 @@ class KdaConv:
                     k,
                     v,
                     cnt,
+                    gcnt,
+                    gcnt_rpb,
+                    gcnt_target,
                 )
         else:
             self.runs(
@@ -647,6 +670,9 @@ class KdaConv:
                 k,
                 v,
                 cnt,
+                gcnt,
+                gcnt_rpb,
+                gcnt_target,
             )
         if cutlass.const_expr(self.with_stats):
             if tid % 32 == 0:
@@ -674,6 +700,9 @@ class KdaConv:
         k,
         v,
         cnt,
+        gcnt,
+        gcnt_rpb,
+        gcnt_target,
     ):
         """All runs b1, b1 + gdy, ... of sequence `seq` for channel block b0.
 
@@ -688,8 +717,9 @@ class KdaConv:
         # Only this bit stays live across the hot tile; the cold path reloads the metadata.
         more = b1 + gdy < ((length + (self.RUN - 1)) >> self.RUN_LOG2)
         self.tile(
-            b1, b0, tid, ring_warp, begin, length, slot, init, src, weight, state, q, k, v, cnt
-        )
+            b1, b0, tid, ring_warp, begin, length, slot, init, src, weight, state, q, k, v, cnt,
+            gcnt, gcnt_rpb, gcnt_target,
+        )  # fmt: skip
         if more:
             begin, length, slot, init = self.meta(seq, state, starts, slots, has_init)
             nrun = (length + (self.RUN - 1)) >> self.RUN_LOG2
@@ -710,6 +740,9 @@ class KdaConv:
                     k,
                     v,
                     cnt,
+                    gcnt,
+                    gcnt_rpb,
+                    gcnt_target,
                 )
 
     @cute.jit
@@ -726,8 +759,9 @@ class KdaConv:
 
     @cute.jit
     def tile(
-        self, bx, by, tid, ring_warp, begin, length, slot, init, src, weight, state, q, k, v, cnt
-    ):
+        self, bx, by, tid, ring_warp, begin, length, slot, init, src, weight, state, q, k, v, cnt,
+        gcnt, gcnt_rpb, gcnt_target,
+    ):  # fmt: skip
         """One warp: run t0 = (bx * W + warp) * L of one sequence, channel block `by`."""
         C, P, L, U = self.C, self.P, self.L, self.U
         lane = tid % 32
@@ -758,6 +792,21 @@ class KdaConv:
         if t0 < length or t0 == 0:
             count = cutlass.max(cutlass.min(length - t0, L), 0)
             row0 = begin + t0
+            if cutlass.const_expr(self.gate_counters):
+                first_row = cutlass.max(row0 - (WIDTH - 1), begin)
+                blk_hi = (row0 + count - 1) // gcnt_rpb
+                for blk in cutlass.range(first_row // gcnt_rpb, blk_hi + 1, unroll=1):
+                    gate_addr = gcnt + cutlass.Int64(blk) * 4
+                    seen = ld_acquire_b32(gate_addr)
+                    rounds = cutlass.Int32(0)
+                    while seen < gcnt_target:
+                        if rounds >= self.max_spins:
+                            cute.arch.griddepcontrol_wait()
+                            seen = gcnt_target
+                        else:
+                            nanosleep(cutlass.Int32(128))
+                            rounds = rounds + 1
+                            seen = ld_acquire_b32(gate_addr)
             ring_lane = ring_warp + lane * 16
             # Halo rows t0-3..t0-1 (needed by token 0) are requested before the ring prologue.
             hw = cute.make_rmem_tensor(cute.make_layout(4 * (WIDTH - 1)), cutlass.Int32)
@@ -1381,16 +1430,21 @@ class KdaConv:
         v,
         grid_y: cutlass.Int32,
         stats: cute.Tensor | None,
+        gcnt: cutlass.Int64,
+        gcnt_rpb: cutlass.Int32,
+        gcnt_target: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         channel_blocks = (self.C + WARP_CH - 1) // WARP_CH
         grid = (channel_blocks, grid_y, min(slots.shape[0], MAX_GRID_YZ))
-        self.kernel(src, weight, state, starts, slots, has_init, q, k, v, stats).launch(
+        self.kernel(
+            src, weight, state, starts, slots, has_init, q, k, v, stats, gcnt, gcnt_rpb, gcnt_target
+        ).launch(
             grid=grid,
             block=(self.W * 32, 1, 1),
             min_blocks_per_mp=self.MB,
             stream=stream,
-            use_pdl=self.fgs_consumer or self.pdl,
+            use_pdl=self.fgs_consumer or self.pdl or self.gate_counters,
         )
 
 
@@ -1441,6 +1495,7 @@ def compile_prefill_conv(
     max_spins: int = 0,
     with_stats: bool = False,
     pdl: bool = False,
+    gate_counters: bool = False,
 ) -> Callable:
     """Compile and cache a convolution layout without retaining caller-owned tensors."""
     with torch.cuda.device(device):
@@ -1481,6 +1536,7 @@ def compile_prefill_conv(
             max_spins,
             with_stats,
             pdl,
+            gate_counters,
         )
         op.MB = min_blocks_per_mp
         stats = None
@@ -1488,7 +1544,10 @@ def compile_prefill_conv(
             stats = make_fake_tensor(cutlass.Int32, (2,), stride=(1,), assumed_align=8)
         stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
         # Grid size and stream remain runtime arguments, not cache-key inputs.
-        return cute.compile(op, *args, cutlass.Int32(1), stats, stream, options="--enable-tvm-ffi")
+        return cute.compile(
+            op, *args, cutlass.Int32(1), stats, cutlass.Int64(0), cutlass.Int32(1), cutlass.Int32(1), stream,
+            options="--enable-tvm-ffi",
+        )  # fmt: skip
 
 
 def fused_prefill_conv(
@@ -1508,6 +1567,9 @@ def fused_prefill_conv(
     fgs_max_spins=1 << 16,
     fgs_stats=None,
     pdl=False,
+    fgs_counters=None,
+    fgs_counter_rows=0,
+    fgs_counter_target=0,
 ):
     """Convolve raw packed QKV into contiguous, unnormalized BF16 Q/K/V.
 
@@ -1593,6 +1655,16 @@ def fused_prefill_conv(
     with_stats = fgs_consumer and fgs_stats is not None
     if with_stats and (fgs_stats.dtype != torch.int32 or fgs_stats.numel() < 2):
         raise ValueError("fgs_stats must be an int32 tensor of 2 elements")
+    gate = fgs_counters is not None
+    if gate:
+        if fgs_consumer or fgs_counter_rows <= 0 or fgs_counter_target <= 0:
+            raise ValueError("fgs_counters needs fgs_counter_rows and fgs_counter_target, without fgs_consumer")
+        if (
+            fgs_counters.dtype != torch.int32
+            or not fgs_counters.is_contiguous()
+            or fgs_counters.numel() < -(-src.shape[0] // fgs_counter_rows)
+        ):
+            raise ValueError("fgs_counters must be a contiguous int32 tensor with a word per source row block")
     stream = cuda.CUstream(torch.cuda.current_stream(src.device).cuda_stream)
     # grid.y only sets parallelism (CTAs loop over the device-side run count): no
     # sequence is longer than T, so a looser bound only adds idle CTAs and an
@@ -1627,9 +1699,13 @@ def fused_prefill_conv(
         seq_loop,
         fgs_consumer,
         fgs_producer,
-        fgs_max_spins if fgs_consumer else 0,
+        fgs_max_spins if (fgs_consumer or gate) else 0,
         with_stats,
         pdl,
+        gate,
     )
     stats = fgs_stats if with_stats else None
-    fn(src, weight, conv_state, starts, slots, has_init, q, k, v, grid_y, stats, stream)
+    fn(
+        src, weight, conv_state, starts, slots, has_init, q, k, v, grid_y, stats,
+        fgs_counters.data_ptr() if gate else 0, max(fgs_counter_rows, 1), max(fgs_counter_target, 1), stream,
+    )  # fmt: skip

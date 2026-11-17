@@ -4,6 +4,16 @@
 (``TLLM_K3_FGS_PREFILL=1``), or the same kernels chained by standard PDL (``TLLM_K3_FGS_PREFILL=pdl``, the FGS-off
 twin). Decode is untouched: the mixer calls :func:`forward` only for a prefill-only batch.
 
+``TLLM_K3_FGS_PREFILL_SYNC=counter`` (default) links pk2 and pk8 with per-row-block counters instead of Lamport
+slots: int32 words, one per 128-row block of the producer's output, in ``[pairs, blocks]`` slabs. The qkvg GEMM's
+epilogue publishes each stored q / k / v tile (``cp.async.bulk.wait_group 0``, ``fence.proxy.async.global``,
+``red.release.gpu.add``); a conv warp acquires the words of the source blocks it reads (halo included) before its
+first load. Each gated-norm CTA publishes after a CTA barrier; o_proj's TMA warp acquires the word of its M tile,
+then ``fence.proxy.async.global``, then issues the tile's TMA loads. Coverage is every block: publishing costs one
+thread per tile / CTA, so no last-wave rule is needed. Re-arm: the next layer's qkvg GEMM arm warp zeroes the
+previous pair's slabs (kilobytes). The data buffers are plain (no sentinels, no slot memory), so the window can
+cover every token count. ``=lamport`` keeps the sentinel slots below.
+
   pre-attention mix -> qkvg GEMM --pk2 p_qkvg--> KdaConv | bfa, f_b GEMMs | BT16 --pk7 p_o--> gated norm
   --pk8 p_core--> o_proj --pk9 p_attn_o--> pre-MoE mix (consumer only, through ``edges.register_external``)
 
@@ -21,9 +31,9 @@ as valid.
 
 ``TLLM_K3_FGS_PREFILL_EDGES`` (default ``pk2,pk8``; ``pk9`` loses its mix-consumer cost to a tail that is
 not there with raster M (A-03); ``pk7`` needs BT16's decomposition route, i.e. one request
-at 96 heads, and is diagnostic), ``_MIN_ROWS`` / ``_MAX_ROWS`` (1024 / 4096 tokens per rank; the slots are sized to
-``_MAX_ROWS``; on one GPU the chain gains 1.3-1.5 % of the layer at 1365 tokens and loses 0.5-0.9 % at 8192, where
-the per-layer re-arm of 0.8-1 GB outweighs the producers' last tile round), ``_RASTER`` (producer GEMM tile
+at 96 heads, and is diagnostic), ``_MIN_ROWS`` / ``_MAX_ROWS`` (1024 / 262144 tokens per rank with the counter link, 4096 with Lamport slots,
+which are sized to ``_MAX_ROWS``; on one GPU the counter link gains 0.6-1.7 % of the layer up to 5460 tokens and is
+noise-level above, the Lamport slots gain 1.5 % at 1365 and lose 0.5-0.9 % at 8192 to their 0.8-1 GB re-arm), ``_RASTER`` (producer GEMM tile
 order; ``n`` publishes row blocks in order but costs the
 weight-streaming qkvg GEMM 3-21 %, A-02), ``_NORM_CTAS`` (gated norm persistent grid of the FGS roles; 0 = the
 default grid, one CTA per row block), ``_DELAY_NS`` (producer GEMMs spin at entry; hazard tests),
@@ -43,12 +53,18 @@ from .. import kimi_k3_cute_gemm
 from . import edges
 
 ENV = "TLLM_K3_FGS_PREFILL"
+SYNC = os.environ.get("TLLM_K3_FGS_PREFILL_SYNC", "counter")
+if SYNC not in ("counter", "lamport"):
+    raise ValueError(f"TLLM_K3_FGS_PREFILL_SYNC={SYNC!r}; valid: counter, lamport")
 MIN_ROWS = int(os.environ.get("TLLM_K3_FGS_PREFILL_MIN_ROWS", "1024"))
-MAX_ROWS = int(os.environ.get("TLLM_K3_FGS_PREFILL_MAX_ROWS", "4096"))
+# Lamport slots cost 123 KB per token of window; the counter link has no slot memory.
+MAX_ROWS = int(os.environ.get("TLLM_K3_FGS_PREFILL_MAX_ROWS", "262144" if SYNC == "counter" else "4096"))
 RASTER = os.environ.get("TLLM_K3_FGS_PREFILL_RASTER", "m")
 NORM_CTAS = int(os.environ.get("TLLM_K3_FGS_PREFILL_NORM_CTAS", "0"))
 DELAY_NS = int(os.environ.get("TLLM_K3_FGS_PREFILL_DELAY_NS", "0"))
 MAX_SPINS = int(os.environ.get("TLLM_K3_FGS_PREFILL_MAX_SPINS", str(1 << 16)))
+# Counter slab words per pair: a word per 64 output rows covers every rubin tactic's CTA tile.
+COUNTER_WORDS = -(-(-(-MAX_ROWS // 64)) // 4) * 4
 
 P_QKVG, P_O, P_CORE, P_ATTN_O = "kda.p_qkvg", "kda.p_o", "kda.p_core", "kda.p_attn_o"
 _EDGE_IDS = {"pk2": P_QKVG, "pk7": P_O, "pk8": P_CORE, "pk9": P_ATTN_O}
@@ -154,6 +170,60 @@ def rearm_skipped(device: torch.device) -> None:
     slots = _slots.get(device)
     if slots is not None:
         slots.fill_dirty()
+    counters = _counters.get(device)
+    if counters is not None:
+        counters.fill_dirty()
+
+
+class _Counters:
+    """One device's counter slabs ``slab[edge][pair, :words]`` (int32, zero = not published); ``dirty[edge][pair]`` =
+    words the last use touched, 0 once re-armed."""
+
+    def __init__(self, device: torch.device, pairs: int):
+        self.slab: Dict[str, torch.Tensor] = {}
+        self.dirty: Dict[str, List[int]] = {}
+        for edge in (P_QKVG, P_CORE):
+            if edge in edges_on():
+                self.slab[edge] = torch.zeros((pairs, COUNTER_WORDS), dtype=torch.int32, device=device)
+                self.dirty[edge] = [0] * pairs
+        logger.info(f"{ENV}=1 counter link: {sorted(self.slab)} x {pairs} pairs x {COUNTER_WORDS} words")
+
+    def words(self, edge: str, pair: int, blocks: int) -> Optional[torch.Tensor]:
+        slab = self.slab.get(edge)
+        if slab is None:
+            return None
+        if blocks > COUNTER_WORDS:
+            raise RuntimeError(f"{edge}: {blocks} row blocks above the {COUNTER_WORDS}-word counter slab")
+        self.dirty[edge][pair] = max(self.dirty[edge][pair], -(-blocks // 4) * 4)
+        return slab[pair]
+
+    def arm_regions(self, pair: int) -> Tuple:
+        regions = []
+        for edge, slab in self.slab.items():
+            words = self.dirty[edge][pair]
+            if words:
+                self.dirty[edge][pair] = 0
+                regions.append((slab[pair, :words], 0))
+        return tuple(regions)
+
+    def fill_dirty(self) -> None:
+        for edge, slab in self.slab.items():
+            for pair, words in enumerate(self.dirty[edge]):
+                if words:
+                    slab[pair, :words].zero_()
+                    self.dirty[edge][pair] = 0
+
+
+_counters: Dict[torch.device, _Counters] = {}
+
+
+def _counters_of(device: torch.device) -> _Counters:
+    counters = _counters.get(device)
+    if counters is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(f"{ENV}=1: counter slabs are allocated by an eager prefill, before any capture")
+        counters = _counters[device] = _Counters(device, 2 + len(_layers) % 2)
+    return counters
 
 
 outcomes: collections.Counter = collections.Counter()
@@ -247,6 +317,8 @@ def forward(
         if fgs():
             rearm_skipped(x2d.device)
         return None
+    if fgs() and SYNC == "counter":
+        return _forward_counter(mixer, x2d, cu_seqlens, mamba_metadata, num_prefills, conv_pool, ssm_pool, layer_cache)
     conv_mod, norm_mod, _ = _kernels()
     d, H, hd = mixer.proj_size, mixer.num_heads, mixer.head_dim
     T = rows
@@ -322,11 +394,87 @@ def forward(
     )
     if core_slot is not None:
         slots.dirty[P_CORE][pair] = T
-    mixer._k3_prefill_pending = (pair, prev, T, core_slot is not None)
+    mixer._k3_prefill_pending = (pair, prev, T, core_slot is not None, None)
     edges.debug(
         "kda.prefill_chain",
         T,
         f"{mode()} pair {pair} edges {sorted(e for e in edges_on() if live)} norm_ctas {NORM_CTAS or 'default'}",
+    )
+    return core.view(T, H, hd)
+
+
+def _forward_counter(mixer, x2d, cu_seqlens, mamba_metadata, num_prefills, conv_pool, ssm_pool, layer_cache):
+    conv_mod, norm_mod, _ = _kernels()
+    d, H, hd = mixer.proj_size, mixer.num_heads, mixer.head_dim
+    T = x2d.shape[0]
+    device = x2d.device
+    slot_indices = mamba_metadata.state_indices[:num_prefills]
+    has_init = mamba_metadata.has_initial_states[:num_prefills]
+    starts = mamba_metadata.query_start_loc[: num_prefills + 1]
+    counters = _counters_of(device)
+    ordinal = _layers.index(mixer.layer_idx)
+    pair, prev = _pair(ordinal), _pair((ordinal - 1) % len(_layers))
+    cta_m, cta_n = kimi_k3_cute_gemm.rubin_tile(4 * d, mixer.hidden_size, T)
+    blocks = -(-T // cta_m)
+    qkv_tiles = 3 * d // cta_n
+    pk2 = counters.words(P_QKVG, pair, blocks) if P_QKVG in edges_on() else None
+
+    from ..kimi_kda.kimi_kda_mixer import _reset_state_rows
+
+    _reset_state_rows(ssm_pool, slot_indices, has_init)
+    qkvg = kimi_k3_cute_gemm.linear_fgs(
+        x2d,
+        mixer._qkvg_proj_weight,
+        x2d.new_empty(T, 4 * d),
+        early_trigger=pk2 is not None,
+        publish=None if pk2 is None else (pk2, qkv_tiles),
+        arm=counters.arm_regions(prev),
+        start_delay_ns=DELAY_NS if pk2 is not None else 0,
+    )
+    q, k, v = (x2d.new_empty(1, T, H, hd) for _ in range(3))
+    conv_mod.fused_prefill_conv(
+        qkvg,
+        mixer._packed_conv_weight,
+        conv_pool,
+        starts,
+        slot_indices,
+        has_init,
+        getattr(mamba_metadata, "kda_max_seqlen", T),
+        q,
+        k,
+        v,
+        fgs_max_spins=MAX_SPINS,
+        pdl=pk2 is None,
+        fgs_counters=pk2,
+        fgs_counter_rows=cta_m if pk2 is not None else 0,
+        fgs_counter_target=qkv_tiles if pk2 is not None else 0,
+    )
+    bfa = kimi_k3_cute_gemm.linear(x2d, mixer._bfa_proj_weight)
+    g = kimi_k3_cute_gemm.linear(bfa[:, :hd], mixer.f_b_proj.weight)
+    beta = bfa[:, hd : hd + H].unsqueeze(0)
+    o = _bt16(mixer, q, k, v, g.view(1, T, H, hd), beta, ssm_pool, slot_indices, cu_seqlens, mamba_metadata, None)
+    mixer._sync_kda_replay_conv_window(layer_cache, slot_indices, conv_pool)
+
+    o_cta_m, _ = kimi_k3_cute_gemm.rubin_tile(mixer.hidden_size, d, T)
+    pk8 = counters.words(P_CORE, pair, -(-T // o_cta_m)) if P_CORE in edges_on() else None
+    norm_rows_per_cta = norm_mod.rows_per_cta(T * H, device.index)
+    core = norm_mod.kda_gated_rmsnorm(
+        o.view(T * H, hd),
+        qkvg[:, 3 * d :].view(T, H, hd),
+        mixer.o_norm.weight,
+        mixer.o_norm.eps,
+        use_pdl=True,
+        fgs_ctas=NORM_CTAS if pk8 is not None else 0,
+        fgs_counters=pk8,
+        fgs_counter_rows=o_cta_m * H if pk8 is not None else 0,
+    )
+    gate = None if pk8 is None else (pk8, H, norm_rows_per_cta, MAX_SPINS)
+    mixer._k3_prefill_pending = (pair, prev, T, False, gate)
+    edges.debug(
+        "kda.prefill_chain",
+        T,
+        f"{mode()} counter link pair {pair} edges {sorted(e for e in edges_on() if e in (P_QKVG, P_CORE))} "
+        f"blocks {blocks} x {cta_m} rows, qkv tiles {qkv_tiles}, norm rows/cta {norm_rows_per_cta}",
     )
     return core.view(T, H, hd)
 
@@ -387,10 +535,14 @@ def pending(mixer) -> bool:
 def o_proj(mixer, core2d: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """``core2d @ weight^T`` closing the chain :func:`forward` opened: consumes p_core, produces p_attn_o (registered
     for the pre-MoE mix), arms every slot of the previous layer."""
-    pair, prev, T, core_in_slot = mixer._k3_prefill_pending
+    pair, prev, T, core_in_slot, gate = mixer._k3_prefill_pending
     mixer._k3_prefill_pending = None
     if core2d.shape[0] != T:
         raise RuntimeError(f"KDA prefill chain: o_proj got {core2d.shape[0]} rows for a {T}-row layer")
+    if fgs() and SYNC == "counter":
+        return kimi_k3_cute_gemm.linear_fgs(
+            core2d, weight, core2d.new_empty(T, weight.shape[0]), early_trigger=False, gate=gate
+        )
     slots = _slots.get(core2d.device) if fgs() else None
     out_slot = slots.slot(P_ATTN_O, pair, T) if slots is not None else None
     arm = ()
