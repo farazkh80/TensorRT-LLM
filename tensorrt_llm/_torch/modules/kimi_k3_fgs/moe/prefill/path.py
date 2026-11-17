@@ -8,8 +8,9 @@
 16 / EP: 2 at EP16, 8 at EP4); the CuTe routing traps on a routing with more local pairs, the torch one drops them.
 ``TLLM_K3_MOE_PREFILL_PUSH`` (``push_mode()``) names the FC2 -> combine push the caller wires: ``tiles``
 (``fc2_push``: tile push, finalize, rest push) or ``stream`` (``stream_push``: finalize fused into one push kernel).
-``TLLM_K3_MOE_PREFILL_FC1_STORE`` / ``TLLM_K3_MOE_PREFILL_FC2_STORE`` (``v4`` | ``tma``) pick the kernels' output
-store path. ``TLLM_K3_MOE_PREFILL_FC12`` is the FC1 -> FC2 edge: ``off`` (FC2 waits for the FC1 grid, standard PDL),
+``TLLM_K3_MOE_PREFILL_FC1_STORE`` / ``TLLM_K3_MOE_PREFILL_FC2_STORE`` (``tma`` | ``v4``) pick the kernels' output
+store path: a TMA-store epilogue (default) or one 16 B thread store per chunk. ``TLLM_K3_MOE_PREFILL_FC12`` is the
+FC1 -> FC2 edge: ``off`` (FC2 waits for the FC1 grid, standard PDL),
 ``B`` (act slots armed 0x80, FC2 checks each 16 B chunk's first byte by TMA ``report_valid``, scales per element
 against 0xFF), ``A`` (slots armed 0xFF, every element checked) or ``counter`` (FC1 publishes per (m, n) item, FC2
 acquires per m-tile). B and A keep two slot pairs that alternate per use; FC1 re-arms the other pair.
@@ -56,11 +57,11 @@ def push_mode() -> str:
 
 
 def fc1_store() -> str:
-    return _choice(FC1_STORE_ENV, "v4", STORES)
+    return _choice(FC1_STORE_ENV, "tma", STORES)
 
 
 def fc2_store() -> str:
-    return _choice(FC2_STORE_ENV, "v4", STORES)
+    return _choice(FC2_STORE_ENV, "tma", STORES)
 
 
 def fc12_mode() -> str:
