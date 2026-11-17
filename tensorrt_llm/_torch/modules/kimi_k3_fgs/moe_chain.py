@@ -101,6 +101,15 @@ TAIL_FGS_MAX_ROWS = 32
 # many ns.
 _HAZARD_DELAY_NS = int(os.environ.get("TLLM_K3_MOE_HAZARD_DELAY_NS", "0"))
 MAX_ROWS_ENV = "TLLM_K3_MOE_MAX_ROWS"
+# Forwards above TLLM_K3_MOE_MAX_ROWS tokens per rank run the prefill expert path (moe.prefill.path).
+PREFILL_ENV = "TLLM_K3_MOE_PREFILL"
+# "inbox": their combine is the chunk-sized Lamport inbox fused with the latent RMSNorm (moe.prefill.combine).
+PREFILL_COMBINE_ENV = "TLLM_K3_MOE_PREFILL_COMBINE"
+# "fc2_push": FC2 publishes per m-tile and the push runs beside it on TLLM_K3_MOE_PREFILL_PUSH_CTAS SMs; otherwise
+# the same kernels in stream order (FC2, finalize, push, reduce with standard PDL).
+PREFILL_FGS_ENV = "TLLM_K3_MOE_PREFILL_FGS"
+PREFILL_PUSH_CTAS_ENV = "TLLM_K3_MOE_PREFILL_PUSH_CTAS"
+PREFILL_COMBINE_ROWS_ENV = "TLLM_K3_MOE_PREFILL_COMBINE_ROWS"
 # Negative controls only: the consumers of these edges skip their waits.
 _HAZARD_NOWAIT = frozenset(filter(None, os.environ.get("TLLM_K3_MOE_HAZARD_NOWAIT", "").split(",")))
 
@@ -1244,6 +1253,8 @@ class _Layer:
         self.entry_events = None
         # The routed-expert latent RMSNorm, for the fused combine; set by ``entry`` at every MoE forward.
         self.tail_norm = None
+        self.prefill_combine = None
+        self.prefill_round = None
 
     @property
     def device(self) -> torch.device:
@@ -1819,14 +1830,16 @@ def install(routed_experts) -> bool:
     - the fused-kernel switches of ``KERNELS``: each needs its entry point and the switches it builds on, and is
       refused while ``moe_chain`` does not call it yet.
 
-    Forwards with more than ``TLLM_K3_MOE_MAX_ROWS`` (default 128) tokens on the fullest rank keep the stock path.
+    Forwards with more than ``TLLM_K3_MOE_MAX_ROWS`` (default 128) tokens on the fullest rank keep the stock path,
+    or with ``TLLM_K3_MOE_PREFILL=cute`` run the routed experts on ``moe.prefill.path`` (stock comm and entry).
     """
     edges = fgs_edges()
     moe_on, comm_on, tail_on = enabled(), os.environ.get(COMM_ENV, "") == "cute", tail_enabled()
+    prefill = switched(PREFILL_ENV, "cute")
     missing = _missing_kernels()
     if missing:
         raise ValueError(f"fused MoE kernels: cannot run {'; '.join(missing)}")
-    if not (moe_on or comm_on or edges):
+    if not (moe_on or comm_on or edges or prefill):
         return False
     from .moe import comm as k3_comm
 
@@ -1836,7 +1849,7 @@ def install(routed_experts) -> bool:
     if edges and not k3_edges.slots():
         raise ValueError(f"{FGS_ENV} needs edge slots ({k3_edges.ENV}=chain|chain_after|lamport)")
     backend = routed_experts.backend
-    if moe_on and not hasattr(getattr(backend, "activation", None), "gate_softcap"):
+    if (moe_on or prefill) and not hasattr(getattr(backend, "activation", None), "gate_softcap"):
         raise ValueError(f"{ENV}=cute needs the SiTU experts, got {type(backend).__name__}")
     comm = getattr(routed_experts, "comm", None)
     # Only an NVLinkOneSided strategy with counted writes has the CFT workspace CuteA2A runs on; other strategies
@@ -1868,9 +1881,17 @@ def install(routed_experts) -> bool:
         raise ValueError(
             "recv_norm has no oracle build; leave it out of TLLM_K3_MOE_FGS_DIAG_EDGES"
         )
-    if not moe_on:
+    if not (moe_on or prefill):
         return True
-    _install_entry(routed_experts, layer)
+    if moe_on:
+        _install_entry(routed_experts, layer)
+    else:
+        routed_experts._k3_moe_layer = layer
+    prefill_inbox = prefill and switched(PREFILL_COMBINE_ENV, "inbox")
+    if prefill_inbox:
+        if comm is None or not tail_enabled():
+            raise ValueError(f"{PREFILL_COMBINE_ENV}=inbox needs the NVLinkOneSided comm and {TAIL_ENV}")
+        _install_prefill_combine(comm, layer)
     stock_run_moe = backend.run_moe
     checked = []
     ep = getattr(comm, "ep_size", 1)
@@ -1892,12 +1913,13 @@ def install(routed_experts) -> bool:
             tokens_per_rank = max(ctx.all_rank_num_tokens)
         else:
             tokens_per_rank = ctx.x.shape[0] // ep
+        decode_rows = within_max_rows(tokens_per_rank)
         if (
             out is None
             or not ctx.do_finalize
             or ctx.token_selected_experts is None
             or ctx.x_sf is None
-            or not within_max_rows(tokens_per_rank)
+            or not (moe_on if decode_rows else prefill)
         ):
             layer.abandon()
             return stock_run_moe(ctx, workspace=workspace)
@@ -1906,11 +1928,89 @@ def install(routed_experts) -> bool:
             checked.append(True)
         if ctx.x_ready_event is not None:
             ctx.x_ready_event.wait()
+        if not decode_rows:
+            layer.abandon()
+            from .moe.prefill import path as prefill_path
+
+            kw = {}
+            if prefill_inbox:
+                pc = _prefill_combine(layer, comm, tokens_per_rank, routed_experts)
+                fgs_push = os.environ.get(PREFILL_FGS_ENV, "") == "fc2_push"
+                if fgs_push:
+                    from .moe.prefill.fc2_push import push_rest, push_tiles
+
+                    ctas = int(os.environ.get(PREFILL_PUSH_CTAS_ENV, "16"))
+                    sms = torch.cuda.get_device_properties(ctx.x.device).multi_processor_count
+                    # The tile push ships single-pair rows as FC2 finishes them; push_rest ships the multi-pair rows
+                    # after the finalize. Both also push this rank's own rows, so the reduce reads every row from the
+                    # inbox and never from ``out`` while FC2 / the finalize still write it.
+                    kw = dict(
+                        fc2_ctas=sms - ctas,
+                        after_fc2=lambda y, plan, done: push_tiles(pc, y, plan, done, fgs=True, ctas=ctas),
+                        after_finalize=lambda y, plan: push_rest(pc, y, plan),
+                    )
+                else:
+                    kw = dict(after_finalize=lambda y, plan: pc.push(y, fgs=False))
+                layer.prefill_round = (pc, fgs_push)
+            k3_edges.debug(
+                "moe.prefill",
+                tokens_per_rank,
+                f"token-M expert path, {ctx.x.shape[0]} rows"
+                + (
+                    f", inbox combine, FC2 -> push {'on' if layer.prefill_round[1] else 'off'}"
+                    if prefill_inbox
+                    else ""
+                ),
+            )
+            prefill_path.run(
+                ctx.x,
+                ctx.x_sf.view(torch.uint8),
+                ctx.token_selected_experts,
+                ctx.token_final_scales.to(torch.bfloat16),
+                ExpertWeights.from_backend(backend),
+                out,
+                ep,
+                **kw,
+            )
+            return out
         layer.run_moe(ctx, out)
         return out
 
     backend.run_moe = run_moe
     return True
+
+
+def _prefill_combine(layer: _Layer, comm, tokens_per_rank: int, routed_experts):
+    """The layer's ``PrefillCombine``, sized once for the largest MoE chunk (collective: every rank allocates it in
+    the same forward)."""
+    from .moe.prefill.combine import PrefillCombine
+
+    pc = layer.prefill_combine
+    if pc is None or pc.rows < tokens_per_rank:
+        rows = int(os.environ.get(PREFILL_COMBINE_ROWS_ENV, "0"))
+        if not rows:
+            cap = getattr(routed_experts, "moe_max_num_tokens", None)
+            rows = -(-cap // comm.ep_size) if cap else tokens_per_rank
+        pc = layer.prefill_combine = PrefillCombine(comm, rows=max(rows, tokens_per_rank))
+    return pc
+
+
+def _install_prefill_combine(comm, layer: _Layer) -> None:
+    """For a forward the prefill expert path armed (``layer.prefill_round``), the combine is the inbox reduce with the
+    latent RMSNorm fused (consumer re-arm after its output rows); ``run_tail`` then runs only the latent up."""
+    inner = comm.combine
+
+    def combine(final_hidden_states, **kwargs):
+        rnd, layer.prefill_round = layer.prefill_round, None
+        if rnd is None:
+            return inner(final_hidden_states, **kwargs)
+        pc, fgs = rnd
+        norm = layer.tail_norm
+        out = pc.reduce_norm(norm.weight, float(norm.variance_epsilon), fgs=fgs, rearm="consumer")
+        _pending_tail.fused = (out.data_ptr(), None)
+        return out
+
+    comm.combine = combine
 
 
 _send_streams: Dict[torch.device, torch.cuda.Stream] = {}
