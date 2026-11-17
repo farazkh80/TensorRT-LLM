@@ -1079,7 +1079,7 @@ class PrefillCombine:
         if ready is not None and (ready.dtype != torch.int32 or ready.numel() < n):
             raise ValueError(f"ready must be int32 [>= {n}]")
         wait = {"poll": _WAIT_POLL, "done": _WAIT_DONE, "pull": _WAIT_PULL}[mode] if check else _WAIT_NONE
-        if mode in ("poll", "done") and check and os.environ.get(CHECK_ENV, "sw") == "hw":
+        if mode in ("poll", "done") and check and os.environ.get(CHECK_ENV, "hw") == "hw":
             from .combine_tma import reduce_norm_tma
 
             reduce_norm_tma(self, out, norm_weight, eps, ready, n, mt, blocks, y_ptr, rearm, own_in_inbox, wait)
