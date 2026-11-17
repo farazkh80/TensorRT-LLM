@@ -94,6 +94,7 @@ PUSH_BLOCKS_ENV = "TLLM_K3_PC_PUSH_BLOCKS"
 POLL_NS_ENV = "TLLM_K3_PC_POLL_NS"
 REDUCE_MIN_BLOCKS_ENV = "TLLM_K3_PC_REDUCE_MIN_BLOCKS"
 CHECK_ENV = "TLLM_K3_PC_CHECK"
+REDUCE_ENV = "TLLM_K3_PC_REDUCE"
 REARMS = ("consumer", "consumer_st", "producer", "none")
 _REARM_NONE, _REARM_BULK, _REARM_ST = 0, 1, 2
 _WAIT_POLL, _WAIT_DONE, _WAIT_NONE, _WAIT_PULL = 0, 1, 2, 3
@@ -1080,9 +1081,12 @@ class PrefillCombine:
             raise ValueError(f"ready must be int32 [>= {n}]")
         wait = {"poll": _WAIT_POLL, "done": _WAIT_DONE, "pull": _WAIT_PULL}[mode] if check else _WAIT_NONE
         if mode in ("poll", "done") and check and os.environ.get(CHECK_ENV, "hw") == "hw":
-            from .combine_tma import reduce_norm_tma
+            if os.environ.get(REDUCE_ENV, "pipe") == "pipe":
+                from .combine_pipe import reduce_norm_pipe as hw_reduce
+            else:
+                from .combine_tma import reduce_norm_tma as hw_reduce
 
-            reduce_norm_tma(self, out, norm_weight, eps, ready, n, mt, blocks, y_ptr, rearm, own_in_inbox, wait)
+            hw_reduce(self, out, norm_weight, eps, ready, n, mt, blocks, y_ptr, rearm, own_in_inbox, wait)
             self._round = None
             self.comm.reset_state()
             return out
