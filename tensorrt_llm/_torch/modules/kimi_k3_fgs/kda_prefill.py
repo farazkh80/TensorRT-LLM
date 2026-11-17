@@ -46,7 +46,10 @@ the hazard test of the norm's acquire), ``_NORM_GATE=0`` (drop the norm's acquir
 counter acquire and a proxy fence, or the per-lane ``cp.async`` ring; the twin uses the same build),
 ``_NORM_STORE=tma|v4`` (the gated norm's output: one TMA store per CTA tile with the counter publish after
 ``cp.async.bulk.wait_group 0`` and ``fence.proxy.async.global`` (default, the same cost as the thread stores on one
-GPU), or 16-byte thread stores; the twin uses the same build).
+GPU), or 16-byte thread stores; the twin uses the same build), ``_NORM_LOAD=v4|tma`` (the gated norm's o and gate
+rows: 16-byte thread loads (default), or two ``cp.async.bulk`` loads per CTA into shared memory issued after the
+gate-tile acquire and ``fence.proxy.async.global`` (+8 … +12 % on the norm kernel with the publish, the acquire →
+proxy fence → bulk → mbarrier chain; the twin uses the same build).
 """
 
 import atexit
@@ -82,6 +85,9 @@ if CONV not in ("bulk", "cpasync"):
 NORM_STORE = os.environ.get("TLLM_K3_FGS_PREFILL_NORM_STORE", "tma")
 if NORM_STORE not in ("v4", "tma"):
     raise ValueError(f"TLLM_K3_FGS_PREFILL_NORM_STORE={NORM_STORE!r}; valid: v4, tma")
+NORM_LOAD = os.environ.get("TLLM_K3_FGS_PREFILL_NORM_LOAD", "v4")
+if NORM_LOAD not in ("v4", "tma"):
+    raise ValueError(f"TLLM_K3_FGS_PREFILL_NORM_LOAD={NORM_LOAD!r}; valid: v4, tma")
 # Counter slab words per pair: a word per 64 output rows covers every rubin tactic's CTA tile.
 COUNTER_WORDS = -(-(-(-MAX_ROWS // 64)) // 4) * 4
 
@@ -579,6 +585,7 @@ def _forward_counter(
         fgs_gate=(pk2[1], cta_m * H, gate_tiles) if pk2 is not None and NORM_GATE else None,
         fgs_stats=stats["norm"] if pk2 is not None and NORM_GATE else None,
         store=NORM_STORE,
+        load=NORM_LOAD,
     )
     gate = None if pk8 is None else (pk8, H, norm_rows_per_cta, MAX_SPINS)
     mixer._k3_prefill_pending = (pair, prev, T, False, gate)
@@ -587,7 +594,7 @@ def _forward_counter(
         T,
         f"{mode()} counter link pair {pair} edges {sorted(e for e in edges_on() if e in (P_QKVG, P_CORE))} "
         f"blocks {blocks} x {cta_m} rows, qkv tiles {qkv_tiles}, norm rows/cta {norm_rows_per_cta}, "
-        f"norm store {NORM_STORE}",
+        f"norm store {NORM_STORE} load {NORM_LOAD}",
     )
     return core.view(T, H, hd)
 
