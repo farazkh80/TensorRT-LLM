@@ -447,7 +447,7 @@ def push_rest(
     Must follow ``push_tiles(fgs=True)`` of the round (which did the round duties and set the reduce's mode)."""
     if pc._round is None or pc._round[4] != "poll" or not pc._round[7]:
         raise RuntimeError("push_rest follows push_tiles(fgs=True) of the same round")
-    n, mt = pc._round[0], pc._round[1]
+    mt = pc._round[1]
     warps = _env_int(PUSH_WARPS_ENV, 8, 1, 32) if warps is None else warps
     ws_base, ws_stride = pc._ws()
     _compile_rest(

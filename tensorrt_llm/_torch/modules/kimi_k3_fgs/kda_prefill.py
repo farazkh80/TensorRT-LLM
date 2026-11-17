@@ -33,10 +33,10 @@ as valid.
 
 ``TLLM_K3_FGS_PREFILL_EDGES`` (default ``pk2,pk8``; ``pk9`` loses its mix-consumer cost to a tail that is
 not there with raster M (A-03); ``pk7`` needs BT16's decomposition route, i.e. one request
-at 96 heads, and is diagnostic), ``_MIN_ROWS`` / ``_MAX_ROWS`` (1024 / 262144 tokens per rank with the counter link, 4096 with Lamport slots,
-which are sized to ``_MAX_ROWS``; on one GPU the counter link gains 0.6-1.7 % of the layer up to 5460 tokens and is
-noise-level above, the Lamport slots gain 1.5 % at 1365 and lose 0.5-0.9 % at 8192 to their 0.8-1 GB re-arm), ``_RASTER`` (producer GEMM tile
-order; ``n`` publishes row blocks in order but costs the
+at 96 heads, and is diagnostic), ``_MIN_ROWS`` / ``_MAX_ROWS`` (1024 / 262144 tokens per rank with the counter
+link, 4096 with Lamport slots, which are sized to ``_MAX_ROWS``; on one GPU the counter link gains 0.6-1.7 % of the
+layer up to 5460 tokens and is noise-level above, the Lamport slots gain 1.5 % at 1365 and lose 0.5-0.9 % at 8192 to
+their 0.8-1 GB re-arm), ``_RASTER`` (producer GEMM tile order; ``n`` publishes row blocks in order but costs the
 weight-streaming qkvg GEMM 3-21 %, A-02), ``_NORM_CTAS`` (gated norm persistent grid of the FGS roles; 0 = the
 default grid, one CTA per row block), ``_DELAY_NS`` (producer GEMMs spin at entry; hazard tests),
 ``_MAX_SPINS`` (consumer rounds before the grid-wait fallback; small values force the slow path),
