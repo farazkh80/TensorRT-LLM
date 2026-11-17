@@ -331,6 +331,89 @@ def tma_gather4(tma_atom, smem_dst_ptr, mbar_ptr, col, r0, r1, r2, r3, *, loc=No
     )
 
 
+def _tma_desc_value(tma_atom, loc, ip):
+    exec_atom = _cute_nvgpu_ir.atom_make_exec_tma(tma_atom._trait.value, loc=loc, ip=ip)
+    desc_ptr_ty = _cute_ir.PtrType.get(
+        _cute_nvgpu_ir.TmaDescriptorTiledType.get(), AddressSpace.generic, 64
+    )
+    return (
+        _cute_nvgpu_ir.get_tma_desc_addr(desc_ptr_ty, exec_atom, loc=loc, ip=ip)
+        .toint()
+        .ir_value(loc=loc, ip=ip)
+    )
+
+
+@dsl_user_op
+def tma_store_2d(tma_atom, smem_src, col, row, *, loc=None, ip=None):
+    """One ``cp.async.bulk.tensor.2d`` store of the atom's box from the shared address ``smem_src`` to global
+    coordinates (``col``, ``row``), tracked by the issuing thread's bulk async-group."""
+    _asm(
+        None,
+        [_tma_desc_value(tma_atom, loc, ip)]
+        + [cutlass.Int32(v).ir_value(loc=loc, ip=ip) for v in (smem_src, col, row)],
+        "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [$0, {$2, $3}], [$1];",
+        "l,r,r,r",
+        side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def tma_scatter4_2d(tma_atom, smem_src, col, r0, r1, r2, r3, *, loc=None, ip=None):
+    """One ``cp.async.bulk.tensor.2d.tile::scatter4`` store: the four consecutive box rows at ``smem_src`` go to
+    global rows ``r0 .. r3`` at column ``col`` (a row index past the tensor is dropped), bulk async-group tracked.
+    The atom's box must be one row high."""
+    _asm(
+        None,
+        [_tma_desc_value(tma_atom, loc, ip)]
+        + [cutlass.Int32(v).ir_value(loc=loc, ip=ip) for v in (smem_src, col, r0, r1, r2, r3)],
+        "cp.async.bulk.tensor.2d.global.shared::cta.tile::scatter4.bulk_group"
+        " [$0, {$2, $3, $4, $5, $6}], [$1];",
+        "l,r,r,r,r,r,r",
+        side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def bulk_commit_group(*, loc=None, ip=None):
+    _asm(None, [], "cp.async.bulk.commit_group;", "", side_effects=True, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def bulk_wait_group_read(n: int, *, loc=None, ip=None):
+    _asm(
+        None,
+        [],
+        f"cp.async.bulk.wait_group.read {n};",
+        "~{memory}",
+        side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def bulk_wait_group(n: int, *, loc=None, ip=None):
+    _asm(None, [], f"cp.async.bulk.wait_group {n};", "~{memory}", side_effects=True, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def st_shared_v4(addr, w0, w1, w2, w3, *, loc=None, ip=None):
+    _asm(
+        None,
+        [cutlass.Int32(addr).ir_value(loc=loc, ip=ip)]
+        + [cutlass.Int32(w).ir_value(loc=loc, ip=ip) for w in (w0, w1, w2, w3)],
+        "st.shared.v4.b32 [$0], {$1, $2, $3, $4};",
+        "r,r,r,r,r",
+        side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
 @dsl_user_op
 def tcgen05_fence(kind: str, *, loc=None, ip=None):
     _asm(None, [], f"tcgen05.fence::{kind}_thread_sync;", "", side_effects=True, loc=loc, ip=ip)

@@ -50,22 +50,29 @@ from .common import (
     W_ROWS,
     CpAsyncUmmaPipeline,
     UnalignedBarrier,
+    bulk_commit_group,
+    bulk_wait_group,
+    bulk_wait_group_read,
     check_tensor,
     e4m3x2,
+    fence_proxy_async_global,
     gmem_ptr,
     ld_global_cg_v4,
     num_sms,
     red_release_gpu_add,
     s2t_copy_and_partition,
     sigmoid_accurate,
+    st_global_b8,
     st_global_b16,
     st_global_b32,
     st_global_v4,
     st_shared_b32,
+    st_shared_v4,
     tanh_accurate,
     tanh_approx,
     tcgen05_fence,
     tma_gather4,
+    tma_store_2d,
     tmem_load_32x32b_x32,
     ue8m0_scale,
     use_pdl,
@@ -73,6 +80,9 @@ from .common import (
 
 M_TILE = 128
 SF_ATOM_BYTES = 512
+# TMA-store epilogue: per epilogue warp two 32-row x 32 B stages (one MXFP8 group of each row), SW32-swizzled.
+OUT_STAGE_BYTES = 32 * SF_VEC
+OUT_STAGES = 2
 
 
 class Fc1TokenM:
@@ -102,6 +112,7 @@ class Fc1TokenM:
         rearm: bool = False,
         hazard_delay_ns: int = 0,
         counters: bool = False,
+        sf_store: str = "b32",
     ):
         if sentinel not in (None, "80", "ff"):
             raise ValueError(f"sentinel must be None, 80 or ff, got {sentinel}")
@@ -123,8 +134,10 @@ class Fc1TokenM:
             raise ValueError(f"pdl_trigger must be end, start or none, got {pdl_trigger}")
         if math not in ("fast", "accurate"):
             raise ValueError(f"math must be fast or accurate, got {math}")
-        if store not in ("v4", "u16"):
-            raise ValueError(f"store must be v4 or u16, got {store}")
+        if store not in ("v4", "u16", "tma"):
+            raise ValueError(f"store must be v4, u16 or tma, got {store}")
+        if sf_store not in ("b32", "b8"):
+            raise ValueError(f"sf_store must be b32 or b8, got {sf_store}")
         if sf_layout not in ("linear", "swizzled"):
             raise ValueError(f"sf_layout must be linear or swizzled, got {sf_layout}")
         if k_blocks not in (4, 8, 16) or num_gather_warps not in (1, 2, 4, 8):
@@ -137,6 +150,7 @@ class Fc1TokenM:
         self.pdl_trigger = pdl_trigger
         self.math = math
         self.store = store
+        self.sf_store = sf_store
         self.sf_layout = sf_layout
         self.diag = diag
         self.a_path = a_path
@@ -164,6 +178,9 @@ class Fc1TokenM:
         self.threads_per_warp = 32
         self.threads_per_cta = 32 * (self.rearm_warp_id + (1 if rearm else 0))
         self.num_epilog_threads = 32 * len(self.epilog_warp_id)
+        self.out_smem_bytes = (
+            len(self.epilog_warp_id) * OUT_STAGES * OUT_STAGE_BYTES if store == "tma" else 0
+        )
         self.cta_sync_barrier = pipeline.NamedBarrier(
             barrier_id=1, num_threads=self.threads_per_cta
         )
@@ -210,7 +227,7 @@ class Fc1TokenM:
             + self.sfa_bytes_per_stage
             + cute.size_in_bytes(cutlass.Float8E8M0FNU, sfb_one)
         )
-        reserved = 1024 + 4 * 1024 + 1024
+        reserved = 1024 + 4 * 1024 + 1024 + self.out_smem_bytes
         self.num_ab_stage = min((self.smem_capacity - reserved) // stage_bytes, self.max_ab_stages)
         if self.num_ab_stage < 2:
             raise ValueError("not enough shared memory for two mainloop stages")
@@ -337,6 +354,16 @@ class Fc1TokenM:
         tma_atom_x, _ = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileG2SOp(), x, x_gather_layout, (1, 128)
         )
+        tma_atom_act = tma_atom_x
+        if cutlass.const_expr(self.store == "tma"):
+            act_store_layout = cute.make_composed_layout(
+                cute.make_swizzle(1, 4, 3),
+                0,
+                cute.make_layout((32, SF_VEC), stride=(SF_VEC, 1)),
+            )
+            tma_atom_act, _ = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileS2GOp(), act, act_store_layout, (32, SF_VEC)
+            )
 
         @cute.struct
         class SharedStorage:
@@ -377,6 +404,7 @@ class Fc1TokenM:
             tma_atom_sfb,
             tma_tensor_sfb,
             tma_atom_x,
+            tma_atom_act,
             x,
             x_sf,
             act,
@@ -399,7 +427,8 @@ class Fc1TokenM:
             grid=[num_ctas, 1, 1],
             block=[self.threads_per_cta, 1, 1],
             cluster=(1, 1, 1),
-            smem=self.shared_storage.size_in_bytes(),
+            smem=self.shared_storage.size_in_bytes()
+            + (self.out_smem_bytes + 1024 if self.out_smem_bytes else 0),
             stream=stream,
             min_blocks_per_mp=1,
             use_pdl=self.use_pdl,
@@ -423,6 +452,7 @@ class Fc1TokenM:
         tma_atom_sfb: cute.CopyAtom,
         mSFB_nkl: cute.Tensor,
         tma_atom_x: cute.CopyAtom,
+        tma_atom_act: cute.CopyAtom,
         mX: cute.Tensor,
         mXsf: cute.Tensor,
         mAct: cute.Tensor,
@@ -455,6 +485,8 @@ class Fc1TokenM:
             cpasync.prefetch_descriptor(tma_atom_x)
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
+        if cutlass.const_expr(self.store == "tma"):
+            out_smem = smem.allocate(self.out_smem_bytes, 1024)
         ab_pipeline = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.ab_mbar.data_ptr(),
             num_stages=self.num_ab_stage,
@@ -884,6 +916,13 @@ class Fc1TokenM:
             inv_linear_cap = cutlass.Float32(1.0 / self.linear_cap)
             n_groups = tile_n // 64
             ch_per_tile = tile_n // 2
+            tma_out = self.store == "tma"
+            if cutlass.const_expr(tma_out):
+                # Stage (h & 1) holds this warp's 32 rows x 32 B of group h; SW32 (16 B chunk ^= bit 2 of the row)
+                # keeps the 16 B row writes bank-conflict-free and matches the store descriptor's swizzle.
+                out_warp = out_smem.toint() + quad * (OUT_STAGES * OUT_STAGE_BYTES)
+                out_row = lane * SF_VEC
+                out_swz = (lane >> 2) & 1
             if cutlass.const_expr(self.hazard_delay_ns > 0):
                 spin_ns(cutlass.Int64(self.hazard_delay_ns))
             for item in cutlass.range(bidx, total_items, gdim, unroll=1):
@@ -934,6 +973,12 @@ class Fc1TokenM:
                     sf_byte, inv_scale = ue8m0_scale(amax)
                     sf_byte = cutlass.select_(valid, sf_byte, cutlass.Int32(0))
                     sf_word = sf_word | (sf_byte << (8 * h))
+                    if cutlass.const_expr(tma_out):
+                        out_stage = out_warp + (h & 1) * OUT_STAGE_BYTES
+                        # The store issued two groups ago read this stage; one group may stay in flight.
+                        if lane == 0:
+                            bulk_wait_group_read(1)
+                        cute.arch.sync_warp()
                     for jb in cutlass.range_constexpr(2):
                         words = []
                         for wq in cutlass.range_constexpr(4):
@@ -964,25 +1009,56 @@ class Fc1TokenM:
                                     )
                                 )
                             words.append(cutlass.select_(valid, c0 | (c1 << 16), cutlass.Int32(0)))
-                        addr = row_act + 32 * h + 16 * jb
-                        if cutlass.const_expr(self.store == "v4"):
-                            st_global_v4(addr, words[0], words[1], words[2], words[3])
+                        if cutlass.const_expr(tma_out):
+                            st_shared_v4(
+                                out_stage + out_row + ((jb ^ out_swz) << 4),
+                                words[0],
+                                words[1],
+                                words[2],
+                                words[3],
+                            )
                         else:
-                            for wq in cutlass.range_constexpr(4):
-                                st_global_b16(addr + 4 * wq, words[wq])
-                                st_global_b16(addr + 4 * wq + 2, words[wq] >> 16)
-                if cutlass.const_expr(n_groups == 4):
+                            addr = row_act + 32 * h + 16 * jb
+                            if cutlass.const_expr(self.store == "v4"):
+                                st_global_v4(addr, words[0], words[1], words[2], words[3])
+                            else:
+                                for wq in cutlass.range_constexpr(4):
+                                    st_global_b16(addr + 4 * wq, words[wq])
+                                    st_global_b16(addr + 4 * wq + 2, words[wq] >> 16)
+                    if cutlass.const_expr(tma_out):
+                        cute.arch.fence_proxy("async.shared", space="cta")
+                        cute.arch.sync_warp()
+                        if lane == 0:
+                            tma_store_2d(
+                                tma_atom_act,
+                                out_stage,
+                                n_tile * ch_per_tile + SF_VEC * h,
+                                m_tile * M_TILE + 32 * quad,
+                            )
+                            bulk_commit_group()
+                if cutlass.const_expr(self.sf_store == "b8"):
+                    for q in cutlass.range_constexpr(n_groups):
+                        st_global_b8(row_sf + q, (sf_word >> (8 * q)) & 0xFF)
+                elif cutlass.const_expr(n_groups == 4):
                     st_global_b32(row_sf, sf_word)
                 else:
                     st_global_b16(row_sf, sf_word)
                 if cutlass.const_expr(self.counters):
                     # Counter link: once all four epilogue warps stored this tile, one release-add per (m, n) item;
-                    # FC2 acquires n_tiles of them per m-tile.
+                    # FC2 acquires n_tiles of them per m-tile. TMA stores must have completed and crossed the proxy
+                    # boundary before the release.
+                    if cutlass.const_expr(tma_out):
+                        if lane == 0:
+                            bulk_wait_group(0)
+                            fence_proxy_async_global()
                     self.epilog_sync_barrier.arrive_and_wait()
                     if tidx == 0:
                         red_release_gpu_add(
                             mCtr.iterator.toint() + cutlass.Int64(m_tile) * 4, cutlass.Int32(1)
                         )
+            if cutlass.const_expr(tma_out):
+                if lane == 0:
+                    bulk_wait_group(0)
             tmem.relinquish_alloc_permit()
             self.epilog_sync_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
@@ -1094,6 +1170,7 @@ def run(
     rearm=None,
     hazard_delay_ns: int = 0,
     counters=None,
+    sf_store: str = "b32",
 ):
     """act[p], act_sf[p] = MXFP8(SiTU-GLU(x[p2e[p] // 16] @ W31[e]^T)) for every row p of every valid 128-row tile of
     the plan (rows at or past the tile's mn_limit get zeros). ``x`` e4m3 [R, 3584], ``x_sf`` uint8 [R, 112] (linear
@@ -1108,7 +1185,9 @@ def run(
     previous use's slot pair over its first ``rows_prev[0]`` rows (int32 device word) after the grid wait;
     ``hazard_delay_ns`` delays every store (tests). Counter link: ``counters=(ctr, ctr_prev)``, int32 [T] words
     zeroed before use; ctr[m] is release-added once per (m, n) item after the tile's stores (reaches 6144 / tile_n
-    per m-tile), and ctr_prev (the previous use's, finished) is zeroed with the re-arm."""
+    per m-tile), and ctr_prev (the previous use's, finished) is zeroed with the re-arm. ``store``: ``v4`` (16 B
+    stores), ``u16`` (2 B stores) or ``tma`` (32 B x 32-row TMA stores from two shared stages per epilogue warp);
+    ``sf_store``: the row's scale bytes of an item as one ``b32`` store or ``b8`` byte stores."""
     check(x, x_sf, weights, plan, act, act_sf)
     if counters is not None and (
         counters[0].dtype != torch.int32
@@ -1147,6 +1226,7 @@ def run(
         rearm is not None,
         hazard_delay_ns,
         counters is not None,
+        sf_store,
     )
     ctas = num_ctas_for(x, plan, tile_n) if num_ctas is None else num_ctas
     args = launch_args(x, x_sf, weights, plan, act, act_sf, ctas, rearm, counters)
@@ -1175,6 +1255,7 @@ def run(
             rearm=rearm is not None,
             hazard_delay_ns=hazard_delay_ns,
             counters=counters is not None,
+            sf_store=sf_store,
         )
         compiled = _compiled[key] = cute.compile(kernel, *args, stream)
     compiled(*args, stream)
