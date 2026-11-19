@@ -44,9 +44,12 @@ try:
     import cutlass.cute as cute
     from cutlass import Int32, Int64
     from cutlass._mlir.dialects import llvm
+    from cutlass.cute.nvgpu import cpasync
+    from cutlass.cute.runtime import make_ptr
     from cutlass.cutlass_dsl import T, dsl_user_op
     from cutlass.utils import SmemAllocator
 
+    from .. import wait_stats
     from .sync import fgs_diag
 
     _CUTE_AVAILABLE = True
@@ -69,13 +72,45 @@ _DISPATCH_WAIT, _DISPATCH_DEFER, _DISPATCH_SEND_ONLY = 0, 1, 2
 _SIDE_BLOCKS = 32
 INBOX_BLOCKS_ENV = "TLLM_K3_COMM_INBOX_BLOCKS"
 INBOX_DATA_ONLY_ENV = "TLLM_K3_COMM_INBOX_DATA_ONLY"
+# How the Lamport push lands a row in the peer's inbox: "bulk" (one 1-D cp.async.bulk from the smem stage), "tma"
+# (a TMA tensor store, UTMASTG, from the same stage) or "v4" (16-B thread stores).
+INBOX_STORE_ENV = "TLLM_K3_COMM_INBOX_STORE"
+INBOX_STORES = ("bulk", "tma", "v4")
+# The inbox's armed value: "80" (the wire dtype's -0; the consumer checks element 0 of each 16 B) or "ff" (0xFF in
+# every byte; every byte checked).
+INBOX_SENTINEL_ENV = "TLLM_K3_COMM_INBOX_SENTINEL"
+INBOX_SENTINELS = ("80", "ff")
+# How the fused reduce + norm checks a remote row: "poll" (thread loads, -0 test per element) or "tma" (a TMA load
+# with report_valid, re-issued while it lands sentinel data).
+INBOX_CHECK_ENV = "TLLM_K3_COMM_INBOX_CHECK"
+INBOX_CHECKS = ("poll", "tma")
 _SIDE_DONE = 0
 _SIDE_MASK = 4096
 _SIDE_INBOX = 8192
+_TMA_CHUNK = 128
 
 
 def enabled() -> bool:
     return os.environ.get(ENV, "") == "cute"
+
+
+def _inbox_choice(env: str, choices: Tuple[str, ...]) -> str:
+    value = os.environ.get(env, choices[0])
+    if value not in choices:
+        raise ValueError(f"{env}={value!r}; valid: {', '.join(choices)}")
+    return value
+
+
+def inbox_store() -> str:
+    return _inbox_choice(INBOX_STORE_ENV, INBOX_STORES)
+
+
+def inbox_sentinel() -> str:
+    return _inbox_choice(INBOX_SENTINEL_ENV, INBOX_SENTINELS)
+
+
+def inbox_check() -> str:
+    return _inbox_choice(INBOX_CHECK_ENV, INBOX_CHECKS)
 
 
 def _pdl() -> bool:
@@ -1630,11 +1665,13 @@ if _CUTE_AVAILABLE:
             delay_ns: int = 0,
             bulk: bool = False,
             data_only: bool = False,
+            tma: bool = False,
         ):
             assert hidden % 512 == 0
-            # bulk: a warp stages the converted row in shared memory and one lane bulk-stores it to the peer;
-            # otherwise every lane stores its 16-B chunks from registers.
-            self.bulk = bulk
+            # bulk: a warp stages the converted row in shared memory and one lane bulk-stores it to the peer (tma:
+            # a TMA tensor store from the same stage); otherwise every lane stores its 16-B chunks from registers.
+            self.bulk = bulk or tma
+            self.tma = tma
             # data_only: for a consumer that polls the inbox chunks, a CTA exits once its reads of the payload are
             # done; it neither waits for its remote stores to land nor publishes the push-completion words.
             self.data_only = data_only
@@ -1643,6 +1680,8 @@ if _CUTE_AVAILABLE:
             self.rows, self.inbox_bytes = rows, inbox_bytes
             self.wire = hidden if lpc else 2 * hidden
             self.delay_ns = delay_ns
+            if tma:
+                assert self.wire % _TMA_CHUNK == 0 and inbox_bytes == ep * rows * self.wire
 
         @cute.jit
         def __call__(
@@ -1658,10 +1697,33 @@ if _CUTE_AVAILABLE:
             fin_done: Int64,
             fin_expected: Int32,
             timeout_ns: Int64,
+            inbox_ptr: cute.Pointer,
+            side_stride32: Int32,
+            stats_recv: Int64,
+            stats_flags: Int64,
             stream,
         ):
+            tma_atom = tma_tensor = None
+            if cutlass.const_expr(self.tma):
+                # Every rank's two inboxes as (chunk byte, chunk, row, rank); rows of parity b start at b * ep * rows.
+                chunks = self.wire // _TMA_CHUNK
+                m_side = cute.make_tensor(
+                    inbox_ptr,
+                    cute.make_layout(
+                        (_TMA_CHUNK, chunks, 2 * self.ep * self.rows, self.ep),
+                        stride=(1, _TMA_CHUNK, self.wire, side_stride32),
+                    ),
+                )
+                tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(
+                    cpasync.CopyBulkTensorTileS2GOp(),
+                    m_side,
+                    cute.make_layout((_TMA_CHUNK, chunks), stride=(1, _TMA_CHUNK)),
+                    (_TMA_CHUNK, chunks),
+                )
             self.kernel(
                 mY,
+                tma_atom,
+                tma_tensor,
                 ws_base,
                 ws_stride,
                 side_base,
@@ -1671,6 +1733,8 @@ if _CUTE_AVAILABLE:
                 fin_done,
                 fin_expected,
                 timeout_ns,
+                stats_recv,
+                stats_flags,
             ).launch(
                 grid=[self.ep, blocks, 1],
                 block=[_PUSH_WARPS * 32, 1, 1],
@@ -1683,6 +1747,8 @@ if _CUTE_AVAILABLE:
         def kernel(
             self,
             mY: cute.Tensor,
+            tma_atom: Optional[cute.CopyAtom],
+            mSide: Optional[cute.Tensor],
             ws_base: Int64,
             ws_stride: Int64,
             side_base: Int64,
@@ -1692,6 +1758,8 @@ if _CUTE_AVAILABLE:
             fin_done: Int64,
             fin_expected: Int32,
             timeout_ns: Int64,
+            stats_recv: Int64,
+            stats_flags: Int64,
         ):
             L = self.lay
             src = mY.iterator.toint()
@@ -1703,7 +1771,29 @@ if _CUTE_AVAILABLE:
             my_ws = ws_base + Int64(rank) * ws_stride
             nbytes = self.hidden * 2
             stage = Int32(0)
-            if cutlass.const_expr(self.bulk):
+            tS = tG = None
+            if cutlass.const_expr(self.tma):
+                smem = SmemAllocator()
+                chunks = self.wire // _TMA_CHUNK
+                sRing = smem.allocate_tensor(
+                    cutlass.Uint8,
+                    cute.make_layout(
+                        (_TMA_CHUNK, chunks, _PUSH_WARPS), stride=(1, _TMA_CHUNK, self.wire)
+                    ),
+                    byte_alignment=128,
+                )
+                stage = Int32(sRing.iterator.toint()) + warp * self.wire
+                gS = cute.local_tile(mSide, (_TMA_CHUNK, chunks), (0, 0, None, None))
+                tS, tG = cpasync.tma_partition(
+                    tma_atom,
+                    0,
+                    cute.make_layout(1),
+                    cute.group_modes(sRing, 0, 2),
+                    cute.group_modes(gS, 0, 2),
+                )
+                if warp == 0:
+                    cpasync.prefetch_descriptor(tma_atom)
+            elif cutlass.const_expr(self.bulk):
                 smem = SmemAllocator()
                 buf = smem.allocate_array(
                     cutlass.Uint8, _PUSH_WARPS * self.wire, byte_alignment=128
@@ -1727,11 +1817,12 @@ if _CUTE_AVAILABLE:
             dst_side = side_base + Int64(source) * side_stride
             if source != rank:
                 # After a send-only dispatch the count word may still be in flight.
-                n = _spin_ne(
-                    my_ws + L["recv_counters"] + (parity * self.ep + source) * 4,
-                    Int32(-1),
-                    timeout_ns,
-                )
+                cnt_addr = my_ws + L["recv_counters"] + (parity * self.ep + source) * 4
+                if stats_recv != 0:
+                    if tidx == 0:
+                        if _ld_sys_b32(cnt_addr) == -1:
+                            wait_stats.add(stats_recv, 1)
+                n = _spin_ne(cnt_addr, Int32(-1), timeout_ns)
                 box = (
                     dst_side
                     + _SIDE_INBOX
@@ -1749,7 +1840,11 @@ if _CUTE_AVAILABLE:
                         )
                     row = src + (Int64(source) * max_tokens + t) * nbytes
                     dst = box + Int64(t) * self.wire
-                    if cutlass.const_expr(self.bulk):
+                    if cutlass.const_expr(self.tma):
+                        # The stage is read by the warp's previous store; whichever lane issued it waits.
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+                        cute.arch.sync_warp()
+                    elif cutlass.const_expr(self.bulk):
                         if lane == 0:
                             _bulk_wait_read()
                         cute.arch.sync_warp()
@@ -1789,13 +1884,29 @@ if _CUTE_AVAILABLE:
                                 _canon(w[2], False),
                                 _canon(w[3], False),
                             )
-                    if cutlass.const_expr(self.bulk):
+                    if cutlass.const_expr(self.tma):
+                        _fence_proxy_async_shared()
+                        cute.arch.sync_warp()
+                        # The TMA store elects its issuing lane itself.
+                        cute.copy(
+                            tma_atom,
+                            tS[(None, warp)],
+                            tG[(None, parity * (self.ep * self.rows) + rank * self.rows + t, source)],
+                        )
+                        cute.arch.cp_async_bulk_commit_group()
+                    elif cutlass.const_expr(self.bulk):
                         _fence_proxy_async_shared()
                         cute.arch.sync_warp()
                         if lane == 0:
                             _bulk_s2g(dst, stage, Int32(self.wire))
                             _bulk_commit()
-            if cutlass.const_expr(self.bulk):
+            if cutlass.const_expr(self.tma):
+                if cutlass.const_expr(self.data_only):
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                else:
+                    cute.arch.cp_async_bulk_wait_group(0)
+                    _fence_proxy_async_global()
+            elif cutlass.const_expr(self.bulk):
                 if lane == 0:
                     if cutlass.const_expr(self.data_only):
                         _bulk_wait_read()
@@ -1817,7 +1928,11 @@ if _CUTE_AVAILABLE:
                         )
                     if warp == 0:
                         if lane < self.ep:
-                            _spin_eq(my_ws + L["combine_flags"] + lane * 4, value, timeout_ns)
+                            flag_addr = my_ws + L["combine_flags"] + lane * 4
+                            if stats_flags != 0:
+                                if _ld_sys_b32(flag_addr) != value:
+                                    wait_stats.add(stats_flags, 1)
+                            _spin_eq(flag_addr, value, timeout_ns)
                         cute.arch.sync_warp()
                         if lane == 0:
                             _st_b32(my_ws + L["flag"], value)
@@ -2154,6 +2269,10 @@ if _CUTE_AVAILABLE:
                 i64,
                 i32,
                 i64,
+                make_ptr(cutlass.Uint8, 1 << 20, cute.AddressSpace.gmem, assumed_align=128),
+                i32,
+                i64,
+                i64,
                 stream,
                 options=opt,
             )
@@ -2218,7 +2337,8 @@ class LamportInbox(NamedTuple):
     ``side_base + r * side_stride``; inbox ``b`` (b = round parity) at ``_SIDE_INBOX + b * inbox_bytes``; the row of
     (source rank s, slot d) at ``(s * rows + d) * wire``; ``wire`` bytes per row, e4m3 (``lpc``) or bf16.
     Push-completion words ``done[s][by]`` (u32) at ``_SIDE_DONE + (s * _SIDE_BLOCKS + by) * 4`` hold the round's
-    combine value once source s's CTA ``by`` < ``blocks`` finished."""
+    combine value once source s's CTA ``by`` < ``blocks`` finished. ``sentinel`` is the inbox's armed value
+    (``INBOX_SENTINELS``)."""
 
     side_base: int
     side_stride: int
@@ -2227,6 +2347,7 @@ class LamportInbox(NamedTuple):
     inbox_bytes: int
     lpc: bool
     blocks: int
+    sentinel: str
 
 
 def _align(x: int, a: int) -> int:
@@ -2293,19 +2414,23 @@ class CuteA2A:
             self._alloc_side(lamport_rows)
 
     def _alloc_side(self, rows: int) -> None:
-        """One symmetric allocation per rank: header, then two inboxes armed with the -0 sentinel."""
+        """One symmetric allocation per rank: header, then two inboxes armed with the sentinel
+        (``TLLM_K3_COMM_INBOX_SENTINEL``: the wire dtype's -0, or 0xFF in every byte)."""
         from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 
         hidden = int(self.comm._workspace_state["hidden_size"])
         self.hidden = hidden
         self.wire = hidden if self.lpc else 2 * hidden
         self.inbox_bytes = _align(self.ep * rows * self.wire, _CACHELINE)
+        self.sentinel = inbox_sentinel()
         self._side_mem = MnnvlMemory(self.comm.mapping, _SIDE_INBOX + 2 * self.inbox_bytes)
         self.side = self._side_mem.as_torch_strided_tensor(torch.uint8)
         mine = self.side[self.rank]
         mine[:_SIDE_INBOX].zero_()
         boxes = mine[_SIDE_INBOX : _SIDE_INBOX + 2 * self.inbox_bytes]
-        if self.lpc:
+        if self.sentinel == "ff":
+            boxes.fill_(0xFF)
+        elif self.lpc:
             boxes.fill_(0x80)
         else:
             boxes.view(torch.int16).fill_(-32768)
@@ -2638,6 +2763,7 @@ class CuteA2A:
             self.inbox_bytes,
             self.lpc,
             self._lamport_blocks(runtime_max),
+            self.sentinel,
         )
 
     def combine_push(
@@ -2649,12 +2775,14 @@ class CuteA2A:
         hazard_skip_base: bool = False,
         bulk: bool = True,
         data_only: bool = False,
+        store: Optional[str] = None,
     ) -> LamportInbox:
         """Push each received row back to its source rank's inbox: a warp per row loads the bf16 expert output
         (after ``fin_done[s * max + t] >= fin_expected`` when given, else after the producer grid), casts it to the
-        wire format, turns -0 into +0 and stores 16-B chunks into ``inbox[parity]`` of the source. Own rows stay in
-        the payload. The consumer (``lamport_reduce`` or a fused kernel following ``LamportInbox``) must read this
-        round's rows, re-arm what it read and ``griddepcontrol.wait`` before it exits."""
+        wire format, turns -0 into +0 and stores the row into ``inbox[parity]`` of the source with ``store``
+        (``INBOX_STORES``; None: ``bulk``, else 16-B thread stores). Own rows stay in the payload. The consumer
+        (``lamport_reduce`` or a fused kernel following ``LamportInbox``) must read this round's rows, re-arm what
+        it read and ``griddepcontrol.wait`` before it exits."""
         y, n, runtime_max = self._combine_args(final_hidden_states)
         if self.side is None:
             raise RuntimeError("the Lamport inbox needs CuteA2A(..., lamport_rows=N)")
@@ -2662,6 +2790,13 @@ class CuteA2A:
             raise ValueError(
                 f"Lamport combine takes at most {self.lamport_rows} rows of {self.hidden}"
             )
+        if store is None:
+            store = "bulk" if bulk else "v4"
+        if store not in INBOX_STORES:
+            raise ValueError(f"combine_push: store {store!r}; valid: {', '.join(INBOX_STORES)}")
+        side_stride = self.side.stride(0)
+        if store == "tma" and side_stride >= 1 << 31:
+            raise ValueError(f"Lamport TMA store: side stride {side_stride} exceeds the descriptor's int32")
         fgs = fin_done is not None
         ws_base, ws_stride, _ = self._ws()
         blocks = self._lamport_blocks(runtime_max)
@@ -2677,20 +2812,30 @@ class CuteA2A:
             self.lamport_rows,
             self.inbox_bytes,
             hazard_delay_ns,
-            bulk,
+            store == "bulk",
             data_only,
+            store == "tma",
         )(
             y.view(-1),
             ws_base,
             ws_stride,
             self.side.data_ptr(),
-            self.side.stride(0),
+            side_stride,
             self.rank,
             runtime_max,
             blocks,
             fin_done.data_ptr() if fgs else 0,
             fin_expected,
             _TIMEOUT_NS,
+            make_ptr(
+                cutlass.Uint8,
+                self.side.data_ptr() + _SIDE_INBOX,
+                cute.AddressSpace.gmem,
+                assumed_align=128,
+            ),
+            side_stride,
+            wait_stats.addr("moe.push.recv_counters_spin"),
+            wait_stats.addr("moe.push.combine_flags_spin"),
         )
         box = self.lamport_inbox()
         self._lamport_round = (n, runtime_max)

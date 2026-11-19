@@ -1590,6 +1590,7 @@ class _Layer:
         ready_lease = None
         if (
             "rn_up" in self.edges
+            and not k3_edges.links_off()
             and 1 <= local_rows <= TAIL_FGS_MAX_ROWS
             and k3_recipe.moe_on("rn_up", local_rows)
         ):
@@ -1602,15 +1603,31 @@ class _Layer:
         fin_kw = _push_wait(call, final_hidden_states.numel() // HIDDEN)
         norm = self.tail_norm
         inbox_kw = {}
-        # The inbox changes what peers push, so the recipe decides it on the rank-consistent row count.
-        inbox = self.inbox and k3_recipe.moe_on("recv_norm", call.rows)
+        # The inbox changes what peers push, so every rank decides it on the rank-consistent row count; the
+        # recv_norm edge only decides how the reduce waits for it.
+        inbox = self.inbox and call.rows <= self.a2a.lamport_rows
         if inbox:
-            poll = "recv_norm" in self.edges and fgs_diag("recv_norm") != "ready"
-            inbox_kw = {"inbox": "lamport", "lamport_wait": "poll" if poll else "done"}
+            from .moe import comm as k3_comm
+
+            link = "recv_norm" in self.edges and fgs_diag("recv_norm") != "ready"
+            wait = k3_comm.inbox_check() if link else "done"
+            rearm = not k3_edges.links_off()
+            inbox_kw = {
+                "inbox": "lamport",
+                "lamport_wait": wait,
+                "rearm": rearm,
+                "store": k3_comm.inbox_store(),
+            }
             k3_edges.debug(
                 "moe.recv_norm",
                 local_rows,
-                "on, inbox poll" if "recv_norm" in self.edges else "off, push-completion words",
+                (
+                    f"on, inbox {wait}, sentinel {self.a2a.sentinel}"
+                    if link
+                    else "off, push-completion words"
+                )
+                + f", push {inbox_kw['store']}"
+                + ("" if rearm else ", no re-arm"),
             )
         out = tail.combine_norm(
             self.a2a,
@@ -1862,7 +1879,7 @@ def install(routed_experts) -> bool:
     # The forward's edge leases are taken at the CuTe dispatch, so it is wrapped for any edge, not only the comm ones.
     if a2a is not None and (edges or layer.tail_fused or layer.send):
         layer.install_comm(comm)
-    if "rn_up" in edges and fgs_diag("rn_up") == "ready":
+    if "rn_up" in edges and fgs_diag("rn_up") == "ready" and not k3_edges.links_off():
         raise ValueError("rn_up has no ready build; leave it out of TLLM_K3_MOE_FGS_DIAG_EDGES")
     if "recv_norm" in edges and fgs_diag("recv_norm") == "oracle":
         raise ValueError(

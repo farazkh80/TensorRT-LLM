@@ -58,6 +58,9 @@ def install(config) -> None:
             f"fine_grained_sync_config: kernel_switches {bad} are not fused-MoE switches "
             f"({', '.join(p + '*' for p in SWITCH_PREFIXES)}); set them in the environment"
         )
+    # A family is env-driven only when its variables were set outside the config; a kernel switch such as
+    # TLLM_K3_COMM_INBOX keeps the recipe's ownership (e.g. the inbox transport without the recv_norm edge).
+    preset = {n for names in FAMILY_ENVS.values() for n in names if n in os.environ}
     for name, value in config.kernel_switches.items():
         os.environ.setdefault(name, value)
     os.environ.setdefault(MODE_ENV, "off" if config.edges == {} else config.mode)
@@ -72,7 +75,7 @@ def install(config) -> None:
         )
     _windows = {name: config.windows(name) for name in config.edges}
     _owned = frozenset(
-        family for family, names in FAMILY_ENVS.items() if not any(n in os.environ for n in names)
+        family for family, names in FAMILY_ENVS.items() if not any(n in preset for n in names)
     )
     if "moe" in _owned and "moe.recv_norm" in _windows:
         os.environ.setdefault(INBOX_ENV, "combine")
