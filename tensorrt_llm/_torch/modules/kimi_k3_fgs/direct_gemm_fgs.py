@@ -66,6 +66,9 @@ checks element 0 only (TMA ``report_valid``, KdaDecodeT1, the mixes) could accep
   groups instead of being held for a whole K loop, so the next group's loads overlap the current group's FMAs.
   Needs ``pzo``, N % 8 == 0, one row per CTA and ``P * block_size`` <= 1024.
 
+``stats_addr`` (``wait_stats`` counter, 0 when off) receives every reload round of the consumer checks and of the
+``head_last`` tail wait, the kernel's software wait sites.
+
 The kernel never writes sentinels; the caller owns sentinel initialization of the activation buffer.
 """
 
@@ -84,6 +87,11 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute import experimental as cute_ext
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
+
+try:
+    from . import wait_stats
+except ImportError:  # standalone copy next to wait_stats.py
+    import wait_stats
 
 _VECTOR_WIDTH = 8
 _SUPPORTED_BLOCK_SIZES = (32, 64, 96, 128, 192, 256, 384)
@@ -461,6 +469,7 @@ class DirectFgsGemmKernel:
         gB: cute.Tensor,
         gC: cute.Tensor,
         retry_count: cute.Tensor,
+        stats_addr: Int64,
         stream: _cuda.CUstream,
     ) -> None:
         n = cute.size(gB, mode=[0])
@@ -477,7 +486,7 @@ class DirectFgsGemmKernel:
             load_cache_mode=cute.nvgpu.LoadCacheMode.STREAMING,
         )
         if const_expr(self.chunk):
-            self.kernel_chunk(gA, gB, gC, retry_count, copy_a, copy_b).launch(
+            self.kernel_chunk(gA, gB, gC, retry_count, stats_addr, copy_a, copy_b).launch(
                 grid=[cute.ceil_div(n, _CHUNK), self.num_rows, 1],
                 block=[self.chunk_parallel * self.block_size, 1, 1],
                 smem=_CHUNK * self.num_warps * 4,
@@ -486,7 +495,7 @@ class DirectFgsGemmKernel:
                 min_blocks_per_mp=self.min_ctas_per_sm,
             )
         elif const_expr(self.group8):
-            self.kernel_group8(gA, gB, gC, retry_count, copy_a, copy_b).launch(
+            self.kernel_group8(gA, gB, gC, retry_count, stats_addr, copy_a, copy_b).launch(
                 grid=[cute.ceil_div(n, _CHUNK), self.num_rows // self.rows_per_block, 1],
                 block=[self.block_size, 1, 1],
                 smem=self.group * self.rows_per_block * self.outputs_per_block * self.num_warps * 4,
@@ -498,7 +507,7 @@ class DirectFgsGemmKernel:
             smem = self.rows_per_block * self.outputs_per_block * self.num_warps * 4
             if const_expr(self.gather):
                 smem = (smem + 15) // 16 * 16 + self.rows_per_block * _CHUNK * 2
-            self.kernel(gA, gB, gC, retry_count, copy_a, copy_b).launch(
+            self.kernel(gA, gB, gC, retry_count, stats_addr, copy_a, copy_b).launch(
                 grid=[
                     cute.ceil_div(n, self.outputs_per_block),
                     self.num_rows // self.rows_per_block,
@@ -519,6 +528,7 @@ class DirectFgsGemmKernel:
         gB: cute.Tensor,
         gC: cute.Tensor,
         retry_count: cute.Tensor,
+        stats_addr: Int64,
         copy_a: cute.CopyAtom,
         copy_b: cute.CopyAtom,
     ) -> None:
@@ -555,7 +565,7 @@ class DirectFgsGemmKernel:
         tB_all = cute.logical_divide(gB_vec, (None, (None, block_size)))
         tA = tA_all[None, (None, (tidx, None))]
         if const_expr(self.check_valid and self.check_mode == "heads_before_b"):
-            self._wait_heads_written(tA, m_base, retry_count)
+            self._wait_heads_written(tA, m_base, retry_count, stats_addr)
 
         b_regs = cute.make_rmem_tensor(
             cute.make_layout(
@@ -569,7 +579,7 @@ class DirectFgsGemmKernel:
             for k_tile in cutlass.range_constexpr(num_k_tiles):
                 cute.copy(copy_b, tB[None, k_tile], b_regs[ni, k_tile, None])
         if const_expr(self.check_valid and self.check_mode == "heads"):
-            self._wait_heads_written(tA, m_base, retry_count)
+            self._wait_heads_written(tA, m_base, retry_count, stats_addr)
 
         rows_check = self.check_valid and self.check_mode == "rows"
         if const_expr(rows_check):
@@ -580,7 +590,7 @@ class DirectFgsGemmKernel:
                 ),
                 self.element_type,
             )
-            self._load_rows_checked(copy_a, tA, m_base, a_rows, retry_count)
+            self._load_rows_checked(copy_a, tA, m_base, a_rows, retry_count, stats_addr)
         a_regs = cute.make_rmem_tensor(
             cute.make_layout((num_k_tiles, vector_width), stride=(vector_width, 1)),
             self.element_type,
@@ -588,7 +598,7 @@ class DirectFgsGemmKernel:
         per_row_check = self.check_valid and self.check_mode == "row"
         for mi in cutlass.range_constexpr(num_rows):
             if const_expr(per_row_check):
-                self._load_a_checked(copy_a, tA, m_base + mi, a_regs, retry_count)
+                self._load_a_checked(copy_a, tA, m_base + mi, a_regs, retry_count, stats_addr)
             elif const_expr(rows_check):
                 pass
             else:
@@ -674,7 +684,7 @@ class DirectFgsGemmKernel:
                         gC[m_base + mi, n_base + ni] = total.to(self.element_type)
             if const_expr(self.head_last):
                 if is_head:
-                    self._wait_chunk_tails(gC, m_base, n_base, retry_count)
+                    self._wait_chunk_tails(gC, m_base, n_base, retry_count, stats_addr)
                     for mi in cutlass.range_constexpr(num_rows):
                         cute.recast_tensor(gC, cutlass.Int16)[m_base + mi, n_base] = cutlass.Int16(
                             head_bits[mi]
@@ -699,6 +709,7 @@ class DirectFgsGemmKernel:
         gB: cute.Tensor,
         gC: cute.Tensor,
         retry_count: cute.Tensor,
+        stats_addr: Int64,
         copy_a: cute.CopyAtom,
         copy_b: cute.CopyAtom,
     ) -> None:
@@ -748,7 +759,7 @@ class DirectFgsGemmKernel:
             self.element_type,
         )
         if const_expr(self.check_valid):
-            self._load_rows_checked(copy_a, tA, row, a_rows, retry_count)
+            self._load_rows_checked(copy_a, tA, row, a_rows, retry_count, stats_addr)
         else:
             for k_tile in cutlass.range_constexpr(num_k_tiles):
                 cute.copy(copy_a, tA[row, None, k_tile], a_rows[0, k_tile, None])
@@ -812,6 +823,7 @@ class DirectFgsGemmKernel:
         gB: cute.Tensor,
         gC: cute.Tensor,
         retry_count: cute.Tensor,
+        stats_addr: Int64,
         copy_a: cute.CopyAtom,
         copy_b: cute.CopyAtom,
     ) -> None:
@@ -847,7 +859,7 @@ class DirectFgsGemmKernel:
             self.element_type,
         )
         if const_expr(self.check_valid):
-            self._load_rows_checked(copy_a, tA, m_base, a_rows, retry_count)
+            self._load_rows_checked(copy_a, tA, m_base, a_rows, retry_count, stats_addr)
         else:
             for mi in cutlass.range_constexpr(num_rows):
                 for k_tile in cutlass.range_constexpr(num_k_tiles):
@@ -932,12 +944,14 @@ class DirectFgsGemmKernel:
         return pending
 
     @cute.jit
-    def _count(self, retry_count: cute.Tensor, rounds, bad):
+    def _count(self, retry_count: cute.Tensor, rounds, bad, stats_addr):
         """Lane 0 adds the warp's reload rounds and, if a ``spin_limit`` wait ended unwritten, one give-up."""
         stuck = cute.arch.vote_any_sync(bad)
         if cute.arch.lane_idx() == 0:
             if rounds > 0:
                 cute.arch.atomic_add(retry_count.iterator, rounds)
+                if stats_addr != 0:
+                    wait_stats.add(stats_addr, rounds)
             if stuck:
                 cute.arch.atomic_add(retry_count.iterator + 1, Int32(1))
 
@@ -956,7 +970,7 @@ class DirectFgsGemmKernel:
         return _has_sentinel(acc) if self.check_elements else acc
 
     @cute.jit
-    def _wait_heads_written(self, tA: cute.Tensor, m_base, retry_count: cute.Tensor):
+    def _wait_heads_written(self, tA: cute.Tensor, m_base, retry_count: cute.Tensor, stats_addr):
         """Return once every activation chunk this warp reads in rows ``m_base ..`` is written (element 0 only
         without ``check_elements``)."""
         num_rows: cutlass.Constexpr = self.rows_per_block
@@ -983,7 +997,7 @@ class DirectFgsGemmKernel:
         if rounds > 0:
             # The default body's loads must not hit the lines the first pass cached with the sentinel.
             cute.arch.fence_acq_rel_gpu()
-            self._count(retry_count, rounds, bad)
+            self._count(retry_count, rounds, bad, stats_addr)
 
     @cute.jit
     def _load_a_checked(
@@ -993,6 +1007,7 @@ class DirectFgsGemmKernel:
         row,
         a_regs: cute.Tensor,
         retry_count: cute.Tensor,
+        stats_addr,
     ):
         """Load this thread's chunks of activation ``row`` into ``a_regs`` and return once every lane of the warp
         holds written ones."""
@@ -1025,7 +1040,7 @@ class DirectFgsGemmKernel:
                 acc = _chunk_bad(acc, reloaded, self.check_elements)
             bad = self._check_done(acc)
             pending = self._keep_waiting(cute.arch.vote_any_sync(bad), rounds)
-        self._count(retry_count, rounds, bad)
+        self._count(retry_count, rounds, bad, stats_addr)
 
     @cute.jit
     def _load_rows_checked(
@@ -1035,6 +1050,7 @@ class DirectFgsGemmKernel:
         m_base,
         a_rows: cute.Tensor,
         retry_count: cute.Tensor,
+        stats_addr,
     ):
         """``_load_a_checked`` for all of the CTA's rows at once, before any FMA."""
         num_rows: cutlass.Constexpr = self.rows_per_block
@@ -1062,10 +1078,10 @@ class DirectFgsGemmKernel:
                     acc = _chunk_bad(acc, reloaded, self.check_elements)
             bad = self._check_done(acc)
             pending = self._keep_waiting(cute.arch.vote_any_sync(bad), rounds)
-        self._count(retry_count, rounds, bad)
+        self._count(retry_count, rounds, bad, stats_addr)
 
     @cute.jit
-    def _wait_chunk_tails(self, gC: cute.Tensor, m_base, n_base, retry_count: cute.Tensor):
+    def _wait_chunk_tails(self, gC: cute.Tensor, m_base, n_base, retry_count: cute.Tensor, stats_addr):
         """Spin until elements ``outputs_per_block .. 7`` of the output chunks at (rows ``m_base ..``, ``n_base``)
         are no longer -0.0 (stored by the group's other CTAs). One thread."""
         num_rows: cutlass.Constexpr = self.rows_per_block
@@ -1085,6 +1101,9 @@ class DirectFgsGemmKernel:
             if pending:
                 _backoff(rounds)
                 rounds = rounds + 1
+        if rounds > 0:
+            if stats_addr != 0:
+                wait_stats.add(stats_addr, rounds)
         if const_expr(self.spin_limit):
             if bad:
                 cute.arch.atomic_add(retry_count.iterator + 1, Int32(1))
@@ -1162,7 +1181,7 @@ def _get_compiled_direct_kernel(
     tensors = _make_compile_repr_tensors(dtype, m, n, k)
     retry = _retry_tensor(_torch.zeros(RETRY_COUNTER_SLOTS, dtype=_torch.int32, device="cuda"))
     stream = _cuda.CUstream(_torch.cuda.current_stream().cuda_stream)
-    return cute_ext.compile(kernel, *tensors, retry, stream, options=_COMPILE_OPTIONS)
+    return cute_ext.compile(kernel, *tensors, retry, Int64(0), stream, options=_COMPILE_OPTIONS)
 
 
 def _validate_runtime_tensors(a, b, out, tactic: DirectTactic):
@@ -1247,11 +1266,13 @@ def run_direct_dense_fgs(
     chunk_parallel: int = 0,
     min_ctas_per_sm: int | None = None,
     spin_limit: int = 0,
+    stats_addr: int = 0,
 ):
     """Run direct ``A[M,K] @ B[K,N]`` with the ``mm_bf16`` layouts; ``a`` is the FGS-checked operand.
 
     ``retry_counter`` (int32, ``RETRY_COUNTER_SLOTS`` elements) accumulates the activation reload rounds and the
-    waits ``spin_limit`` (diagnostic) gave up. With every
+    waits ``spin_limit`` (diagnostic) gave up; ``stats_addr`` (a ``wait_stats`` counter address) receives the
+    reload rounds as well. With every
     role off (``check_valid=False``, ``pdl_wait_activation=True``) this is FlashInfer's ``run_direct_dense``.
     ``check_mode=None`` takes ``default_check_mode``; ``min_ctas_per_sm`` (launch bound) ``None`` takes
     ``default_min_ctas_per_sm`` when any role is on and 1 (the default build's) otherwise.
@@ -1303,7 +1324,7 @@ def run_direct_dense_fgs(
     )
     tensors = tuple(_from_dlpack_static(tensor) for tensor in (a, b.T, out))
     stream = _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream)
-    compiled(*tensors, _retry_tensor(retry_counter), stream)
+    compiled(*tensors, _retry_tensor(retry_counter), Int64(stats_addr), stream)
     return out
 
 

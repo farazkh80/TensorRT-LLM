@@ -45,6 +45,13 @@ Compile-time producer roles (the output is a report_valid consumer's input):
   stages its tile in shared memory (the A stage buffers, idle after the last
   MMA) and stores it with one 16 B store per chunk, which a consumer that checks
   element 0 per 16 B sees whole. Needs a row-major output with N % 8 == 0.
+- ``tma_store``: the tile is staged as for ``store16`` and written by one TMA
+  store (``cp.async.bulk.tensor`` from shared memory, out-of-bounds rows and
+  columns clipped by the tensor map); the issuing warp waits for the bulk
+  group's smem reads before the CTA exits. Alternative to ``store16``.
+
+``stats_addr`` (``wait_stats`` counter, 0 when off) receives the activation
+re-issues of ``report_valid`` builds.
 
 The kernel never writes sentinels; the caller owns sentinel initialization of
 the activation buffer.
@@ -67,6 +74,11 @@ from cutlass.cute import experimental as cute_ext
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
+
+try:
+    from . import wait_stats
+except ImportError:  # standalone copy next to wait_stats.py
+    import wait_stats
 
 #: Per-CTA SMEM capacity reported by CuTeDSL on SM100/SM103.
 _SMEM_CAPACITY_BYTES = utils.get_smem_capacity_in_bytes("sm_100")
@@ -424,8 +436,11 @@ OWNER_RANK = 0
 #: Warp that validates and re-issues activation stages.
 RETRY_WARP = 3
 
-#: Named barrier of the epilogue warps (store16 staging).
+#: Named barrier of the epilogue warps (store16 / tma_store staging).
 EPILOG_BARRIER = 1
+
+#: Epilogue warp that issues the tma_store of the staged tile.
+TMA_STORE_WARP = 4
 
 #: Slots of the retry counter: activation re-issues, stages released invalid after retry_limit.
 RETRY_COUNTER_SLOTS = 2
@@ -456,9 +471,12 @@ class SplitKFgsGemmKernel:
         addend: bool = False,
         ready_wait: bool = False,
         l2_prefetch: bool = False,
+        tma_store: bool = False,
     ) -> None:
         if addend and not has_bias:
             raise ValueError("addend is passed as the bias operand")
+        if store16 and tma_store:
+            raise ValueError("store16 and tma_store are alternatives")
         if report_valid and not retry_warp:
             raise ValueError("report_valid needs retry_warp to re-issue invalid stages")
         if timeline and not retry_warp:
@@ -482,6 +500,7 @@ class SplitKFgsGemmKernel:
         self.pzo = pzo
         self.early_trigger = early_trigger and use_pdl
         self.store16 = store16
+        self.tma_store = tma_store
         self.addend = addend
         self.ready_wait = ready_wait
         self.l2_prefetch = l2_prefetch
@@ -530,10 +549,11 @@ class SplitKFgsGemmKernel:
         bias: cute.Tensor,
         retry_count: cute.Tensor,
         ready_addr: cutlass.Int64,
+        stats_addr: cutlass.Int64,
         stream: _cuda.CUstream,
     ):
         # Grid-y packs output-N tile and cluster rank.
-        self.kernel(a, b, c, bias, retry_count, ready_addr).launch(
+        self.kernel(a, b, c, bias, retry_count, ready_addr, stats_addr).launch(
             grid=(
                 cute.ceil_div(c.layout.shape[0], self.cta_m),
                 cute.ceil_div(c.layout.shape[1], self.cta_n) * self.split_k,
@@ -556,6 +576,7 @@ class SplitKFgsGemmKernel:
         mBias: cute.Tensor,  # Broadcast bias; dead when has_bias=False
         mRetry: cute.Tensor,  # Int32 (re-issues, stages released invalid); dead without retry_warp
         ready_addr: cutlass.Int64,  # Int32 per public-M row; 0 or dead without ready_wait
+        stats_addr: cutlass.Int64,  # wait_stats re-issue counter; 0 when the stats are off
     ):
         """Allocate storage and dispatch the specialized warps."""
         if cutlass.const_expr(self.early_trigger):
@@ -747,11 +768,13 @@ class SplitKFgsGemmKernel:
                     k_tile_count,
                     mRetry,
                     bidx + block_idx[1] * cute.arch.grid_dim()[0],
+                    stats_addr,
                 )
             elif cutlass.const_expr(self.l2_prefetch):
                 self.prefetch_l2_warp(mA, bidx, k_tile_start, k_tile_count)
         elif warp_idx >= 4:
             self.epilog_warp(
+                warp_idx,
                 bar_tma_epilog,
                 bar_mma_epilog,
                 bar_tmem_alloc,
@@ -879,6 +902,7 @@ class SplitKFgsGemmKernel:
         k_tile_count: cutlass.Int32,
         mRetry: cute.Tensor,
         cta_id: cutlass.Int32,
+        stats_addr: cutlass.Int64,
     ):
         """Release each activation stage once its primary phase completes with valid data.
 
@@ -980,6 +1004,8 @@ class SplitKFgsGemmKernel:
         with cute.arch.elect_one():
             if retries > 0:
                 cute.arch.atomic_add(mRetry.iterator, retries)
+                if stats_addr != 0:
+                    wait_stats.add(stats_addr, retries)
             if unchecked > 0:
                 cute.arch.atomic_add(mRetry.iterator + 1, unchecked)
         if cutlass.const_expr(self.timeline):
@@ -1044,6 +1070,7 @@ class SplitKFgsGemmKernel:
     @cute.experimental.jit
     def epilog_warp(
         self,
+        warp_idx: cutlass.Int32,
         bar_tma_epilog,
         bar_mma_epilog,
         bar_tmem_alloc,
@@ -1178,13 +1205,21 @@ class SplitKFgsGemmKernel:
                 rD.store(rAcc.load().to(c_dtype, pzo=True))
             else:
                 rD.store(rAcc.load().to(c_dtype))
-            if cutlass.const_expr(self.store16):
+            if cutlass.const_expr(self.store16 or self.tma_store):
                 # Kernel-M (public N) is contiguous in both the staged tile and the output.
                 sD = cute.make_tensor(
                     cute.recast_ptr(stage_ptr, dtype=c_dtype),
                     cute.make_layout((self.cta_m, self.cta_n), stride=(1, self.cta_m)),
                 )
                 cute_ext.partition_and_copy(thr_t2r, rD, sD)
+            if cutlass.const_expr(self.tma_store):
+                cute.arch.fence_proxy("async.shared", space="cta")
+                cute.arch.barrier(barrier_id=EPILOG_BARRIER, number_of_threads=self.epilog_threads)
+                if warp_idx == TMA_STORE_WARP:
+                    cute_ext.tma_store(sD, gD_tile)
+                    cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+            elif cutlass.const_expr(self.store16):
                 cute.arch.barrier(barrier_id=EPILOG_BARRIER, number_of_threads=self.epilog_threads)
                 chunks_m = self.cta_m // 8
                 s_base = sD.iterator.toint()
@@ -1218,6 +1253,7 @@ def _bmm_no_bias(
     c: cute.Tensor,
     retry_count: cute.Tensor,
     ready_addr: cutlass.Int64,
+    stats_addr: cutlass.Int64,
     stream: _cuda.CUstream,
 ):
     c = cute.make_tensor(c.iterator, cute.select(c.layout, mode=[1, 2, 0]))
@@ -1228,6 +1264,7 @@ def _bmm_no_bias(
         cute.make_tensor(c.iterator, cute.select(c.layout, mode=[0, 1, 2])),
         retry_count,
         ready_addr,
+        stats_addr,
         stream,
     )
 
@@ -1241,6 +1278,7 @@ def _bmm_bias(
     bias: cute.Tensor,
     retry_count: cute.Tensor,
     ready_addr: cutlass.Int64,
+    stats_addr: cutlass.Int64,
     stream: _cuda.CUstream,
 ):
     gemm_op(
@@ -1250,6 +1288,7 @@ def _bmm_bias(
         cute.make_tensor(bias.iterator, cute.select(bias.layout, mode=[1, 2, 0])),
         retry_count,
         ready_addr,
+        stats_addr,
         stream,
     )
 
@@ -1377,6 +1416,7 @@ def _get_compiled_splitk_kernel(
     addend: bool = False,
     ready_wait: bool = False,
     l2_prefetch: bool = False,
+    tma_store: bool = False,
 ):
     if dtype not in _SUPPORTED_TORCH_DTYPES:
         raise ValueError(f"split-K dense GEMM supports {_SUPPORTED_TORCH_DTYPES}; got {dtype}")
@@ -1402,13 +1442,23 @@ def _get_compiled_splitk_kernel(
             addend=addend,
             ready_wait=ready_wait,
             l2_prefetch=l2_prefetch,
+            tma_store=tma_store,
         )
         stream = _cuda.CUstream(_torch.cuda.current_stream().cuda_stream)
         ready_addr = cutlass.Int64(0)
+        stats_addr = cutlass.Int64(0)
         if has_bias:
-            return cute_ext.compile(_bmm_bias, kernel, *compile_tensors, ready_addr, stream)
+            return cute_ext.compile(
+                _bmm_bias, kernel, *compile_tensors, ready_addr, stats_addr, stream
+            )
         return cute_ext.compile(
-            _bmm_no_bias, kernel, *compile_tensors[:3], compile_tensors[4], ready_addr, stream
+            _bmm_no_bias,
+            kernel,
+            *compile_tensors[:3],
+            compile_tensors[4],
+            ready_addr,
+            stats_addr,
+            stream,
         )
 
 
@@ -1480,25 +1530,28 @@ def run_splitk_dense_fgs(
     ready: _torch.Tensor | None = None,
     ready_wait: bool = False,
     l2_prefetch: bool = False,
+    tma_store: bool = False,
+    stats_addr: int = 0,
 ):
     """Run ``A[M,K] @ B[K,N]`` with the ``mm_bf16`` layouts; ``a`` is the FGS-checked operand.
 
     ``retry_counter`` (int32, ``RETRY_COUNTER_SLOTS`` elements) accumulates the
     activation re-issues and, with ``retry_limit``, the stages released invalid
-    after a CTA exceeded its re-issue budget. ``exact_smem`` and
+    after a CTA exceeded its re-issue budget; ``stats_addr`` (a ``wait_stats``
+    counter address) receives the re-issues as well. ``exact_smem`` and
     ``smem_carveout`` (percent, CUDA preferred carveout) let a consumer CTA share
     an SM with a concurrently running producer. ``timeline`` (diagnostic) also
     stores per-CTA load stamps; the counter then needs ``timeline_slots``
-    elements. ``pzo``, ``early_trigger`` and ``store16`` are the producer roles
-    (module docstring). ``addend`` takes ``bias`` as a ``[M, N]`` tensor added
-    after the output rounding. ``ready`` (int32 per row of ``a``, needs
-    ``ready_wait``) makes the activation loads wait per row instead of on the
-    grid dependency.
+    elements. ``pzo``, ``early_trigger``, ``store16`` and ``tma_store`` are the
+    producer roles (module docstring). ``addend`` takes ``bias`` as a ``[M, N]``
+    tensor added after the output rounding. ``ready`` (int32 per row of ``a``,
+    needs ``ready_wait``) makes the activation loads wait per row instead of on
+    the grid dependency.
     """
     m, n, k = _validate_runtime_tensors(a, b, bias, out, addend)
     validate_tactic(tactic, m, n, k)
-    if store16 and (out.stride(-1) != 1 or n % 8):
-        raise ValueError("store16 needs a row-major output with N % 8 == 0")
+    if (store16 or tma_store) and (out.stride(-1) != 1 or n % 8):
+        raise ValueError("store16 / tma_store need a row-major output with N % 8 == 0")
     slots = timeline_slots(tactic, m, n) if timeline else RETRY_COUNTER_SLOTS
     if retry_counter is None and not timeline:
         retry_counter = _scratch_retry_counter(a.device)
@@ -1539,11 +1592,13 @@ def run_splitk_dense_fgs(
             addend=addend,
             ready_wait=ready_wait,
             l2_prefetch=l2_prefetch,
+            tma_store=tma_store,
         )
         compiled(
             *(tensors[:4] if has_bias else tensors[:3]),
             _retry_tensor(retry_counter, timeline),
             ready.data_ptr() if ready is not None else 0,
+            stats_addr,
             _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream),
         )
     return out
