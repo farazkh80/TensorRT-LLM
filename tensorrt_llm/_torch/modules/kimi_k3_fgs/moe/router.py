@@ -152,6 +152,13 @@ def _ld_global_f32(addr, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _ld_global_b32(addr, *, loc=None, ip=None):
+    return cutlass.Int32(
+        _asm(T.i32(), [_i64(addr, loc, ip)], "ld.global.b32 $0, [$1];", "=r,l", loc, ip)
+    )
+
+
+@dsl_user_op
 def _st_global_b32(addr, v, *, loc=None, ip=None):
     _asm(None, [_i64(addr, loc, ip), _i32(v, loc, ip)], "st.global.b32 [$0], $1;", "l,r", loc, ip)
 
@@ -474,6 +481,7 @@ class RouterKernel:
         x_wait: bool = True,
         smem_budget: int = SMEM_BUDGET,
         balanced: tuple = None,
+        table: bool = False,
     ):
         if n_mma not in N_MMA:
             raise ValueError(f"n_mma must be one of {N_MMA}")
@@ -486,6 +494,7 @@ class RouterKernel:
         self.x_check = x_check
         self.x_wait = x_wait
         self.balanced = balanced
+        self.table = table
         self.n_mma = n_mma
         self.split = split
         self.k_iters = K_TILES // split
@@ -569,6 +578,7 @@ class RouterKernel:
         cand_addr: cutlass.Int64,
         cnt_addr: cutlass.Int64,
         tl_addr: cutlass.Int64,
+        table_addr: cutlass.Int64,
         stream: cuda.CUstream,
     ):
         n = self.n_mma
@@ -632,6 +642,7 @@ class RouterKernel:
             cand_addr,
             cnt_addr,
             tl_addr,
+            table_addr,
             cluster_layout_vmnk,
             a_layout,
             b_layout,
@@ -663,6 +674,7 @@ class RouterKernel:
         cand_addr: cutlass.Int64,
         cnt_addr: cutlass.Int64,
         tl_addr: cutlass.Int64,
+        table_addr: cutlass.Int64,
         cluster_layout_vmnk: cute.Layout,
         a_layout: cute.ComposedLayout,
         b_layout: cute.ComposedLayout,
@@ -896,6 +908,7 @@ class RouterKernel:
                 cand_addr,
                 cnt_addr,
                 tl_addr,
+                table_addr,
                 bidx,
             )
 
@@ -923,6 +936,7 @@ class RouterKernel:
         cand_addr,
         cnt_addr,
         tl_addr,
+        table_addr,
         bidx,
     ):
         n = self.n_mma
@@ -1091,6 +1105,7 @@ class RouterKernel:
                     wts_addr,
                     ready_addr,
                     cand_addr,
+                    table_addr,
                 )
                 self._stamp(tl_addr, bidx, 6, lane == 0)
 
@@ -1113,6 +1128,14 @@ class RouterKernel:
         for j in cutlass.range_constexpr(TOP_K):
             ej = _shfl_idx(e, cutlass.Int32(j))
             out = cutlass.select_(_shfl_idx(rank, cutlass.Int32(j)) == lane, ej, out)
+        return out
+
+    @cute.jit
+    def _table_id(self, t, lane, table_addr):
+        """Lane k < 16: expert k of token t from the benchmark's id table (int32 [T, 16])."""
+        out = cutlass.Int32(0)
+        if lane < TOP_K:
+            out = _ld_global_b32(table_addr + cutlass.Int64((t * TOP_K + lane) * 4))
         return out
 
     @cute.jit
@@ -1164,7 +1187,9 @@ class RouterKernel:
                 stale = stale | self._stale(tidx, xs_base + c * self.xs_chunk_bytes, num_tokens)
 
     @cute.jit
-    def _merge(self, t, num_tokens, lane, table, ids_addr, wts_addr, ready_addr, cand_addr):
+    def _merge(
+        self, t, num_tokens, lane, table, ids_addr, wts_addr, ready_addr, cand_addr, table_addr
+    ):
         """One warp: token t's top-16 as a merge of the tiles' descending candidate lists (lane i owns tile i's list
         in the warp's shared table [tile][position] of (key, 65535 - expert, score) and pops its head when it wins a
         round), then the stock normalization; lane 0 stores ids / bf16 weights with 16 B stores and raises ready[t]
@@ -1207,7 +1232,9 @@ class RouterKernel:
             norm = _add_rn(norm, _shfl_bfly_f32(norm, off))
         norm = _bits_f32(_shfl_idx(_f32_bits(norm), cutlass.Int32(0)))
         expert_id = 65535 - my_l
-        if cutlass.const_expr(self.balanced is not None):
+        if cutlass.const_expr(self.table):
+            expert_id = self._table_id(t, lane, table_addr)
+        elif cutlass.const_expr(self.balanced is not None):
             expert_id = self._balanced_id(t, num_tokens, lane)
         wbits = self._weight_bits(_bits_f32(my_sig), norm)
         partner = _shfl_idx(wbits, lane + 1)
@@ -1300,6 +1327,7 @@ def run(
     timeline: torch.Tensor = None,
     smem_budget: int = None,
     balanced: tuple = None,
+    hot_ids: torch.Tensor = None,
 ) -> None:
     """ids [T, 16] int32, weights [T, 16] bf16 = Kimi K3 noaux_tc top-16 of x [T, 7168] bf16 with the fp32 gate
     weight [896, 7168] and e_score_correction_bias [896] fp32; T <= 128. One kernel on the current stream, no
@@ -1314,7 +1342,8 @@ def run(
     (int32 [CTAs, 8]) per-CTA %globaltimer_lo stamps of the kernel's phases (tests only). ``smem_budget`` (or
     ``TLLM_K3_ROUTER_SMEM_KB``) caps the shared memory per CTA, so the kernel can share SMs with a concurrent one.
     ``balanced=(dp_rank, ep_size)`` (benchmarks only) stores the layer-wise benchmark's Balanced expert ids instead
-    of the selected ones, with the selected tokens' weights, before ``router_send``."""
+    of the selected ones, with the selected tokens' weights, before ``router_send``; ``hot_ids`` (int32 [T, 16],
+    benchmarks only, exclusive with ``balanced``) stores that table's ids the same way."""
     tokens = x.shape[0]
     if not 1 <= tokens <= MAX_TOKENS:
         raise ValueError(f"router serves 1 .. {MAX_TOKENS} tokens, got {tokens}")
@@ -1367,6 +1396,16 @@ def run(
             raise ValueError(
                 f"balanced routing needs (dp_rank >= 0, ep_size dividing {NUM_EXPERTS})"
             )
+    if hot_ids is not None:
+        if balanced is not None:
+            raise ValueError("hot_ids and balanced are exclusive")
+        if (
+            hot_ids.dtype != torch.int32
+            or tuple(hot_ids.shape) != (tokens, TOP_K)
+            or not hot_ids.is_contiguous()
+            or hot_ids.device != x.device
+        ):
+            raise ValueError("hot_ids must be contiguous int32 [T, 16] on x's device")
     pdl = _use_pdl() if enable_pdl is None else enable_pdl
     split = split or default_split(tokens)
     ws = workspace(x.device)
@@ -1383,6 +1422,7 @@ def run(
         x_wait,
         smem_budget or int(os.environ.get("TLLM_K3_ROUTER_SMEM_KB", "227")) * 1024,
         balanced,
+        hot_ids is not None,
     )
     args = (
         make_ptr(cutlass.TFloat32, weight.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
@@ -1397,6 +1437,7 @@ def run(
         cutlass.Int64(ws.cand.data_ptr()),
         cutlass.Int64(ws.counters.data_ptr()),
         cutlass.Int64(0 if timeline is None else timeline.data_ptr()),
+        cutlass.Int64(0 if hot_ids is None else hot_ids.data_ptr()),
     )
     stream = cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
     compiled = _compiled.get(key)

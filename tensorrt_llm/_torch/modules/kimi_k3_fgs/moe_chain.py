@@ -1154,9 +1154,10 @@ class _Layer:
         self.route_ready = None
         # The latent_send slab and its per-token target, released like route_ready.
         self.latent_ready = None
-        # Benchmark-only hook, inert unless the layer-wise benchmark sets ``routed_experts._k3_balanced_routing``: the
-        # fused router then writes the benchmark's Balanced ids into the pending buffers, which the benchmark keeps
-        # (the early send already holds them).
+        # Benchmark-only hook, inert unless the layer-wise benchmark sets ``routed_experts._k3_balanced_routing``
+        # (Balanced ids computed in the kernel) or ``_k3_routing_table`` (``(rows, device) -> int32 [rows, 16]``, the
+        # benchmark's hot ids): the fused router then writes those ids into the pending buffers, which the benchmark
+        # keeps (the early send already holds them).
         self.balanced_ids = False
         self.entry_kernels: Tuple[str, ...] = ()
         layer_idx = getattr(routed_experts, "layer_idx", None)
@@ -2085,11 +2086,16 @@ def entry(runtime, hidden_states: torch.Tensor, all_rank_num_tokens) -> Optional
     latent_sync = _mix_sync(layer, "mix_latent", hidden_states)
     if fused_latent:
         latent_sync = _latent_send(layer, m, latent_sync)
-    balanced = None
+    balanced = hot_ids = None
     if fused_router:
         ids, weights = bufs.ids[:m], bufs.weights[:m]
         balanced = getattr(experts, "_k3_balanced_routing", None)
-        if balanced is not None:
+        table = getattr(experts, "_k3_routing_table", None)
+        if table is not None:
+            balanced = None
+            hot_ids = table(m, hidden_states.device)
+            k3_edges.debug("moe.router", m, "benchmark ids table")
+        elif balanced is not None:
             k3_edges.debug(
                 "moe.router", m, f"benchmark Balanced ids (dp_rank, ep) = {tuple(balanced)}"
             )
@@ -2110,6 +2116,7 @@ def entry(runtime, hidden_states: torch.Tensor, all_rank_num_tokens) -> Optional
             fgs=router_sync,
             enable_pdl=_pdl(),
             balanced=balanced,
+            hot_ids=hot_ids,
         )
         return ids
 
@@ -2144,7 +2151,7 @@ def entry(runtime, hidden_states: torch.Tensor, all_rank_num_tokens) -> Optional
     if "latent_down" in layer.entry_kernels:
         _log_stage("latent_down", max(counts), latent_sync)
     layer.pending = (ids, weights, xq, x_sf)
-    layer.balanced_ids = balanced is not None
+    layer.balanced_ids = balanced is not None or hot_ids is not None
     return routed_in, router_logits
 
 
