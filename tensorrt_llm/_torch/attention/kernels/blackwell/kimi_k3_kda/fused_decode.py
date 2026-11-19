@@ -628,7 +628,7 @@ class KdaDecodeT1:
         tma_in = (None,) * 12
         if cutlass.const_expr(self.input_tma):
             bars = smem.allocate_array(cutlass.Int64, 2, byte_alignment=8)
-            box = cute.make_layout((D, 1, 1), stride=(1, D, D))
+            box = cute.make_layout((D, 1, 1, 1), stride=(1, D, D, D))
             x_s = smem.allocate_tensor(
                 BF16, cute.make_layout((D, 1, 1, 3), stride=(1, D, D, D)), byte_alignment=128
             )
@@ -643,21 +643,21 @@ class KdaDecodeT1:
                 0,
                 cute.make_layout(1),
                 cute.group_modes(x_s, 0, 3),
-                cute.group_modes(cute.local_tile(mx, tile, (None, None, None)), 0, 3),
+                cute.group_modes(cute.local_tile(mx, tile, (0, None, None)), 0, 3),
             )
             tOsO, tOgO = cpasync.tma_partition(
                 tma_og,
                 0,
                 cute.make_layout(1),
                 cute.group_modes(og_s, 0, 3),
-                cute.group_modes(cute.local_tile(mog, tile, (None, None, None)), 0, 3),
+                cute.group_modes(cute.local_tile(mog, tile, (0, None, None)), 0, 3),
             )
             tGsG, tGgG = cpasync.tma_partition(
                 tma_g,
                 0,
                 cute.make_layout(1),
                 cute.group_modes(g_s, 0, 3),
-                cute.group_modes(cute.local_tile(mg, tile, (None, None, None)), 0, 3),
+                cute.group_modes(cute.local_tile(mg, tile, (0, None, None)), 0, 3),
             )
             tBsB, tBgB = cpasync.tma_partition(
                 tma_b,
