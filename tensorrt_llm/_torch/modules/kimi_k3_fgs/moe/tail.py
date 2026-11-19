@@ -85,6 +85,7 @@ from .latent import _THREADS_PER_ROW, _VEC
 
 _THREADS = 256
 _NORM_BARRIER = 1
+_SMEM_CAPACITY = 227 * 1024
 WIRE_DTYPES = ("bf16", "e4m3")
 LAMPORT_WAITS = {"": 0, "poll": 1, "done": 2, "tma": 3}
 SENTINELS = ("80", "ff")
@@ -225,6 +226,7 @@ class ReduceNormKernel:
             self.smem_bytes += 32 * 4 + top_k * 8 + 256 + top_k * self.row_bytes
         if self.flag_tma:
             self.smem_bytes += 256 + _SIDE_DONE_STRIDE * push_blocks * ep
+        assert self.smem_bytes <= _SMEM_CAPACITY, f"reduce_norm: {self.smem_bytes} B of smem"
 
     @cute.jit
     def __call__(
