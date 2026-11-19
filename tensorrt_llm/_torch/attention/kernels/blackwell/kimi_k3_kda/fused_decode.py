@@ -1388,9 +1388,10 @@ class KdaDecodeT1:
         pending = cutlass.Boolean(True)
         while pending:
             done, seen = cute.arch.mbarrier_try_wait_primary(bar, phase)
-            # One decision per warp: a lane that saw the phase complete also saw its report.
+            # One decision per warp, from the lanes that saw the phase complete: a re-arm of a
+            # phase still pending would over-arrive the count-1 barrier.
             complete = cute.arch.vote_any_sync(done)
-            invalid = cute.arch.vote_any_sync(seen)
+            invalid = cute.arch.vote_any_sync(done & seen)
             if complete:
                 phase = phase ^ 1
                 if invalid:
