@@ -465,6 +465,24 @@ the import rather than silently measuring stock.
 _CUTE_NORM_ENABLED = os.environ.get(KIMI_K3_CUTE_NORM_ENV, "0") == "1"
 if _CUTE_NORM_ENABLED:
     from ..modules.kimi_k3_attn_res.attn_res_mix_cute import attn_res_mix as _cute_attn_res_mix
+    from ..modules.kimi_k3_attn_res.attn_res_mix_cute import default_config as _cute_mix_config
+
+KIMI_K3_MIX_ATTN_CHECK_ENV = "TLLM_K3_MIX_ATTN_CHECK"
+"""How the pre-MoE mix consumer of the ``mla.attn_o`` edge waits for the attention row: ``sw`` (default) re-reads
+16-byte chunks in software, ``tma`` lands the row by a TMA load with ``report_valid`` and re-issues it while it
+reads the -0.0 sentinel."""
+
+KIMI_K3_MIX_TMA_STORE_ENV = "TLLM_K3_MIX_TMA_STORE"
+"""Set to ``1`` to write the outputs of every producer-build mix (x_norm / MoE input slots, updated residual)
+through shared memory and TMA stores."""
+
+KIMI_K3_MIX_PLAIN_PDL_ENV = "TLLM_K3_MIX_PLAIN_PDL"
+"""Set to ``1`` to launch the register-kernel mixes that have no slot like the FGS producer builds: PDL, -0.0
+fix-up of the outputs, trigger placement per ``TLLM_K3_FGS_LINKS_TRIGGER`` (parity arm for FGS off)."""
+
+_MIX_ATTN_CHECK = os.environ.get(KIMI_K3_MIX_ATTN_CHECK_ENV, "sw")
+_MIX_TMA_STORE = os.environ.get(KIMI_K3_MIX_TMA_STORE_ENV, "0") == "1"
+_MIX_PLAIN_PDL = os.environ.get(KIMI_K3_MIX_PLAIN_PDL_ENV, "0") == "1"
 
 KIMI_K3_CUTE_NORM_FOLD_ENV = "TLLM_K3_CUTE_NORM_FOLD"
 """With ``TLLM_K3_CUTE_NORM=1``, set to ``1`` to fold each layer's closing ``prefix + MoE output`` add into the next
@@ -532,6 +550,23 @@ def _cute_norm_mode(M: int, H: int, N: int) -> str:
     return "kimi" if stock_fuses else "flashinfer"
 
 
+def _mix_fgs_kwargs(rows: int, fgs_kwargs: dict) -> dict:
+    """The mix's sync knobs for one call: the attention-row check and the TMA store of the FGS builds, the links-off
+    control arm and trigger placement, and the PDL parity launch of the plain register kernel."""
+    kwargs = dict(fgs_kwargs)
+    plain = not kwargs.get("fgs_consumer") and not kwargs.get("fgs_producer")
+    if plain and _MIX_PLAIN_PDL and _cute_mix_config(rows)[0] == "reg":
+        kwargs["fgs_producer"] = True
+    if kwargs.get("fgs_consumer"):
+        kwargs.setdefault("fgs_attn_check", _MIX_ATTN_CHECK)
+        kwargs.setdefault("fgs_links_off", k3_fgs_edges.links_off())
+    if kwargs.get("fgs_producer"):
+        kwargs.setdefault("fgs_tma_store", _MIX_TMA_STORE)
+        if plain or k3_fgs_edges.links_off():
+            kwargs.setdefault("fgs_trigger", k3_fgs_edges.links_trigger())
+    return kwargs
+
+
 def _cute_attn_res(
     prefix_sum: torch.Tensor,
     block_residual: torch.Tensor,
@@ -568,7 +603,7 @@ def _cute_attn_res(
         addend=addend,
         updated=updated,
         out=out,
-        **fgs_kwargs,
+        **_mix_fgs_kwargs(M, fgs_kwargs),
         **kwargs,
     )
 
