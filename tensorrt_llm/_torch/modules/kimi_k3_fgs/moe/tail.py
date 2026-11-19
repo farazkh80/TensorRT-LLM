@@ -14,11 +14,15 @@ The contributions arrive as bf16 (the CuTe combine) or as e4m3 (the low-precisio
 ``cvt.rn.satfinite.e4m3x2.bf16x2`` per element, summed in the same order after an exact widening).
 
 With ``lamport`` the contributions come from the combine's Lamport inbox (``CuteA2A.combine_push``) instead of the
-counted-write receive region: each thread re-loads its chunks of a remote row until no element is the -0 sentinel
-(``lamport="poll"``, the fine-grained-sync consumer) or first waits for every peer's push-completion words
-(``lamport="done"``, the same build without the edge), and stores the sentinel back over what it read. The push does
-the round duties then, so this kernel leaves the round flag alone. Own rows are read from the bf16 payload (cast to
-e4m3 first for the low-precision combine) in the Lamport and finalize-push modes.
+counted-write receive region. ``lamport="tma"`` (the hardware consumer) lands each remote row in shared memory with
+one TMA load that reports the sentinel check (``report_valid``) and re-issues a row that landed with sentinel data;
+``lamport="poll"`` re-loads its chunks with thread loads until no element is the -0 sentinel; ``lamport="done"`` (the
+same build without the edge) first waits for every peer's push-completion words. The sentinel is the wire dtype's -0
+(``sentinel="80"``, element 0 of each 16 B checked, which needs a push that lands whole 16 B chunks) or 0xFF in every
+byte (``sentinel="ff"``, every byte checked, any store width; the e4m3 wire never carries 0xFF because the saturating
+cast emits no NaN). With ``rearm`` the consumer stores the sentinel back over what it read. The push does the round
+duties, so this kernel leaves the round flag alone. Own rows are read from the bf16 payload (cast to e4m3 first for
+the low-precision combine) in the Lamport and finalize-push modes.
 
 Fine-grained sync (runtime switch, same binary): with ``ready`` (int32 per local token, zero-armed by the caller) the
 kernel stores ``ready[t] = 1`` with release semantics after row t of ``out``, so a consumer launched early (the
@@ -37,14 +41,19 @@ import cutlass.cute as cute
 import torch
 from cutlass import BFloat16, Float32, Int32, Int64
 from cutlass._mlir.dialects import llvm
+from cutlass.cute.nvgpu import cpasync
+from cutlass.cute.runtime import make_ptr
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.utils import SmemAllocator
 
+from .. import wait_stats
 from . import comm as _comm
 from .comm import (
     _COUNTER_STRIDE,
     _SIDE_BLOCKS,
     _SIDE_DONE,
+    _SIDE_DONE_ARMED,
+    _SIDE_DONE_STRIDE,
     _SIDE_INBOX,
     _asm,
     _bf16x2_to_f32,
@@ -56,6 +65,7 @@ from .comm import (
     _group8,
     _ld_b32,
     _ld_b64,
+    _ld_sys_b32,
     _ld_v4,
     _ld_vol_v2,
     _ld_vol_v4,
@@ -68,14 +78,20 @@ from .comm import (
     _st_b64,
     _st_v2,
     _st_v4,
+    _tma_flag_wait,
     _v,
 )
 from .latent import _THREADS_PER_ROW, _VEC
 
 _THREADS = 256
 _NORM_BARRIER = 1
+_SMEM_CAPACITY = 227 * 1024
 WIRE_DTYPES = ("bf16", "e4m3")
-LAMPORT_WAITS = {"": 0, "poll": 1, "done": 2}
+LAMPORT_WAITS = {"": 0, "poll": 1, "done": 2, "tma": 3}
+SENTINELS = ("80", "ff")
+# Inner TMA box of an inbox row (bytes); the row is (_TMA_CHUNK, row_bytes // _TMA_CHUNK).
+_TMA_CHUNK = 128
+_STATS_SITE = {1: "poll", 2: "done_spin", 3: "retry"}
 # Kinds of a contribution's source row.
 _SRC_INBOX, _SRC_OWN, _SRC_LAMPORT = 0, 1, 2
 FGS_WAITS = {"combine_norm": ("recv_norm",)}
@@ -93,6 +109,32 @@ def _ld_v2(addr, *, loc=None, ip=None):
         ip,
     )
     return [Int32(llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(2)]
+
+
+@dsl_user_op
+def _ld_shared_v2(addr, *, loc=None, ip=None):
+    res = _asm(
+        llvm.StructType.get_literal([T.i32()] * 2),
+        [_v(addr, Int32, loc, ip)],
+        "ld.shared.v2.b32 {$0, $1}, [$2];",
+        "=r,=r,r",
+        loc,
+        ip,
+    )
+    return [Int32(llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(2)]
+
+
+@dsl_user_op
+def _ld_shared_v4(addr, *, loc=None, ip=None):
+    res = _asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [_v(addr, Int32, loc, ip)],
+        "ld.shared.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,r",
+        loc,
+        ip,
+    )
+    return [Int32(llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(4)]
 
 
 @dsl_user_op
@@ -127,9 +169,11 @@ class ReduceNormKernel:
 
     ``fgs`` is the combine's finalize-push mode (``CuteA2A.combine(fin_done=...)``): own rows are read from the
     payload and this kernel advances the round flag. ``lamport`` (``LAMPORT_WAITS``) reads the Lamport inbox of
-    ``rows`` rows per source and ``inbox_bytes`` per parity instead (see the module docstring). ``check_in=False``
-    (negative-control builds only) skips the slot counter waits or the inbox polls. ``delay_ns`` (hazard tests only)
-    delays the normed row stores.
+    ``rows`` rows per source and ``inbox_bytes`` per parity instead (see the module docstring); ``sentinel``
+    (``SENTINELS``) is the inbox's armed value and ``rearm`` stores it back. With ``flag_tma`` the ``done`` wait is
+    one TMA load of the ``push_blocks`` x ``ep`` completion words (``comm.FLAG_CHECK_ENV``), re-issued until it
+    reports them valid, and the words are re-armed. ``check_in=False`` (negative-control builds only) skips the slot
+    counter waits or the inbox polls. ``delay_ns`` (hazard tests only) delays the normed row stores.
     """
 
     def __init__(
@@ -146,23 +190,51 @@ class ReduceNormKernel:
         lamport: int = 0,
         rows: int = 0,
         inbox_bytes: int = 0,
+        sentinel: str = "80",
+        rearm: bool = True,
+        flag_tma: bool = False,
+        push_blocks: int = 0,
     ):
-        assert top_k <= 32 and wire in WIRE_DTYPES
+        assert top_k <= 32 and wire in WIRE_DTYPES and sentinel in SENTINELS
         assert not (lamport and fgs), "the Lamport push takes the finalize words itself"
         assert hidden % (_VEC * _THREADS_PER_ROW) == 0
+        assert not (lamport == 1 and sentinel != "80"), "the poll tests the -0 sentinel"
         self.ep, self.top_k, self.H, self.lay = ep, top_k, hidden, dict(lay)
         self.pdl, self.fgs, self.wire = pdl, fgs, wire
         self.check_in, self.delay_ns = check_in, delay_ns
         self.lamport, self.rows, self.inbox_bytes = lamport, rows, inbox_bytes
-        self.row_bytes = hidden * (2 if wire == "bf16" else 1)
+        self.tma, self.rearm = lamport == 3, rearm
+        self.flag_tma, self.push_blocks = lamport == 2 and flag_tma, push_blocks
+        if self.flag_tma:
+            assert 0 < push_blocks <= _SIDE_BLOCKS and ep * _SIDE_BLOCKS * _SIDE_DONE_STRIDE <= _SIDE_INBOX
+        lpc = wire == "e4m3"
+        self.row_bytes = hidden * (1 if lpc else 2)
+        if sentinel == "ff":
+            self.sentinel_word = -1
+            self.pattern = cpasync.SentinelPattern.PER_ELEMENT_FF
+        else:
+            self.sentinel_word = -0x7F7F7F80 if lpc else -0x7FFF8000
+            self.pattern = (
+                cpasync.SentinelPattern.PER_16BYTES_80
+                if lpc
+                else cpasync.SentinelPattern.PER_16BYTES_8000
+            )
         self.blocks = hidden // (_VEC * _THREADS_PER_ROW)
         self.smem_bytes = 32 * 8 + 32 * 4 + 16 + 2 * 4 + hidden * 2 + 4 * 16
+        if self.tma:
+            assert self.row_bytes % _TMA_CHUNK == 0 and inbox_bytes == ep * rows * self.row_bytes
+            self.smem_bytes += 32 * 4 + top_k * 8 + 256 + top_k * self.row_bytes
+        if self.flag_tma:
+            self.smem_bytes += 256 + _SIDE_DONE_STRIDE * push_blocks * ep
+        assert self.smem_bytes <= _SMEM_CAPACITY, f"reduce_norm: {self.smem_bytes} B of smem"
 
     @cute.jit
     def __call__(
         self,
         mOut: cute.Tensor,
         mW: cute.Tensor,
+        inbox_ptr: cute.Pointer,
+        done_ptr: cute.Pointer,
         ready_addr: Int64,
         ws_base: Int64,
         ws_stride: Int64,
@@ -176,6 +248,8 @@ class ReduceNormKernel:
         side_stride: Int64,
         blocks: Int32,
         eps: Float32,
+        stats: Int64,
+        stats_stale: Int64,
         stream,
     ):
         tv_layout = cute.make_layout(
@@ -183,9 +257,49 @@ class ReduceNormKernel:
             stride=((_VEC, 1), (1, _VEC * _THREADS_PER_ROW)),
         )
         tiler_mn = (1, self.H)
+        tma_done = tma_tensor_done = None
+        if cutlass.const_expr(self.flag_tma):
+            # The completion words of every (source, push CTA) as (chunk word, CTA, source): one 16 B chunk each.
+            B = self.push_blocks
+            words = _SIDE_DONE_STRIDE // 4
+            m_done = cute.make_tensor(
+                done_ptr,
+                cute.make_layout(
+                    (words, B, self.ep, 1),
+                    stride=(1, words, _SIDE_BLOCKS * words, _SIDE_BLOCKS * words * self.ep),
+                ),
+            )
+            tma_done, tma_tensor_done = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(),
+                m_done,
+                cute.make_layout((words, B, self.ep), stride=(1, words, words * B)),
+                (words, B, self.ep),
+            )
+        tma_atom = tma_tensor = None
+        if cutlass.const_expr(self.tma):
+            # Both parities of this rank's inbox as (chunk byte, chunk, row): rows of parity b start at
+            # b * ep * rows (inbox_bytes == ep * rows * row_bytes).
+            chunks = self.row_bytes // _TMA_CHUNK
+            m_inbox = cute.make_tensor(
+                inbox_ptr,
+                cute.make_layout(
+                    (_TMA_CHUNK, chunks, 2 * self.ep * self.rows),
+                    stride=(1, _TMA_CHUNK, self.row_bytes),
+                ),
+            )
+            tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(),
+                m_inbox,
+                cute.make_layout((_TMA_CHUNK, chunks), stride=(1, _TMA_CHUNK)),
+                (_TMA_CHUNK, chunks),
+            )
         self.kernel(
             mOut,
             mW,
+            tma_atom,
+            tma_tensor,
+            tma_done,
+            tma_tensor_done,
             ready_addr,
             ws_base,
             ws_stride,
@@ -199,6 +313,8 @@ class ReduceNormKernel:
             side_stride,
             blocks,
             eps,
+            stats,
+            stats_stale,
             tv_layout,
             tiler_mn,
         ).launch(
@@ -214,6 +330,10 @@ class ReduceNormKernel:
         self,
         mOut: cute.Tensor,
         mW: cute.Tensor,
+        tma_atom: Optional[cute.CopyAtom],
+        mInbox: Optional[cute.Tensor],
+        tma_done: Optional[cute.CopyAtom],
+        mDone: Optional[cute.Tensor],
         ready_addr: Int64,
         ws_base: Int64,
         ws_stride: Int64,
@@ -227,6 +347,8 @@ class ReduceNormKernel:
         side_stride: Int64,
         blocks: Int32,
         eps: Float32,
+        stats: Int64,
+        stats_stale: Int64,
         tv_layout: cute.Layout,
         tiler_mn: cute.Shape,
     ):
@@ -244,6 +366,57 @@ class ReduceNormKernel:
         sX = smem.allocate_tensor(
             BFloat16, cute.make_layout(tiler_mn, stride=(self.H, 1)), byte_alignment=16
         )
+        ring = Int32(0)
+        s_row = bars = tS = tG = None
+        if cutlass.const_expr(self.tma):
+            s_row = smem.allocate_tensor(Int32, cute.make_layout((32,)), byte_alignment=16)
+            bars = smem.allocate_array(Int64, K)
+            chunks = self.row_bytes // _TMA_CHUNK
+            sRing = smem.allocate_tensor(
+                cutlass.Uint8,
+                cute.make_layout((_TMA_CHUNK, chunks, K), stride=(1, _TMA_CHUNK, self.row_bytes)),
+                byte_alignment=128,
+            )
+            ring = Int32(sRing.iterator.toint())
+            gIn = cute.local_tile(mInbox, (_TMA_CHUNK, chunks), (0, 0, None))
+            tS, tG = cpasync.tma_partition(
+                tma_atom,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sRing, 0, 2),
+                cute.group_modes(gIn, 0, 2),
+            )
+            if warp == 0:
+                cpasync.prefetch_descriptor(tma_atom)
+                with cute.arch.elect_one():
+                    for s in cutlass.range_constexpr(K):
+                        cute.arch.mbarrier_v1_init(bars + s, 1)
+                cute.arch.mbarrier_init_fence()
+        sDone = tS_d = tG_d = bar_done = None
+        if cutlass.const_expr(self.flag_tma):
+            B = self.push_blocks
+            words = _SIDE_DONE_STRIDE // 4
+            sDone = smem.allocate_tensor(
+                Int32,
+                cute.make_layout(
+                    (words, B, self.ep, 1), stride=(1, words, words * B, words * B * self.ep)
+                ),
+                byte_alignment=128,
+            )
+            bar_done = smem.allocate_array(Int64, 1)
+            gDone = cute.local_tile(mDone, (words, B, self.ep), (0, 0, 0, None))
+            tS_d, tG_d = cpasync.tma_partition(
+                tma_done,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sDone, 0, 3),
+                cute.group_modes(gDone, 0, 3),
+            )
+            if warp == 0:
+                cpasync.prefetch_descriptor(tma_done)
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_v1_init(bar_done, 1)
+                cute.arch.mbarrier_init_fence()
         my_ws = ws_base + Int64(rank) * ws_stride
         inbox = my_ws + L["combine_recv"]
 
@@ -268,11 +441,13 @@ class ReduceNormKernel:
         cute.arch.griddepcontrol_launch_dependents()
         cute.arch.griddepcontrol_wait()
         lam_inbox = Int64(0)
+        parity = Int32(0)
         if cutlass.const_expr(self.lamport > 0):
             f = _ld_b32(my_ws + L["flag"])
             done_value = ((f - 1) | 1) + 1
+            parity = ((f - 1) >> 1) & 1
             my_side = side_base + Int64(rank) * side_stride
-            lam_inbox = my_side + _SIDE_INBOX + Int64(((f - 1) >> 1) & 1) * self.inbox_bytes
+            lam_inbox = my_side + _SIDE_INBOX + Int64(parity) * self.inbox_bytes
         if n_local > 0:
             if warp == 0:
                 tr = Int32(-1)
@@ -299,14 +474,45 @@ class ReduceNormKernel:
                                     _st_b64(base_addr, target)
                 if cutlass.const_expr(self.lamport == 2):
                     # Inbox without the edge: every peer's every push CTA completes first.
+                    miss = Int32(0)
+                    if cutlass.const_expr(self.flag_tma):
+                        retries = _tma_flag_wait(
+                            tma_done,
+                            tG_d[(None, 0)],
+                            tS_d[(None, 0)],
+                            bar_done,
+                            _SIDE_DONE_STRIDE * self.push_blocks * self.ep,
+                            False,
+                        )
+                        if stats != 0:
+                            if lane == 0:
+                                if retries > 0:
+                                    wait_stats.add(stats, retries)
                     for i in cutlass.range(lane, self.ep * blocks, 32, unroll=1):
                         src = i // blocks
+                        by = i % blocks
                         if src != rank:
-                            _spin_eq(
-                                my_side + _SIDE_DONE + (src * _SIDE_BLOCKS + i % blocks) * 4,
-                                done_value,
-                                timeout_ns,
+                            addr = (
+                                my_side + _SIDE_DONE + (src * _SIDE_BLOCKS + by) * _SIDE_DONE_STRIDE
                             )
+                            if cutlass.const_expr(self.flag_tma):
+                                # A word a spin-mode round left unarmed passes the check: verify, then re-arm.
+                                if sDone[(0, by, src, 0)] != done_value:
+                                    miss = miss + 1
+                                    _spin_eq(addr, done_value, timeout_ns)
+                                _st_b32(addr, Int32(_SIDE_DONE_ARMED))
+                            else:
+                                if stats != 0:
+                                    if _ld_sys_b32(addr) != done_value:
+                                        miss = miss + 1
+                                _spin_eq(addr, done_value, timeout_ns)
+                    if cutlass.const_expr(self.flag_tma):
+                        if stats_stale != 0:
+                            if miss > 0:
+                                wait_stats.add(stats_stale, miss)
+                    elif stats != 0:
+                        if miss > 0:
+                            wait_stats.add(stats, miss)
                 if cutlass.const_expr(self.lamport == 0):
                     _fence_fabric_acquire()
                 valid = cute.arch.vote_ballot_sync(di >= 0)
@@ -325,6 +531,25 @@ class ReduceNormKernel:
                             kind = Int32(_SRC_OWN)
                     s_src[at] = row_src
                     s_kind[at] = kind
+                    if cutlass.const_expr(self.tma):
+                        row = Int32(-1)
+                        if kind == _SRC_LAMPORT:
+                            row = parity * (self.ep * self.rows) + tr * self.rows + di
+                        s_row[at] = row
+                if cutlass.const_expr(self.tma):
+                    cute.arch.sync_warp()
+                    count0 = cute.arch.popc(valid)
+                    pending = Int32(0)
+                    for s in cutlass.range(count0, unroll=1):
+                        row = cute.arch.make_warp_uniform(s_row[s])
+                        if row >= 0:
+                            pending = pending | (Int32(1) << s)
+                            self._issue(tma_atom, tS, tG, bars, s, row)
+                    retries = self._land(tma_atom, tS, tG, bars, s_row, count0, pending)
+                    if stats != 0:
+                        if lane == 0:
+                            if retries > 0:
+                                wait_stats.add(stats, retries)
             cute.arch.sync_threads()
             # Threads load slots warp 0 waited for: each fences after the barrier.
             if cutlass.const_expr(self.lamport == 0):
@@ -333,7 +558,11 @@ class ReduceNormKernel:
                 _fence_acq_rel_sys()
 
             count = s_n[0]
-            self._reduce_row(sX, s_src, s_kind, count, timeout_ns)
+            polled = self._reduce_row(sX, s_src, s_kind, count, timeout_ns, ring)
+            if cutlass.const_expr(self.lamport == 1):
+                if stats != 0:
+                    if polled > 0:
+                        wait_stats.add(stats, polled)
             cute.arch.sync_threads()
 
             if tidx < _THREADS_PER_ROW:
@@ -374,6 +603,44 @@ class ReduceNormKernel:
                             _st_b32(my_ws + L["flag"], flag)
 
     @cute.jit
+    def _issue(self, tma_atom, tS, tG, bars, s, row):
+        """Load inbox row ``row`` into landing slot ``s`` on its barrier, with the sentinel check."""
+        # The TMA copy elects its issuing thread itself; only the arrive is ours to elect.
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive_and_expect_tx(bars + s, self.row_bytes)
+        cute.copy(
+            tma_atom,
+            tG[(None, row)],
+            tS[(None, s)],
+            tma_bar_ptr=bars + s,
+            report_valid=self.pattern,
+        )
+
+    @cute.jit
+    def _land(self, tma_atom, tS, tG, bars, s_row, count, pending):
+        """Wait until every slot of ``pending`` landed valid; a slot that landed with sentinel data is re-issued.
+        Bit s of ``phase`` is the primary-phase parity slot s completes next. Returns the re-issue count."""
+        phase = Int32(0)
+        retries = Int32(0)
+        while pending != 0:
+            for s in cutlass.range(count, unroll=1):
+                bit = Int32(1) << s
+                if (pending & bit) != 0:
+                    complete, invalid = cute.arch.mbarrier_try_wait_primary(
+                        bars + s, (phase >> s) & 1
+                    )
+                    if complete:
+                        phase = phase ^ bit
+                        if invalid:
+                            retries = retries + 1
+                            self._issue(
+                                tma_atom, tS, tG, bars, s, cute.arch.make_warp_uniform(s_row[s])
+                            )
+                        else:
+                            pending = pending ^ bit
+        return retries
+
+    @cute.jit
     def _reduce_row(
         self,
         sX: cute.Tensor,
@@ -381,18 +648,21 @@ class ReduceNormKernel:
         s_kind: cute.Tensor,
         count: Int32,
         timeout_ns: Int64,
+        ring: Int32,
     ):
         """Row sum of the ``count`` contributions into ``sX`` (bf16), in the order of ``comm._Reduce``. Every
-        source's chunk is loaded before any Lamport chunk is checked, so only late chunks are re-polled."""
+        source's chunk is loaded before any Lamport chunk is checked, so only late chunks are re-polled. Returns
+        the number of chunks this thread had to re-poll."""
         tidx, _, _ = cute.arch.thread_idx()
         K = self.top_k
         lpc = self.wire == "e4m3"
-        sentinel = Int32(-0x7F7F7F80) if lpc else Int32(-0x7FFF8000)
+        sentinel = Int32(self.sentinel_word)
         ns = (K + 7) // 8 * 8
         words = cute.recast_tensor(sX, Int32)
         a = cute.make_rmem_tensor(cute.make_layout((8, ns)), Float32)
         raw = cute.make_rmem_tensor(cute.make_layout((4, ns)), Int32)
         res = cute.make_rmem_tensor(cute.make_layout((8,)), Float32)
+        polled = Int32(0)
         for v in cutlass.range(tidx, self.H // _VEC, _THREADS, unroll=1):
             a.fill(0.0)
             raw.fill(0)
@@ -408,7 +678,16 @@ class ReduceNormKernel:
                             for q in cutlass.range_constexpr(4):
                                 raw[q, s] = w[q]
                     elif kind == _SRC_LAMPORT:
-                        if cutlass.const_expr(lpc):
+                        if cutlass.const_expr(self.tma):
+                            if cutlass.const_expr(lpc):
+                                e = _ld_shared_v2(ring + s * self.row_bytes + v * 8)
+                                raw[0, s] = e[0]
+                                raw[1, s] = e[1]
+                            else:
+                                w = _ld_shared_v4(ring + s * self.row_bytes + v * 16)
+                                for q in cutlass.range_constexpr(4):
+                                    raw[q, s] = w[q]
+                        elif cutlass.const_expr(lpc):
                             e = _ld_vol_v2(s_src[s] + v * 8)
                             raw[0, s] = e[0]
                             raw[1, s] = e[1]
@@ -433,10 +712,12 @@ class ReduceNormKernel:
                                 addr = s_src[s] + v * 8
                                 if cutlass.const_expr(self.lamport == 1 and self.check_in):
                                     if (_dirty(raw[0, s], True) | _dirty(raw[1, s], True)) != 0:
+                                        polled = polled + 1
                                         e0, e1 = _poll_v2(addr, timeout_ns)
                                         raw[0, s] = e0
                                         raw[1, s] = e1
-                                _st_v2(addr, sentinel, sentinel)
+                                if cutlass.const_expr(self.rearm):
+                                    _st_v2(addr, sentinel, sentinel)
                             else:
                                 addr = s_src[s] + v * 16
                                 if cutlass.const_expr(self.lamport == 1 and self.check_in):
@@ -447,12 +728,14 @@ class ReduceNormKernel:
                                         | _dirty(raw[3, s], False)
                                     )
                                     if d != 0:
+                                        polled = polled + 1
                                         w0, w1, w2, w3 = _poll_v4(addr, False, timeout_ns)
                                         raw[0, s] = w0
                                         raw[1, s] = w1
                                         raw[2, s] = w2
                                         raw[3, s] = w3
-                                _st_v4(addr, sentinel, sentinel, sentinel, sentinel)
+                                if cutlass.const_expr(self.rearm):
+                                    _st_v4(addr, sentinel, sentinel, sentinel, sentinel)
             for s in cutlass.range_constexpr(ns):
                 if cutlass.const_expr(lpc):
                     for h in cutlass.range_constexpr(2):
@@ -477,11 +760,27 @@ class ReduceNormKernel:
                         res[j] = (g[0] + g[1]) + (g[2] + g[3])
             for q in cutlass.range_constexpr(4):
                 words[0, v * 4 + q] = _f32x2_to_bf16x2(res[2 * q], res[2 * q + 1])
+        return polled
 
 
 @functools.lru_cache(maxsize=None)
 def _compiled(
-    ep, top_k, hidden, lay, pdl, fgs, wire, check_in, delay_ns, lamport, rows, inbox_bytes
+    ep,
+    top_k,
+    hidden,
+    lay,
+    pdl,
+    fgs,
+    wire,
+    check_in,
+    delay_ns,
+    lamport,
+    rows,
+    inbox_bytes,
+    sentinel,
+    rearm,
+    flag_tma,
+    push_blocks,
 ):
     def fake(dtype, shape):
         return cute.runtime.make_fake_compact_tensor(
@@ -491,10 +790,27 @@ def _compiled(
     i64, i32 = Int64(0), Int32(0)
     return cute.compile(
         ReduceNormKernel(
-            ep, top_k, hidden, lay, pdl, fgs, wire, check_in, delay_ns, lamport, rows, inbox_bytes
+            ep,
+            top_k,
+            hidden,
+            lay,
+            pdl,
+            fgs,
+            wire,
+            check_in,
+            delay_ns,
+            lamport,
+            rows,
+            inbox_bytes,
+            sentinel,
+            rearm,
+            flag_tma,
+            push_blocks,
         ),
         fake(BFloat16, (cute.sym_int(), hidden)),
         fake(BFloat16, (hidden,)),
+        make_ptr(cutlass.Uint8, 1 << 20, cute.AddressSpace.gmem, assumed_align=128),
+        make_ptr(Int32, 1 << 20, cute.AddressSpace.gmem, assumed_align=128),
         i64,
         i64,
         i64,
@@ -508,6 +824,8 @@ def _compiled(
         i64,
         i32,
         Float32(1e-6),
+        i64,
+        i64,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
@@ -537,9 +855,12 @@ def reduce_norm(
     hazard_delay_ns: int = 0,
     lamport: str = "",
     inbox=None,
+    rearm: bool = True,
+    flag_check: Optional[str] = None,
 ) -> torch.Tensor:
     """Launch :class:`ReduceNormKernel` on a combine receive region (``CuteA2A`` workspace layout ``lay``), or with
-    ``lamport`` ("poll" / "done") on the Lamport inbox ``inbox`` (``CuteA2A.lamport_inbox()``)."""
+    ``lamport`` ("tma" / "poll" / "done") on the Lamport inbox ``inbox`` (``CuteA2A.lamport_inbox()``); ``flag_check``
+    (``comm.FLAG_CHECKS``, None: the environment) selects how "done" waits for the completion words."""
     hidden = out.shape[-1]
     if (
         out.dtype != torch.bfloat16
@@ -556,6 +877,11 @@ def reduce_norm(
     mode = LAMPORT_WAITS[lamport]
     if mode and inbox is None:
         raise ValueError("reduce_norm: the Lamport modes need the inbox descriptor")
+    if flag_check is None:
+        flag_check = _comm.flag_check()
+    if flag_check not in _comm.FLAG_CHECKS:
+        raise ValueError(f"reduce_norm: flag_check {flag_check!r}; valid: {', '.join(_comm.FLAG_CHECKS)}")
+    flag_tma = mode == 2 and flag_check == "tma"
     fn = _compiled(
         ep,
         top_k,
@@ -569,10 +895,22 @@ def reduce_norm(
         mode,
         inbox.rows if mode else 0,
         inbox.inbox_bytes if mode else 0,
+        inbox.sentinel if mode else "80",
+        rearm,
+        flag_tma,
+        inbox.blocks if flag_tma else 0,
     )
+    my_side = inbox.side_base + rank * inbox.side_stride if mode else 0
+    inbox_addr = my_side + _SIDE_INBOX if mode == 3 else 1 << 20
+    done_addr = my_side + _SIDE_DONE if flag_tma else 1 << 20
+    site = _STATS_SITE[mode] if mode else ""
+    if flag_tma:
+        site = "done_retry"
     fn(
         out,
         norm_weight,
+        make_ptr(cutlass.Uint8, inbox_addr, cute.AddressSpace.gmem, assumed_align=128),
+        make_ptr(Int32, done_addr, cute.AddressSpace.gmem, assumed_align=128),
         ready.data_ptr() if ready is not None else 0,
         ws_base,
         ws_stride,
@@ -586,6 +924,8 @@ def reduce_norm(
         inbox.side_stride if mode else 0,
         inbox.blocks if mode else 1,
         eps,
+        wait_stats.addr(f"moe.recv_norm.{site}") if mode else 0,
+        wait_stats.addr("moe.recv_norm.done_stale") if flag_tma else 0,
     )
     return out
 
@@ -603,11 +943,15 @@ def combine_norm(
     hazard_delay_ns: int = 0,
     inbox: Optional[str] = None,
     lamport_wait: str = "poll",
+    rearm: bool = True,
+    store: str = "bulk",
+    flag_check: Optional[str] = None,
 ) -> torch.Tensor:
     """``CuteA2A.combine`` with its reduce replaced by :class:`ReduceNormKernel`: returns the latent-normed
     ``[local_tokens, hidden]`` rows (``out`` when given). Same push, flags, finalize-push mode and wire format (bf16,
     or e4m3 with a low-precision combine communicator) as the combine; ``inbox="lamport"`` pushes into the Lamport
-    inbox (``CuteA2A.combine_push``) and reads it with ``lamport_wait`` ("poll" or "done")."""
+    inbox (``CuteA2A.combine_push``, store path ``store``, flag wait ``flag_check``) and reads it with
+    ``lamport_wait`` ("tma", "poll" or "done"), storing the sentinel back when ``rearm``."""
     y, n, runtime_max = a2a._combine_args(final_hidden_states)
     hidden = y.shape[1]
     if out is None:
@@ -633,11 +977,30 @@ def combine_norm(
         hazard_delay_ns=hazard_delay_ns,
     )
     if inbox == "lamport":
-        # The poll consumer accepts each chunk only once it is written, so it does not need the push's completion.
-        data_only = lamport_wait == "poll" and os.environ.get(_comm.INBOX_DATA_ONLY_ENV, "0") == "1"
-        box = a2a.combine_push(y, fin_done=fin_done, fin_expected=fin_expected, data_only=data_only)
+        # A consumer that checks the data accepts each chunk only once it is written, so it does not need the
+        # push's completion words.
+        data_only = (
+            lamport_wait in ("poll", "tma")
+            and os.environ.get(_comm.INBOX_DATA_ONLY_ENV, "0") == "1"
+        )
+        box = a2a.combine_push(
+            y,
+            fin_done=fin_done,
+            fin_expected=fin_expected,
+            data_only=data_only,
+            store=store,
+            flags=flag_check,
+        )
         return reduce_norm(
-            out, norm_weight, eps, pdl=True, lamport=lamport_wait, inbox=box, **common
+            out,
+            norm_weight,
+            eps,
+            pdl=True,
+            lamport=lamport_wait,
+            inbox=box,
+            rearm=rearm,
+            flag_check=flag_check,
+            **common,
         )
     if inbox is not None:
         raise ValueError(f"unknown combine inbox {inbox!r}")

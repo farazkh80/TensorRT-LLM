@@ -407,7 +407,12 @@ def fgs_diag(edge: str) -> str:
     edge or to the comma list in ``TLLM_K3_MOE_FGS_DIAG_EDGES``): ``oracle`` launches the consumer as its FGS build
     does but skips its waits (wrong numerics: the upper bound of the edge); ``ready`` makes the FGS build wait for its
     producer grid first (launched as the FUSED-OFF build launches that consumer: in stream order, or with PDL plus a
-    grid wait), so its waits find the input complete (the cost of the edge). Empty when off for this edge."""
+    grid wait), so its waits find the input complete (the cost of the edge). Empty when off for this edge. With the
+    links off (``edges.links_off``, the parity control arm) every edge takes its ``ready`` build."""
+    from ..edges import links_off
+
+    if links_off():
+        return "ready"
     mode = os.environ.get(DIAG_ENV, "")
     if mode and mode not in DIAG_MODES:
         raise ValueError(f"{DIAG_ENV}={mode!r}; valid: {', '.join(DIAG_MODES)}")
