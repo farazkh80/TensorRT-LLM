@@ -45,6 +45,8 @@ from . import recipe
 
 ENV = "TLLM_K3_FGS"
 MODES = ("off", "early", "lamport", "chain", "chain_after")
+LINKS_ENV = "TLLM_K3_FGS_LINKS"
+LINKS_TRIGGER_ENV = "TLLM_K3_FGS_LINKS_TRIGGER"
 # The chain modes pay from 8 to 64 rows; from 4 rows down the decode projections include direct GEMMs, whose
 # fine-grained-sync builds cost more than the chain saves.
 MIN_ROWS = int(os.environ.get("TLLM_K3_FGS_MIN_ROWS", "8"))
@@ -105,6 +107,24 @@ def mode() -> str:
     value = os.environ.get(ENV, "off").strip().lower() or "off"
     if value not in MODES:
         raise ValueError(f"{ENV}={value!r}; valid: {', '.join(MODES)}")
+    return value
+
+
+def links_off() -> bool:
+    """``TLLM_K3_FGS_LINKS=off`` (default ``on``): consumers of every edge wait for their producer grid
+    (``griddepcontrol.wait``) and do not check sentinels; the slots are not re-armed."""
+    value = os.environ.get(LINKS_ENV, "on").strip().lower()
+    if value not in ("on", "off"):
+        raise ValueError(f"{LINKS_ENV}={value!r}; valid: on, off")
+    return value == "off"
+
+
+def links_trigger() -> str:
+    """With the links off, where producers release their PDL dependents: ``entry`` (default, as with the links
+    on) or ``stock`` (the producer's non-FGS trigger point)."""
+    value = os.environ.get(LINKS_TRIGGER_ENV, "entry").strip().lower()
+    if value not in ("entry", "stock"):
+        raise ValueError(f"{LINKS_TRIGGER_ENV}={value!r}; valid: entry, stock")
     return value
 
 
@@ -220,7 +240,7 @@ def _workspaces():
             if workspaces is None:
                 from ..fine_grained_sync import EdgeWorkspaces
 
-                workspaces = _device_workspaces[device] = EdgeWorkspaces.from_env()
+                workspaces = _device_workspaces[device] = EdgeWorkspaces.from_env(rearm=not links_off())
     return workspaces
 
 
@@ -299,7 +319,8 @@ def model_scope(
     debug(
         "model_scope",
         0 if rows is None else rows,
-        f"reset-stream fork / join around the forward, {len(workspaces.ledger())} edges",
+        f"reset-stream fork / join around the forward, {len(workspaces.ledger())} edges"
+        + (f", links off (trigger {links_trigger()}), no re-arm" if links_off() else ""),
     )
     try:
         with workspaces.scope():

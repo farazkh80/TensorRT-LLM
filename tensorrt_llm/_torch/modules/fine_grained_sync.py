@@ -415,6 +415,7 @@ class EdgeWorkspaces:
         max_streams_per_slot: int = 8,
         cute_min_bytes: int = 4 << 20,
         reset_policy: ResetPolicy = ResetPolicy.RELEASE,
+        rearm: bool = True,
     ) -> None:
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
@@ -426,6 +427,9 @@ class EdgeWorkspaces:
         self.max_streams_per_slot = max_streams_per_slot
         self.cute_min_bytes = cute_min_bytes
         self.reset_policy = ResetPolicy(reset_policy)
+        # False: releases keep their stream joins and ready events but launch no fill (consumers that do not check
+        # sentinels, e.g. a links-off control arm).
+        self.rearm = rearm
         # Number of flushes that re-armed at least one slot.
         self.flushes = 0
         self._touched: Set[str] = set()
@@ -767,11 +771,12 @@ class EdgeWorkspaces:
         events = ws._joins[lease.slot]
         for index in lease._joins.values():
             self.reset_stream.wait_event(events[index])
-        with torch.cuda.stream(self.reset_stream):
-            if ws.bounds is not None:
-                self._fill_bounded(ws, [lease])
-            else:
-                self._fill(ws, lease.tensor)
+        if self.rearm:
+            with torch.cuda.stream(self.reset_stream):
+                if ws.bounds is not None:
+                    self._fill_bounded(ws, [lease])
+                else:
+                    self._fill(ws, lease.tensor)
         ws._ready[lease.slot].record(self.reset_stream)
         ws._pending[lease.slot] = True
         ws._lease[lease.slot] = None
@@ -802,6 +807,8 @@ class EdgeWorkspaces:
     def _fill_batch(self, dirty: List[Tuple[EdgeWorkspace, EdgeLease]]) -> None:
         # Adjacent dirty slots of one workspace merge into one span (packed STEP
         # slots of one scope are adjacent), then CUTE spans share launches.
+        if not self.rearm:
+            return
         spans: List[Tuple[EdgeWorkspace, torch.Tensor]] = []
         for ws in {id(ws): ws for ws, _ in dirty}.values():
             if ws.bounds is not None:
