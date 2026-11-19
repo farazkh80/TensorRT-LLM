@@ -240,7 +240,9 @@ def _workspaces():
             if workspaces is None:
                 from ..fine_grained_sync import EdgeWorkspaces
 
-                workspaces = _device_workspaces[device] = EdgeWorkspaces.from_env(rearm=not links_off())
+                workspaces = _device_workspaces[device] = EdgeWorkspaces.from_env(
+                    rearm=not links_off()
+                )
     return workspaces
 
 

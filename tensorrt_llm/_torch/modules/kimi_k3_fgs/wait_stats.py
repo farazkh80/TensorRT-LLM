@@ -12,9 +12,8 @@ import atexit
 import os
 from typing import Dict, Optional
 
-import torch
-
 import cutlass
+import torch
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
 
