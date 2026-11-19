@@ -24,17 +24,22 @@ within 256 ulps of a bf16 rounding midpoint; those elements (about 0.8%), g <= -
 and NaN fall back to the IEEE formula. The bf16 result is therefore identical to the exact path.
 
 ``fgs_producer`` publishes the output to a fine-grained-sync consumer that validates each 16-B chunk by its first
-element (bf16 -0.0 = not written yet): every 16-B chunk is one ``st.global.v4``, -0.0 is stored as +0.0, and the
-grid triggers its dependents on entry and waits for its own inputs (PDL). The output buffer is the framework's
-sentinel-initialized slot; the kernel writes sentinels only into ``fgs_arm``.
+element (bf16 -0.0 = not written yet): every 16-B chunk is one ``st.global.v4`` (``fgs_store="thread"``) or part of
+the CTA's TMA store (``fgs_store="tma"``, from a smem tile), -0.0 is stored as +0.0, and the grid triggers its
+dependents on entry (``fgs_trigger="entry"``; ``"end"``: after the stores) and waits for its own inputs (PDL). The
+output buffer is the framework's sentinel-initialized slot; the kernel writes sentinels only into ``fgs_arm``.
 
 ``fgs_arm`` (with ``fgs_producer``) is a second region shaped like ``out``, the slot of the edge's next use: the thread
 that stores an output chunk then stores the -0.0 sentinel over the same chunk of ``fgs_arm``, so that slot is armed
 for its producer without the framework's fill. ``fgs_arm_delay_ns`` > 0 delays those stores (hazard tests only).
 
 ``fgs_consumer`` reads o and g from fine-grained-sync slots instead of waiting for their producers: no
-``griddepcontrol.wait``; each 16-B chunk is loaded with ``ld.global.cg`` and, while any of its elements is the -0.0
-sentinel, reloaded by the warp-uniform wait of ``mla_fgs.poll_chunks``. Both modes can be on together.
+``griddepcontrol.wait``. ``fgs_check="sw"``: each 16-B chunk is loaded with ``ld.global.cg`` and, while any of its
+elements is the -0.0 sentinel, reloaded by the warp-uniform wait of ``mla_fgs.poll_chunks``. ``fgs_check="tma"``:
+warp 0 TMA-loads the CTA's o and g tiles into shared memory with ``report_valid`` (sentinel in element 0 of each
+16-B chunk) and re-issues them while a completion reports a sentinel; the threads then read their vectors from smem.
+``fgs_wait_grid`` (links-off control arm): the consumer waits for its producer grid first and its TMA loads run
+without ``report_valid``. Both modes can be on together.
 """
 
 from typing import Callable, Optional
@@ -44,6 +49,7 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass.base_dsl.dsl import BaseDSL
+from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import make_ptr
 
 from tensorrt_llm._utils import get_sm_version
@@ -51,6 +57,9 @@ from tensorrt_llm._utils import get_sm_version
 THREADS = 256
 LOG2E = 1.4426950408889634
 MIDPOINT_GUARD_ULPS = 256
+CHECKS = ("sw", "tma")
+STORES = ("thread", "tma")
+TRIGGERS = ("entry", "end")
 
 
 @cute.jit
@@ -77,6 +86,7 @@ def _sigmoid_bf16_as_f32(g: cutlass.Float32, fast: cutlass.Constexpr) -> cutlass
 
 
 try:
+    from . import mla_fgs_tma as tma
     from .mla_fgs import (
         BF16_SENTINEL,
         STATS_LEN,
@@ -88,6 +98,7 @@ try:
         st_global_v4,
     )
 except ImportError:
+    import mla_fgs_tma as tma
     from mla_fgs import (
         BF16_SENTINEL,
         STATS_LEN,
@@ -143,6 +154,7 @@ def _gate_consumer(
     out_base: cutlass.Int64,
     first: cutlass.Int64,
     num_vecs: cutlass.Int64,
+    sw_counter: cutlass.Int64,
     vec: cutlass.Constexpr,
     unroll: cutlass.Constexpr,
     fast: cutlass.Constexpr,
@@ -179,7 +191,8 @@ def _gate_consumer(
                 words[8 * k + i] = w[i]
     else:
         load_chunks(words, addrs, n, cutlass.Boolean(True))
-    poll_chunks(words, addrs, n, False, spin_limit, mStats, with_stats)
+    sweeps = poll_chunks(words, addrs, n, False, spin_limit, mStats, with_stats)
+    tma.count(sw_counter, sweeps)
     for u in cutlass.range_constexpr(unroll):
         v = first + cutlass.Int64(u * THREADS)
         if v < num_vecs:
@@ -200,26 +213,146 @@ def _gate_consumer(
             )
 
 
-@cute.kernel
-def _output_gate_kernel(
+@cute.jit
+def _gate_tma(
     mO: cute.Tensor,
     mG: cute.Tensor,
     mOut: cute.Tensor,
-    mStats: cute.Tensor,
-    num_vecs: cutlass.Int64,
+    atom_o: Optional[cute.CopyAtom],
+    tma_o: Optional[cute.Tensor],
+    atom_g: Optional[cute.CopyAtom],
+    tma_g: Optional[cute.Tensor],
+    atom_out: Optional[cute.CopyAtom],
+    tma_out: Optional[cute.Tensor],
+    out_base: cutlass.Int64,
+    retry_counter: cutlass.Int64,
+    span: cutlass.Constexpr,
     vec: cutlass.Constexpr,
     unroll: cutlass.Constexpr,
     fast: cutlass.Constexpr,
     producer: cutlass.Constexpr,
     hw_pzo: cutlass.Constexpr,
     consumer: cutlass.Constexpr,
+    tma_in: cutlass.Constexpr,
+    tma_store: cutlass.Constexpr,
+    wait_grid: cutlass.Constexpr,
+    spin_limit: cutlass.Constexpr,
+    arm_base: cutlass.Int64,
+    arm: cutlass.Constexpr,
+    arm_delay_ns: cutlass.Constexpr,
+):
+    """One full CTA tile of ``span`` elements per input: o and g TMA-loaded into smem (``tma_in``) or read with
+    plain vector loads; the result replaces o's smem tile and leaves by one TMA store (``tma_store``) or by the
+    thread stores of ``_store_out``."""
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+    warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+    smem = cutlass.utils.SmemAllocator()
+    sO = smem.allocate_tensor(cutlass.BFloat16, tma.tile_layout(1, span), byte_alignment=tma.SMEM_ALIGN)
+    sG = None
+    bar = None
+    if cutlass.const_expr(tma_in):
+        sG = smem.allocate_tensor(cutlass.BFloat16, tma.tile_layout(1, span), byte_alignment=tma.SMEM_ALIGN)
+        bar = smem.allocate_array(cutlass.Int64, 1, byte_alignment=8)
+        if warp_idx == 0:
+            tma.init_barrier(bar, not wait_grid)
+        cute.arch.barrier()
+        if cutlass.const_expr(wait_grid):
+            cute.arch.griddepcontrol_wait()
+        if warp_idx == 0:
+            tSo, tGo = tma.partition_row_tiles(atom_o, tma_o, sO, 1, span)
+            tSg, tGg = tma.partition_row_tiles(atom_g, tma_g, sG, 1, span)
+
+            def issue():
+                if cutlass.const_expr(wait_grid):
+                    cute.copy(atom_o, tGo[(None, bidx)], tSo[(None, 0)], tma_bar_ptr=bar)
+                    cute.copy(atom_g, tGg[(None, bidx)], tSg[(None, 0)], tma_bar_ptr=bar)
+                else:
+                    cute.copy(
+                        atom_o, tGo[(None, bidx)], tSo[(None, 0)], tma_bar_ptr=bar, report_valid=tma.BF16_PATTERN
+                    )
+                    cute.copy(
+                        atom_g, tGg[(None, bidx)], tSg[(None, 0)], tma_bar_ptr=bar, report_valid=tma.BF16_PATTERN
+                    )
+
+            tma.checked_load(
+                bar, cutlass.Int32(2 * span * 2), issue, not wait_grid, spin_limit, retry_counter, cutlass.Int32(0)
+            )
+        cute.arch.barrier()
+    elif cutlass.const_expr(producer and not consumer):
+        cute.arch.griddepcontrol_wait()
+    o_flat = cute.make_tensor(sO.iterator, cute.make_layout((span,)))
+    g_flat = None
+    if cutlass.const_expr(tma_in):
+        g_flat = cute.make_tensor(sG.iterator, cute.make_layout((span,)))
+    o_words = cute.recast_tensor(o_flat, cutlass.Int32)
+    out_arr = cutlass.make_array_view(mOut)
+    o_arr = cutlass.make_array_view(mO)
+    g_arr = cutlass.make_array_view(mG)
+    arm_args = (arm_base, arm_delay_ns) if arm else None
+    cta_first = cutlass.Int64(bidx) * cutlass.Int64(span)
+    for u in cutlass.range_constexpr(unroll):
+        local = (u * THREADS + tidx) * vec
+        res = []
+        if cutlass.const_expr(tma_in):
+            o_frag = cute.make_rmem_tensor((vec,), cutlass.BFloat16)
+            g_frag = cute.make_rmem_tensor((vec,), cutlass.BFloat16)
+            cute.autovec_copy(cute.make_tensor(o_flat.iterator + local, cute.make_layout((vec,))), o_frag)
+            cute.autovec_copy(cute.make_tensor(g_flat.iterator + local, cute.make_layout((vec,))), g_frag)
+            for e in cutlass.range_constexpr(vec):
+                res.append(
+                    o_frag[e].to(cutlass.Float32) * _sigmoid_bf16_as_f32(g_frag[e].to(cutlass.Float32), fast)
+                )
+        else:
+            o = o_arr.load(cta_first + cutlass.Int64(local), vec, alignment=2 * vec).to(cutlass.Float32)
+            g = g_arr.load(cta_first + cutlass.Int64(local), vec, alignment=2 * vec).to(cutlass.Float32)
+            for e in cutlass.range_constexpr(vec):
+                res.append(o[e] * _sigmoid_bf16_as_f32(g[e], fast))
+        if cutlass.const_expr(tma_store):
+            for p in cutlass.range_constexpr(vec // 2):
+                o_words[local // 2 + p] = bf16x2_pzo(res[2 * p], res[2 * p + 1], hw_pzo)
+        else:
+            _store_out(out_arr, out_base, cta_first + cutlass.Int64(local), res, vec, producer, hw_pzo, arm_args)
+    if cutlass.const_expr(tma_store):
+        cute.arch.fence_proxy("async.shared", space="cta")
+        cute.arch.barrier()
+        if warp_idx == 0:
+            tSo, tGo = tma.partition_row_tiles(atom_out, tma_out, sO, 1, span)
+            tma.store_tile(atom_out, tSo[(None, 0)], tGo[(None, bidx)])
+
+
+@cute.kernel
+def _output_gate_kernel(
+    mO: cute.Tensor,
+    mG: cute.Tensor,
+    mOut: cute.Tensor,
+    mStats: cute.Tensor,
+    atom_o: Optional[cute.CopyAtom],
+    tma_o: Optional[cute.Tensor],
+    atom_g: Optional[cute.CopyAtom],
+    tma_g: Optional[cute.Tensor],
+    atom_out: Optional[cute.CopyAtom],
+    tma_out: Optional[cute.Tensor],
+    num_vecs: cutlass.Int64,
+    retry_counter: cutlass.Int64,
+    sw_counter: cutlass.Int64,
+    vec: cutlass.Constexpr,
+    unroll: cutlass.Constexpr,
+    fast: cutlass.Constexpr,
+    producer: cutlass.Constexpr,
+    hw_pzo: cutlass.Constexpr,
+    consumer: cutlass.Constexpr,
+    tma_in: cutlass.Constexpr,
+    tma_store: cutlass.Constexpr,
+    wait_grid: cutlass.Constexpr,
+    trigger_end: cutlass.Constexpr,
     spin_limit: cutlass.Constexpr,
     with_stats: cutlass.Constexpr,
     arm_base: cutlass.Int64,
     arm: cutlass.Constexpr,
     arm_delay_ns: cutlass.Constexpr,
 ):
-    if cutlass.const_expr(producer):
+    if cutlass.const_expr(producer and not trigger_end):
         cute.arch.griddepcontrol_launch_dependents()
     arm_args = (arm_base, arm_delay_ns) if arm else None
     tidx, _, _ = cute.arch.thread_idx()
@@ -228,9 +361,17 @@ def _output_gate_kernel(
     if cutlass.const_expr(producer):
         out_base = mOut.iterator.toint()
     first = cutlass.Int64(bidx) * cutlass.Int64(THREADS * unroll) + cutlass.Int64(tidx)
-    if cutlass.const_expr(consumer):
+    if cutlass.const_expr(tma_in or tma_store):
+        _gate_tma(
+            mO, mG, mOut, atom_o, tma_o, atom_g, tma_g, atom_out, tma_out, out_base, retry_counter,
+            THREADS * unroll * vec, vec, unroll, fast, producer, hw_pzo, consumer, tma_in, tma_store, wait_grid,
+            spin_limit, arm_base, arm, arm_delay_ns,
+        )  # fmt: skip
+    elif cutlass.const_expr(consumer):
+        if cutlass.const_expr(wait_grid):
+            cute.arch.griddepcontrol_wait()
         _gate_consumer(
-            mO, mG, mOut, mStats, out_base, first, num_vecs, vec, unroll, fast, producer, hw_pzo,
+            mO, mG, mOut, mStats, out_base, first, num_vecs, sw_counter, vec, unroll, fast, producer, hw_pzo,
             spin_limit, with_stats, arm_base, arm, arm_delay_ns,
         )  # fmt: skip
     else:
@@ -271,6 +412,8 @@ def _output_gate_kernel(
                         hw_pzo,
                         arm_args,
                     )
+    if cutlass.const_expr(producer and trigger_end):
+        cute.arch.griddepcontrol_launch_dependents()
 
 
 @cute.jit
@@ -283,32 +426,61 @@ def _output_gate_host(
     stream: cuda.CUstream,
     num_vecs: cutlass.Int64,
     num_ctas: cutlass.Int32,
+    retry_counter: cutlass.Int64,
+    sw_counter: cutlass.Int64,
     vec: cutlass.Constexpr,
     unroll: cutlass.Constexpr,
     fast: cutlass.Constexpr,
     producer: cutlass.Constexpr,
     hw_pzo: cutlass.Constexpr,
     consumer: cutlass.Constexpr,
+    tma_in: cutlass.Constexpr,
+    tma_store: cutlass.Constexpr,
+    wait_grid: cutlass.Constexpr,
+    trigger_end: cutlass.Constexpr,
     spin_limit: cutlass.Constexpr,
     with_stats: cutlass.Constexpr,
     arm: cutlass.Constexpr,
     arm_delay_ns: cutlass.Constexpr,
 ):
-    layout = cute.make_layout(
-        (num_ctas, THREADS * unroll * vec), stride=(THREADS * unroll * vec, 1)
-    )
+    span = THREADS * unroll * vec
+    layout = cute.make_layout((num_ctas, span), stride=(span, 1))
+    mO = cute.make_tensor(o_ptr, layout)
+    mG = cute.make_tensor(g_ptr, layout)
+    mOut = cute.make_tensor(out_ptr, layout)
+    atom_o, tma_o, atom_g, tma_g, atom_out, tma_out = None, None, None, None, None, None
+    if cutlass.const_expr(tma_in):
+        atom_o, tma_o = tma.make_row_tile_atom(cpasync.CopyBulkTensorTileG2SOp(), mO, 1, span)
+        atom_g, tma_g = tma.make_row_tile_atom(cpasync.CopyBulkTensorTileG2SOp(), mG, 1, span)
+    if cutlass.const_expr(tma_store):
+        atom_out, tma_out = tma.make_row_tile_atom(cpasync.CopyBulkTensorTileS2GOp(), mOut, 1, span)
+    smem = 0
+    if cutlass.const_expr(tma_in or tma_store):
+        smem = (3 if tma_in else 1) * span * 2 + 2 * tma.SMEM_ALIGN
     _output_gate_kernel(
-        cute.make_tensor(o_ptr, layout),
-        cute.make_tensor(g_ptr, layout),
-        cute.make_tensor(out_ptr, layout),
+        mO,
+        mG,
+        mOut,
         cute.make_tensor(stats_ptr, cute.make_layout((STATS_LEN,))),
+        atom_o,
+        tma_o,
+        atom_g,
+        tma_g,
+        atom_out,
+        tma_out,
         num_vecs,
+        retry_counter,
+        sw_counter,
         vec,
         unroll,
         fast,
         producer,
         hw_pzo,
         consumer,
+        tma_in,
+        tma_store,
+        wait_grid,
+        trigger_end,
         spin_limit,
         with_stats,
         arm_ptr.toint(),
@@ -317,6 +489,7 @@ def _output_gate_host(
     ).launch(
         grid=(num_ctas, 1, 1),
         block=(THREADS, 1, 1),
+        smem=smem,
         stream=stream,
         use_pdl=producer or consumer,
     )
@@ -366,6 +539,11 @@ def mla_output_gate(
     fgs_spin_limit: int = 0,
     fgs_arm: Optional[torch.Tensor] = None,
     fgs_arm_delay_ns: int = 0,
+    fgs_check: str = "sw",
+    fgs_store: str = "thread",
+    fgs_wait_grid: bool = False,
+    fgs_trigger: str = "entry",
+    fgs_counters: Optional[dict] = None,
 ) -> torch.Tensor:
     """out = o * sigmoid(g), bf16, bit-matching ``o * g.sigmoid()``. ``out`` may alias ``o``.
 
@@ -373,11 +551,16 @@ def mla_output_gate(
     consumer's slot) and must not overlap ``o`` or ``g``.
     With ``fgs_consumer`` o and g are fine-grained-sync slots (``out`` must not overlap them); ``fgs_stats``
     (int32 [4]) accumulates the wait statistics of ``mla_fgs.poll_chunks`` and ``fgs_spin_limit`` > 0 traps after
-    that many reload sweeps (diagnostic). ``fgs_arm`` / ``fgs_arm_delay_ns``: see the module docstring (needs
-    ``fgs_producer``; shaped like ``out``, disjoint from ``out``, ``o`` and ``g``).
+    that many reload sweeps or TMA re-issues (diagnostic). ``fgs_arm`` / ``fgs_arm_delay_ns``: see the module
+    docstring (needs ``fgs_producer``; shaped like ``out``, disjoint from ``out``, ``o`` and ``g``).
+    ``fgs_check`` / ``fgs_store`` / ``fgs_wait_grid`` / ``fgs_trigger``: module docstring; the TMA paths need
+    ``o.numel()`` to be a multiple of the CTA span (2048 elements for the decode config) and ``out`` not aliasing
+    ``o``. ``fgs_counters`` maps ``"retry"`` / ``"sw"`` to ``wait_stats`` counter addresses.
     """
     if not supported(o, g):
         raise ValueError("mla_output_gate needs contiguous, 32B-aligned bf16 o / g of equal shape")
+    if fgs_check not in CHECKS or fgs_store not in STORES or fgs_trigger not in TRIGGERS:
+        raise ValueError(f"fgs_check {fgs_check!r}, fgs_store {fgs_store!r}, fgs_trigger {fgs_trigger!r}")
     if fgs_producer and out is None:
         raise ValueError("mla_output_gate: fgs_producer needs the consumer's out slot")
     if (fgs_producer or fgs_consumer) and out is not None:
@@ -424,6 +607,16 @@ def mla_output_gate(
     num_vecs = o.numel() // vec
     if num_vecs == 0:
         return out
+    tma_in = fgs_consumer and fgs_check == "tma"
+    tma_store = fgs_store == "tma"
+    if tma_in or tma_store:
+        span = THREADS * unroll * vec
+        if o.numel() % span or span % 256:
+            raise ValueError(f"mla_output_gate TMA paths need numel a multiple of the CTA span {span}")
+        if out.data_ptr() == o.data_ptr():
+            raise ValueError("mla_output_gate TMA paths need out distinct from o")
+        if tma_store and (fgs_arm is not None or (fgs_consumer and not tma_in)):
+            raise ValueError("mla_output_gate: fgs_store='tma' needs fgs_check='tma' for a consumer and no fgs_arm")
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     ptrs = _ptrs(2 * vec, o, g, out)
     stats_ptr = make_ptr(
@@ -432,12 +625,16 @@ def mla_output_gate(
         cute.AddressSpace.gmem,
         assumed_align=4,
     )
-    hw_pzo = fgs_producer and get_sm_version() == 107
+    hw_pzo = (fgs_producer or tma_store) and get_sm_version() == 107
     spin_limit = fgs_spin_limit if fgs_consumer else 0
+    wait_grid = fgs_wait_grid and fgs_consumer
+    trigger_end = fgs_producer and fgs_trigger == "end"
     arm = fgs_arm is not None
     arm_delay = fgs_arm_delay_ns if arm else 0
     arm_ptr = _ptrs(2 * vec, fgs_arm if arm else out)[0]
-    key = (config, fgs_producer, hw_pzo, fgs_consumer, spin_limit, with_stats, arm, arm_delay)
+    counters = fgs_counters or {}
+    key = (config, fgs_producer, hw_pzo, fgs_consumer, tma_in, tma_store, wait_grid, trigger_end, spin_limit,
+           with_stats, arm, arm_delay)  # fmt: skip
     fn = _COMPILED.get(key)
     if fn is None:
         with BaseDSL.enable_pyir():
@@ -449,12 +646,18 @@ def mla_output_gate(
                 stream,
                 cutlass.Int64(1),
                 cutlass.Int32(1),
+                cutlass.Int64(0),
+                cutlass.Int64(0),
                 vec,
                 unroll,
                 fast,
                 fgs_producer,
                 hw_pzo,
                 fgs_consumer,
+                tma_in,
+                tma_store,
+                wait_grid,
+                trigger_end,
                 spin_limit,
                 with_stats,
                 arm,
@@ -468,5 +671,7 @@ def mla_output_gate(
         stream,
         cutlass.Int64(num_vecs),
         cutlass.Int32(-(-num_vecs // (THREADS * unroll))),
+        cutlass.Int64(counters.get("retry", 0)),
+        cutlass.Int64(counters.get("sw", 0)),
     )
     return out

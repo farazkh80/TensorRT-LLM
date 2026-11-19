@@ -33,15 +33,22 @@ CTA roles (blockIdx.x ranges, 256 threads, one 16-byte vector or one int per thr
 
 Fine-grained sync (Lamport) modes, both opt-in and combinable:
   fgs_consumer  q_pe, compressed_kv and k_pe are FGS slots: launched with PDL, no ``griddepcontrol.wait``; the
-                step inputs (kv_lens, page table) are read first, then every 16-B input chunk is loaded with
-                ``ld.global.cg`` and, while it holds the -0.0 sentinel, reloaded by the warp-uniform wait of
-                ``mla_fgs.poll_chunks``.
+                step inputs (kv_lens, page table) are read first. ``fgs_check="sw"``: every 16-B input chunk is
+                loaded with ``ld.global.cg`` and, while it holds the -0.0 sentinel, reloaded by the warp-uniform
+                wait of ``mla_fgs.poll_chunks``. ``fgs_check="tma"``: one CTA per token; warp 0 TMA-loads the
+                token's q_pe tile (H x rope) and its cache row (compressed_kv | k_pe, 1152 B) into shared memory
+                with ``report_valid`` (sentinel in element 0 of each 16-B chunk) and re-issues a load while its
+                completion reports a sentinel.
   fgs_producer  fused_q[..., latent:] and the cache rows are published to FGS consumers: dependents are triggered
-                on entry and every 16-B chunk is one ``st.global.v4`` with -0.0 stored as +0.0 (with
-                ``fgs_consumer`` the copied chunks already hold no -0.0, so they are stored as loaded).
-  rearm_ckv     (with fgs_consumer) the latent append is the last reader of compressed_kv: each thread stores the
-                -0.0 sentinel over the compressed_kv chunk it copied, after its own load, so the slot is armed for its
-                next producer without the framework's fill. ``rearm_delay_ns`` > 0 sleeps that long before the
+                on entry (``fgs_trigger="entry"``; ``"end"``: after the stores) and every 16-B chunk is one
+                ``st.global.v4`` with -0.0 stored as +0.0 (with ``fgs_consumer`` the copied chunks already hold no
+                -0.0, so they are stored as loaded). ``fgs_store="tma"`` (with ``fgs_check="tma"``): the smem tiles
+                leave through TMA stores (the fused_q rope tile and the 1152-B cache row).
+  fgs_wait_grid (links-off control arm) the consumer waits for its producer grid first; TMA loads run without
+                ``report_valid``.
+  rearm_ckv     (with the software check) the latent append is the last reader of compressed_kv: each thread stores
+                the -0.0 sentinel over the compressed_kv chunk it copied, after its own load, so the slot is armed for
+                its next producer without the framework's fill. ``rearm_delay_ns`` > 0 sleeps that long before the
                 re-arm (hazard tests only).
 In either mode the page table is not written (the decode kernel prefetches it before its first wait, so it must be
 complete before the step: ``mla_decode_page_table``).
@@ -54,9 +61,11 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass.base_dsl.dsl import BaseDSL
+from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import make_ptr
 
 try:
+    from . import mla_fgs_tma as tma
     from .mla_fgs import (
         BF16_SENTINEL,
         STATS_LEN,
@@ -67,6 +76,7 @@ try:
         st_global_v4,
     )
 except ImportError:
+    import mla_fgs_tma as tma
     from mla_fgs import (
         BF16_SENTINEL,
         STATS_LEN,
@@ -80,6 +90,9 @@ except ImportError:
 THREADS = 256
 VEC = 8  # bf16 elements per 16-byte access
 SENTINEL_X2 = (BF16_SENTINEL | (BF16_SENTINEL << 16)) - (1 << 32)
+CHECKS = ("sw", "tma")
+STORES = ("thread", "tma")
+TRIGGERS = ("entry", "end")
 
 
 @cute.jit
@@ -154,12 +167,14 @@ def _append_fgs(
     ckv_stride: cutlass.Int64,
     kpe_stride: cutlass.Int64,
     pool_row_stride: cutlass.Int64,
+    sw_counter: cutlass.Int64,
     num_heads: cutlass.Constexpr,
     latent: cutlass.Constexpr,
     rope: cutlass.Constexpr,
     page_size: cutlass.Constexpr,
     consumer: cutlass.Constexpr,
     producer: cutlass.Constexpr,
+    wait_grid: cutlass.Constexpr,
     spin_limit: cutlass.Constexpr,
     with_stats: cutlass.Constexpr,
     rearm_ckv: cutlass.Constexpr,
@@ -229,11 +244,12 @@ def _append_fgs(
     words = cute.make_rmem_tensor((4,), cutlass.Int32)
     addrs = cute.make_rmem_tensor((1,), cutlass.Int64)
     addrs[0] = src
-    if cutlass.const_expr(not consumer):
+    if cutlass.const_expr(not consumer or wait_grid):
         cute.arch.griddepcontrol_wait()
     load_chunks(words, addrs, 1, active)
     if cutlass.const_expr(consumer):
-        poll_chunks(words, addrs, 1, False, spin_limit, mStats, with_stats)
+        sweeps = poll_chunks(words, addrs, 1, False, spin_limit, mStats, with_stats)
+        tma.count(sw_counter, sweeps)
     if active:
         # A chunk that passed the consumer wait holds no -0.0 element, so only the producer-only build canonicalizes.
         if cutlass.const_expr(producer and not consumer):
@@ -255,6 +271,142 @@ def _append_fgs(
                 st_global_v4(src, s, s, s, s)
 
 
+@cute.jit
+def _append_tma(
+    mQpe: cute.Tensor,
+    mFusedQ: cute.Tensor,
+    mCkv: cute.Tensor,
+    mKpe: cute.Tensor,
+    mPool: cute.Tensor,
+    mPtIn: cute.Tensor,
+    mKvLens: cute.Tensor,
+    atom_q: cute.CopyAtom,
+    tma_q: cute.Tensor,
+    atom_ckv: cute.CopyAtom,
+    tma_ckv: cute.Tensor,
+    atom_kpe: cute.CopyAtom,
+    tma_kpe: cute.Tensor,
+    atom_fq: Optional[cute.CopyAtom],
+    tma_fq: Optional[cute.Tensor],
+    atom_row: Optional[cute.CopyAtom],
+    tma_row: Optional[cute.Tensor],
+    seq_len_q: cutlass.Int32,
+    pt_in_stride: cutlass.Int32,
+    page_offset: cutlass.Int32,
+    pool_row_stride: cutlass.Int64,
+    retry_counter: cutlass.Int64,
+    num_heads: cutlass.Constexpr,
+    latent: cutlass.Constexpr,
+    rope: cutlass.Constexpr,
+    page_size: cutlass.Constexpr,
+    tma_store: cutlass.Constexpr,
+    wait_grid: cutlass.Constexpr,
+    spin_limit: cutlass.Constexpr,
+):
+    """One CTA per token: q_pe (H, rope) and the cache row [compressed_kv | k_pe] TMA-loaded into smem on two
+    barriers (re-issued while invalid), then stored by TMA or by 16-B thread stores."""
+    tidx, _, _ = cute.arch.thread_idx()
+    t, _, _ = cute.arch.block_idx()
+    warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+    row_elems: cutlass.Constexpr = latent + rope
+    q_elems: cutlass.Constexpr = num_heads * rope
+    smem = cutlass.utils.SmemAllocator()
+    sQ = smem.allocate_tensor(
+        cutlass.BFloat16,
+        cute.make_layout((1, num_heads, rope, 1), stride=(q_elems, rope, 1, q_elems)),
+        byte_alignment=tma.SMEM_ALIGN,
+    )
+    sRow = smem.allocate_tensor(
+        cutlass.BFloat16, tma.tile_layout(1, row_elems), byte_alignment=tma.SMEM_ALIGN
+    )
+    sCkv = cute.make_tensor(sRow.iterator, tma.tile_layout(1, latent))
+    sKpe = cute.make_tensor(sRow.iterator + latent, tma.tile_layout(1, rope))
+    bars = smem.allocate_array(cutlass.Int64, 2, byte_alignment=8)
+    if warp_idx == 0:
+        tma.init_barrier(bars, not wait_grid)
+        tma.init_barrier(bars + 1, not wait_grid)
+    cute.arch.barrier()
+    if cutlass.const_expr(wait_grid):
+        cute.arch.griddepcontrol_wait()
+    b = t // seq_len_q
+    pos = cutlass.Int32(mKvLens[b]) - seq_len_q + (t - b * seq_len_q)
+    row_index = cutlass.Int32(0)
+    if pos >= cutlass.Int32(0):
+        page = cutlass.Int32(mPtIn[b * pt_in_stride + pos // cutlass.Int32(page_size)]) + page_offset
+        row_index = page * cutlass.Int32(page_size) + pos % cutlass.Int32(page_size)
+    if warp_idx == 0:
+        gQ = cute.local_tile(tma_q, (1, num_heads, rope), (None, 0, 0))
+        tSq, tGq = cpasync.tma_partition(
+            atom_q, 0, cute.make_layout(1), cute.group_modes(sQ, 0, 3), cute.group_modes(gQ, 0, 3)
+        )
+        tSc, tGc = tma.partition_row_tiles(atom_ckv, tma_ckv, sCkv, 1, latent)
+        tSk, tGk = tma.partition_row_tiles(atom_kpe, tma_kpe, sKpe, 1, rope)
+
+        def issue_q():
+            if cutlass.const_expr(wait_grid):
+                cute.copy(atom_q, tGq[(None, t)], tSq[(None, 0)], tma_bar_ptr=bars)
+            else:
+                cute.copy(atom_q, tGq[(None, t)], tSq[(None, 0)], tma_bar_ptr=bars, report_valid=tma.BF16_PATTERN)
+
+        def issue_row():
+            if cutlass.const_expr(wait_grid):
+                cute.copy(atom_ckv, tGc[(None, t)], tSc[(None, 0)], tma_bar_ptr=bars + 1)
+                cute.copy(atom_kpe, tGk[(None, t)], tSk[(None, 0)], tma_bar_ptr=bars + 1)
+            else:
+                cute.copy(
+                    atom_ckv, tGc[(None, t)], tSc[(None, 0)], tma_bar_ptr=bars + 1, report_valid=tma.BF16_PATTERN
+                )
+                cute.copy(
+                    atom_kpe, tGk[(None, t)], tSk[(None, 0)], tma_bar_ptr=bars + 1, report_valid=tma.BF16_PATTERN
+                )
+
+        tma.checked_load(
+            bars, cutlass.Int32(q_elems * 2), issue_q, not wait_grid, spin_limit, retry_counter, cutlass.Int32(0)
+        )
+        tma.checked_load(
+            bars + 1, cutlass.Int32(row_elems * 2), issue_row, not wait_grid, spin_limit, retry_counter,
+            cutlass.Int32(0),
+        )  # fmt: skip
+    cute.arch.barrier()
+    if cutlass.const_expr(tma_store):
+        if warp_idx == 0:
+            gF = cute.local_tile(tma_fq, (1, num_heads, rope), (None, 0, 0))
+            tSf, tGf = cpasync.tma_partition(
+                atom_fq, 0, cute.make_layout(1), cute.group_modes(sQ, 0, 3), cute.group_modes(gF, 0, 3)
+            )
+            cute.copy(atom_fq, tSf[(None, 0)], tGf[(None, t)])
+            if pos >= cutlass.Int32(0):
+                tSr, tGr = tma.partition_row_tiles(atom_row, tma_row, sRow, 1, row_elems)
+                cute.copy(atom_row, tSr[(None, 0)], tGr[(None, row_index)])
+            cute.arch.cp_async_bulk_commit_group()
+            cute.arch.cp_async_bulk_wait_group(0)
+    else:
+        q_words = cute.recast_tensor(cute.make_tensor(sQ.iterator, cute.make_layout((q_elems,))), cutlass.Int32)
+        row_words = cute.recast_tensor(
+            cute.make_tensor(sRow.iterator, cute.make_layout((row_elems,))), cutlass.Int32
+        )
+        fq_base = mFusedQ.iterator.toint() + cutlass.Int64(2) * (
+            cutlass.Int64(t) * cutlass.Int64(num_heads * row_elems) + cutlass.Int64(latent)
+        )
+        for c in cutlass.range_constexpr(q_elems // VEC // THREADS):
+            chunk = c * THREADS + tidx
+            h = chunk // (rope // VEC)
+            v = chunk - h * (rope // VEC)
+            dst = fq_base + cutlass.Int64(2) * (cutlass.Int64(h) * cutlass.Int64(row_elems) + cutlass.Int64(v * VEC))
+            st_global_v4(
+                dst, q_words[4 * chunk], q_words[4 * chunk + 1], q_words[4 * chunk + 2], q_words[4 * chunk + 3]
+            )
+        if tidx < cutlass.Int32(row_elems // VEC):
+            if pos >= cutlass.Int32(0):
+                dst = mPool.iterator.toint() + cutlass.Int64(2) * (
+                    cutlass.Int64(row_index) * pool_row_stride + cutlass.Int64(tidx * VEC)
+                )
+                st_global_v4(
+                    dst, row_words[4 * tidx], row_words[4 * tidx + 1], row_words[4 * tidx + 2],
+                    row_words[4 * tidx + 3],
+                )  # fmt: skip
+
+
 @cute.kernel
 def _latent_append_kernel(
     mQpe: cute.Tensor,
@@ -269,6 +421,16 @@ def _latent_append_kernel(
     mCuKv: cute.Tensor,
     mCounter: cute.Tensor,
     mStats: cute.Tensor,
+    atom_q: Optional[cute.CopyAtom],
+    tma_q: Optional[cute.Tensor],
+    atom_ckv: Optional[cute.CopyAtom],
+    tma_ckv: Optional[cute.Tensor],
+    atom_kpe: Optional[cute.CopyAtom],
+    tma_kpe: Optional[cute.Tensor],
+    atom_fq: Optional[cute.CopyAtom],
+    tma_fq: Optional[cute.Tensor],
+    atom_row: Optional[cute.CopyAtom],
+    tma_row: Optional[cute.Tensor],
     num_tokens: cutlass.Int32,
     seq_len_q: cutlass.Int32,
     batch: cutlass.Int32,
@@ -283,6 +445,8 @@ def _latent_append_kernel(
     ckv_stride: cutlass.Int64,
     kpe_stride: cutlass.Int64,
     pool_row_stride: cutlass.Int64,
+    retry_counter: cutlass.Int64,
+    sw_counter: cutlass.Int64,
     num_heads: cutlass.Constexpr,
     latent: cutlass.Constexpr,
     rope: cutlass.Constexpr,
@@ -291,12 +455,16 @@ def _latent_append_kernel(
     write_meta: cutlass.Constexpr,
     consumer: cutlass.Constexpr,
     producer: cutlass.Constexpr,
+    tma_in: cutlass.Constexpr,
+    tma_store: cutlass.Constexpr,
+    wait_grid: cutlass.Constexpr,
+    trigger_end: cutlass.Constexpr,
     spin_limit: cutlass.Constexpr,
     with_stats: cutlass.Constexpr,
     rearm_ckv: cutlass.Constexpr,
     rearm_delay_ns: cutlass.Constexpr,
 ):
-    if cutlass.const_expr(producer):
+    if cutlass.const_expr(producer and not trigger_end):
         cute.arch.griddepcontrol_launch_dependents()
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
@@ -311,13 +479,24 @@ def _latent_append_kernel(
     kpe = cutlass.make_array_view(mKpe)
     pool = cutlass.make_array_view(mPool)
 
-    if cutlass.const_expr(consumer or producer):
+    if cutlass.const_expr(tma_in):
+        if bidx < ctas_q:
+            _append_tma(
+                mQpe, mFusedQ, mCkv, mKpe, mPool, mPtIn, mKvLens, atom_q, tma_q, atom_ckv, tma_ckv, atom_kpe,
+                tma_kpe, atom_fq, tma_fq, atom_row, tma_row, seq_len_q, pt_in_stride, page_offset,
+                pool_row_stride, retry_counter, num_heads, latent, rope, page_size, tma_store, wait_grid,
+                spin_limit,
+            )  # fmt: skip
+        else:
+            if cutlass.const_expr(write_meta):
+                _write_meta(mKvLens, mCuQ, mCuKv, mCounter, batch, seq_len_q, num_heads)
+    elif cutlass.const_expr(consumer or producer):
         if bidx < ctas_q + ctas_kv:
             _append_fgs(
                 mQpe, mFusedQ, mCkv, mKpe, mPool, mPtIn, mKvLens, mStats, num_tokens, seq_len_q, ctas_q,
                 pt_in_stride, page_offset, q_tok_stride, q_head_stride, ckv_stride, kpe_stride, pool_row_stride,
-                num_heads, latent, rope, page_size, consumer, producer, spin_limit, with_stats, rearm_ckv,
-                rearm_delay_ns,
+                sw_counter, num_heads, latent, rope, page_size, consumer, producer, wait_grid, spin_limit,
+                with_stats, rearm_ckv, rearm_delay_ns,
             )  # fmt: skip
         else:
             if cutlass.const_expr(write_meta):
@@ -393,6 +572,8 @@ def _latent_append_kernel(
         else:
             if cutlass.const_expr(write_meta):
                 _write_meta(mKvLens, mCuQ, mCuKv, mCounter, batch, seq_len_q, num_heads)
+    if cutlass.const_expr(producer and trigger_end):
+        cute.arch.griddepcontrol_launch_dependents()
 
 
 @cute.jit
@@ -426,6 +607,8 @@ def _latent_append_host(
     ckv_stride: cutlass.Int64,
     kpe_stride: cutlass.Int64,
     pool_row_stride: cutlass.Int64,
+    retry_counter: cutlass.Int64,
+    sw_counter: cutlass.Int64,
     num_heads: cutlass.Constexpr,
     latent: cutlass.Constexpr,
     rope: cutlass.Constexpr,
@@ -434,6 +617,10 @@ def _latent_append_host(
     write_meta: cutlass.Constexpr,
     consumer: cutlass.Constexpr,
     producer: cutlass.Constexpr,
+    tma_in: cutlass.Constexpr,
+    tma_store: cutlass.Constexpr,
+    wait_grid: cutlass.Constexpr,
+    trigger_end: cutlass.Constexpr,
     spin_limit: cutlass.Constexpr,
     with_stats: cutlass.Constexpr,
     rearm_ckv: cutlass.Constexpr,
@@ -462,6 +649,31 @@ def _latent_append_host(
     mCuKv = cute.make_tensor(cu_kv_ptr, cute.make_layout((batch + 1,), stride=(1,)))
     mCounter = cute.make_tensor(counter_ptr, cute.make_layout((1,), stride=(1,)))
     mStats = cute.make_tensor(stats_ptr, cute.make_layout((STATS_LEN,), stride=(1,)))
+    atoms = [None] * 10
+    smem = 0
+    if cutlass.const_expr(tma_in):
+        q_layout = cute.make_layout(
+            (1, num_heads, rope, 1), stride=(num_heads * rope, rope, 1, num_heads * rope)
+        )
+        atoms[0], atoms[1] = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(), mQpe, q_layout, (1, num_heads, rope)
+        )
+        atoms[2], atoms[3] = tma.make_row_tile_atom(cpasync.CopyBulkTensorTileG2SOp(), mCkv, 1, latent)
+        atoms[4], atoms[5] = tma.make_row_tile_atom(cpasync.CopyBulkTensorTileG2SOp(), mKpe, 1, rope)
+        if cutlass.const_expr(tma_store):
+            mFq = cute.make_tensor(
+                fused_q_ptr + latent,
+                cute.make_layout(
+                    (num_tokens, num_heads, rope), stride=(num_heads * (latent + rope), latent + rope, 1)
+                ),
+            )
+            atoms[6], atoms[7] = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileS2GOp(), mFq, q_layout, (1, num_heads, rope)
+            )
+            atoms[8], atoms[9] = tma.make_row_tile_atom(
+                cpasync.CopyBulkTensorTileS2GOp(), mPool, 1, latent + rope
+            )
+        smem = (num_heads * rope + latent + rope) * 2 + 16 + 3 * tma.SMEM_ALIGN
     _latent_append_kernel(
         mQpe,
         mFusedQ,
@@ -475,6 +687,7 @@ def _latent_append_host(
         mCuKv,
         mCounter,
         mStats,
+        *atoms,
         num_tokens,
         seq_len_q,
         batch,
@@ -489,6 +702,8 @@ def _latent_append_host(
         ckv_stride,
         kpe_stride,
         pool_row_stride,
+        retry_counter,
+        sw_counter,
         num_heads,
         latent,
         rope,
@@ -497,6 +712,10 @@ def _latent_append_host(
         write_meta,
         consumer,
         producer,
+        tma_in,
+        tma_store,
+        wait_grid,
+        trigger_end,
         spin_limit,
         with_stats,
         rearm_ckv,
@@ -504,6 +723,7 @@ def _latent_append_host(
     ).launch(
         grid=(ctas_q + ctas_kv + ctas_pt + n_meta, 1, 1),
         block=(THREADS, 1, 1),
+        smem=smem,
         stream=stream,
         use_pdl=consumer or producer,
     )
@@ -526,8 +746,8 @@ def _ptrs(addrs):
 def _compiled(key: tuple, addrs, stream) -> Callable:
     fn = _COMPILED.get(key)
     if fn is None:
-        (num_heads, latent, rope, page_size, write_pt, write_meta, consumer, producer, spin_limit,
-         with_stats, rearm_ckv, rearm_delay_ns) = key  # fmt: skip
+        (num_heads, latent, rope, page_size, write_pt, write_meta, consumer, producer, tma_in, tma_store,
+         wait_grid, trigger_end, spin_limit, with_stats, rearm_ckv, rearm_delay_ns) = key  # fmt: skip
         one32, eight64 = cutlass.Int32(1), cutlass.Int64(8)
         with BaseDSL.enable_pyir():
             fn = cute.compile(
@@ -536,6 +756,8 @@ def _compiled(key: tuple, addrs, stream) -> Callable:
                 stream,
                 *([one32] * 11),
                 *([eight64] * 5),
+                cutlass.Int64(0),
+                cutlass.Int64(0),
                 num_heads,
                 latent,
                 rope,
@@ -544,6 +766,10 @@ def _compiled(key: tuple, addrs, stream) -> Callable:
                 write_meta,
                 consumer,
                 producer,
+                tma_in,
+                tma_store,
+                wait_grid,
+                trigger_end,
                 spin_limit,
                 with_stats,
                 rearm_ckv,
@@ -613,6 +839,11 @@ def mla_latent_append(
     fgs_spin_limit: int = 0,
     fgs_rearm_ckv: bool = False,
     fgs_rearm_delay_ns: int = 0,
+    fgs_check: str = "sw",
+    fgs_store: str = "thread",
+    fgs_wait_grid: bool = False,
+    fgs_trigger: str = "entry",
+    fgs_counters: Optional[dict] = None,
 ) -> Optional[torch.Tensor]:
     """Append this step's latent rows to the paged cache and copy q_pe into fused_q.
 
@@ -627,13 +858,21 @@ def mla_latent_append(
 
     Returns the page table the CuTe MLA decode kernel consumes ([max_blocks, B]), or None in the FGS modes
     (``fgs_consumer`` / ``fgs_producer``, see the module docstring), which never write it: the caller provides it
-    before the step (``mla_decode_page_table``). ``fgs_stats`` (int32 [4]) accumulates the consumer's wait
-    statistics; ``fgs_spin_limit`` > 0 traps after that many reload sweeps (diagnostic). ``fgs_rearm_ckv``
-    (needs ``fgs_consumer``) re-arms every compressed_kv chunk after it is read; ``fgs_rearm_delay_ns`` delays that
-    (hazard tests).
+    before the step (``mla_decode_page_table``). ``fgs_stats`` (int32 [4]) accumulates the software consumer's wait
+    statistics; ``fgs_spin_limit`` > 0 traps after that many reload sweeps or TMA re-issues (diagnostic).
+    ``fgs_rearm_ckv`` (needs ``fgs_consumer`` with the software check) re-arms every compressed_kv chunk after it
+    is read; ``fgs_rearm_delay_ns`` delays that (hazard tests). ``fgs_check`` / ``fgs_store`` / ``fgs_wait_grid`` /
+    ``fgs_trigger``: module docstring (``fgs_store="tma"`` needs ``fgs_check="tma"``); ``fgs_counters`` maps
+    ``"retry"`` / ``"sw"`` to ``wait_stats`` counter addresses.
     """
-    if fgs_rearm_ckv and not fgs_consumer:
-        raise ValueError("fgs_rearm_ckv re-arms an FGS input slot: it needs fgs_consumer")
+    if fgs_check not in CHECKS or fgs_store not in STORES or fgs_trigger not in TRIGGERS:
+        raise ValueError(f"fgs_check {fgs_check!r}, fgs_store {fgs_store!r}, fgs_trigger {fgs_trigger!r}")
+    tma_in = fgs_consumer and fgs_check == "tma"
+    tma_store = fgs_store == "tma"
+    if fgs_rearm_ckv and (not fgs_consumer or tma_in):
+        raise ValueError("fgs_rearm_ckv re-arms an FGS input slot: it needs fgs_consumer with fgs_check='sw'")
+    if tma_store and not tma_in:
+        raise ValueError("fgs_store='tma' needs fgs_consumer with fgs_check='tma'")
     fgs = fgs_consumer or fgs_producer
     num_tokens, num_heads, rope = q_pe.shape
     latent = compressed_kv.shape[-1]
@@ -660,6 +899,8 @@ def mla_latent_append(
     strides = (q_pe.stride(0), q_pe.stride(1), compressed_kv.stride(0), k_pe.stride(0))
     if any(s % VEC for s in strides) or latent % VEC or rope % VEC:
         raise ValueError("row strides and widths must be multiples of 8 elements")
+    if tma_in and (num_heads > 256 or rope > 256 or latent % 64 or rope % 64 or (latent + rope) % 64):
+        raise ValueError("the TMA append needs H, rope <= 256 and latent / rope multiples of 64")
     if page_table_rows.dtype != torch.int32 or page_table_rows.stride(1) != 1:
         raise ValueError("page_table_rows must be int32 with unit last stride")
     if kv_lens.dtype != torch.int32 or not kv_lens.is_contiguous() or kv_lens.numel() < batch:
@@ -703,8 +944,11 @@ def mla_latent_append(
     if with_stats and (fgs_stats.dtype != torch.int32 or fgs_stats.numel() < STATS_LEN):
         raise ValueError("fgs_stats must be an int32 tensor with at least 4 entries")
 
-    ctas_q = -(-num_tokens * num_heads * (rope // VEC) // THREADS)
-    ctas_kv = -(-num_tokens * ((latent + rope) // VEC) // THREADS)
+    if tma_in:
+        ctas_q, ctas_kv = num_tokens, 0
+    else:
+        ctas_q = -(-num_tokens * num_heads * (rope // VEC) // THREADS)
+        ctas_kv = -(-num_tokens * ((latent + rope) // VEC) // THREADS)
     ctas_pt = -(-batch * max_blocks // THREADS) if write_pt else 0
     n_meta = 1 if write_meta else 0
     dummy = kv_lens.data_ptr()
@@ -725,8 +969,11 @@ def mla_latent_append(
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     spin_limit = fgs_spin_limit if fgs_consumer else 0
     rearm_delay = fgs_rearm_delay_ns if fgs_rearm_ckv else 0
-    key = (num_heads, latent, rope, page_size, write_pt, write_meta, fgs_consumer, fgs_producer, spin_limit,
-           with_stats, fgs_rearm_ckv, rearm_delay)  # fmt: skip
+    wait_grid = fgs_wait_grid and fgs_consumer
+    trigger_end = fgs_producer and fgs_trigger == "end"
+    counters = fgs_counters or {}
+    key = (num_heads, latent, rope, page_size, write_pt, write_meta, fgs_consumer, fgs_producer, tma_in, tma_store,
+           wait_grid, trigger_end, spin_limit, with_stats, fgs_rearm_ckv, rearm_delay)  # fmt: skip
     fn = _compiled(key, addrs, stream)
     i32, i64 = cutlass.Int32, cutlass.Int64
     fn(
@@ -748,6 +995,8 @@ def mla_latent_append(
         i64(compressed_kv.stride(0)),
         i64(k_pe.stride(0)),
         i64(row_stride),
+        i64(counters.get("retry", 0)),
+        i64(counters.get("sw", 0)),
     )
     return result
 
@@ -779,7 +1028,7 @@ def mla_decode_page_table(
     pt = page_table_rows.data_ptr()
     addrs = (base, base, base, base, base, pt, pt, page_table_out.data_ptr(), pt, pt, pt, pt)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    key = (1, 8, 8, kv_pool.shape[2], True, False, False, False, 0, False, False, 0)
+    key = (1, 8, 8, kv_pool.shape[2], True, False, False, False, False, False, False, False, 0, False, False, 0)
     fn = _compiled(key, addrs, stream)
     i32, i64 = cutlass.Int32, cutlass.Int64
     fn(
@@ -797,5 +1046,7 @@ def mla_decode_page_table(
         i32(layer_in_pool),
         i32(1),
         *([i64(8)] * 5),
+        i64(0),
+        i64(0),
     )
     return page_table_out

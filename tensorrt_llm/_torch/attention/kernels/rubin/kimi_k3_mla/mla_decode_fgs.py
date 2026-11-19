@@ -61,6 +61,22 @@ one whole warp still computes the row's LSE, and every output element is still s
 thread, so the output is bit-identical. ``fgs_red_carveout``: preferred shared-memory carveout (percent) of the
 reduction launch, so that more than the 1 KB-per-CTA default carveout's CTAs fit on an SM.
 
+Hardware (TMA ``report_valid``) forms of the software waits above, each behind its own flag:
+  * ``fgs_rows_check="tma"``: the page-table warp TMA-loads this step's 1152-B cache row into a smem scratch with
+    ``report_valid`` (bf16 -0.0 in element 0 of each 16-B chunk) on a v1 barrier and re-issues it while the completion
+    reports a sentinel; both the check and the tile's KV loads are async-proxy reads, so no proxy fence is needed.
+  * ``fgs_lse_check="tma"``: every partial LSE entry takes one 16-B chunk (``LSE_PAD`` words, the value in word 0:
+    ``initialize_workspace``, ``fill_lse_sentinel(lse_pad=...)``), the split kernel runs ``fence.proxy.async.global``
+    before its release fence, and warp 0 of the reduction CTA TMA-loads one box of ``LSE_TMA_SPLITS`` entries per head
+    row with ``report_valid`` (fp32 -0.0), re-issues while invalid, then ``fence.proxy.async.global`` before the
+    CTA reads the partial O with generic loads. Entries past the request's split count are never armed (the
+    workspace is zeroed once), so their stale values never report invalid.
+  * ``fgs_q_pace="try"``: the Q retry warp waits with ``mbarrier.try_wait`` (hardware timeout) instead of
+    ``mbarrier_wait_primary`` + ``nanosleep`` between re-issues.
+  * ``fgs_store="tma"``: the reduction output tile (R rows x 512 bf16) is staged in smem and stored by TMA.
+  * ``fgs_wait_grid`` (links-off control): both kernels ``griddepcontrol.wait`` at entry and the Q / row / LSE TMA
+    loads run without ``report_valid``; ``fgs_trigger="end"`` moves the PDL trigger after the stores.
+
 Framework contract (sentinel = -0.0; bf16 0x8000, fp32 0x80000000):
   * fused_q (all 576 columns of the step's rows) holds the sentinel before W_UK / latent append write it.
   * The current cache rows of every MLA layer hold the sentinel before the latent append writes them
@@ -105,6 +121,7 @@ except ImportError:
     )
 
 try:
+    from . import mla_fgs_tma as tma
     from .mla_fgs import (
         BF16_SENTINEL,
         F32_SENTINEL,
@@ -119,6 +136,7 @@ try:
         trap,
     )
 except ImportError:
+    import mla_fgs_tma as tma
     from mla_fgs import (
         BF16_SENTINEL,
         F32_SENTINEL,
@@ -137,7 +155,8 @@ _Base = BlackwellMultiHeadLatentAttentionForwardFP16
 
 LATENT_DIM = 512
 ROPE_DIM = 64
-ROW_CHUNKS = (LATENT_DIM + ROPE_DIM) * 2 // 16
+ROW_ELEMS = LATENT_DIM + ROPE_DIM
+ROW_CHUNKS = ROW_ELEMS * 2 // 16
 STATS_LEN = 16
 # Stats layout (int32): [0] Q re-issues, [1] clusters that re-issued Q, [2:5] current-row poll (sweeps, warps
 # that waited, chunks reloaded), [8:11] reduction partial-O poll, [11:14] reduction partial-LSE poll.
@@ -145,13 +164,30 @@ _STATS_Q = 0
 _STATS_ROW = 2
 _STATS_RED_O = 8
 _STATS_RED_LSE = 11
+# wait_stats counter addresses (int64 tensor): TMA re-issues of Q / current row / LSE, then the software sites.
+CNT_Q = 0
+CNT_ROWS = 1
+CNT_LSE = 2
+CNT_Q_SLEEP = 3
+CNT_ROWS_SW = 4
+CNT_LSE_SW = 5
+CNT_LEN = 8
 _MSG_DONE = 0
 _MSG_REISSUE = 1
 _MSG_BYTES = 16
 _EXTRA_SMEM = 128
+_EXTRA_SMEM_ROWS = _EXTRA_SMEM + ROW_ELEMS * 2 + 256
 _RED_UNROLL = 8
 _RED_SPIN_NS_MAX = 128
 _FILL_LSE_THREADS = 256
+# TMA-checked partial LSE: each entry padded to one 16-B chunk (element 0 checked), one box of this many splits per
+# head row (the runner never plans more splits than this).
+LSE_PAD = 4
+LSE_TMA_SPLITS = 32
+CHECKS = ("sw", "tma")
+PACES = ("sleep", "try")
+STORES = ("thread", "tma")
+TRIGGERS = ("entry", "end")
 
 
 @cute.struct
@@ -160,6 +196,15 @@ class _FgsSharedStorage:
     # lanes arrive after reading).
     msg_mbar: cute.struct.MemRange[cutlass.Int64, 2]
     msg: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 4], 16]
+
+
+@cute.struct
+class _FgsSharedStorageRows:
+    msg_mbar: cute.struct.MemRange[cutlass.Int64, 2]
+    msg: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 4], 16]
+    row_mbar: cutlass.Int64
+    # This step's cache row, landed by the checked TMA load (data-as-flag only, never read).
+    row_buf: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, ROW_ELEMS], 128]
 
 
 @dsl_user_op
@@ -348,6 +393,12 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         fgs_skip_empty: bool = False,
         fgs_red_rows: int = 1,
         fgs_red_carveout: Optional[int] = None,
+        fgs_rows_check: str = "sw",
+        fgs_lse_check: str = "sw",
+        fgs_q_pace: str = "sleep",
+        fgs_store: str = "thread",
+        fgs_wait_grid: bool = False,
+        fgs_trigger: str = "entry",
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -362,6 +413,30 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         self.fgs_skip_empty = fgs_skip_empty
         self.fgs_red_rows = fgs_red_rows
         self.fgs_red_carveout = fgs_red_carveout
+        self.fgs_q_pace = fgs_q_pace
+        self.fgs_wait_grid = fgs_wait_grid
+        self.fgs_trigger = fgs_trigger
+        if (
+            fgs_rows_check not in CHECKS
+            or fgs_lse_check not in CHECKS
+            or fgs_q_pace not in PACES
+            or fgs_store not in STORES
+            or fgs_trigger not in TRIGGERS
+        ):
+            raise ValueError(
+                f"fgs_rows_check {fgs_rows_check!r}, fgs_lse_check {fgs_lse_check!r}, fgs_q_pace {fgs_q_pace!r},"
+                f" fgs_store {fgs_store!r}, fgs_trigger {fgs_trigger!r}"
+            )
+        self._fgs_rows_tma = fgs_consumer and fgs_rows_check == "tma"
+        self._fgs_lse_tma = fgs_reduction and fgs_lse_check == "tma"
+        self._fgs_o_tma = fgs_reduction and fgs_store == "tma"
+        self.lse_pad = LSE_PAD if self._fgs_lse_tma else 1
+        if self._fgs_lse_tma and not (
+            fgs_partials == "lse" and self.reducer_d_tiles == 1 and self.num_heads % fgs_red_rows == 0
+        ):
+            raise ValueError("fgs_lse_check='tma' needs 'lse' partials, one D band and num_heads divisible by rows")
+        if fgs_store == "tma" and not fgs_reduction:
+            raise ValueError("fgs_store='tma' stores the reduction output: it needs fgs_reduction")
         self._fgs_split = fgs_consumer or fgs_producer or pdl_early or fgs_skip_empty
         self._fgs_red = fgs_reduction or pdl_early
         if self._fgs_split or self._fgs_red:
@@ -458,14 +533,46 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         softmax_scale: cutlass.Float32,
         output_scale: cutlass.Float32,
         fgs_stats: Optional[cute.Tensor],
+        wait_counters: Optional[cute.Tensor],
         stream: cuda.CUstream,
     ):
-        """``__call__`` with an optional int32 stats tensor of ``STATS_LEN`` entries (needs ``fgs_stats``)."""
+        """``__call__`` with an optional int32 stats tensor of ``STATS_LEN`` entries (needs ``fgs_stats``) and an
+        optional int64 tensor of ``CNT_LEN`` ``wait_stats`` counter addresses (``CNT_*``; 0 = not counted)."""
         stats = fgs_stats
         if cutlass.const_expr(not self.fgs_stats):
             stats = None
         self._fgs_c_latent = c_latent
         self._fgs_stats_tensor = stats
+        self._fgs_counters = wait_counters
+        self._fgs_row_atom, self._fgs_row_tensor = None, None
+        if cutlass.const_expr(self._fgs_rows_tma):
+            pool2d = cute.make_tensor(
+                c_latent.iterator,
+                cute.make_layout(
+                    (c_latent.shape[0] * c_latent.shape[2], ROW_ELEMS), stride=(c_latent.stride[0], 1)
+                ),
+            )
+            self._fgs_row_atom, self._fgs_row_tensor = tma.make_row_tile_atom(
+                cpasync.CopyBulkTensorTileG2SOp(), pool2d, 1, ROW_ELEMS
+            )
+        self._fgs_lse_atom, self._fgs_lse_tensor = None, None
+        self._fgs_o_atom, self._fgs_o_tensor = None, None
+        if cutlass.const_expr(self._fgs_o_tma):
+            rows = self.fgs_red_rows
+            o5 = cute.make_tensor(
+                o.iterator,
+                cute.make_layout(
+                    (o.shape[0], 2, LATENT_DIM // 2, o.shape[2], o.shape[3]),
+                    stride=(o.stride[0], LATENT_DIM // 2, 1, o.stride[2], o.stride[3]),
+                ),
+            )
+            o_smem = cute.make_layout(
+                (rows, 2, LATENT_DIM // 2, 1, 1, 1),
+                stride=(LATENT_DIM, LATENT_DIM // 2, 1, rows * LATENT_DIM, rows * LATENT_DIM, rows * LATENT_DIM),
+            )
+            self._fgs_o_atom, self._fgs_o_tensor = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileS2GOp(), o5, o_smem, (rows, 2, LATENT_DIM // 2, 1, 1)
+            )
         self._run(
             q_latent,
             q_rope,
@@ -491,9 +598,15 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
             return _NoLaunch()
         if not self._fgs_split:
             return _Base.split_kv_kernel(self, *args)
-        extra = _EXTRA_SMEM if self.fgs_consumer else 0
+        extra = 0
+        if self.fgs_consumer:
+            extra = _EXTRA_SMEM_ROWS if self._fgs_rows_tma else _EXTRA_SMEM
         return _PdlLaunch(
-            self._fgs_split_kv_kernel(*args, self._fgs_c_latent, self._fgs_stats_tensor), extra
+            self._fgs_split_kv_kernel(
+                *args, self._fgs_c_latent, self._fgs_stats_tensor, self._fgs_row_atom, self._fgs_row_tensor,
+                self._fgs_counters,
+            ),  # fmt: skip
+            extra,
         )
 
     def reduction_kernel(self, *args):
@@ -501,11 +614,20 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
             return _NoLaunch()
         if not self._fgs_red:
             return _Base.reduction_kernel(self, *args)
-        if self.fgs_red_rows > 1:
-            kernel = self._fgs_reduction_rows_kernel(*args, self._fgs_stats_tensor)
+        if self.fgs_red_rows > 1 or self._fgs_lse_tma or self._fgs_o_tma:
+            kernel = self._fgs_reduction_rows_kernel(
+                *args, self._fgs_stats_tensor, self._fgs_lse_atom, self._fgs_lse_tensor, self._fgs_o_atom,
+                self._fgs_o_tensor, self._fgs_counters,
+            )  # fmt: skip
+            extra = 256 if (self._fgs_lse_tma or self._fgs_o_tma) else 0
+            if self._fgs_lse_tma:
+                extra += LSE_TMA_SPLITS * LSE_PAD * 4
+            if self._fgs_o_tma:
+                extra += LATENT_DIM * 2
         else:
-            kernel = self._fgs_reduction_kernel(*args, self._fgs_stats_tensor)
-        return _PdlLaunch(kernel, rows=self.fgs_red_rows, carveout=self.fgs_red_carveout)
+            kernel = self._fgs_reduction_kernel(*args, self._fgs_stats_tensor, self._fgs_counters)
+            extra = 0
+        return _PdlLaunch(kernel, extra, rows=self.fgs_red_rows, carveout=self.fgs_red_carveout)
 
     def issue_q_tma_load(self, *args):
         if self.fgs_consumer:
@@ -532,9 +654,69 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         return sum(num_heads * s * (LATENT_DIM + 1) * 4 for s in splits_per_request if s > 1)
 
     @staticmethod
-    def lse_flag_bytes(num_heads: int, splits_per_request) -> int:
+    def lse_flag_bytes(num_heads: int, splits_per_request, lse_pad: int = 1) -> int:
         """Bytes ``fill_lse_sentinel`` writes (the partial LSE entries the reduction reads)."""
-        return sum(num_heads * s * 4 for s in splits_per_request if s > 1)
+        return sum(num_heads * s * 4 * lse_pad for s in splits_per_request if s > 1)
+
+    @cute.jit
+    def initialize_workspace(
+        self,
+        H: cutlass.Int32,
+        D: cutlass.Int32,
+        S: cutlass.Int32,
+        B: cutlass.Int32,
+        split_kv: cutlass.Int32,
+        acc_dtype,
+        workspace: cute.Tensor,
+    ):
+        """The base layout, with each partial LSE entry padded to ``LSE_PAD`` words (16 B, the value in word 0) when
+        the reduction checks the flags with TMA; builds that load's atom (one box of ``LSE_TMA_SPLITS`` entries per
+        head row)."""
+        if cutlass.const_expr(workspace is None or self.lse_pad == 1):
+            return _Base.initialize_workspace(self, H, D, S, B, split_kv, acc_dtype, workspace)
+        workspace_rows = cutlass.max(H, cutlass.Int32(128))
+        align = 256 // self.q_dtype.width
+        acc_o_layout = cute.make_layout(
+            (workspace_rows, split_kv, D, S, B),
+            stride=(
+                cute.assume(split_kv * D, align),
+                cute.assume(D, align),
+                1,
+                cute.assume(split_kv * workspace_rows * D, align),
+                cute.assume(workspace_rows * split_kv * S * D, align),
+            ),
+        )
+        acc_o_iter = cute.recast_ptr(workspace.iterator, dtype=acc_dtype)
+        acc_o = cute.make_tensor(acc_o_iter, acc_o_layout)
+        pad = LSE_PAD
+        acc_lse_iter = acc_o_iter + cute.cosize(acc_o_layout)
+        acc_lse = cute.make_tensor(
+            acc_lse_iter,
+            cute.make_layout(
+                (workspace_rows, split_kv, S, B),
+                stride=(
+                    pad * split_kv, pad, pad * workspace_rows * split_kv, pad * workspace_rows * split_kv * S,
+                ),
+            ),  # fmt: skip
+        )
+        lse5 = cute.make_tensor(
+            acc_lse_iter,
+            cute.make_layout(
+                (workspace_rows, split_kv, pad, S, B),
+                stride=(
+                    pad * split_kv, pad, 1, pad * workspace_rows * split_kv, pad * workspace_rows * split_kv * S,
+                ),
+            ),  # fmt: skip
+        )
+        rows = self.fgs_red_rows
+        box = LSE_TMA_SPLITS * pad
+        smem_layout = cute.make_layout(
+            (1, LSE_TMA_SPLITS, pad, 1, 1, rows), stride=(box, pad, 1, box, box, box)
+        )
+        self._fgs_lse_atom, self._fgs_lse_tensor = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(), lse5, smem_layout, (1, LSE_TMA_SPLITS, pad, 1, 1)
+        )
+        return acc_o, acc_lse
 
     @cute.kernel
     def _fgs_split_kv_kernel(
@@ -575,9 +757,13 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         SharedStorage: cutlass.Constexpr,
         mCLraw: cute.Tensor,
         mStats: Optional[cute.Tensor],
+        atom_row: Optional[cute.CopyAtom],
+        tma_row: Optional[cute.Tensor],
+        mCounters: Optional[cute.Tensor],
     ):
-        cute.arch.griddepcontrol_launch_dependents()
-        if cutlass.const_expr(not self.fgs_consumer):
+        if cutlass.const_expr(self.fgs_trigger == "entry"):
+            cute.arch.griddepcontrol_launch_dependents()
+        if cutlass.const_expr(not self.fgs_consumer or self.fgs_wait_grid):
             cute.arch.griddepcontrol_wait()
         args = (
             tiled_mma_qk, tiled_mma_pv, tma_atom_q_latent, mQL, tma_atom_q_rope, mQR, tma_atom_c_latent, mCL,
@@ -585,7 +771,7 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
             cache_seqs, kv_bounds, cum_seq_lens_q, block_split_kvs, softmax_scale_log2, output_scale,
             q_latent_smem_layout_staged, q_rope_smem_layout_staged, kc_smem_layout_staged, p_smem_layout_staged,
             vc_smem_layout_staged, kc_smem_layout_for_tma, vc_smem_layout_for_tma, cta_layout_vmnk,
-            tile_sched_params, SharedStorage, mCLraw, mStats,
+            tile_sched_params, SharedStorage, mCLraw, mStats, atom_row, tma_row, mCounters,
         )  # fmt: skip
         if cutlass.const_expr(self.fgs_skip_empty):
             # Both CTAs of a cluster share (request, split), so they leave together before any cluster-scope
@@ -604,6 +790,8 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
                 self._fgs_split_kv_body(*args)
         else:
             self._fgs_split_kv_body(*args)
+        if cutlass.const_expr(self.fgs_trigger == "end"):
+            cute.arch.griddepcontrol_launch_dependents()
 
     @cute.jit
     def _fgs_split_kv_body(
@@ -644,6 +832,9 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         SharedStorage: cutlass.Constexpr,
         mCLraw: cute.Tensor,
         mStats: Optional[cute.Tensor],
+        atom_row: Optional[cute.CopyAtom],
+        tma_row: Optional[cute.Tensor],
+        mCounters: Optional[cute.Tensor],
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
@@ -657,11 +848,15 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
             cpasync.prefetch_descriptor(tma_atom_c_latent)
             cpasync.prefetch_descriptor(tma_atom_c_rope)
             cpasync.prefetch_descriptor(tma_atom_c_latent_transpose)
+            if cutlass.const_expr(self._fgs_rows_tma):
+                cpasync.prefetch_descriptor(atom_row)
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
         fgs_storage = None
-        if cutlass.const_expr(self.fgs_consumer):
+        if cutlass.const_expr(self._fgs_rows_tma):
+            fgs_storage = smem.allocate(_FgsSharedStorageRows)
+        elif cutlass.const_expr(self.fgs_consumer):
             fgs_storage = smem.allocate(_FgsSharedStorage)
 
         tmem = utils.TmemAllocator(
@@ -715,6 +910,11 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
                     cute.arch.mbarrier_init(
                         fgs_storage.msg_mbar.data_ptr() + 1, self.threads_per_warp
                     )
+                    if cutlass.const_expr(self._fgs_rows_tma):
+                        if cutlass.const_expr(self.fgs_wait_grid):
+                            cute.arch.mbarrier_init(fgs_storage.row_mbar, 1)
+                        else:
+                            cute.arch.mbarrier_v1_init(fgs_storage.row_mbar, 1)
 
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mnk, is_relaxed=True)
 
@@ -771,6 +971,7 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
                         sQ=sQ,
                         sQ_rope=sQ_rope,
                         mStats=mStats,
+                        mCounters=mCounters,
                     )
                     self._fgs_q_retry_warp(retry_params)
         if warp_idx == self.load_pt_warp_id:
@@ -782,6 +983,7 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             work_tile = tile_sched.initial_work_tile_info()
+            row_phase = cutlass.Int32(0)
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
                 k_index, k_tile_count, local_split_kv, _, _, _ = self.get_k_tile_count(
@@ -798,10 +1000,14 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
                         K=cache_seqs[blk_coord[2]],
                         mCLraw=mCLraw,
                         mStats=mStats,
+                        mCounters=mCounters,
+                        atom_row=atom_row,
+                        tma_row=tma_row,
+                        fgs_storage=fgs_storage,
                     )
                     if cutlass.const_expr(self.fgs_consumer):
-                        load_pt_producer_state = self._fgs_load_page_table(
-                            load_pt_common_params, k_index, k_tile_count, load_pt_producer_state
+                        load_pt_producer_state, row_phase = self._fgs_load_page_table(
+                            load_pt_common_params, k_index, k_tile_count, load_pt_producer_state, row_phase
                         )
                     else:
                         load_pt_producer_state = self.load_page_table(
@@ -1182,6 +1388,7 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         empty_phase = cutlass.Int32(1)
         sent = cutlass.Int32(0)
         reissues = cutlass.Int32(0)
+        sleeps = cutlass.Int32(0)
         while work_tile.is_valid_tile:
             blk_coord = work_tile.tile_idx
             k_tile_count = self.get_k_tile_count(
@@ -1191,7 +1398,16 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
                 sleep_ns = cutlass.Int32(SPIN_NS_MIN)
                 pending = cutlass.Boolean(True)
                 while pending:
-                    invalid = cute.arch.mbarrier_wait_primary(q_full, q_state.phase)[1]
+                    invalid = cutlass.Boolean(False)
+                    if cutlass.const_expr(self.fgs_q_pace == "try"):
+                        # Paced by the hardware try_wait timeout alone (no nanosleep between re-issues).
+                        waiting = cutlass.Boolean(True)
+                        while waiting:
+                            complete, invalid = cute.arch.mbarrier_try_wait_primary(q_full, q_state.phase)
+                            if complete:
+                                waiting = cutlass.Boolean(False)
+                    else:
+                        invalid = cute.arch.mbarrier_wait_primary(q_full, q_state.phase)[1]
                     code = cutlass.Int32(_MSG_DONE)
                     if invalid:
                         code = cutlass.Int32(_MSG_REISSUE)
@@ -1199,8 +1415,10 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
                         if cutlass.const_expr(self.spin_limit > 0):
                             if reissues > cutlass.Int32(self.spin_limit):
                                 trap()
-                        nanosleep(sleep_ns)
-                        sleep_ns = cutlass.min(sleep_ns * 2, cutlass.Int32(SPIN_NS_MAX))
+                        if cutlass.const_expr(self.fgs_q_pace == "sleep"):
+                            nanosleep(sleep_ns)
+                            sleeps = sleeps + 1
+                            sleep_ns = cutlass.min(sleep_ns * 2, cutlass.Int32(SPIN_NS_MAX))
                     cute.arch.mbarrier_wait(msg_empty, empty_phase)
                     empty_phase = empty_phase ^ 1
                     sent = sent + 1
@@ -1225,6 +1443,9 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
             work_tile = tile_sched.get_current_work()
         if sent > 0:
             cute.arch.mbarrier_wait(msg_empty, empty_phase)
+        if cutlass.const_expr(p.mCounters is not None):
+            tma.count(p.mCounters[CNT_Q], reissues)
+            tma.count(p.mCounters[CNT_Q_SLEEP], sleeps)
         if cutlass.const_expr(self.fgs_stats):
             if reissues > 0:
                 if cute.arch.lane_idx() == 0:
@@ -1275,22 +1496,29 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         tQsQ_rope: cute.Tensor,
         tma_bar_ptr,
     ):
+        # Links off (fgs_wait_grid): the same loads without the validity report, the data is complete.
         for i in cutlass.range(self.iterations_qk_latent):
-            cute.copy(
-                tma_atom_q_latent,
-                tQLgQL[None, i],
-                tQsQ[None, (i, 0)],
-                tma_bar_ptr=tma_bar_ptr,
-                report_valid=True,
-            )
+            if cutlass.const_expr(self.fgs_wait_grid):
+                cute.copy(tma_atom_q_latent, tQLgQL[None, i], tQsQ[None, (i, 0)], tma_bar_ptr=tma_bar_ptr)
+            else:
+                cute.copy(
+                    tma_atom_q_latent,
+                    tQLgQL[None, i],
+                    tQsQ[None, (i, 0)],
+                    tma_bar_ptr=tma_bar_ptr,
+                    report_valid=True,
+                )
         for i in cutlass.range(self.iterations_qk_rope):
-            cute.copy(
-                tma_atom_q_rope,
-                tQRgQR[None, i],
-                tQsQ_rope[None, i],
-                tma_bar_ptr=tma_bar_ptr,
-                report_valid=True,
-            )
+            if cutlass.const_expr(self.fgs_wait_grid):
+                cute.copy(tma_atom_q_rope, tQRgQR[None, i], tQsQ_rope[None, i], tma_bar_ptr=tma_bar_ptr)
+            else:
+                cute.copy(
+                    tma_atom_q_rope,
+                    tQRgQR[None, i],
+                    tQsQ_rope[None, i],
+                    tma_bar_ptr=tma_bar_ptr,
+                    report_valid=True,
+                )
 
     @cute.jit
     def _fgs_poll_cache_row(
@@ -1313,13 +1541,45 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
                 chunk = cutlass.Int32(0)
             addrs[j] = row_addr + cutlass.Int64(chunk) * 16
         load_chunks(words, addrs, n, cutlass.Boolean(True))
+        sweeps = cutlass.Int32(0)
         if cutlass.const_expr(self.fgs_stats):
             row_stats = cute.make_tensor(
                 common_params.mStats.iterator + _STATS_ROW, cute.make_layout(4)
             )
-            poll_chunks(words, addrs, n, False, self.spin_limit, row_stats, True)
+            sweeps = poll_chunks(words, addrs, n, False, self.spin_limit, row_stats, True)
         else:
-            poll_chunks(words, addrs, n, False, self.spin_limit, words, False)
+            sweeps = poll_chunks(words, addrs, n, False, self.spin_limit, words, False)
+        if cutlass.const_expr(common_params.mCounters is not None):
+            tma.count(common_params.mCounters[CNT_ROWS_SW], sweeps)
+
+    @cute.jit
+    def _fgs_tma_cache_row(
+        self, common_params: SimpleNamespace, row: cutlass.Int32, phase: cutlass.Int32
+    ) -> cutlass.Int32:
+        """Warp-uniform: TMA-load cache row ``row`` of this request into the row buffer with ``report_valid``
+        (element 0 of each 16-B chunk), re-issuing while a sentinel chunk is reported; returns the next phase."""
+        page = common_params.mPTfull[row // self.page_size, common_params.blk_coord[2]]
+        row_index = page * cutlass.Int32(self.page_size) + row % cutlass.Int32(self.page_size)
+        bar = common_params.fgs_storage.row_mbar
+        sRow = cute.make_tensor(common_params.fgs_storage.row_buf.data_ptr(), tma.tile_layout(1, ROW_ELEMS))
+        tS, tG = tma.partition_row_tiles(common_params.atom_row, common_params.tma_row, sRow, 1, ROW_ELEMS)
+
+        def issue():
+            if cutlass.const_expr(self.fgs_wait_grid):
+                cute.copy(common_params.atom_row, tG[(None, row_index)], tS[(None, 0)], tma_bar_ptr=bar)
+            else:
+                cute.copy(
+                    common_params.atom_row, tG[(None, row_index)], tS[(None, 0)], tma_bar_ptr=bar,
+                    report_valid=tma.BF16_PATTERN,
+                )  # fmt: skip
+
+        counter = cutlass.Int64(0)
+        if cutlass.const_expr(common_params.mCounters is not None):
+            counter = common_params.mCounters[CNT_ROWS]
+        _, phase = tma.checked_load(
+            bar, cutlass.Int32(ROW_ELEMS * 2), issue, not self.fgs_wait_grid, self.spin_limit, counter, phase
+        )
+        return phase
 
     @cute.jit
     def _fgs_load_page_table(
@@ -1328,8 +1588,11 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         k_index: cutlass.Int32,
         k_tile_count: cutlass.Int32,
         load_pt_producer_state: pipeline.PipelineState,
-    ) -> pipeline.PipelineState:
-        # ``load_page_table`` plus the current-row poll before the stage of the tile holding the row is published.
+        row_phase: cutlass.Int32,
+    ):
+        # ``load_page_table`` plus the current-row check before the stage of the tile holding the row is published:
+        # a software poll (generic loads, then a proxy fence so the TMA loads of the tile see the rows) or a checked
+        # TMA load (``_fgs_tma_cache_row``; async proxy on both sides, no fence).
         mPT = common_params.mPT[None, common_params.blk_coord[2]]
         common_params.mPTfull = common_params.mPT
         page_per_tile = self.mma_qk_tiler[1] // self.page_size
@@ -1360,15 +1623,19 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
             tile_lo = k_index * self.mma_qk_tiler[1]
             row_lo = cutlass.max(common_params.K - self.seq_len_q, tile_lo)
             row_hi = cutlass.min(common_params.K, tile_lo + self.mma_qk_tiler[1])
-            for row in cutlass.range(row_lo, row_hi):
-                self._fgs_poll_cache_row(common_params, row, tidx)
-            if row_lo < row_hi:
-                cute.arch.fence_proxy("async.global")
+            if cutlass.const_expr(self._fgs_rows_tma):
+                for row in cutlass.range(row_lo, row_hi):
+                    row_phase = self._fgs_tma_cache_row(common_params, row, row_phase)
+            else:
+                for row in cutlass.range(row_lo, row_hi):
+                    self._fgs_poll_cache_row(common_params, row, tidx)
+                if row_lo < row_hi:
+                    cute.arch.fence_proxy("async.global")
             load_pt_pipeline.producer_commit(load_pt_producer_state)
             load_pt_producer_state.advance()
             k_index += 1
             k_tile_count -= 1
-        return load_pt_producer_state
+        return load_pt_producer_state, row_phase
 
     @cute.jit
     def _fgs_load_tma_qk_one_k_tile(
@@ -1391,8 +1658,9 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         page_table_stage = load_pt_consumer_state.index
         load_pt_consumer_state.advance()
         tile_lo = k_index * self.mma_qk_tiler[1]
-        if tile_lo + self.mma_qk_tiler[1] > common_params.K - self.seq_len_q:
-            cute.arch.fence_proxy("async.global")
+        if cutlass.const_expr(not self._fgs_rows_tma):
+            if tile_lo + self.mma_qk_tiler[1] > common_params.K - self.seq_len_q:
+                cute.arch.fence_proxy("async.global")
         k_idx = cute.make_rmem_tensor(cute.make_layout(page_per_tile), cutlass.Int32)
         for i in cutlass.range_constexpr(page_per_tile):
             k_idx[i] = (
@@ -1511,6 +1779,9 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
                 if cute.elem_less(cLSE[tidx][0], common_params.H):
                     gLSE[tidx] = canon_f32(lse)
         if cutlass.const_expr(lse_flag):
+            if cutlass.const_expr(self._fgs_lse_tma):
+                # The reduction observes the LSE flag through the async proxy (TMA report_valid load).
+                cute.arch.fence_proxy("async.global")
             cute.arch.fence_acq_rel_gpu()
             self.epilogue_exchange_sync_bar.arrive_and_wait()
             if tidx < cute.size(gLSE):
@@ -1536,9 +1807,11 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         cum_seq_lens_q: Optional[cute.Tensor],
         block_split_kvs: cute.Tensor,
         mStats: Optional[cute.Tensor],
+        mCounters: Optional[cute.Tensor],
     ):
-        cute.arch.griddepcontrol_launch_dependents()
-        if cutlass.const_expr(not self.fgs_reduction):
+        if cutlass.const_expr(self.fgs_trigger == "entry"):
+            cute.arch.griddepcontrol_launch_dependents()
+        if cutlass.const_expr(not self.fgs_reduction or self.fgs_wait_grid):
             cute.arch.griddepcontrol_wait()
         check_lse = self.fgs_reduction
         check_o = self.fgs_reduction and self.fgs_partials == "all"
@@ -1589,19 +1862,22 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
                         else:
                             bits[i] = _ld_cg_b32(addrs[i])
                 if cutlass.const_expr(check_lse):
+                    sweeps = cutlass.Int32(0)
                     if cutlass.const_expr(with_stats):
                         lse_stats = cute.make_tensor(
                             mStats.iterator + _STATS_RED_LSE, cute.make_layout(4)
                         )
-                        _poll_words(
+                        sweeps = _poll_words(
                             bits, addrs, lse_per_thread, self.spin_limit, lse_stats, True,
                             _RED_SPIN_NS_MAX,
                         )  # fmt: skip
                     else:
-                        _poll_words(
+                        sweeps = _poll_words(
                             bits, addrs, lse_per_thread, self.spin_limit, bits, False,
                             _RED_SPIN_NS_MAX,
                         )  # fmt: skip
+                    if cutlass.const_expr(mCounters is not None):
+                        tma.count(mCounters[CNT_LSE_SW], sweeps)
                 if cutlass.const_expr(lse_flag):
                     # Acquire pattern (relaxed loads that saw every published LSE, then fence.acquire): the
                     # producer's partial O stores are visible to this CTA's O loads after the barrier below.
@@ -1681,6 +1957,8 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
                     mO.iterator + cute.crd2idx((head_idx, e0, bidy, bidz), mO.layout)
                 ).toint()
                 st_global_v4(out_addr, w0, w1, n0, n1)
+        if cutlass.const_expr(self.fgs_trigger == "end"):
+            cute.arch.griddepcontrol_launch_dependents()
         return
 
     @cute.kernel
@@ -1696,8 +1974,15 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         cum_seq_lens_q: Optional[cute.Tensor],
         block_split_kvs: cute.Tensor,
         mStats: Optional[cute.Tensor],
+        atom_lse: Optional[cute.CopyAtom],
+        tma_lse: Optional[cute.Tensor],
+        atom_o: Optional[cute.CopyAtom],
+        tma_o: Optional[cute.Tensor],
+        mCounters: Optional[cute.Tensor],
     ):
-        # ``_fgs_reduction_kernel`` ("lse" partials, one D band) for ``fgs_red_rows`` head rows per CTA.
+        # ``_fgs_reduction_kernel`` ("lse" partials, one D band) for ``fgs_red_rows`` head rows per CTA. The partial
+        # LSE flags are polled in software or TMA-loaded with report_valid (``fgs_lse_check``, padded entries); the
+        # output leaves by 16-B thread stores or one TMA store per CTA (``fgs_store``).
         rows = self.fgs_red_rows
         row_threads = self.threads_per_warp * self.num_compute_warps // rows
         row_warps = row_threads // self.threads_per_warp
@@ -1705,7 +1990,13 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
         chunks = elems // 4
         unroll = max(_RED_UNROLL // chunks, 1)
         with_stats = self.fgs_stats
-        cute.arch.griddepcontrol_launch_dependents()
+        lse_tma = self._fgs_lse_tma
+        o_tma = self._fgs_o_tma
+        lse_box = LSE_TMA_SPLITS * LSE_PAD
+        if cutlass.const_expr(self.fgs_trigger == "entry"):
+            cute.arch.griddepcontrol_launch_dependents()
+        if cutlass.const_expr(not self.fgs_reduction or self.fgs_wait_grid):
+            cute.arch.griddepcontrol_wait()
 
         bidx, bidy, bidz = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
@@ -1721,6 +2012,34 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
             cute.recast_ptr(storage, dtype=self.acc_dtype),
             cute.make_layout((self.reducer_max_splits, rows)),
         )
+        sLSE, lse_bar, lse_words, sOut, out_words = None, None, None, None, None
+        if cutlass.const_expr(lse_tma):
+            sLSE = smem.allocate_tensor(
+                self.acc_dtype,
+                cute.make_layout(
+                    (1, LSE_TMA_SPLITS, LSE_PAD, 1, 1, rows),
+                    stride=(lse_box, LSE_PAD, 1, lse_box, lse_box, lse_box),
+                ),
+                byte_alignment=tma.SMEM_ALIGN,
+            )
+            lse_words = cute.recast_tensor(
+                cute.make_tensor(sLSE.iterator, cute.make_layout((rows * lse_box,))), cutlass.Int32
+            )
+            lse_bar = smem.allocate_array(cutlass.Int64, 1, byte_alignment=8)
+        if cutlass.const_expr(o_tma):
+            sOut = smem.allocate_tensor(
+                self.o_dtype,
+                cute.make_layout(
+                    (rows, 2, LATENT_DIM // 2, 1, 1, 1),
+                    stride=(
+                        LATENT_DIM, LATENT_DIM // 2, 1, rows * LATENT_DIM, rows * LATENT_DIM, rows * LATENT_DIM,
+                    ),
+                ),  # fmt: skip
+                byte_alignment=tma.SMEM_ALIGN,
+            )
+            out_words = cute.recast_tensor(
+                cute.make_tensor(sOut.iterator, cute.make_layout((rows * LATENT_DIM,))), cutlass.Int32
+            )
 
         flat_q_row = bidy * self.num_heads + head_idx
         q_tile = flat_q_row >> 7
@@ -1737,6 +2056,42 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
             reduce_row = local_split_kv != 1
         if reduce_row:
             gLSE = mAccLSE[q_tile_row, None, q_tile, bidz]
+            if cutlass.const_expr(lse_tma):
+                if local_split_kv > cutlass.Int32(LSE_TMA_SPLITS):
+                    trap()
+                if warp_idx == 0:
+                    tma.init_barrier(lse_bar, not self.fgs_wait_grid)
+                cute.arch.barrier()
+                if warp_idx == 0:
+                    gL = cute.local_tile(
+                        tma_lse, (1, LSE_TMA_SPLITS, LSE_PAD, 1, 1), (None, 0, 0, None, None)
+                    )
+                    tS, tG = cpasync.tma_partition(
+                        atom_lse, 0, cute.make_layout(1), cute.group_modes(sLSE, 0, 5), cute.group_modes(gL, 0, 5)
+                    )
+
+                    def issue():
+                        for r in cutlass.range_constexpr(rows):
+                            flat_r = bidy * self.num_heads + bidx * rows + r
+                            src = tG[(None, flat_r & 127, flat_r >> 7, bidz)]
+                            if cutlass.const_expr(self.fgs_wait_grid):
+                                cute.copy(atom_lse, src, tS[(None, r)], tma_bar_ptr=lse_bar)
+                            else:
+                                cute.copy(
+                                    atom_lse, src, tS[(None, r)], tma_bar_ptr=lse_bar, report_valid=tma.F32_PATTERN
+                                )
+
+                    counter = cutlass.Int64(0)
+                    if cutlass.const_expr(mCounters is not None):
+                        counter = mCounters[CNT_LSE]
+                    tma.checked_load(
+                        lse_bar, cutlass.Int32(rows * lse_box * 4), issue, not self.fgs_wait_grid,
+                        self.spin_limit, counter, cutlass.Int32(0),
+                    )  # fmt: skip
+                    # The flags were observed through the async proxy; the partial O below is read with generic
+                    # loads.
+                    cute.arch.fence_proxy("async.global")
+                cute.arch.barrier()
             if warp_idx % row_warps == 0:
                 lse_per_thread = cute.ceil_div(self.reducer_max_splits, self.threads_per_warp)
                 local_lse = cute.make_rmem_tensor(cute.make_layout(lse_per_thread), self.lse_dtype)
@@ -1747,25 +2102,34 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
                     addrs[i] = (gLSE.iterator + cute.crd2idx(split_kv_idx, gLSE.layout)).toint()
                     bits[i] = cutlass.Int32(0)
                     if split_kv_idx < local_split_kv:
-                        bits[i] = _ld_relaxed_b32(addrs[i])
-                if cutlass.const_expr(with_stats):
-                    lse_stats = cute.make_tensor(
-                        mStats.iterator + _STATS_RED_LSE, cute.make_layout(4)
-                    )
-                    _poll_words(
-                        bits,
-                        addrs,
-                        lse_per_thread,
-                        self.spin_limit,
-                        lse_stats,
-                        True,
-                        _RED_SPIN_NS_MAX,
-                    )
-                else:
-                    _poll_words(
-                        bits, addrs, lse_per_thread, self.spin_limit, bits, False, _RED_SPIN_NS_MAX
-                    )
-                _fence_acquire_gpu()
+                        if cutlass.const_expr(lse_tma):
+                            bits[i] = lse_words[row * lse_box + split_kv_idx * LSE_PAD]
+                        elif cutlass.const_expr(self.fgs_reduction):
+                            bits[i] = _ld_relaxed_b32(addrs[i])
+                        else:
+                            bits[i] = _ld_cg_b32(addrs[i])
+                if cutlass.const_expr(self.fgs_reduction and not lse_tma):
+                    sweeps = cutlass.Int32(0)
+                    if cutlass.const_expr(with_stats):
+                        lse_stats = cute.make_tensor(
+                            mStats.iterator + _STATS_RED_LSE, cute.make_layout(4)
+                        )
+                        sweeps = _poll_words(
+                            bits,
+                            addrs,
+                            lse_per_thread,
+                            self.spin_limit,
+                            lse_stats,
+                            True,
+                            _RED_SPIN_NS_MAX,
+                        )
+                    else:
+                        sweeps = _poll_words(
+                            bits, addrs, lse_per_thread, self.spin_limit, bits, False, _RED_SPIN_NS_MAX
+                        )
+                    if cutlass.const_expr(mCounters is not None):
+                        tma.count(mCounters[CNT_LSE_SW], sweeps)
+                    _fence_acquire_gpu()
                 lse_max = -self.lse_dtype.inf
                 for i in cutlass.range_constexpr(lse_per_thread):
                     split_kv_idx = lane + i * self.threads_per_warp
@@ -1823,17 +2187,33 @@ class KimiK3MlaDecodeFgs(BlackwellMultiHeadLatentAttentionForwardFP16):
                                     _as_f32(words[4 * (u * chunks + c) + j])
                                     * smem_lse_scale[g + u, row]
                                 )
-            for k in cutlass.range_constexpr(elems // 8):
-                out_addr = (
-                    mO.iterator + cute.crd2idx((head_idx, e0 + 8 * k, bidy, bidz), mO.layout)
-                ).toint()
-                st_global_v4(
-                    out_addr,
-                    bf16x2_pzo(rAccO[8 * k], rAccO[8 * k + 1], True),
-                    bf16x2_pzo(rAccO[8 * k + 2], rAccO[8 * k + 3], True),
-                    bf16x2_pzo(rAccO[8 * k + 4], rAccO[8 * k + 5], True),
-                    bf16x2_pzo(rAccO[8 * k + 6], rAccO[8 * k + 7], True),
-                )
+            if cutlass.const_expr(o_tma):
+                for k in cutlass.range_constexpr(elems // 2):
+                    out_words[(row * LATENT_DIM + e0) // 2 + k] = bf16x2_pzo(
+                        rAccO[2 * k], rAccO[2 * k + 1], True
+                    )
+                cute.arch.fence_proxy("async.shared", space="cta")
+                cute.arch.barrier()
+                if warp_idx == 0:
+                    gO = cute.local_tile(tma_o, (rows, 2, LATENT_DIM // 2, 1, 1), (None, 0, 0, None, None))
+                    tS, tG = cpasync.tma_partition(
+                        atom_o, 0, cute.make_layout(1), cute.group_modes(sOut, 0, 5), cute.group_modes(gO, 0, 5)
+                    )
+                    tma.store_tile(atom_o, tS[(None, 0)], tG[(None, bidx, bidy, bidz)])
+            else:
+                for k in cutlass.range_constexpr(elems // 8):
+                    out_addr = (
+                        mO.iterator + cute.crd2idx((head_idx, e0 + 8 * k, bidy, bidz), mO.layout)
+                    ).toint()
+                    st_global_v4(
+                        out_addr,
+                        bf16x2_pzo(rAccO[8 * k], rAccO[8 * k + 1], True),
+                        bf16x2_pzo(rAccO[8 * k + 2], rAccO[8 * k + 3], True),
+                        bf16x2_pzo(rAccO[8 * k + 4], rAccO[8 * k + 5], True),
+                        bf16x2_pzo(rAccO[8 * k + 6], rAccO[8 * k + 7], True),
+                    )
+        if cutlass.const_expr(self.fgs_trigger == "end"):
+            cute.arch.griddepcontrol_launch_dependents()
         return
 
 
@@ -1920,10 +2300,12 @@ def _fill_lse_kernel(
     heads: cutlass.Int32,
     kv_tile: cutlass.Constexpr,
     rows: cutlass.Constexpr,
+    lse_pad: cutlass.Constexpr,
     seq_q_tiles: cutlass.Int32,
     batch: cutlass.Int32,
 ):
-    # acc_lse[row, split, s, b] (fp32) follows acc_o in the workspace; see ``_fill_partials_kernel``.
+    # acc_lse[row, split, s, b] (fp32, ``lse_pad`` words per entry) follows acc_o in the workspace; see
+    # ``_fill_partials_kernel``.
     tidx, _, _ = cute.arch.thread_idx()
     bs, _, _ = cute.arch.block_idx()
     b = bs // seq_q_tiles
@@ -1954,7 +2336,7 @@ def _fill_lse_kernel(
             _st_global_b32(
                 lse_base
                 + (tile_base + cutlass.Int64(row) * cutlass.Int64(split_kv) + cutlass.Int64(split))
-                * 4,
+                * (4 * lse_pad),
                 F32_SENTINEL,
             )
 
@@ -1971,9 +2353,10 @@ def _fill_lse_host(
     stream: cuda.CUstream,
     kv_tile: cutlass.Constexpr,
     rows: cutlass.Constexpr,
+    lse_pad: cutlass.Constexpr,
 ):
     _fill_lse_kernel(
-        ws_base, cache_seqs, block_split_kvs, split_kv, heads, kv_tile, rows, seq_q_tiles, batch
+        ws_base, cache_seqs, block_split_kvs, split_kv, heads, kv_tile, rows, lse_pad, seq_q_tiles, batch
     ).launch(grid=(batch * seq_q_tiles, 1, 1), block=(_FILL_LSE_THREADS, 1, 1), stream=stream)
 
 
@@ -2075,11 +2458,13 @@ def fill_lse_sentinel(
     block_split_kvs=None,
     kv_tile: int = 128,
     rows: int = 128,
+    lse_pad: int = 1,
 ):
     """Sentinel-fill only the partial LSE entries the reduction will read (``fgs_partials="lse"``; one launch,
-    one CTA per request and q tile, graph-capturable). Same arguments as ``fill_partials_sentinel``."""
+    one CTA per request and q tile, graph-capturable). Same arguments as ``fill_partials_sentinel``; ``lse_pad``
+    is the kernel's ``lse_pad`` (words per LSE entry)."""
     batch = int(cache_seqs.shape[0])
-    key = ("lse", block_split_kvs is None, kv_tile, rows)
+    key = ("lse", block_split_kvs is None, kv_tile, rows, lse_pad)
     args = [
         cutlass.Int64(split_workspace.data_ptr()),
         _from_torch(cache_seqs),
@@ -2092,7 +2477,7 @@ def fill_lse_sentinel(
     ]
     fn = _FILL_CACHE.get(key)
     if fn is None:
-        fn = cute.compile(_fill_lse_host, *args, kv_tile, rows)
+        fn = cute.compile(_fill_lse_host, *args, kv_tile, rows, lse_pad)
         _FILL_CACHE[key] = fn
     fn(*args)
 
