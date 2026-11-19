@@ -25,6 +25,19 @@ outside the recipe's ``mla.attn_o`` rows o_proj writes a plain buffer and the pr
 The chain's reduction reduces several head rows per CTA from 8 decode rows up (``TLLM_K3_FGS_MLA_RED_ROWS``, default
 ``auto``): fewer CTAs let W_UV, its PDL dependent, launch sooner; the output is bit-identical. With
 ``TLLM_K3_FGS_DEBUG=1`` the path log names the rows per CTA (and the skip-empty split clusters when on) per row count.
+
+Consumer wait of the chain's side kernels (``TLLM_K3_FGS_MLA_CHECK``): ``sw`` (default) polls the slots with
+``ld.global.cg`` / ``ld.relaxed.gpu`` loads, ``tma`` loads them by TMA with ``report_valid`` and re-issues invalid
+loads; per-site overrides as ``tma,gate=sw`` (sites ``norm``, ``append``, ``rows``, ``lse``, ``gate``; ``qpace`` =
+the split-KV Q retry warp's pacing: ``tma`` waits with ``mbarrier.try_wait`` instead of ``nanosleep``). With
+``lse=tma`` the partial LSE entries are padded to 16 B. ``TLLM_K3_FGS_MLA_STORE=tma`` makes the side kernels store
+through TMA. Links off (``edges.links_off``): the side kernels and the split-KV / reduction wait for their producer
+grid, load without ``report_valid`` and the per-step cache-row / LSE fills are skipped; ``edges.links_trigger`` places
+their PDL trigger. ``TLLM_K3_FGS_MLA_GPROJ_STREAM=aux`` runs g_proj on the MLA module's aux stream, forked after the
+fused q_a | kv_a GEMM and joined before the gate. ``TLLM_K3_FGS_MLA_AUX`` (links off only; ``kvnorm``, ``append``)
+runs the kv_a norm beside the q_a norm and the latent append beside W_UK on that stream, as the stock path does.
+``TLLM_K3_FGS_WAIT_STATS=1`` counts the re-issues (``mla.<site>.retry``) and the software waits (``mla.<site>.sw_wait``,
+``mla.q.sw_sleep``) of every site.
 """
 
 import functools
@@ -35,7 +48,7 @@ from typing import Dict, NamedTuple, Optional, Tuple
 import torch
 
 from .. import kimi_k3_cute_gemm
-from . import edges, recipe
+from . import edges, recipe, wait_stats
 
 X_NORM = "mla.x_norm"
 QKV_A = "mla.qkv_a"
@@ -78,11 +91,53 @@ SKIP_EMPTY_SPLITS = os.environ.get("TLLM_K3_FGS_MLA_SKIP_EMPTY", "0") == "1"
 RED_ROWS = os.environ.get("TLLM_K3_FGS_MLA_RED_ROWS", "auto")
 RED_CARVEOUT = int(os.environ.get("TLLM_K3_FGS_MLA_RED_CARVEOUT", "-1"))
 
+CHECK_SITES = ("norm", "append", "rows", "lse", "gate", "qpace")
+CHECK_ENV = "TLLM_K3_FGS_MLA_CHECK"
+STORE_ENV = "TLLM_K3_FGS_MLA_STORE"
+GPROJ_STREAM_ENV = "TLLM_K3_FGS_MLA_GPROJ_STREAM"
+AUX_ENV = "TLLM_K3_FGS_MLA_AUX"
+
+
+def _parse_check(value: str) -> Dict[str, str]:
+    items = [v.strip() for v in value.split(",") if v.strip()]
+    default = "sw"
+    if items and "=" not in items[0]:
+        default = items.pop(0)
+    if default not in ("sw", "tma"):
+        raise ValueError(f"{CHECK_ENV}={value!r}: the default must be sw or tma")
+    check = {site: default for site in CHECK_SITES}
+    for item in items:
+        site, _, mode = item.partition("=")
+        if site not in CHECK_SITES or mode not in ("sw", "tma"):
+            raise ValueError(f"{CHECK_ENV}: bad item {item!r} (sites {CHECK_SITES}, modes sw / tma)")
+        check[site] = mode
+    return check
+
+
+CHECK = _parse_check(os.environ.get(CHECK_ENV, "sw"))
+STORE = os.environ.get(STORE_ENV, "thread")
+GPROJ_STREAM = os.environ.get(GPROJ_STREAM_ENV, "main")
+AUX = frozenset(filter(None, os.environ.get(AUX_ENV, "").split(",")))
+if STORE not in ("thread", "tma"):
+    raise ValueError(f"{STORE_ENV}={STORE!r}; valid: thread, tma")
+if GPROJ_STREAM not in ("main", "aux"):
+    raise ValueError(f"{GPROJ_STREAM_ENV}={GPROJ_STREAM!r}; valid: main, aux")
+if AUX - {"kvnorm", "append"}:
+    raise ValueError(f"{AUX_ENV}={','.join(sorted(AUX))!r}; valid items: kvnorm, append")
+
 
 def _red_rows(batch: int) -> int:
     if RED_ROWS == "auto":
         return 1 if batch < 8 else 2 if batch < 16 else 4
     return int(RED_ROWS)
+
+
+def _trigger() -> str:
+    return "end" if edges.links_off() and edges.links_trigger() == "stock" else "entry"
+
+
+def _aux_on(item: str) -> bool:
+    return item in AUX and edges.links_off()
 
 
 # In-kernel sentinel re-arm (comma list): ``kv_c`` = the latent append re-arms compressed_kv after reading it (its last
@@ -187,11 +242,13 @@ class Chain:
         decode: "_Decode",
         weights: Weights,
         prepared: torch.cuda.Event,
+        aux_stream: Optional[torch.cuda.Stream],
     ):
         self.leases = leases
         self.decode = decode
         self.weights = weights
         self.prepared = prepared
+        self.aux_stream = aux_stream
 
     def slot(self, name: str) -> torch.Tensor:
         return self.leases[name].tensor
@@ -209,7 +266,8 @@ def begin(
     None (nothing held, nothing launched).
 
     ``kv_pool`` is the layer's ``get_buffers`` view, ``page_rows`` its ``[B, max_blocks]`` block offsets and
-    ``kv_lens`` the int32 KV lengths including this step's token; ``owner`` keeps the layer's persistent buffers.
+    ``kv_lens`` the int32 KV lengths including this step's token; ``owner`` keeps the layer's persistent buffers
+    (and its ``aux_stream`` serves the g_proj / kv norm / append side launches when selected).
     Call it right before the pre-attention mix, which then writes ``chain.slot(X_NORM)``; no PDL launch that
     triggers early may come in between.
     """
@@ -238,7 +296,10 @@ def begin(
         decode.prepare()
     prepared = torch.cuda.Event()
     prepared.record(side)
-    return Chain(leases, decode, weights, prepared)
+    aux = getattr(owner, "aux_stream", None)
+    if aux is None and (GPROJ_STREAM == "aux" or (AUX and edges.links_off())):
+        edges.debug("mla.aux", rows, "no aux stream on the MLA module: side launches stay on the main stream")
+    return Chain(leases, decode, weights, prepared, aux)
 
 
 def run(chain: Chain) -> torch.Tensor:
@@ -252,52 +313,91 @@ def run(chain: Chain) -> torch.Tensor:
     heads, kv_lora, nope = w.k_b.shape
     v_dim = w.v_b.shape[1]
     q_lora = w.q_a_norm.numel()
+    cur = torch.cuda.current_stream()
+    aux = chain.aux_stream
+    counters = k.counters(x.device)
+    links_off = edges.links_off()
+    trigger = _trigger()
+    side_kwargs = dict(fgs_consumer=True, fgs_producer=True, fgs_store=STORE, fgs_wait_grid=links_off,
+                       fgs_trigger=trigger)  # fmt: skip
 
     qkv_a = chain.slot(QKV_A)
     kimi_k3_cute_gemm.linear(x, w.fused_a, qkv_a)
     g = chain.slot(GATE)
     late_gproj = rows <= LATE_GPROJ_ROWS
+    g_done = None
     if not late_gproj:
-        kimi_k3_cute_gemm.linear(x, w.g_proj, g)
+        if GPROJ_STREAM == "aux" and aux is not None:
+            # Fork after the fused q_a | kv_a GEMM, join before the gate.
+            aux.wait_stream(cur)
+            with torch.cuda.stream(aux):
+                kimi_k3_cute_gemm.linear(x, w.g_proj, g)
+            g_done = torch.cuda.Event()
+            g_done.record(aux)
+            edges.debug("mla.g_proj", rows, "aux stream beside the query path")
+        else:
+            kimi_k3_cute_gemm.linear(x, w.g_proj, g)
 
     q_a_n = chain.slot(Q_A_NORM)
-    k.rmsnorm(qkv_a[:, :q_lora], w.q_a_norm, q_a_n, w.q_a_eps, fgs_consumer=True, fgs_producer=True)
-    edges.consumed(leases[QKV_A])
     kv_c = chain.slot(KV_C)
-    k.rmsnorm(
-        qkv_a[:, q_lora : q_lora + kv_lora],
-        w.kv_a_norm,
-        kv_c,
-        w.kv_a_eps,
-        fgs_consumer=True,
-        fgs_producer=True,
-    )
+    norm_kwargs = dict(side_kwargs, fgs_check=CHECK["norm"], fgs_counters=counters["norm"])
+    kv_done = None
+    if _aux_on("kvnorm") and aux is not None:
+        aux.wait_stream(cur)
+        with torch.cuda.stream(aux):
+            k.rmsnorm(qkv_a[:, q_lora : q_lora + kv_lora], w.kv_a_norm, kv_c, w.kv_a_eps, **norm_kwargs)
+            edges.consumed(leases[QKV_A])
+        kv_done = torch.cuda.Event()
+        kv_done.record(aux)
+        edges.debug("mla.kv_a_norm", rows, "aux stream beside the q_a norm")
+    k.rmsnorm(qkv_a[:, :q_lora], w.q_a_norm, q_a_n, w.q_a_eps, **norm_kwargs)
     edges.consumed(leases[QKV_A])
+    if kv_done is None:
+        k.rmsnorm(qkv_a[:, q_lora : q_lora + kv_lora], w.kv_a_norm, kv_c, w.kv_a_eps, **norm_kwargs)
+        edges.consumed(leases[QKV_A])
 
     q = chain.slot(Q).view(rows, heads, -1)
     kimi_k3_cute_gemm.linear(q_a_n, w.q_b, q.view(rows, -1))
     fused_q = chain.slot(FUSED_Q).view(rows, heads, -1)
+    d = chain.decode
+    append_kwargs = dict(side_kwargs, fgs_check=CHECK["append"], fgs_counters=counters["append"])
+
+    def append():
+        if kv_done is not None:
+            torch.cuda.current_stream().wait_event(kv_done)
+        torch.cuda.current_stream().wait_event(chain.prepared)
+        k.latent_append(
+            q[..., nope:],
+            kv_c,
+            qkv_a[:, q_lora + kv_lora :],
+            fused_q,
+            d.kv_pool,
+            d.page_rows,
+            d.kv_lens,
+            **append_kwargs,
+        )
+        for name in (Q, KV_C, QKV_A):
+            edges.consumed(leases[name])
+
+    append_done = None
+    if _aux_on("append") and aux is not None:
+        # Beside the W_UK BMM, as the stock path runs it.
+        aux.wait_stream(cur)
+        with torch.cuda.stream(aux):
+            append()
+        append_done = torch.cuda.Event()
+        append_done.record(aux)
+        edges.debug("mla.append", rows, "aux stream beside W_UK")
     kimi_k3_cute_gemm.bmm(
         q[..., :nope].transpose(0, 1), w.k_b, fused_q[..., :kv_lora].transpose(0, 1)
     )
-    d = chain.decode
-    torch.cuda.current_stream().wait_event(chain.prepared)
-    k.latent_append(
-        q[..., nope:],
-        kv_c,
-        qkv_a[:, q_lora + kv_lora :],
-        fused_q,
-        d.kv_pool,
-        d.page_rows,
-        d.kv_lens,
-        fgs_consumer=True,
-        fgs_producer=True,
-    )
-    for name in (Q, KV_C, QKV_A):
-        edges.consumed(leases[name])
+    if append_done is None:
+        append()
+    else:
+        cur.wait_event(append_done)
 
     latent = chain.slot(ATTN_LATENT)
-    d.run(fused_q, latent)
+    d.run(fused_q, latent, k.decode_counters(x.device))
     edges.consumed(leases[FUSED_Q])
     if late_gproj:
         kimi_k3_cute_gemm.linear(x, w.g_proj, g)
@@ -308,8 +408,10 @@ def run(chain: Chain) -> torch.Tensor:
         attn_out.view(rows, heads, v_dim).transpose(0, 1),
     )
 
+    if g_done is not None:
+        cur.wait_event(g_done)
     gated = chain.slot(GATED)
-    k.gate(attn_out, g, out=gated, fgs_consumer=True, fgs_producer=True)
+    k.gate(attn_out, g, out=gated, fgs_check=CHECK["gate"], fgs_counters=counters["gate"], **side_kwargs)
     edges.consumed(leases[ATTN_OUT])
     edges.consumed(leases[GATE])
     o = chain.slot(ATTN_O) if ATTN_O in leases else gated.new_empty(rows, w.o_proj.shape[0])
@@ -350,16 +452,55 @@ class _Kernels(NamedTuple):
     latent_append: object
     gate: object
 
+    @staticmethod
+    def counters(device) -> Dict[str, Dict[str, int]]:
+        return _side_counters(torch.device(device))
+
+    @staticmethod
+    def decode_counters(device) -> Optional[torch.Tensor]:
+        return _decode_counters(torch.device(device))
+
+
+@functools.lru_cache(maxsize=None)
+def _side_counters(device: torch.device) -> Dict[str, Dict[str, int]]:
+    """``wait_stats`` counter addresses of the side kernels (0 when the stats are off)."""
+    return {
+        site: {
+            "retry": wait_stats.addr(f"mla.{site}.retry", device),
+            "sw": wait_stats.addr(f"mla.{site}.sw_wait", device),
+        }
+        for site in ("norm", "append", "gate")
+    }
+
+
+@functools.lru_cache(maxsize=None)
+def _decode_counters(device: torch.device) -> Optional[torch.Tensor]:
+    """The split-KV / reduction counter addresses (``mla_decode_fgs.CNT_*``), or None when the stats are off."""
+    if not wait_stats.enabled():
+        return None
+    from ...attention.kernels.rubin.kimi_k3_mla import mla_decode_fgs as mdf
+
+    names = {
+        mdf.CNT_Q: "mla.q.retry",
+        mdf.CNT_ROWS: "mla.rows.retry",
+        mdf.CNT_LSE: "mla.lse.retry",
+        mdf.CNT_Q_SLEEP: "mla.q.sw_sleep",
+        mdf.CNT_ROWS_SW: "mla.rows.sw_wait",
+        mdf.CNT_LSE_SW: "mla.lse.sw_wait",
+    }
+    values = [wait_stats.addr(names[i], device) if i in names else 0 for i in range(mdf.CNT_LEN)]
+    return torch.tensor(values, dtype=torch.int64, device=device)
+
 
 _SHARED: Dict[tuple, torch.Tensor] = {}
 
 
-def _shared(name: str, numel: int, dtype: torch.dtype, device) -> torch.Tensor:
+def _shared(name: str, numel: int, dtype: torch.dtype, device, zero: bool = False) -> torch.Tensor:
     """A persistent buffer of at least ``numel`` elements shared by every MLA layer (one per name and device)."""
     key = (name, dtype, torch.device(device))
     buf = _SHARED.get(key)
     if buf is None or buf.numel() < numel:
-        buf = torch.empty(numel, dtype=dtype, device=device)
+        buf = (torch.zeros if zero else torch.empty)(numel, dtype=dtype, device=device)
         _SHARED[key] = buf
     return buf[:numel]
 
@@ -412,6 +553,7 @@ class _Decode:
     ):
         import cutlass
 
+        from ...attention.kernels.rubin.kimi_k3_mla import mla_decode_fgs as mdf
         from ...custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner as Runner
 
         self.owner, self.kv_pool, self.page_rows, self.kv_lens = owner, kv_pool, page_rows, kv_lens
@@ -420,6 +562,7 @@ class _Decode:
         batch = page_rows.shape[0]
         self.batch = batch
         self.c_latent, self.c_rope = _decode_pool_views(kv_pool, kv_lora, rope)
+        self.lse_pad = mdf.LSE_PAD if CHECK["lse"] == "tma" else 1
 
         runner = Runner(cutlass.BFloat16, heads, 1, self.page_size, max_requests)
         self.runner = runner
@@ -427,16 +570,22 @@ class _Decode:
         lse_off, lse_size, split_off, split_size, total = runner.get_workspace_layout(
             heads, 1, kv_lora, max_batch, cutlass.Float32
         )
-        ws = _shared("mla_decode_workspace", total, torch.uint8, kv_pool.device)
+        if self.lse_pad > 1:
+            # Each partial LSE entry takes lse_pad words instead of one.
+            split_size = -(-(split_size * (kv_lora + self.lse_pad) // (kv_lora + 1)) // 256) * 256
+            total = split_off + split_size
+        ws = _shared("mla_decode_workspace", total, torch.uint8, kv_pool.device, zero=True)
         lse = ws[lse_off : lse_off + lse_size].view(torch.float32).view(max_batch, 1, heads)
         self.lse = lse[:batch].permute(2, 1, 0)
         self.split_ws = ws[split_off : split_off + split_size]
         split_kv = runner.default_tactic(batch)[2]
         q_tiles = runner.get_num_q_tiles(heads, 1)
-        split_rows = split_size // (runner._MMA_TILE_M * (kv_lora + 1) * 4)
+        split_rows = split_size // (runner._MMA_TILE_M * (kv_lora + self.lse_pad) * 4)
         fitting = split_rows // (batch * q_tiles)
         self.use_workspace = split_kv > 1 and fitting >= 1
         self.split_kv = max(1, min(split_kv, fitting))
+        if self.lse_pad > 1:
+            self.split_kv = min(self.split_kv, mdf.LSE_TMA_SPLITS)
         self.q_tiles = q_tiles
         # Persistent buffers are allocated here, on the main stream; prepare() runs on the reset stream.
         max_blocks = page_rows.shape[1]
@@ -456,21 +605,26 @@ class _Decode:
         self.plan = None
 
     def prepare(self) -> None:
-        """Launch the layer's step inputs: page table, split plan (once per forward), current-row and LSE sentinels."""
+        """Launch the layer's step inputs: page table, split plan (once per forward), current-row and LSE sentinels
+        (the sentinels only with the links on)."""
         from ...attention.kernels.rubin.kimi_k3_mla import mla_decode_fgs
         from ...attention.kernels.rubin.kimi_k3_mla.mla_latent_append import mla_decode_page_table
 
         self.page_table = mla_decode_page_table(self.kv_pool, self.page_rows, self.page_table_buf)
         if self.use_workspace:
             self.plan = _split_plan(self.runner, self.kv_lens, self.plan_buf, self.heads)
+        if edges.links_off():
+            return
         mla_decode_fgs.fill_current_rows_sentinel(self.c_latent, self.page_table, self.kv_lens, 1)
         if self.use_workspace:
             mla_decode_fgs.fill_lse_sentinel(
-                self.split_ws, self.heads, self.q_tiles, self.kv_lens, self.split_kv, self.plan
-            )
+                self.split_ws, self.heads, self.q_tiles, self.kv_lens, self.split_kv, self.plan,
+                lse_pad=self.lse_pad,
+            )  # fmt: skip
 
-    def run(self, fused_q: torch.Tensor, out: torch.Tensor) -> None:
-        """Split-KV kernel and reduction from the ``fused_q`` slot [B, H, 576] into the ``out`` slot [B, H * 512]."""
+    def run(self, fused_q: torch.Tensor, out: torch.Tensor, counters: Optional[torch.Tensor]) -> None:
+        """Split-KV kernel and reduction from the ``fused_q`` slot [B, H, 576] into the ``out`` slot [B, H * 512];
+        ``counters`` is the ``wait_stats`` address tensor of ``_decode_counters`` (or None)."""
         import cuda.bindings.driver as cuda
         import cutlass
         import cutlass.cute as cute
@@ -487,16 +641,23 @@ class _Decode:
         plan = self.plan if self.use_workspace else None
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         red_rows = _red_rows(batch) if plan is not None else 1
+        links_off = edges.links_off()
         if plan is not None:
             edges.debug("mla.reduction", batch, f"{red_rows} head rows per CTA")
         if SKIP_EMPTY_SPLITS:
             edges.debug("mla.split_kv", batch, "split clusters without K tiles exit at entry")
+        edges.debug(
+            "mla.decode", batch,
+            f"rows check {CHECK['rows']}, lse check {CHECK['lse']}, q pace {CHECK['qpace']}, store {STORE}, "
+            f"links {'off' if links_off else 'on'}",
+        )  # fmt: skip
         key = (
             self.page_size,
             heads,
             self.use_workspace,
             plan is not None,
             red_rows,
+            counters is not None,
             fused_q.device,
         )
         fn = self._compiled.get(key)
@@ -512,6 +673,9 @@ class _Decode:
                 fgs_consumer=True, fgs_producer=True, fgs_reduction=True, fgs_skip_empty=SKIP_EMPTY_SPLITS,
                 fgs_red_rows=red_rows,
                 fgs_red_carveout=RED_CARVEOUT if RED_CARVEOUT >= 0 else None,
+                fgs_rows_check=CHECK["rows"], fgs_lse_check=CHECK["lse"] if var_split else "sw",
+                fgs_q_pace="try" if CHECK["qpace"] == "tma" else "sleep", fgs_store=STORE,
+                fgs_wait_grid=links_off, fgs_trigger=_trigger(),
             )  # fmt: skip
 
             def ct(t, leading, align=16):
@@ -529,7 +693,9 @@ class _Decode:
                 None if split_ws is None else from_dlpack(split_ws, assumed_align=32).mark_layout_dynamic(),
                 self.split_kv, from_dlpack(self.kv_lens, assumed_align=16).mark_layout_dynamic(), None, None,
                 None if plan is None else from_dlpack(plan, assumed_align=4).mark_layout_dynamic(),
-                cutlass.Float32(self.softmax_scale), cutlass.Float32(1.0), None, stream,
+                cutlass.Float32(self.softmax_scale), cutlass.Float32(1.0), None,
+                None if counters is None else from_dlpack(counters, assumed_align=8).mark_layout_dynamic(),
+                stream,
                 options="--opt-level 2",
             )  # fmt: skip
             self._compiled[key] = fn
@@ -540,7 +706,7 @@ class _Decode:
                 leading_dim=0
             )
         fn(q_latent, q_rope, self.c_latent, self.c_rope, page_table, o, self.lse, split_ws, self.split_kv,
-           self.kv_lens, None, None, plan, self.softmax_scale, 1.0, None, stream)  # fmt: skip
+           self.kv_lens, None, None, plan, self.softmax_scale, 1.0, None, counters, stream)  # fmt: skip
 
 
 def _decode_pool_views(kv_pool: torch.Tensor, kv_lora: int, rope: int):

@@ -22,13 +22,20 @@ covers the MLA norms (H = 1536 and 512).
 
 Fine-grained sync (Lamport) modes, opt-in and combinable:
   fgs_consumer  x is an FGS slot (the fused q_a / kv_a GEMM output): launched with PDL and no
-                ``griddepcontrol.wait``; the weight is loaded first, then x straight into registers with 16-B
-                ``ld.global.cg`` loads (no cp.async staging); while any element of a thread's fragment is the -0.0
-                sentinel the warp waits (warp-uniform, nanosleep backoff) and reloads that fragment with
-                ``ld.relaxed.gpu``. The reduction and the output are those of the default build.
+                ``griddepcontrol.wait``. ``fgs_check="sw"``: the weight is loaded first, then x straight into
+                registers with 16-B ``ld.global.cg`` loads (no cp.async staging); while any element of a thread's
+                fragment is the -0.0 sentinel the warp waits (warp-uniform, nanosleep backoff) and reloads that
+                fragment with ``ld.relaxed.gpu``. ``fgs_check="tma"``: warp 0 TMA-loads the CTA's row tile into
+                shared memory with ``report_valid`` (sentinel in element 0 of each 16-B chunk) and re-issues the
+                load while the completion reports a sentinel; the math then reads x from smem exactly as the
+                default build does. The reduction and the output are those of the default build.
   fgs_producer  y is published to FGS consumers (the q_b GEMM, the latent / context append): dependents are
-                triggered on entry and y is converted with cvt.rn.pzo (-0.0 stored as +0.0; each 16-B chunk is one
-                vector store).
+                triggered on entry (``fgs_trigger="entry"``; ``"end"``: after the stores) and y is converted with
+                cvt.rn.pzo (-0.0 stored as +0.0; each 16-B chunk is one vector store).
+  fgs_store     ``"thread"``: one 128-bit store per thread; ``"tma"``: the CTA's output tile is staged in smem and
+                leaves through one TMA store (whole 16-B chunks), available in every mode.
+  fgs_wait_grid (links-off control arm) a consumer waits for its producer grid before its first x load and its TMA
+                load runs without ``report_valid``.
 """
 
 import functools
@@ -40,8 +47,10 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32, Int64
+from cutlass.cute.nvgpu import cpasync
 
 try:
+    from . import mla_fgs_tma as tma
     from .mla_fgs import (
         SPIN_NS_MAX,
         SPIN_NS_MIN,
@@ -52,6 +61,7 @@ try:
         trap,
     )
 except ImportError:
+    import mla_fgs_tma as tma
     from mla_fgs import (
         SPIN_NS_MAX,
         SPIN_NS_MIN,
@@ -63,6 +73,9 @@ except ImportError:
     )
 
 COPY_BITS = 128
+CHECKS = ("sw", "tma")
+STORES = ("thread", "tma")
+TRIGGERS = ("entry", "end")
 
 
 def _warp_reduce(val, op, width: cutlass.Constexpr[int] = 32):
@@ -137,6 +150,10 @@ class MlaRMSNormKernel:
         spin_limit: int = 0,
         with_stats: bool = False,
         hw_pzo: bool = True,
+        fgs_check: str = "sw",
+        fgs_store: str = "thread",
+        fgs_wait_grid: bool = False,
+        fgs_trigger: str = "entry",
     ):
         self.dtype = cutlass.BFloat16
         self.H = H
@@ -157,11 +174,22 @@ class MlaRMSNormKernel:
         self.spin_limit = spin_limit
         self.with_stats = with_stats
         self.hw_pzo = hw_pzo
+        self.fgs_check = fgs_check
+        self.fgs_store = fgs_store
+        self.fgs_wait_grid = fgs_wait_grid
+        self.fgs_trigger = fgs_trigger
+        if fgs_check not in CHECKS or fgs_store not in STORES or fgs_trigger not in TRIGGERS:
+            raise ValueError(f"fgs_check {fgs_check!r}, fgs_store {fgs_store!r}, fgs_trigger {fgs_trigger!r}")
+        self.tma_in = fgs_consumer and fgs_check == "tma"
+        self.tma_out = fgs_store == "tma"
         # FlashInfer stages x through shared memory with cp.async whenever the tile fits (always for H <= 16384);
-        # the FGS consumer loads x into registers so that it can check and reload it.
+        # the software-checked FGS consumer loads x into registers so that it can check and reload it.
         self.use_async_copy = self.copy_bits >= 32 and not fgs_consumer
+        self.smem_x = self.use_async_copy or self.tma_in
         if self.vec_size * self.dtype.width != COPY_BITS and (fgs_consumer or fgs_producer):
             raise ValueError("FGS modes need 16-byte vectors (H a multiple of 8)")
+        if (self.tma_in or self.tma_out) and (self.cols_per_tile != H or H % 64):
+            raise ValueError("the TMA paths need H a multiple of 64 that fills the CTA tile")
 
     @staticmethod
     def _threads_per_row(H: int) -> int:
@@ -186,8 +214,12 @@ class MlaRMSNormKernel:
         return cute.make_layout(shape, stride=stride)
 
     def _smem_size_in_bytes(self) -> int:
-        tile = self.rows_per_block * self.cols_per_tile * 2 if self.use_async_copy else 0
-        return tile + self.rows_per_block * self.warps_per_row * 4
+        tile = self.rows_per_block * self.cols_per_tile * 2
+        size = (tile if self.smem_x else 0) + (tile if self.tma_out else 0)
+        size += self.rows_per_block * self.warps_per_row * 4
+        if self.tma_in or self.tma_out:
+            size += 2 * tma.SMEM_ALIGN
+        return size
 
     @cute.jit
     def __call__(
@@ -198,11 +230,25 @@ class MlaRMSNormKernel:
         mStats: cute.Tensor,
         M: Int64,
         eps: Float32,
+        retry_counter: Int64,
+        sw_counter: Int64,
         enable_pdl: cutlass.Constexpr[bool],
         stream,
     ):
         tiler_mn = (self.rows_per_block, self.cols_per_tile)
-        self.kernel(mX, mW, mY, mStats, M, eps, enable_pdl, self._tv_layout(), tiler_mn).launch(
+        atom_x, tma_x, atom_y, tma_y = None, None, None, None
+        if cutlass.const_expr(self.tma_in):
+            atom_x, tma_x = tma.make_row_tile_atom(
+                cpasync.CopyBulkTensorTileG2SOp(), mX, self.rows_per_block, self.H
+            )
+        if cutlass.const_expr(self.tma_out):
+            atom_y, tma_y = tma.make_row_tile_atom(
+                cpasync.CopyBulkTensorTileS2GOp(), mY, self.rows_per_block, self.H
+            )
+        self.kernel(
+            mX, mW, mY, mStats, M, eps, atom_x, tma_x, atom_y, tma_y, retry_counter, sw_counter, enable_pdl,
+            self._tv_layout(), tiler_mn,
+        ).launch(  # fmt: skip
             grid=[cute.ceil_div(M, self.rows_per_block), 1, 1],
             block=[self.num_threads, 1, 1],
             smem=self._smem_size_in_bytes(),
@@ -219,18 +265,27 @@ class MlaRMSNormKernel:
         mStats: cute.Tensor,
         M: Int64,
         eps: Float32,
+        atom_x: Optional[cute.CopyAtom],
+        tma_x: Optional[cute.Tensor],
+        atom_y: Optional[cute.CopyAtom],
+        tma_y: Optional[cute.Tensor],
+        retry_counter: Int64,
+        sw_counter: Int64,
         enable_pdl: cutlass.Constexpr[bool],
         tv_layout: cute.Layout,
         tiler_mn: cute.Shape,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
-        if cutlass.const_expr(self.fgs_producer):
+        if cutlass.const_expr(self.fgs_producer and self.fgs_trigger == "entry"):
             cute.arch.griddepcontrol_launch_dependents()
         if cutlass.const_expr(not self.fgs_consumer):
             if cutlass.const_expr(enable_pdl or self.fgs_producer):
                 cute.arch.griddepcontrol_wait()
+        elif cutlass.const_expr(self.fgs_wait_grid):
+            cute.arch.griddepcontrol_wait()
 
         H = self.H
         threads_per_row = tv_layout.shape[0][0]
@@ -238,12 +293,24 @@ class MlaRMSNormKernel:
         warps_per_row = max(threads_per_row // 32, 1)
 
         smem = cutlass.utils.SmemAllocator()
-        if cutlass.const_expr(self.use_async_copy):
+        sX_tma, sY_tma, bar = None, None, None
+        if cutlass.const_expr(self.tma_in):
+            sX_tma = smem.allocate_tensor(
+                mX.element_type, tma.tile_layout(rows_per_block, H), byte_alignment=tma.SMEM_ALIGN
+            )
+            sX = cute.make_tensor(sX_tma.iterator, cute.make_ordered_layout(tiler_mn, order=(1, 0)))
+            bar = smem.allocate_array(Int64, 1, byte_alignment=8)
+        elif cutlass.const_expr(self.use_async_copy):
             sX = smem.allocate_tensor(
                 mX.element_type,
                 cute.make_ordered_layout(tiler_mn, order=(1, 0)),
                 byte_alignment=16,
             )
+        if cutlass.const_expr(self.tma_out):
+            sY_tma = smem.allocate_tensor(
+                mY.element_type, tma.tile_layout(rows_per_block, H), byte_alignment=tma.SMEM_ALIGN
+            )
+            sY = cute.make_tensor(sY_tma.iterator, cute.make_ordered_layout(tiler_mn, order=(1, 0)))
         reduction_buffer = smem.allocate_tensor(
             Float32,
             cute.make_layout((rows_per_block, warps_per_row)),
@@ -283,7 +350,7 @@ class MlaRMSNormKernel:
         tXgX = thr_copy_X.partition_S(gX)
         tXcX = thr_copy_X.partition_S(cX)
         tXrX = cute.make_fragment_like(tXgX)
-        if cutlass.const_expr(self.use_async_copy):
+        if cutlass.const_expr(self.smem_x):
             tXsX = thr_copy_X.partition_D(sX)
 
         tWgW = thr_copy_W.partition_S(gW)
@@ -292,13 +359,38 @@ class MlaRMSNormKernel:
 
         tXgO = thr_copy_O.partition_D(gY)
         tXrO = cute.make_fragment_like(tXgO)
+        if cutlass.const_expr(self.tma_out):
+            tXsO = thr_copy_O.partition_D(sY)
 
         tXpX = _predicate_k(tXcX, limit=H)
         tWpW = _predicate_k(thr_copy_W.partition_S(cX), limit=H)
         row_coord = tXcX[(0, 0), 0, 0]
         row_in_bounds = row_coord[0] < M
 
-        if cutlass.const_expr(self.use_async_copy):
+        if cutlass.const_expr(self.tma_in):
+            if warp_idx == 0:
+                tma.init_barrier(bar, not self.fgs_wait_grid)
+            cute.arch.barrier()
+            if warp_idx == 0:
+                tS, tG = tma.partition_row_tiles(atom_x, tma_x, sX_tma, rows_per_block, H)
+
+                def issue():
+                    if cutlass.const_expr(self.fgs_wait_grid):
+                        cute.copy(atom_x, tG[(None, bidx)], tS[(None, 0)], tma_bar_ptr=bar)
+                    else:
+                        cute.copy(
+                            atom_x, tG[(None, bidx)], tS[(None, 0)], tma_bar_ptr=bar,
+                            report_valid=tma.BF16_PATTERN,
+                        )  # fmt: skip
+
+                tma.checked_load(
+                    bar, Int32(rows_per_block * H * 2), issue, not self.fgs_wait_grid, self.spin_limit,
+                    retry_counter, Int32(0),
+                )  # fmt: skip
+            cute.copy(copy_atom_sync, tWgW, tWrW, pred=tWpW)
+            cute.arch.barrier()
+            cute.autovec_copy(tXsX, tXrX)
+        elif cutlass.const_expr(self.use_async_copy):
             if row_in_bounds:
                 cute.copy(copy_atom_async, tXgX, tXsX, pred=tXpX)
             cute.arch.cp_async_commit_group()
@@ -307,7 +399,7 @@ class MlaRMSNormKernel:
             cute.autovec_copy(tXsX, tXrX)
         elif cutlass.const_expr(self.fgs_consumer):
             self._load_x_fgs(
-                mStats, tXgX, tXrX, tXpX, tWgW, tWrW, tWpW, copy_atom_sync, row_in_bounds
+                mStats, tXgX, tXrX, tXpX, tWgW, tWrW, tWpW, copy_atom_sync, row_in_bounds, sw_counter
             )
         else:
             tXrX.store(cute.zeros_like(tXrX, dtype=mX.element_type))
@@ -324,7 +416,7 @@ class MlaRMSNormKernel:
 
         cute.arch.barrier()
 
-        if cutlass.const_expr(self.use_async_copy):
+        if cutlass.const_expr(self.smem_x):
             cute.autovec_copy(tXsX, tXrX)
             x = tXrX.load().to(Float32)
 
@@ -341,10 +433,20 @@ class MlaRMSNormKernel:
         else:
             tXrO.store(y.to(mY.element_type))
 
-        if row_in_bounds:
+        if cutlass.const_expr(self.tma_out):
+            cute.copy(copy_atom_store, tXrO, tXsO, pred=tXpX)
+            cute.arch.fence_proxy("async.shared", space="cta")
+            cute.arch.barrier()
+            if warp_idx == 0:
+                tS, tG = tma.partition_row_tiles(atom_y, tma_y, sY_tma, rows_per_block, H)
+                tma.store_tile(atom_y, tS[(None, 0)], tG[(None, bidx)])
+        elif row_in_bounds:
             cute.copy(copy_atom_store, tXrO, tXgO, pred=tXpX)
 
-        if cutlass.const_expr(enable_pdl and not self.fgs_producer):
+        if cutlass.const_expr(self.fgs_producer):
+            if cutlass.const_expr(self.fgs_trigger == "end"):
+                cute.arch.griddepcontrol_launch_dependents()
+        elif cutlass.const_expr(enable_pdl):
             cute.arch.griddepcontrol_launch_dependents()
 
     @cute.jit
@@ -359,6 +461,7 @@ class MlaRMSNormKernel:
         tWpW: cute.Tensor,
         copy_atom_sync: cute.CopyAtom,
         row_in_bounds: cutlass.Boolean,
+        sw_counter: Int64,
     ):
         """x for the FGS consumer: weight first, then x (``.cg``); a warp with a sentinel left in any lane's
         fragment sleeps and reloads those fragments (``ld.relaxed.gpu``) until none is left."""
@@ -395,6 +498,7 @@ class MlaRMSNormKernel:
                     if sweeps > Int32(self.spin_limit):
                         trap()
                 again = cute.arch.vote_any_sync(pending != Int32(0))
+            tma.count(sw_counter, sweeps)
             if cutlass.const_expr(self.with_stats):
                 if cute.arch.lane_idx() == 0:
                     cute.arch.atomic_add(mStats.iterator, sweeps)
@@ -410,8 +514,14 @@ def _compiled(
     spin_limit: int,
     with_stats: bool,
     hw_pzo: bool = True,
+    check: str = "sw",
+    store: str = "thread",
+    wait_grid: bool = False,
+    trigger: str = "entry",
 ):
-    kernel = MlaRMSNormKernel(H, consumer, producer, spin_limit, with_stats, hw_pzo)
+    kernel = MlaRMSNormKernel(
+        H, consumer, producer, spin_limit, with_stats, hw_pzo, check, store, wait_grid, trigger
+    )
     sym_m = cute.sym_int(64)
     bf16 = cutlass.BFloat16
     x = cute.runtime.make_fake_tensor(
@@ -431,6 +541,8 @@ def _compiled(
         stats,
         Int64(1),
         Float32(1e-6),
+        Int64(0),
+        Int64(0),
         enable_pdl,
         stream,
         options="--enable-tvm-ffi",
@@ -453,12 +565,19 @@ def mla_rmsnorm(
     fgs_producer: bool = False,
     fgs_stats: Optional[torch.Tensor] = None,
     fgs_spin_limit: int = 0,
+    fgs_check: str = "sw",
+    fgs_store: str = "thread",
+    fgs_wait_grid: bool = False,
+    fgs_trigger: str = "entry",
+    fgs_counters: Optional[dict] = None,
 ) -> torch.Tensor:
     """out = rmsnorm(x) * weight for 2-D bf16 x / out with unit last stride (row strides multiples of 8).
 
     Default build: ``flashinfer.norm.rmsnorm(x, weight, eps, out=out, enable_pdl=enable_pdl)`` bit for bit.
-    ``fgs_consumer`` / ``fgs_producer``: see the module docstring; ``fgs_stats`` (int32 [4]) accumulates the
-    consumer's reload sweeps / waiting warps; ``fgs_spin_limit`` > 0 traps after that many sweeps (diagnostic).
+    ``fgs_consumer`` / ``fgs_producer`` / ``fgs_check`` / ``fgs_store`` / ``fgs_wait_grid`` / ``fgs_trigger``: see
+    the module docstring; ``fgs_stats`` (int32 [4]) accumulates the software consumer's reload sweeps / waiting
+    warps; ``fgs_spin_limit`` > 0 traps after that many sweeps or TMA re-issues (diagnostic); ``fgs_counters``
+    maps ``"retry"`` (TMA re-issues) and ``"sw"`` (software sweeps) to ``wait_stats`` counter addresses.
     """
     if (
         x.dim() != 2
@@ -478,6 +597,13 @@ def mla_rmsnorm(
     stats = fgs_stats if with_stats else _dummy_stats(x.device)
     spin_limit = fgs_spin_limit if fgs_consumer else 0
     hw_pzo = fgs_producer and torch.cuda.get_device_capability(x.device) == (10, 7)
-    fn = _compiled(H, enable_pdl, fgs_consumer, fgs_producer, spin_limit, with_stats, hw_pzo)
-    fn(x, weight, out, stats, M, eps)
+    check = fgs_check if fgs_consumer else "sw"
+    wait_grid = fgs_wait_grid and fgs_consumer
+    trigger = fgs_trigger if fgs_producer else "entry"
+    counters = fgs_counters or {}
+    fn = _compiled(
+        H, enable_pdl, fgs_consumer, fgs_producer, spin_limit, with_stats, hw_pzo, check, fgs_store, wait_grid,
+        trigger,
+    )  # fmt: skip
+    fn(x, weight, out, stats, M, eps, counters.get("retry", 0), counters.get("sw", 0))
     return out
