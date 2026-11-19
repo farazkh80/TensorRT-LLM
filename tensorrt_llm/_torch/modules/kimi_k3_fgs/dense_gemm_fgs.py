@@ -34,7 +34,8 @@ Consumer (A is a sentinel-armed edge slot; B, the weights, is never checked):
   polls it.
 
 Diagnostic: ``timeline`` stores ``%globaltimer_lo`` when each CTA starts and when each CTA tile's last TMA store is
-issued (see :func:`timeline_slots`); ``retry_count[0]`` accumulates the A re-issues of report_valid builds.
+issued (see :func:`timeline_slots`); ``retry_count[0]`` and the ``stats_addr`` ``wait_stats`` counter (0 when off)
+accumulate the A re-issues of report_valid builds.
 
 The kernel never writes sentinels; the framework arms the A slot before the producer runs.
 """
@@ -54,6 +55,7 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from ...kernels.blackwell.custom_pipeline import PipelineTmaUmma, PipelineUmmaAsync
 from ...kernels.rubin.dense_bf16_gemm_persistent import PersistentDenseGemmKernel
+from . import wait_stats
 
 try:
     from cutlass._mlir.dialects.nvvm import MBarrierScopeKind
@@ -169,6 +171,7 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
         c: cute.Tensor,
         stamps: cute.Tensor,
         retry_count: cute.Tensor,
+        stats_addr: cutlass.Int64,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -244,6 +247,7 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
             tma_tensor_c,
             stamps,
             retry_count,
+            stats_addr,
             self.cluster_layout_vmnk,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
@@ -271,6 +275,7 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
         mC_mnl: cute.Tensor,
         stamps: cute.Tensor,
         retry_count: cute.Tensor,
+        stats_addr: cutlass.Int64,
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
@@ -536,6 +541,7 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
                     a_full_mcast_mask,
                     k_tile_cnt,
                     retry_count,
+                    stats_addr,
                     retry_cluster_mbar,
                     retry_dst_rank,
                     retry_is_signalling,
@@ -770,6 +776,7 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
         a_full_mcast_mask,
         k_tile_cnt: cutlass.Int32,
         retry_count: cute.Tensor,
+        stats_addr: cutlass.Int64,
         retry_cluster_mbar,
         retry_dst_rank,
         retry_is_signalling,
@@ -926,6 +933,8 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
             with cute.arch.elect_one():
                 if reissues > 0:
                     cute.arch.atomic_add(retry_count.iterator, reissues)
+                    if stats_addr != 0:
+                        wait_stats.add(stats_addr, reissues)
 
     @cute.jit
     def _retry_peer(
@@ -984,6 +993,7 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
         c_tensor: cute.Tensor,
         stamps: cute.Tensor,
         retry_count: cute.Tensor,
+        stats_addr: cutlass.Int64,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -993,7 +1003,9 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
         b_tensor = cute.make_tensor(
             b_ptr, layout=cute.make_ordered_layout((n, k, batch_size), order=(1, 0, 2))
         )
-        self(a_tensor, b_tensor, c_tensor, stamps, retry_count, max_active_clusters, stream)
+        self(
+            a_tensor, b_tensor, c_tensor, stamps, retry_count, stats_addr, max_active_clusters, stream
+        )
 
     @cute.jit
     def wrapper_strided_fgs(
@@ -1011,6 +1023,7 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
         b_stride_batch: cutlass.Int32,
         stamps: cute.Tensor,
         retry_count: cute.Tensor,
+        stats_addr: cutlass.Int64,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -1023,7 +1036,9 @@ class FgsDenseGemmKernel(PersistentDenseGemmKernel):
             b_ptr,
             layout=cute.make_layout((n, k, batch_size), stride=(b_stride_n, 1, b_stride_batch)),
         )
-        self(a_tensor, b_tensor, c_tensor, stamps, retry_count, max_active_clusters, stream)
+        self(
+            a_tensor, b_tensor, c_tensor, stamps, retry_count, stats_addr, max_active_clusters, stream
+        )
 
 
 def timeline_slots(m: int, n: int, tactic: tuple = O_PROJ_TACTIC) -> int:
@@ -1093,13 +1108,14 @@ def run_gemm_fgs(
     retry_counter: Optional[torch.Tensor] = None,
     max_ctas: Optional[int] = None,
     n_order: Optional[Tuple[int, int]] = None,
+    stats_addr: int = 0,
 ) -> torch.Tensor:
     """``out[L, M, N] = a[L, M, K] @ w[L, N, K]^T`` in BF16 at an in-tree ``base`` tactic.
 
     Any operand may be a strided view with K (``a``, ``w``) / N (``out``) innermost and 16 B aligned rows, as for the
     in-tree batched runner. Defaults are the report_valid consumer; ``retry_counter`` (int32[``RETRY_COUNTER_SLOTS``])
-    accumulates the A re-issues. ``max_ctas`` caps the persistent grid (default: the device's max active clusters).
-    ``n_order`` (heads, h1) is the kernel's head-ordered tile mapping.
+    and the ``stats_addr`` ``wait_stats`` counter accumulate the A re-issues. ``max_ctas`` caps the persistent grid
+    (default: the device's max active clusters). ``n_order`` (heads, h1) is the kernel's head-ordered tile mapping.
     """
     if a.dim() != 3 or w.dim() != 3 or out.dim() != 3:
         raise ValueError("run_gemm_fgs takes [L, M, K], [L, N, K], [L, M, N] operands")
@@ -1181,13 +1197,25 @@ def run_gemm_fgs(
             *strides,
             stamps_tensor,
             retry_tensor,
+            cutlass.Int64(0),
             clusters,
             stream,
             options="--opt-level 2",
         )
         _COMPILED[key] = compiled
     compiled(
-        m, n, k, batch, a_ptr, b_ptr, c_tensor, *strides, stamps_tensor, retry_tensor, stream=stream
+        m,
+        n,
+        k,
+        batch,
+        a_ptr,
+        b_ptr,
+        c_tensor,
+        *strides,
+        stamps_tensor,
+        retry_tensor,
+        cutlass.Int64(stats_addr),
+        stream=stream,
     )
     return out
 
@@ -1273,10 +1301,13 @@ def run_dense_fgs(
             c_tensor,
             stamps_tensor,
             retry_tensor,
+            cutlass.Int64(0),
             clusters,
             stream,
             options="--opt-level 2",
         )
         _COMPILED[key] = compiled
-    compiled(m, n, k, 1, a_ptr, b_ptr, c_tensor, stamps_tensor, retry_tensor, stream=stream)
+    compiled(
+        m, n, k, 1, a_ptr, b_ptr, c_tensor, stamps_tensor, retry_tensor, cutlass.Int64(0), stream=stream
+    )
     return out

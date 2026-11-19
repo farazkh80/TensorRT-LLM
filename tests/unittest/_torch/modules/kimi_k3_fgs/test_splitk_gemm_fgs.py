@@ -265,14 +265,17 @@ def test_decode_shapes_ready_and_late_chunk(shape: str, m: int) -> None:
 PRODUCER = dict(
     report_valid=False, retry_warp=False, pdl_wait_activation=True, pzo=True, early_trigger=True
 )
+STORES = {"store16": dict(store16=True), "tma_store": dict(tma_store=True)}
 
 
+@pytest.mark.parametrize("store", list(STORES))
 @pytest.mark.parametrize(
     "shape,m",
     [("bfa", 16), ("qa_kva", 16), ("qb", 16), ("gproj", 16), ("qb", 32), ("bfa", 8), ("qa_kva", 1)],
 )
-def test_producer_build_changes_only_negative_zero(shape: str, m: int) -> None:
-    """.pzo + early trigger + 16 B owner stores equal the plain build with -0.0 read as +0.0, rows past M untouched."""
+def test_producer_build_changes_only_negative_zero(shape: str, m: int, store: str) -> None:
+    """.pzo + early trigger + whole-chunk owner stores (16 B thread stores or one TMA store per tile) equal the
+    plain build with -0.0 read as +0.0; the row past M stays untouched (a tile's columns past N would land in it)."""
     n, k, tactics = DECODE_SPLITK[shape]
     tactic = fgs.SplitKTactic(*tactics[m])
     torch.manual_seed(m)
@@ -287,9 +290,62 @@ def test_producer_build_changes_only_negative_zero(shape: str, m: int) -> None:
         return buf
 
     plain = run(**VARIANTS["plain"])
-    prod = run(**PRODUCER, store16=True)
+    prod = run(**PRODUCER, **STORES[store])
     torch.cuda.synchronize()
     canon = plain.view(torch.int16).clone()
     canon[canon == NEG0] = 0
     assert torch.equal(prod.view(torch.int16), canon)
     assert bool(torch.isnan(prod[m].float()).all())
+
+
+@pytest.mark.parametrize("store", list(STORES))
+def test_consumer_reads_producer_slot(store: str) -> None:
+    """A producer build (whole-chunk stores into a -0.0 armed slot) on one stream feeds a report_valid consumer
+    launched on another stream before it: the consumer re-issues the stages it saw armed and matches the plain
+    pair bitwise."""
+    m = 16
+    n1, k1, tactics1 = DECODE_SPLITK["qa_kva"]
+    tactic1 = fgs.SplitKTactic(*tactics1[m])
+    torch.manual_seed(7)
+    x = torch.randn(m, k1, device="cuda").to(torch.bfloat16)
+    w1 = (torch.randn(n1, k1, device="cuda") * 0.02).to(torch.bfloat16)
+    k2, n2 = n1, 1536
+    w2 = (torch.randn(n2, k2, device="cuda") * 0.02).to(torch.bfloat16)
+    tactic2 = fgs.SplitKTactic(64, 16, 4, 10)
+
+    def producer(out, **flags):
+        fgs.run_splitk_dense_fgs(x, w1.t(), None, out, True, tactic1, **flags)
+
+    def consumer(a, out, counter, variant):
+        fgs.run_splitk_dense_fgs(
+            a, w2.t(), None, out, True, tactic2, retry_counter=counter, **VARIANTS[variant]
+        )
+
+    mid = torch.empty(m, n1, device="cuda", dtype=torch.bfloat16)
+    producer(mid, **VARIANTS["plain"])
+    expected = torch.empty(m, n2, device="cuda", dtype=torch.bfloat16)
+    consumer(mid, expected, None, "plain")
+    # JIT both FGS builds before the timed pair.
+    slot = torch.empty(m, n1, device="cuda", dtype=torch.bfloat16)
+    producer(slot, **PRODUCER, **STORES[store])
+    counter = torch.zeros(fgs.RETRY_COUNTER_SLOTS, dtype=torch.int32, device="cuda")
+    out = torch.empty(m, n2, device="cuda", dtype=torch.bfloat16)
+    consumer(slot, out, counter, "fgs")
+    torch.cuda.synchronize()
+
+    slot.view(torch.int16).fill_(NEG0)
+    counter.zero_()
+    out.fill_(float("nan"))
+    s_cons, s_prod = torch.cuda.Stream(), torch.cuda.Stream()
+    torch.cuda.synchronize()
+    with torch.cuda.stream(s_cons):
+        consumer(slot, out, counter, "fgs")
+    with torch.cuda.stream(s_prod):
+        producer(slot, **PRODUCER, **STORES[store])
+    torch.cuda.synchronize()
+    reissues, unchecked = counter.tolist()
+    assert unchecked == 0
+    assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
+    canon = mid.view(torch.int16).clone()
+    canon[canon == NEG0] = 0
+    assert torch.equal(slot.view(torch.int16), canon)

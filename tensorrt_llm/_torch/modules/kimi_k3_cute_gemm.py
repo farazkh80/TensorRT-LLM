@@ -34,13 +34,22 @@ The ``rubin`` producer build of the KDA qkvg projection computes the q / k / v t
 (``dense_gemm_fgs`` ``n_order``; same tiles, bit-exact): h1 = 70 at 9..16 rows by default (the rows the KDA core's
 late-gate, head-major producer order runs at), ``TLLM_K3_FGS_QKVG_ORDER=<h1>`` at every row (0: stock order).
 
+Control arms. ``TLLM_K3_FGS_LINKS=off`` (``kimi_k3_fgs.edges.links_off``): every slot consumer waits for its
+producer grid (``griddepcontrol.wait``) and, with ``TLLM_K3_FGS_LINKS_ROLES=keep`` (default), keeps the report_valid
+load and retry warp of the same kernel build (they never re-issue complete data), or drops them with ``=off``;
+producers trigger their dependents at entry or at the stock point per ``edges.links_trigger``.
+``TLLM_K3_FGS_TMA_STORE=1``: the split-K producers store their tile by TMA instead of 16 B thread stores (the
+``rubin`` producers always TMA-store). ``TLLM_K3_CUTE_GEMM_FGS_CLASSES=<rows>`` (``1``: 64): a launch without edge
+slots at up to that many rows takes the fine-grained-sync build of its table entry with every check off (the
+producer store path, the FGS tactics and launch bounds, PDL waits), for an FGS-off arm on the same kernels.
+
 A shape without an entry runs the ``rubin`` backend under the TRT-LLM autotuner. Non-BF16 operands keep the
 cuBLAS matmul; empty problems launch nothing.
 """
 
 import functools
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -241,6 +250,60 @@ def _x5() -> bool:
     return os.environ.get("TLLM_K3_CUTE_GEMM_X5", "1") == "1" and fgs_dsl()
 
 
+@functools.lru_cache(maxsize=None)
+def _tma_store() -> bool:
+    return os.environ.get("TLLM_K3_FGS_TMA_STORE", "0") == "1"
+
+
+@functools.lru_cache(maxsize=None)
+def _fgs_classes_rows() -> int:
+    """Rows up to which a slot-less launch takes the FGS build with the checks off (0: never)."""
+    rows = int(os.environ.get("TLLM_K3_CUTE_GEMM_FGS_CLASSES", "0"))
+    return 64 if rows == 1 else rows
+
+
+@functools.lru_cache(maxsize=None)
+def _links_roles() -> str:
+    value = os.environ.get("TLLM_K3_FGS_LINKS_ROLES", "keep")
+    if value not in ("keep", "off"):
+        raise ValueError(f"TLLM_K3_FGS_LINKS_ROLES={value!r}; valid: keep, off")
+    return value
+
+
+class _Roles(NamedTuple):
+    """Sync roles of one launch: the consumer check (TMA report_valid + retry warp, or the direct GEMM's software
+    check), the grid wait before the activation loads, the producer build (.pzo, whole-chunk stores) and the
+    trigger at kernel entry."""
+
+    check: bool
+    wait: bool
+    arm: bool
+    early: bool
+
+
+def _roles(consume: bool, produce: bool, parity: bool = False) -> _Roles:
+    from .kimi_k3_fgs import edges as fgs_edges
+
+    off = fgs_edges.links_off()
+    arm = produce or parity
+    if parity or off:
+        early = arm and fgs_edges.links_trigger() == "entry"
+    else:
+        early = produce
+    return _Roles(
+        check=consume and (not off or _links_roles() == "keep"),
+        wait=not consume or off,
+        arm=arm,
+        early=early,
+    )
+
+
+def _stats(edge: Optional[str], site: str) -> int:
+    from .kimi_k3_fgs import wait_stats
+
+    return wait_stats.addr(f"gemm.{edge or 'none'}.{site}")
+
+
 # KDA qkvg projection (N, K) and its heads (q | k | v | gate sections of one-tile heads).
 _QKVG = (49152, 7168)
 _QKVG_HEADS = 96
@@ -318,7 +381,9 @@ def _row_major(t: torch.Tensor) -> bool:
     return t.stride(-1) == 1 and t.stride(0) == t.shape[-1]
 
 
-def _fgs_consume(x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor) -> None:
+def _fgs_consume(
+    x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor, roles: _Roles, stats: int
+) -> None:
     """o_proj on a live edge slot: report_valid loads, retry warp, no griddepcontrol.wait."""
     from .kimi_k3_fgs.splitk_gemm_fgs import SplitKTactic, run_splitk_dense_fgs
 
@@ -332,8 +397,12 @@ def _fgs_consume(x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor) -> No
             out[r : r + rows],
             _pdl(),
             SplitKTactic(*tactic),
+            report_valid=roles.check,
+            retry_warp=roles.check,
+            pdl_wait_activation=roles.wait,
             exact_smem=exact,
             smem_carveout=_VSPLITK_CARVEOUT if exact else None,
+            stats_addr=stats,
         )
 
 
@@ -356,10 +425,10 @@ def _fgs_rubin(
     w3,
     out3,
     tactic,
-    consume: bool,
-    produce: bool,
+    roles: _Roles,
     max_ctas: Optional[int] = None,
     n_order: Optional[Tuple[int, int]] = None,
+    stats: int = 0,
 ) -> None:
     from .kimi_k3_fgs.dense_gemm_fgs import run_gemm_fgs
 
@@ -370,19 +439,27 @@ def _fgs_rubin(
         w3,
         out3,
         tactic,
-        report_valid=consume,
-        retry_warp=consume,
-        wait_input=not consume,
-        pzo=produce,
-        early_trigger=produce,
+        report_valid=roles.check,
+        retry_warp=roles.check,
+        wait_input=roles.wait,
+        pzo=roles.arm,
+        early_trigger=roles.early,
         use_pdl=_pdl(),
         max_ctas=max_ctas,
         n_order=n_order,
+        stats_addr=stats,
     )
 
 
 def _fgs_direct(
-    x, weight, out, tactic, consume: bool, produce: str, in_edge: Optional[str]
+    x,
+    weight,
+    out,
+    tactic,
+    roles: _Roles,
+    produce: str,
+    in_edge: Optional[str],
+    out_edge: Optional[str],
 ) -> None:
     """``produce``: "" (no output slot), "pzo" (element-checked readers), "group8", "head_last", "cluster" or
     "chunk"."""
@@ -393,7 +470,8 @@ def _fgs_direct(
     _debug(
         f"linear N={weight.shape[0]} K={x.shape[1]}",
         x.shape[0],
-        f"fgs direct {tuple(tactic)} consumer={'-' if not consume else 'elements' if check_elements else 'elem0'}"
+        f"fgs direct {tuple(tactic)} consumer="
+        f"{'-' if not roles.check else 'elements' if check_elements else 'elem0'}"
         f"{'' if check_mode is None else ' ' + check_mode} producer={produce or '-'}",
     )
     chunk = {}
@@ -405,22 +483,29 @@ def _fgs_direct(
             chunk_prefetch=3,
             min_ctas_per_sm=1024 // (parallel * tactic[0]),
         )
+    # Software wait sites of this kernel: the consumer's reload rounds, the head_last producer's tail wait.
+    stats = 0
+    if roles.check:
+        stats = _stats(in_edge, "poll")
+    elif produce == "head_last":
+        stats = _stats(out_edge, "head_last")
     run_direct_dense_fgs(
         x,
         weight.t(),
         out,
         _pdl(),
         DirectTactic(*tactic),
-        check_valid=consume,
-        check_mode=check_mode if consume else None,
+        check_valid=roles.check,
+        check_mode=check_mode if roles.check else None,
         check_elements=check_elements,
-        pdl_wait_activation=not consume,
+        pdl_wait_activation=roles.wait,
         pzo=bool(produce),
-        early_trigger=bool(produce),
+        early_trigger=roles.early,
         head_last=produce == "head_last",
         group8=produce == "group8",
         gather=produce == "cluster",
         chunk=produce == "chunk",
+        stats_addr=stats,
         **chunk,
     )
 
@@ -433,13 +518,16 @@ def _fgs_linear(
     produce: bool,
     out_edge: Optional[str] = None,
     in_edge: Optional[str] = None,
+    parity: bool = False,
 ) -> None:
-    """``linear`` on edge-slot operands: the fine-grained-sync build of the table entry's kernel."""
+    """``linear`` on edge-slot operands (or a slot-less ``parity`` launch): the fine-grained-sync build of the
+    table entry's kernel."""
     from .kimi_k3_fgs.splitk_gemm_fgs import SplitKTactic, default_tactic, run_splitk_dense_fgs
 
     m, k = x.shape
     n = weight.shape[0]
     dense = _row_major(x) and _row_major(out)
+    roles = _roles(consume, produce, parity)
     backend, tactic = _select(_GEMM_TABLE.get((n, k)), m)
     if backend == "fi_splitk" and tactic[2] == 1:
         fgs_tactic = next(
@@ -449,7 +537,7 @@ def _fgs_linear(
             tactic = fgs_tactic
             _debug(f"linear N={n} K={k}", m, f"fgs split-K tactic {fgs_tactic}")
     direct_store = ""
-    if produce:
+    if roles.arm:
         direct_store = "pzo" if out_edge in _element_checked_edges() else _direct_producer(n)
         if direct_store == "auto":
             direct_store = _DIRECT_AUTO_STORE.get(n, "group8")
@@ -463,20 +551,21 @@ def _fgs_linear(
         and dense
         and x.data_ptr() % 32 == 0
         and out.data_ptr() % 32 == 0
-        and (not produce or (n % 8 == 0 and direct_store != "splitk"))
+        and (not roles.arm or (n % 8 == 0 and direct_store != "splitk"))
     ):
-        _fgs_direct(x, weight, out, tactic, consume, direct_store, in_edge)
+        _fgs_direct(x, weight, out, tactic, roles, direct_store, in_edge, out_edge)
         return
+    stats = _stats(in_edge, "retry") if roles.check else 0
     # The decode o_proj consumer at the table's split-K / direct rows; its rubin rows (17 and up) take the table's
     # GEMM below, since a split-K build would change their reduction order.
     if consume and not produce and dense and n == 7168 and k == 12288 and backend != "rubin":
-        _fgs_consume(x, weight, out)
+        _fgs_consume(x, weight, out, roles, stats)
         return
     if backend == "rubin" or not dense:
         if backend != "rubin":
             tactic = _FGS_SMALL_TACTIC
         n_order = None
-        if produce and backend == "rubin" and (n, k) == _QKVG:
+        if roles.arm and backend == "rubin" and (n, k) == _QKVG:
             h1 = _qkvg_order(m)
             if h1 > 0:
                 n_order = (_QKVG_HEADS, h1)
@@ -486,9 +575,9 @@ def _fgs_linear(
             weight.unsqueeze(0),
             out.unsqueeze(0),
             tactic,
-            consume,
-            produce,
+            roles,
             n_order=n_order,
+            stats=stats,
         )
         return
     exact = backend == "vsplitk"
@@ -505,14 +594,16 @@ def _fgs_linear(
             out[r : r + rows],
             _pdl(),
             launch_tactic,
-            report_valid=consume,
-            retry_warp=consume,
-            pdl_wait_activation=not consume,
+            report_valid=roles.check,
+            retry_warp=roles.check,
+            pdl_wait_activation=roles.wait,
             exact_smem=exact,
             smem_carveout=_VSPLITK_CARVEOUT if exact else None,
-            pzo=produce,
-            early_trigger=produce,
-            store16=produce,
+            pzo=roles.arm,
+            early_trigger=roles.early,
+            store16=roles.arm and not _tma_store(),
+            tma_store=roles.arm and _tma_store(),
+            stats_addr=stats,
         )
 
 
@@ -544,16 +635,25 @@ def linear(
             out,
             in_lease is not None,
             out_lease is not None,
-            None if out_lease is None or _fgs_direct_mode() == "0" else out_lease.workspace.name,
-            None if in_lease is None or _fgs_direct_mode() == "0" else in_lease.workspace.name,
+            None if out_lease is None else out_lease.workspace.name,
+            None if in_lease is None else in_lease.workspace.name,
         )
         _debug(
             f"linear N={n} K={k}",
             m,
-            f"fgs consume={in_lease is not None} produce={out_lease is not None}",
+            f"fgs consume={in_lease is not None} produce={out_lease is not None} "
+            f"roles={_roles(in_lease is not None, out_lease is not None)} tma_store={_tma_store()}",
         )
         if in_lease is not None:
             fgs_edges.consumed(in_lease)
+        return out
+    if m <= _fgs_classes_rows():
+        _fgs_linear(x, weight, out, False, False, parity=True)
+        _debug(
+            f"linear N={n} K={k}",
+            m,
+            f"fgs classes, checks off, roles={_roles(False, False, True)} tma_store={_tma_store()}",
+        )
         return out
     backend, tactic = _select(_GEMM_TABLE.get((n, k)), m)
     if backend == "vsplitk" and not _x5():
@@ -644,22 +744,28 @@ def bmm(x: torch.Tensor, weight: torch.Tensor, out: Optional[torch.Tensor] = Non
     if in_lease is not None or out_lease is not None:
         from .kimi_k3_fgs import edges as fgs_edges
 
+        roles = _roles(in_lease is not None, out_lease is not None)
         _fgs_rubin(
             x,
             weight,
             out,
             tactic,
-            in_lease is not None,
-            out_lease is not None,
+            roles,
             _FGS_BMM_MAX_CTAS.get((b, n, k)),
+            stats=_stats(in_lease.workspace.name, "retry") if roles.check else 0,
         )
         _debug(
             f"bmm B={b} N={n} K={k}",
             m,
-            f"fgs consume={in_lease is not None} produce={out_lease is not None}",
+            f"fgs consume={in_lease is not None} produce={out_lease is not None} roles={roles}",
         )
         if in_lease is not None:
             fgs_edges.consumed(in_lease)
+        return out
+    if m <= _fgs_classes_rows():
+        roles = _roles(False, False, True)
+        _fgs_rubin(x, weight, out, tactic, roles, _FGS_BMM_MAX_CTAS.get((b, n, k)))
+        _debug(f"bmm B={b} N={n} K={k}", m, f"fgs classes, checks off, roles={roles}")
         return out
     _debug(f"bmm B={b} N={n} K={k}", m, f"rubin {tactic}")
     _run_bmm(x, weight, out, tactic)
