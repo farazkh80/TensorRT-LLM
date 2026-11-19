@@ -67,8 +67,8 @@ _TIMEOUT_NS = int(os.environ.get("TLLM_K3_COMM_TIMEOUT_S", "300")) * 1_000_000_0
 # Dispatch modes: WAIT waits for the peers' data in-kernel; DEFER leaves the data wait (and the baselines) to the
 # routing kernel; SEND_ONLY ends after the sends and leaves the baselines to the combine of the same round.
 _DISPATCH_WAIT, _DISPATCH_DEFER, _DISPATCH_SEND_ONLY = 0, 1, 2
-# Lamport combine side buffer (one symmetric MNNVL allocation): push-completion words done[src][by] (u32), the
-# per-source active-expert masks, then two inboxes selected by the round parity.
+# Lamport combine side buffer (one symmetric MNNVL allocation): push-completion words done[src][by] (u32, one per
+# 16 B chunk so a TMA load can check them), then two inboxes selected by the round parity.
 _SIDE_BLOCKS = 32
 INBOX_BLOCKS_ENV = "TLLM_K3_COMM_INBOX_BLOCKS"
 INBOX_DATA_ONLY_ENV = "TLLM_K3_COMM_INBOX_DATA_ONLY"
@@ -84,8 +84,16 @@ INBOX_SENTINELS = ("80", "ff")
 # with report_valid, re-issued while it lands sentinel data).
 INBOX_CHECK_ENV = "TLLM_K3_COMM_INBOX_CHECK"
 INBOX_CHECKS = ("poll", "tma")
+# How the protocol's flag words are waited for: "spin" (ld.relaxed.sys loops) or "tma" (a TMA load of the armed
+# words with report_valid, re-issued until valid, the reader re-arming them): the push's combine_flags bank
+# (armed -1, PER_ELEMENT_FF) and the inbox's push-completion words (armed 0x80000000, PER_16BYTES_80000000).
+# The recv_counters bank keeps its spin: the stock layout packs both parity banks 4 B apart, so no 16 B chunk holds
+# only the words of one round.
+FLAG_CHECK_ENV = "TLLM_K3_COMM_FLAG_CHECK"
+FLAG_CHECKS = ("spin", "tma")
 _SIDE_DONE = 0
-_SIDE_MASK = 4096
+_SIDE_DONE_STRIDE = 16
+_SIDE_DONE_ARMED = -0x80000000
 _SIDE_INBOX = 8192
 _TMA_CHUNK = 128
 
@@ -111,6 +119,10 @@ def inbox_sentinel() -> str:
 
 def inbox_check() -> str:
     return _inbox_choice(INBOX_CHECK_ENV, INBOX_CHECKS)
+
+
+def flag_check() -> str:
+    return _inbox_choice(FLAG_CHECK_ENV, FLAG_CHECKS)
 
 
 def _pdl() -> bool:
@@ -713,6 +725,46 @@ if _CUTE_AVAILABLE:
         while _ld_sys_b64(addr) < target:
             if _globaltimer() - start > timeout_ns:
                 _trap()
+
+    @cute.jit
+    def _tma_flag_wait(tma_atom, gFlags, sFlags, bar, nbytes, ff: cutlass.Constexpr) -> Int32:
+        """Warp-wide: load the armed flag words ``gFlags`` into ``sFlags`` on the fresh v1 barrier ``bar`` until
+        the load reports them valid (0xFF bytes with ``ff``, else the 32-bit -0 in element 0 of each 16 B).
+        Returns the re-issue count."""
+        phase = Int32(0)
+        retries = Int32(0)
+        pending = Int32(1)
+        while pending != 0:
+            # The TMA copy elects its issuing thread itself; only the arrive is ours to elect.
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(bar, nbytes)
+            if cutlass.const_expr(ff):
+                cute.copy(
+                    tma_atom,
+                    gFlags,
+                    sFlags,
+                    tma_bar_ptr=bar,
+                    report_valid=cpasync.SentinelPattern.PER_ELEMENT_FF,
+                )
+            else:
+                cute.copy(
+                    tma_atom,
+                    gFlags,
+                    sFlags,
+                    tma_bar_ptr=bar,
+                    report_valid=cpasync.SentinelPattern.PER_16BYTES_80000000,
+                )
+            landed = Int32(0)
+            while landed == 0:
+                complete, invalid = cute.arch.mbarrier_try_wait_primary(bar, phase)
+                if complete:
+                    landed = Int32(1)
+                    phase = phase ^ 1
+                    if invalid:
+                        retries = retries + 1
+                    else:
+                        pending = Int32(0)
+        return retries
 
     @cute.jit
     def wait_recv_block(
@@ -1666,12 +1718,15 @@ if _CUTE_AVAILABLE:
             bulk: bool = False,
             data_only: bool = False,
             tma: bool = False,
+            flag_tma: bool = False,
         ):
             assert hidden % 512 == 0
             # bulk: a warp stages the converted row in shared memory and one lane bulk-stores it to the peer (tma:
             # a TMA tensor store from the same stage); otherwise every lane stores its 16-B chunks from registers.
             self.bulk = bulk or tma
             self.tma = tma
+            # flag_tma: the round CTA checks the combine_flags bank with a TMA load (FLAG_CHECK_ENV) and re-arms it.
+            self.flag_tma = flag_tma
             # data_only: for a consumer that polls the inbox chunks, a CTA exits once its reads of the payload are
             # done; it neither waits for its remote stores to land nor publishes the push-completion words.
             self.data_only = data_only
@@ -1701,8 +1756,19 @@ if _CUTE_AVAILABLE:
             side_stride32: Int32,
             stats_recv: Int64,
             stats_flags: Int64,
+            cf_ptr: cute.Pointer,
+            stats_stale: Int64,
             stream,
         ):
+            tma_cf = tma_tensor_cf = None
+            if cutlass.const_expr(self.flag_tma):
+                m_cf = cute.make_tensor(cf_ptr, cute.make_layout((self.ep, 1), stride=(1, self.ep)))
+                tma_cf, tma_tensor_cf = cpasync.make_tiled_tma_atom(
+                    cpasync.CopyBulkTensorTileG2SOp(),
+                    m_cf,
+                    cute.make_layout((self.ep, 1), stride=(1, self.ep)),
+                    (self.ep, 1),
+                )
             tma_atom = tma_tensor = None
             if cutlass.const_expr(self.tma):
                 # Every rank's two inboxes as (chunk byte, chunk, row, rank); rows of parity b start at b * ep * rows.
@@ -1724,6 +1790,8 @@ if _CUTE_AVAILABLE:
                 mY,
                 tma_atom,
                 tma_tensor,
+                tma_cf,
+                tma_tensor_cf,
                 ws_base,
                 ws_stride,
                 side_base,
@@ -1735,10 +1803,12 @@ if _CUTE_AVAILABLE:
                 timeout_ns,
                 stats_recv,
                 stats_flags,
+                stats_stale,
             ).launch(
                 grid=[self.ep, blocks, 1],
                 block=[_PUSH_WARPS * 32, 1, 1],
-                smem=_PUSH_WARPS * self.wire + 128 if self.bulk else 0,
+                smem=(_PUSH_WARPS * self.wire + 128 if self.bulk else 0)
+                + (256 if self.flag_tma else 0),
                 stream=stream,
                 use_pdl=self.pdl,
             )
@@ -1749,6 +1819,8 @@ if _CUTE_AVAILABLE:
             mY: cute.Tensor,
             tma_atom: Optional[cute.CopyAtom],
             mSide: Optional[cute.Tensor],
+            tma_cf: Optional[cute.CopyAtom],
+            mCf: Optional[cute.Tensor],
             ws_base: Int64,
             ws_stride: Int64,
             side_base: Int64,
@@ -1760,6 +1832,7 @@ if _CUTE_AVAILABLE:
             timeout_ns: Int64,
             stats_recv: Int64,
             stats_flags: Int64,
+            stats_stale: Int64,
         ):
             L = self.lay
             src = mY.iterator.toint()
@@ -1770,10 +1843,10 @@ if _CUTE_AVAILABLE:
             lane = cute.arch.lane_idx()
             my_ws = ws_base + Int64(rank) * ws_stride
             nbytes = self.hidden * 2
+            smem = SmemAllocator()
             stage = Int32(0)
             tS = tG = None
             if cutlass.const_expr(self.tma):
-                smem = SmemAllocator()
                 chunks = self.wire // _TMA_CHUNK
                 sRing = smem.allocate_tensor(
                     cutlass.Uint8,
@@ -1794,11 +1867,32 @@ if _CUTE_AVAILABLE:
                 if warp == 0:
                     cpasync.prefetch_descriptor(tma_atom)
             elif cutlass.const_expr(self.bulk):
-                smem = SmemAllocator()
                 buf = smem.allocate_array(
                     cutlass.Uint8, _PUSH_WARPS * self.wire, byte_alignment=128
                 )
                 stage = Int32(buf.toint()) + warp * self.wire
+            sCf = tS_cf = tG_cf = bar_cf = None
+            if cutlass.const_expr(self.flag_tma):
+                sCf = smem.allocate_tensor(
+                    Int32,
+                    cute.make_layout((self.ep, 1, 1), stride=(1, self.ep, self.ep)),
+                    byte_alignment=128,
+                )
+                bar_cf = smem.allocate_array(Int64, 1)
+                gCf = cute.local_tile(mCf, (self.ep, 1), (0, None))
+                tS_cf, tG_cf = cpasync.tma_partition(
+                    tma_cf,
+                    0,
+                    cute.make_layout(1),
+                    cute.group_modes(sCf, 0, 2),
+                    cute.group_modes(gCf, 0, 2),
+                )
+                if source == rank:
+                    if by == 0:
+                        if warp == 0:
+                            with cute.arch.elect_one():
+                                cute.arch.mbarrier_v1_init(bar_cf, 1)
+                            cute.arch.mbarrier_init_fence()
 
             if cutlass.const_expr(self.fin):
                 cute.arch.griddepcontrol_launch_dependents()
@@ -1917,7 +2011,9 @@ if _CUTE_AVAILABLE:
             if cutlass.const_expr(not self.data_only):
                 if tidx == 0:
                     _fence_acq_rel_sys()
-                    _st_sys_b32(dst_side + _SIDE_DONE + (rank * _SIDE_BLOCKS + by) * 4, value)
+                    _st_sys_b32(
+                        dst_side + _SIDE_DONE + (rank * _SIDE_BLOCKS + by) * _SIDE_DONE_STRIDE, value
+                    )
             if source == rank:
                 if by == 0:
                     if cutlass.const_expr(self.fin):
@@ -1927,12 +2023,28 @@ if _CUTE_AVAILABLE:
                             my_ws, rank, True, warp, lane, self.ep, self.adv_base, L, timeout_ns
                         )
                     if warp == 0:
-                        if lane < self.ep:
-                            flag_addr = my_ws + L["combine_flags"] + lane * 4
+                        flag_addr = my_ws + L["combine_flags"] + lane * 4
+                        if cutlass.const_expr(self.flag_tma):
+                            retries = _tma_flag_wait(
+                                tma_cf, tG_cf[(None, 0)], tS_cf[(None, 0)], bar_cf, self.ep * 4, True
+                            )
+                            if lane < self.ep:
+                                # A bank a counted-write round left unarmed passes the check: verify the value.
+                                if sCf[(lane, 0, 0)] != value:
+                                    if stats_stale != 0:
+                                        wait_stats.add(stats_stale, 1)
+                                    _spin_eq(flag_addr, value, timeout_ns)
+                                _st_b32(flag_addr, Int32(-1))
                             if stats_flags != 0:
-                                if _ld_sys_b32(flag_addr) != value:
-                                    wait_stats.add(stats_flags, 1)
-                            _spin_eq(flag_addr, value, timeout_ns)
+                                if lane == 0:
+                                    if retries > 0:
+                                        wait_stats.add(stats_flags, retries)
+                        else:
+                            if lane < self.ep:
+                                if stats_flags != 0:
+                                    if _ld_sys_b32(flag_addr) != value:
+                                        wait_stats.add(stats_flags, 1)
+                                _spin_eq(flag_addr, value, timeout_ns)
                         cute.arch.sync_warp()
                         if lane == 0:
                             _st_b32(my_ws + L["flag"], value)
@@ -2073,7 +2185,9 @@ if _CUTE_AVAILABLE:
                             src = i // blocks
                             if src != rank:
                                 _spin_eq(
-                                    my_side + _SIDE_DONE + (src * _SIDE_BLOCKS + i % blocks) * 4,
+                                    my_side
+                                    + _SIDE_DONE
+                                    + (src * _SIDE_BLOCKS + i % blocks) * _SIDE_DONE_STRIDE,
                                     value,
                                     timeout_ns,
                                 )
@@ -2273,6 +2387,8 @@ if _CUTE_AVAILABLE:
                 i32,
                 i64,
                 i64,
+                make_ptr(Int32, 1 << 20, cute.AddressSpace.gmem, assumed_align=16),
+                i64,
                 stream,
                 options=opt,
             )
@@ -2336,9 +2452,9 @@ class LamportInbox(NamedTuple):
     """Consumer view of the Lamport combine inbox (``CuteA2A.combine_push``). Rank r's side buffer starts at
     ``side_base + r * side_stride``; inbox ``b`` (b = round parity) at ``_SIDE_INBOX + b * inbox_bytes``; the row of
     (source rank s, slot d) at ``(s * rows + d) * wire``; ``wire`` bytes per row, e4m3 (``lpc``) or bf16.
-    Push-completion words ``done[s][by]`` (u32) at ``_SIDE_DONE + (s * _SIDE_BLOCKS + by) * 4`` hold the round's
-    combine value once source s's CTA ``by`` < ``blocks`` finished. ``sentinel`` is the inbox's armed value
-    (``INBOX_SENTINELS``)."""
+    Push-completion words ``done[s][by]`` (u32) at ``_SIDE_DONE + (s * _SIDE_BLOCKS + by) * _SIDE_DONE_STRIDE``
+    hold the round's combine value once source s's CTA ``by`` < ``blocks`` finished (armed ``_SIDE_DONE_ARMED`` for
+    the TMA flag check; a rank's own words stay 0). ``sentinel`` is the inbox's armed value (``INBOX_SENTINELS``)."""
 
     side_base: int
     side_stride: int
@@ -2427,6 +2543,12 @@ class CuteA2A:
         self.side = self._side_mem.as_torch_strided_tensor(torch.uint8)
         mine = self.side[self.rank]
         mine[:_SIDE_INBOX].zero_()
+        done_bytes = self.ep * _SIDE_BLOCKS * _SIDE_DONE_STRIDE
+        if done_bytes > _SIDE_INBOX:
+            raise ValueError(f"Lamport inbox: {self.ep} ranks exceed the {_SIDE_INBOX} B header")
+        done = mine[:done_bytes].view(torch.int32).view(self.ep, _SIDE_BLOCKS, 4)
+        done[:, :, 0] = _SIDE_DONE_ARMED
+        done[self.rank, :, 0] = 0
         boxes = mine[_SIDE_INBOX : _SIDE_INBOX + 2 * self.inbox_bytes]
         if self.sentinel == "ff":
             boxes.fill_(0xFF)
@@ -2776,11 +2898,13 @@ class CuteA2A:
         bulk: bool = True,
         data_only: bool = False,
         store: Optional[str] = None,
+        flags: Optional[str] = None,
     ) -> LamportInbox:
         """Push each received row back to its source rank's inbox: a warp per row loads the bf16 expert output
         (after ``fin_done[s * max + t] >= fin_expected`` when given, else after the producer grid), casts it to the
         wire format, turns -0 into +0 and stores the row into ``inbox[parity]`` of the source with ``store``
-        (``INBOX_STORES``; None: ``bulk``, else 16-B thread stores). Own rows stay in the payload. The consumer
+        (``INBOX_STORES``; None: ``bulk``, else 16-B thread stores). The round CTA waits for the peers' push-start
+        flags with ``flags`` (``FLAG_CHECKS``; None: ``FLAG_CHECK_ENV``). Own rows stay in the payload. The consumer
         (``lamport_reduce`` or a fused kernel following ``LamportInbox``) must read this round's rows, re-arm what
         it read and ``griddepcontrol.wait`` before it exits."""
         y, n, runtime_max = self._combine_args(final_hidden_states)
@@ -2797,8 +2921,15 @@ class CuteA2A:
         side_stride = self.side.stride(0)
         if store == "tma" and side_stride >= 1 << 31:
             raise ValueError(f"Lamport TMA store: side stride {side_stride} exceeds the descriptor's int32")
+        if flags is None:
+            flags = flag_check()
+        if flags not in FLAG_CHECKS:
+            raise ValueError(f"combine_push: flags {flags!r}; valid: {', '.join(FLAG_CHECKS)}")
+        flag_tma = flags == "tma"
+        if flag_tma and (self.lay.combine_flags % 16 or (self.ep * 4) % 16):
+            raise ValueError("TMA flag check needs a 16 B aligned combine_flags bank")
         fgs = fin_done is not None
-        ws_base, ws_stride, _ = self._ws()
+        ws_base, ws_stride, my_ws = self._ws()
         blocks = self._lamport_blocks(runtime_max)
         _compile(
             "lamport_push",
@@ -2815,6 +2946,7 @@ class CuteA2A:
             store == "bulk",
             data_only,
             store == "tma",
+            flag_tma,
         )(
             y.view(-1),
             ws_base,
@@ -2835,7 +2967,14 @@ class CuteA2A:
             ),
             side_stride,
             wait_stats.addr("moe.push.recv_counters_spin"),
-            wait_stats.addr("moe.push.combine_flags_spin"),
+            wait_stats.addr("moe.push.combine_flags_" + ("retry" if flag_tma else "spin")),
+            make_ptr(
+                Int32,
+                my_ws + self.lay.combine_flags,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            wait_stats.addr("moe.push.combine_flags_stale"),
         )
         box = self.lamport_inbox()
         self._lamport_round = (n, runtime_max)

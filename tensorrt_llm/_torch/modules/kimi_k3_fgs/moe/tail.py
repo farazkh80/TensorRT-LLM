@@ -52,6 +52,8 @@ from .comm import (
     _COUNTER_STRIDE,
     _SIDE_BLOCKS,
     _SIDE_DONE,
+    _SIDE_DONE_ARMED,
+    _SIDE_DONE_STRIDE,
     _SIDE_INBOX,
     _asm,
     _bf16x2_to_f32,
@@ -76,6 +78,7 @@ from .comm import (
     _st_b64,
     _st_v2,
     _st_v4,
+    _tma_flag_wait,
     _v,
 )
 from .latent import _THREADS_PER_ROW, _VEC
@@ -166,9 +169,10 @@ class ReduceNormKernel:
     ``fgs`` is the combine's finalize-push mode (``CuteA2A.combine(fin_done=...)``): own rows are read from the
     payload and this kernel advances the round flag. ``lamport`` (``LAMPORT_WAITS``) reads the Lamport inbox of
     ``rows`` rows per source and ``inbox_bytes`` per parity instead (see the module docstring); ``sentinel``
-    (``SENTINELS``) is the inbox's armed value and ``rearm`` stores it back. ``check_in=False`` (negative-control
-    builds only) skips the slot counter waits or the inbox polls. ``delay_ns`` (hazard tests only) delays the normed
-    row stores.
+    (``SENTINELS``) is the inbox's armed value and ``rearm`` stores it back. With ``flag_tma`` the ``done`` wait is
+    one TMA load of the ``push_blocks`` x ``ep`` completion words (``comm.FLAG_CHECK_ENV``), re-issued until it
+    reports them valid, and the words are re-armed. ``check_in=False`` (negative-control builds only) skips the slot
+    counter waits or the inbox polls. ``delay_ns`` (hazard tests only) delays the normed row stores.
     """
 
     def __init__(
@@ -187,6 +191,8 @@ class ReduceNormKernel:
         inbox_bytes: int = 0,
         sentinel: str = "80",
         rearm: bool = True,
+        flag_tma: bool = False,
+        push_blocks: int = 0,
     ):
         assert top_k <= 32 and wire in WIRE_DTYPES and sentinel in SENTINELS
         assert not (lamport and fgs), "the Lamport push takes the finalize words itself"
@@ -197,6 +203,9 @@ class ReduceNormKernel:
         self.check_in, self.delay_ns = check_in, delay_ns
         self.lamport, self.rows, self.inbox_bytes = lamport, rows, inbox_bytes
         self.tma, self.rearm = lamport == 3, rearm
+        self.flag_tma, self.push_blocks = lamport == 2 and flag_tma, push_blocks
+        if self.flag_tma:
+            assert 0 < push_blocks <= _SIDE_BLOCKS and ep * _SIDE_BLOCKS * _SIDE_DONE_STRIDE <= _SIDE_INBOX
         lpc = wire == "e4m3"
         self.row_bytes = hidden * (1 if lpc else 2)
         if sentinel == "ff":
@@ -214,6 +223,8 @@ class ReduceNormKernel:
         if self.tma:
             assert self.row_bytes % _TMA_CHUNK == 0 and inbox_bytes == ep * rows * self.row_bytes
             self.smem_bytes += 32 * 4 + top_k * 8 + 256 + top_k * self.row_bytes
+        if self.flag_tma:
+            self.smem_bytes += 256 + _SIDE_DONE_STRIDE * push_blocks * ep
 
     @cute.jit
     def __call__(
@@ -221,6 +232,7 @@ class ReduceNormKernel:
         mOut: cute.Tensor,
         mW: cute.Tensor,
         inbox_ptr: cute.Pointer,
+        done_ptr: cute.Pointer,
         ready_addr: Int64,
         ws_base: Int64,
         ws_stride: Int64,
@@ -235,6 +247,7 @@ class ReduceNormKernel:
         blocks: Int32,
         eps: Float32,
         stats: Int64,
+        stats_stale: Int64,
         stream,
     ):
         tv_layout = cute.make_layout(
@@ -242,6 +255,24 @@ class ReduceNormKernel:
             stride=((_VEC, 1), (1, _VEC * _THREADS_PER_ROW)),
         )
         tiler_mn = (1, self.H)
+        tma_done = tma_tensor_done = None
+        if cutlass.const_expr(self.flag_tma):
+            # The completion words of every (source, push CTA) as (chunk word, CTA, source): one 16 B chunk each.
+            B = self.push_blocks
+            words = _SIDE_DONE_STRIDE // 4
+            m_done = cute.make_tensor(
+                done_ptr,
+                cute.make_layout(
+                    (words, B, self.ep, 1),
+                    stride=(1, words, _SIDE_BLOCKS * words, _SIDE_BLOCKS * words * self.ep),
+                ),
+            )
+            tma_done, tma_tensor_done = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(),
+                m_done,
+                cute.make_layout((words, B, self.ep), stride=(1, words, words * B)),
+                (words, B, self.ep),
+            )
         tma_atom = tma_tensor = None
         if cutlass.const_expr(self.tma):
             # Both parities of this rank's inbox as (chunk byte, chunk, row): rows of parity b start at
@@ -265,6 +296,8 @@ class ReduceNormKernel:
             mW,
             tma_atom,
             tma_tensor,
+            tma_done,
+            tma_tensor_done,
             ready_addr,
             ws_base,
             ws_stride,
@@ -279,6 +312,7 @@ class ReduceNormKernel:
             blocks,
             eps,
             stats,
+            stats_stale,
             tv_layout,
             tiler_mn,
         ).launch(
@@ -296,6 +330,8 @@ class ReduceNormKernel:
         mW: cute.Tensor,
         tma_atom: Optional[cute.CopyAtom],
         mInbox: Optional[cute.Tensor],
+        tma_done: Optional[cute.CopyAtom],
+        mDone: Optional[cute.Tensor],
         ready_addr: Int64,
         ws_base: Int64,
         ws_stride: Int64,
@@ -310,6 +346,7 @@ class ReduceNormKernel:
         blocks: Int32,
         eps: Float32,
         stats: Int64,
+        stats_stale: Int64,
         tv_layout: cute.Layout,
         tiler_mn: cute.Shape,
     ):
@@ -352,6 +389,31 @@ class ReduceNormKernel:
                 with cute.arch.elect_one():
                     for s in cutlass.range_constexpr(K):
                         cute.arch.mbarrier_v1_init(bars + s, 1)
+                cute.arch.mbarrier_init_fence()
+        sDone = tS_d = tG_d = bar_done = None
+        if cutlass.const_expr(self.flag_tma):
+            B = self.push_blocks
+            words = _SIDE_DONE_STRIDE // 4
+            sDone = smem.allocate_tensor(
+                Int32,
+                cute.make_layout(
+                    (words, B, self.ep, 1), stride=(1, words, words * B, words * B * self.ep)
+                ),
+                byte_alignment=128,
+            )
+            bar_done = smem.allocate_array(Int64, 1)
+            gDone = cute.local_tile(mDone, (words, B, self.ep), (0, 0, 0, None))
+            tS_d, tG_d = cpasync.tma_partition(
+                tma_done,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sDone, 0, 3),
+                cute.group_modes(gDone, 0, 3),
+            )
+            if warp == 0:
+                cpasync.prefetch_descriptor(tma_done)
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_v1_init(bar_done, 1)
                 cute.arch.mbarrier_init_fence()
         my_ws = ws_base + Int64(rank) * ws_stride
         inbox = my_ws + L["combine_recv"]
@@ -411,15 +473,42 @@ class ReduceNormKernel:
                 if cutlass.const_expr(self.lamport == 2):
                     # Inbox without the edge: every peer's every push CTA completes first.
                     miss = Int32(0)
+                    if cutlass.const_expr(self.flag_tma):
+                        retries = _tma_flag_wait(
+                            tma_done,
+                            tG_d[(None, 0)],
+                            tS_d[(None, 0)],
+                            bar_done,
+                            _SIDE_DONE_STRIDE * self.push_blocks * self.ep,
+                            False,
+                        )
+                        if stats != 0:
+                            if lane == 0:
+                                if retries > 0:
+                                    wait_stats.add(stats, retries)
                     for i in cutlass.range(lane, self.ep * blocks, 32, unroll=1):
                         src = i // blocks
+                        by = i % blocks
                         if src != rank:
-                            addr = my_side + _SIDE_DONE + (src * _SIDE_BLOCKS + i % blocks) * 4
-                            if stats != 0:
-                                if _ld_sys_b32(addr) != done_value:
+                            addr = (
+                                my_side + _SIDE_DONE + (src * _SIDE_BLOCKS + by) * _SIDE_DONE_STRIDE
+                            )
+                            if cutlass.const_expr(self.flag_tma):
+                                # A word a spin-mode round left unarmed passes the check: verify, then re-arm.
+                                if sDone[(0, by, src, 0)] != done_value:
                                     miss = miss + 1
-                            _spin_eq(addr, done_value, timeout_ns)
-                    if stats != 0:
+                                    _spin_eq(addr, done_value, timeout_ns)
+                                _st_b32(addr, Int32(_SIDE_DONE_ARMED))
+                            else:
+                                if stats != 0:
+                                    if _ld_sys_b32(addr) != done_value:
+                                        miss = miss + 1
+                                _spin_eq(addr, done_value, timeout_ns)
+                    if cutlass.const_expr(self.flag_tma):
+                        if stats_stale != 0:
+                            if miss > 0:
+                                wait_stats.add(stats_stale, miss)
+                    elif stats != 0:
                         if miss > 0:
                             wait_stats.add(stats, miss)
                 if cutlass.const_expr(self.lamport == 0):
@@ -688,6 +777,8 @@ def _compiled(
     inbox_bytes,
     sentinel,
     rearm,
+    flag_tma,
+    push_blocks,
 ):
     def fake(dtype, shape):
         return cute.runtime.make_fake_compact_tensor(
@@ -711,10 +802,13 @@ def _compiled(
             inbox_bytes,
             sentinel,
             rearm,
+            flag_tma,
+            push_blocks,
         ),
         fake(BFloat16, (cute.sym_int(), hidden)),
         fake(BFloat16, (hidden,)),
         make_ptr(cutlass.Uint8, 1 << 20, cute.AddressSpace.gmem, assumed_align=128),
+        make_ptr(Int32, 1 << 20, cute.AddressSpace.gmem, assumed_align=128),
         i64,
         i64,
         i64,
@@ -728,6 +822,7 @@ def _compiled(
         i64,
         i32,
         Float32(1e-6),
+        i64,
         i64,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
@@ -759,9 +854,11 @@ def reduce_norm(
     lamport: str = "",
     inbox=None,
     rearm: bool = True,
+    flag_check: Optional[str] = None,
 ) -> torch.Tensor:
     """Launch :class:`ReduceNormKernel` on a combine receive region (``CuteA2A`` workspace layout ``lay``), or with
-    ``lamport`` ("tma" / "poll" / "done") on the Lamport inbox ``inbox`` (``CuteA2A.lamport_inbox()``)."""
+    ``lamport`` ("tma" / "poll" / "done") on the Lamport inbox ``inbox`` (``CuteA2A.lamport_inbox()``); ``flag_check``
+    (``comm.FLAG_CHECKS``, None: the environment) selects how "done" waits for the completion words."""
     hidden = out.shape[-1]
     if (
         out.dtype != torch.bfloat16
@@ -778,6 +875,11 @@ def reduce_norm(
     mode = LAMPORT_WAITS[lamport]
     if mode and inbox is None:
         raise ValueError("reduce_norm: the Lamport modes need the inbox descriptor")
+    if flag_check is None:
+        flag_check = _comm.flag_check()
+    if flag_check not in _comm.FLAG_CHECKS:
+        raise ValueError(f"reduce_norm: flag_check {flag_check!r}; valid: {', '.join(_comm.FLAG_CHECKS)}")
+    flag_tma = mode == 2 and flag_check == "tma"
     fn = _compiled(
         ep,
         top_k,
@@ -793,12 +895,20 @@ def reduce_norm(
         inbox.inbox_bytes if mode else 0,
         inbox.sentinel if mode else "80",
         rearm,
+        flag_tma,
+        inbox.blocks if flag_tma else 0,
     )
-    inbox_addr = inbox.side_base + rank * inbox.side_stride + _SIDE_INBOX if mode == 3 else 1 << 20
+    my_side = inbox.side_base + rank * inbox.side_stride if mode else 0
+    inbox_addr = my_side + _SIDE_INBOX if mode == 3 else 1 << 20
+    done_addr = my_side + _SIDE_DONE if flag_tma else 1 << 20
+    site = _STATS_SITE[mode] if mode else ""
+    if flag_tma:
+        site = "done_retry"
     fn(
         out,
         norm_weight,
         make_ptr(cutlass.Uint8, inbox_addr, cute.AddressSpace.gmem, assumed_align=128),
+        make_ptr(Int32, done_addr, cute.AddressSpace.gmem, assumed_align=128),
         ready.data_ptr() if ready is not None else 0,
         ws_base,
         ws_stride,
@@ -812,7 +922,8 @@ def reduce_norm(
         inbox.side_stride if mode else 0,
         inbox.blocks if mode else 1,
         eps,
-        wait_stats.addr(f"moe.recv_norm.{_STATS_SITE[mode]}") if mode else 0,
+        wait_stats.addr(f"moe.recv_norm.{site}") if mode else 0,
+        wait_stats.addr("moe.recv_norm.done_stale") if flag_tma else 0,
     )
     return out
 
@@ -832,12 +943,13 @@ def combine_norm(
     lamport_wait: str = "poll",
     rearm: bool = True,
     store: str = "bulk",
+    flag_check: Optional[str] = None,
 ) -> torch.Tensor:
     """``CuteA2A.combine`` with its reduce replaced by :class:`ReduceNormKernel`: returns the latent-normed
     ``[local_tokens, hidden]`` rows (``out`` when given). Same push, flags, finalize-push mode and wire format (bf16,
     or e4m3 with a low-precision combine communicator) as the combine; ``inbox="lamport"`` pushes into the Lamport
-    inbox (``CuteA2A.combine_push``, store path ``store``) and reads it with ``lamport_wait`` ("tma", "poll" or
-    "done"), storing the sentinel back when ``rearm``."""
+    inbox (``CuteA2A.combine_push``, store path ``store``, flag wait ``flag_check``) and reads it with
+    ``lamport_wait`` ("tma", "poll" or "done"), storing the sentinel back when ``rearm``."""
     y, n, runtime_max = a2a._combine_args(final_hidden_states)
     hidden = y.shape[1]
     if out is None:
@@ -870,7 +982,12 @@ def combine_norm(
             and os.environ.get(_comm.INBOX_DATA_ONLY_ENV, "0") == "1"
         )
         box = a2a.combine_push(
-            y, fin_done=fin_done, fin_expected=fin_expected, data_only=data_only, store=store
+            y,
+            fin_done=fin_done,
+            fin_expected=fin_expected,
+            data_only=data_only,
+            store=store,
+            flags=flag_check,
         )
         return reduce_norm(
             out,
@@ -880,6 +997,7 @@ def combine_norm(
             lamport=lamport_wait,
             inbox=box,
             rearm=rearm,
+            flag_check=flag_check,
             **common,
         )
     if inbox is not None:
