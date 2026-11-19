@@ -47,11 +47,8 @@ from ..mamba.recurrent_state_cache import reset_recurrent_state_rows
 from ..multi_stream_utils import maybe_execute_in_parallel
 from ._kda_kernels import KDAKernelDispatch, fused_kda_post_conv
 
-try:
-    from ..kimi_k3_fgs import edges as k3_fgs_edges
-    from ..kimi_k3_fgs import kda_chain as k3_kda_chain
-except ImportError:
-    k3_fgs_edges = k3_kda_chain = None
+from ..kimi_k3_fgs import edges as k3_fgs_edges
+from ..kimi_k3_fgs import kda_chain as k3_kda_chain
 
 if TYPE_CHECKING:
     from ..mamba.mamba2_metadata import Mamba2Metadata
@@ -421,8 +418,16 @@ class KimiKDALinearAttention(nn.Module):
         # Output buffer for the inplace-only ``trtllm::kda_decode`` op.
         self._o_dense: Optional[torch.Tensor] = None
         # TLLM_K3_FGS=lamport: decode writes the core into a slot of this edge, read only by o_proj.
-        if k3_fgs_edges is not None:
-            k3_fgs_edges.declare("kda.core_o", self.proj_size, self.layer_idx)
+        k3_fgs_edges.declare("kda.core_o", self.proj_size, self.layer_idx)
+        k3_kda_chain.declare(
+            self.layer_idx,
+            self.hidden_size,
+            self.head_dim + self.num_heads
+            if self.use_full_rank_gate
+            else 2 * self.head_dim + self.num_heads,
+            self.proj_size,
+            (4 if self.use_full_rank_gate else 3) * self.proj_size,
+        )
         self._projection_bufs: Optional[Tuple[torch.Tensor, ...]] = None
         self._packed_conv_weight: Optional[torch.Tensor] = None
         self._mtp_conv_weights: Optional[Tuple[torch.Tensor, ...]] = None
@@ -701,12 +706,39 @@ class KimiKDALinearAttention(nn.Module):
             return output
         return cores[0] if len(cores) == 1 else torch.cat(cores, dim=0)
 
+    def k3_chain_ready(self) -> bool:
+        """Whether a TLLM_K3_FGS=chain decode step reads the block input only through the CuTe GEMMs of
+        ``k3_kda_chain.project`` (or their unchained form), so a 2-reader input slot is always consumed."""
+        gemm = _k3_cute_gemm_module()
+        return (
+            k3_fgs_edges.chain()
+            and gemm is not None
+            and gemm.enabled()
+            and self._dispatch.decode_kernel_path == "optimized"
+            and self._qkvg_proj_weight is not None
+            and self._bfa_proj_weight is not None
+            and self.use_full_rank_gate
+            and self._o_allreduce is None
+        )
+
     def _project_output(self, core: Union[torch.Tensor, _KdaPrequantizedCore]) -> torch.Tensor:
         """Project the post-o_norm KDA core and reduce TP partials."""
         if isinstance(core, _KdaPrequantizedCore):
             out = self.o_proj.forward_prequantized(core.activation, core.scale)
         else:
-            out = _linear(self.o_proj, core.reshape(-1, self.proj_size))
+            core2d = core.reshape(-1, self.proj_size)
+            gemm = _k3_cute_gemm_module() if getattr(self.o_proj, "_k3_cute_gemm", False) else None
+            if (
+                gemm is not None
+                and gemm.enabled()
+                and type(self.o_proj) is nn.Linear
+                and self.o_proj.bias is None
+                and self._o_allreduce is None
+            ):
+                # TLLM_K3_FGS=chain: into a slot the pre-MoE mix consumes (the decoder layer releases it).
+                out = k3_kda_chain.o_proj(core2d, self.o_proj.weight)
+            else:
+                out = _linear(self.o_proj, core2d)
         if self._o_allreduce is not None:
             # Head-sharded TP: every rank ran its head shard on the same
             # local batch; sum the row-sharded o_proj partials.
@@ -1225,21 +1257,50 @@ class KimiKDALinearAttention(nn.Module):
             return qkvg if qkvg_out is None else qkvg_out.copy_(qkvg)
 
         projection_aux_stream = (
-            self._projection_aux_stream if B <= _KDA_BFA_MULTISTREAM_MAX_ROWS else None
+            self._projection_aux_stream
+            if B <= _KDA_BFA_MULTISTREAM_MAX_ROWS and not k3_kda_chain.bfa_on_main_stream()
+            else None
         )
-        with maybe_stage(fgs, "kda.dec_proj"):
-            if fgs is not None and projection_aux_stream is not None:
-                projection_aux_stream = fgs.side_stream() or projection_aux_stream
-            qkvg, (beta, g, onorm_lowrank) = maybe_execute_in_parallel(
-                _project_qkvg,
-                lambda: self._project_gate_inputs(
-                    x2d, out=gate_out, before_up=fgs.mark_output if fgs is not None else None
-                ),
-                self._projection_fork_event,
-                self._projection_join_event,
-                projection_aux_stream,
-                disable_on_compile=True,
+        # TLLM_K3_FGS=chain: every projection on this stream, into slots KdaDecodeT1 consumes.
+        chain_proj = None
+        if (
+            fgs is None
+            and fgs_slot
+            and staged_state is None
+            and "decode" in _CUTE_KDA
+            and self._cute_conv_w is not None
+            and self.k3_chain_ready()
+        ):
+            chain_proj = k3_kda_chain.project(
+                x2d, self._bfa_proj_weight, self.f_b_proj.weight, self._qkvg_proj_weight, hd
             )
+        k3_fgs_edges.debug(
+            "kda.dec_proj",
+            B,
+            "chain"
+            if chain_proj is not None
+            else "default (bfa / f_b "
+            + ("on the main stream" if projection_aux_stream is None else "on the aux stream")
+            + (f"; refusal: {k3_fgs_edges.last_refusal()}" if k3_fgs_edges.chain() else "")
+            + ")",
+        )
+        if chain_proj is not None:
+            qkvg, bfa_slot, g, _ = chain_proj
+            beta, onorm_lowrank = bfa_slot[:, hd : hd + H], None
+        else:
+            with maybe_stage(fgs, "kda.dec_proj"):
+                if fgs is not None and projection_aux_stream is not None:
+                    projection_aux_stream = fgs.side_stream() or projection_aux_stream
+                qkvg, (beta, g, onorm_lowrank) = maybe_execute_in_parallel(
+                    _project_qkvg,
+                    lambda: self._project_gate_inputs(
+                        x2d, out=gate_out, before_up=fgs.mark_output if fgs is not None else None
+                    ),
+                    self._projection_fork_event,
+                    self._projection_join_event,
+                    projection_aux_stream,
+                    disable_on_compile=True,
+                )
         x_qkvg = qkvg[:, : 3 * d]
         onorm_g = qkvg[:, 3 * d : 4 * d] if self.use_full_rank_gate else onorm_lowrank
 
@@ -1261,6 +1322,7 @@ class KimiKDALinearAttention(nn.Module):
                 kda_out,
                 mamba_metadata,
                 fgs_slot,
+                chain_proj is not None,
             )
             if o is None:
                 o = self._dispatch.decode_kda(
@@ -1298,6 +1360,8 @@ class KimiKDALinearAttention(nn.Module):
             # Fused-verify replay caches (spec decoding only): keep the
             # committed conv window in sync with the plain-decode advance.
             self._sync_kda_replay_conv_window(layer_cache, slot_indices, conv_pool)
+        if chain_proj is not None:
+            k3_kda_chain.consume(chain_proj[3])
         if fgs is not None:
             fgs.keep(qkvg, beta, g, onorm_g, o)
 
@@ -1317,8 +1381,10 @@ class KimiKDALinearAttention(nn.Module):
         kda_out,
         mamba_metadata,
         fgs_slot: bool = False,
+        chained: bool = False,
     ) -> Optional[torch.Tensor]:
-        """CuTe DSL T=1 decode (TLLM_K3_CUTE_KDA=decode), or None to keep the stock kernel."""
+        """CuTe DSL T=1 decode (TLLM_K3_CUTE_KDA=decode), or None to keep the stock kernel; ``chained``
+        when the projections came from ``k3_kda_chain.project`` (the core is their FGS consumer)."""
         if "decode" not in _CUTE_KDA:
             return None
         from ...attention.kernels.blackwell.kimi_k3_kda import fused_decode
@@ -1355,18 +1421,22 @@ class KimiKDALinearAttention(nn.Module):
                 args = None
         _count_path("decode", args is not None)
         if args is None:
+            k3_fgs_edges.debug("kda.decode_t1", B, "cute=False")
             return None
         fgs_kwargs = {}
-        if k3_fgs_edges is not None and k3_fgs_edges.producer_early(B):
-            fgs_kwargs = dict(fgs_producer=True)
+        if k3_fgs_edges.producer_early(B):
             lease = (
-                k3_fgs_edges.acquire("kda.core_o", B, window=k3_fgs_edges.lamport_window())
+                k3_fgs_edges.acquire(
+                    "kda.core_o", B, window=None if chained else k3_fgs_edges.lamport_window()
+                )
                 if fgs_slot
                 else None
             )
             if lease is not None:
                 args = args[:-1] + (lease.tensor.view(B, H, hd),)
                 fgs_kwargs.update(k3_kda_chain.core_kwargs(B, H, lease))
+            fgs_kwargs.update(k3_kda_chain.core_sync_kwargs(B, chained, True))
+        k3_fgs_edges.debug("kda.decode_t1", B, f"cute=True fgs={sorted(fgs_kwargs)}")
         return fused_decode.kda_decode_t1(
             *args,
             lower_bound=self.gate_lower_bound,

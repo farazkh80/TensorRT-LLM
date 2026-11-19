@@ -31,6 +31,14 @@ KdaDecodeT1 producer of ``CORE`` as one resident wave (``persistent``), with the
 gate only in its epilogue (``ogate=1``) and taking first the heads qkvg publishes first (``first=n``).
 ``TLLM_K3_FGS_KDA_REARM=core_o`` (off by default) makes that producer arm the ``CORE`` slot of the next KDA layer in
 the same step itself (``TLLM_K3_FGS_KDA_REARM_DELAY_NS`` delays its arming stores, for hazard tests).
+
+:func:`core_sync_kwargs` adds the chained core's sync form: ``TLLM_K3_FGS_KDA_CORE_CHECK=sw|tma`` (how the consumer
+checks its slots: the ``ld.relaxed`` poll, or TMA ``report_valid`` loads), ``TLLM_K3_FGS_KDA_CORE_STORE=st|tma`` (how
+the producer stores the core output: 16-B stores, or a TMA store per item), ``edges.links_off()`` (the consumer waits
+for its producer grid and the producer triggers at ``edges.links_trigger()``) and the ``wait_stats`` counters
+``kda.core.retry`` / ``kda.core.sw_poll`` / ``kda.core.sw_fallback``. ``TLLM_K3_KDA_BFA_STREAM=aux|main`` places the
+unchained decode [f_a | b] -> f_b projections on the decoder layer's auxiliary stream (default) or on the main stream
+behind qkvg, the chain's order (parity arm of the stock FGS-off path).
 """
 
 import atexit
@@ -43,7 +51,7 @@ import torch
 
 from ....logger import logger
 from .. import kimi_k3_cute_gemm
-from . import edges
+from . import edges, wait_stats
 
 X_NORM = "kda.x_norm"
 BFA = "kda.bfa"
@@ -368,6 +376,59 @@ def core_kwargs(rows: int, heads: int = 96, lease=None) -> Dict[str, object]:
         shown = {k: "<tensor>" if isinstance(v, torch.Tensor) else v for k, v in kwargs.items()}
         logger.info(f"{CORE_ENV}={os.environ.get(CORE_ENV, CORE_DEFAULT)!r} rows={rows}: {shown}")
         edges.debug("kda.core_knob", rows, str(shown))
+    return kwargs
+
+
+CHECK_ENV = "TLLM_K3_FGS_KDA_CORE_CHECK"
+STORE_ENV = "TLLM_K3_FGS_KDA_CORE_STORE"
+BFA_STREAM_ENV = "TLLM_K3_KDA_BFA_STREAM"
+_sync_logged = set()
+
+
+def _choice(env: str, default: str, valid: Tuple[str, ...]) -> str:
+    value = os.environ.get(env, default).strip().lower() or default
+    if value not in valid:
+        raise ValueError(f"{env}={value!r}; valid: {', '.join(valid)}")
+    return value
+
+
+def core_check() -> str:
+    return _choice(CHECK_ENV, "sw", ("sw", "tma"))
+
+
+def core_store() -> str:
+    return _choice(STORE_ENV, "st", ("st", "tma"))
+
+
+def bfa_on_main_stream() -> bool:
+    return _choice(BFA_STREAM_ENV, "aux", ("aux", "main")) == "main"
+
+
+def core_sync_kwargs(rows: int, consumer: bool, producer: bool) -> Dict[str, object]:
+    """``kda_decode_t1`` kwargs of the decode core's sync form: the consumer check (``CHECK_ENV``), the producer store
+    (``STORE_ENV``), the links-off control arm (grid wait before the first slot read, trigger at
+    ``edges.links_trigger()``) and the wait-site counters."""
+    kwargs: Dict[str, object] = {}
+    if producer:
+        kwargs["fgs_producer"] = True
+        if core_store() == "tma":
+            kwargs["fgs_tma_store"] = True
+        if edges.links_off():
+            kwargs["fgs_trigger"] = edges.links_trigger()
+    if consumer:
+        kwargs["fgs_consumer"] = True
+        kwargs["fgs_input_check"] = core_check()
+        if edges.links_off():
+            kwargs["fgs_links"] = False
+        if wait_stats.enabled():
+            kwargs["fgs_counters"] = tuple(
+                wait_stats.addr(f"kda.core.{site}") for site in ("retry", "sw_poll", "sw_fallback")
+            )
+    key = (rows, consumer, producer)
+    if key not in _sync_logged:
+        _sync_logged.add(key)
+        shown = {k: v for k, v in kwargs.items() if k != "fgs_counters"}
+        edges.debug("kda.core_sync", rows, f"{shown} counters={wait_stats.enabled()}")
     return kwargs
 
 
