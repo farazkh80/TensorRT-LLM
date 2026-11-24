@@ -125,6 +125,7 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.kimi_k3_attn_res.attn_res_mix_cute import attn_res_mix as _cute_attn_res_mix
 from ..modules.kimi_k3_fgs import edges as k3_fgs_edges
 from ..modules.kimi_k3_fgs import kda_chain as k3_kda_chain
+from ..modules.kimi_k3_fgs import mla_chain as k3_mla_chain
 from ..modules.kimi_k3_fgs import moe_chain as k3_moe_chain
 from ..modules.kimi_k3_fgs import moe_streams as k3_moe_streams
 from ..modules.kimi_k3_fgs import recipe as k3_fgs_recipe
@@ -144,6 +145,7 @@ from ..moe.fused_moe import ConfigurableMoE, SiTuActivation, TRTLLMGenFusedMoE, 
 from ..moe.fused_moe.interface import MoESchedulerKind
 from ..moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from ..nccl_window_tensor_scope import nccl_window_tensor_scoped_module
+from ..pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
 from ..utils import AuxStreamType
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
@@ -2223,9 +2225,40 @@ class KimiMLARuntime(nn.Module):
             mapping_with_cp=mapping_with_cp,
         )
 
+    def k3_chain_begin(self, rows: int, attn_metadata: AttentionMetadata):
+        """Arm this decode step's MLA chain (``k3_mla_chain.begin``) and return the x_norm slot lease the
+        pre-attention mix writes, or None to keep the stock path."""
+        self._k3_chain = None
+        mla, meta = self.mixer, attn_metadata
+        if (
+            self._o_allreduce is not None
+            or is_in_breakable_cuda_graph()
+            or meta.num_generations != rows
+            or meta.kv_lens_cuda_runtime.shape[0] != rows
+            or mla.mapping.has_cp_helix()
+            or not mla._k3_latent_append_active(meta, rows)
+        ):
+            return None
+        weights = k3_mla_chain.weights_of(mla)
+        if weights is None:
+            return None
+        pool_idx = int(meta.host_kv_cache_pool_mapping[mla.mqa.get_local_layer_idx(meta), 0])
+        self._k3_chain = k3_mla_chain.begin(
+            mla,
+            meta.kv_cache_manager.get_buffers(mla.mqa.layer_idx),
+            meta.kv_cache_block_offsets[pool_idx, :rows, 0, :],
+            meta.kv_lens_cuda_runtime[:rows].to(torch.int32),
+            int(meta.max_num_requests),
+            weights,
+        )
+        return None if self._k3_chain is None else self._k3_chain.leases[k3_mla_chain.X_NORM]
+
     def forward(
         self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
     ) -> torch.Tensor:
+        chain = self.__dict__.pop("_k3_chain", None)
+        if chain is not None:
+            return k3_mla_chain.run(chain)
         # MLA.forward takes position_ids first; K3 is NoPE, so pass None.
         out = self.mixer(None, hidden_states, attn_metadata)
         if self._o_allreduce is not None:
@@ -2415,7 +2448,8 @@ class KimiLinearDecoderLayer(nn.Module):
             hidden_states = hidden_states + residual_addend
         prefix_sum = hidden_states
         valid_block_residual = block_residual[:num_snapshots]
-        # The pre-attention mix publishes x_norm into a slot the attention chain consumes (both KDA GEMMs).
+        # The pre-attention mix publishes x_norm into a slot the attention chain consumes (both KDA GEMMs, or
+        # the MLA fused-A and g_proj GEMMs).
         x_norm_lease = None
         if (
             sliced is None
@@ -2433,6 +2467,8 @@ class KimiLinearDecoderLayer(nn.Module):
                 x_norm_lease = k3_kda_chain.acquire(
                     k3_kda_chain.X_NORM, prefix_sum.shape[0], readers=2
                 )
+            else:
+                x_norm_lease = self.self_attn.k3_chain_begin(prefix_sum.shape[0], attn_metadata)
         x_norm_fgs = (
             {} if x_norm_lease is None else dict(out=x_norm_lease.tensor, fgs_producer=True)
         )

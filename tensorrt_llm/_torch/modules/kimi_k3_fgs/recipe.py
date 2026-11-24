@@ -6,12 +6,16 @@
 edge the recipe does not list is off; a config without ``edges`` runs ``DEFAULT_EDGES``, an empty map none (FGS off on
 the same kernels).
 
-Edge names: the KDA chain edges (``KDA_EDGES``).
+Edge names: the KDA chain edges (``KDA_EDGES``); ``mla.chain``, every mla.* slot (the decode MLA layer runs as a
+chain only with all of them) except ``mla.attn_o``, the chain's o_proj -> pre-MoE mix edge, which when listed runs only
+at its own rows (unlisted: wherever the chain runs).
 """
 
 from typing import Dict, Optional, Tuple
 
 KDA_EDGES = ("kda.x_norm", "kda.qkvg", "kda.bfa", "kda.g", "kda.core_o", "kda.attn_o")
+MLA_CHAIN = "mla.chain"
+MLA_ATTN_O = "mla.attn_o"
 # Edge windows of the decode recipe, run when the config lists no edges.
 DEFAULT_EDGES: Dict[str, Tuple[Tuple[int, int], ...]] = {
     "kda.x_norm": ((8, 64),),
@@ -19,8 +23,10 @@ DEFAULT_EDGES: Dict[str, Tuple[Tuple[int, int], ...]] = {
     "kda.bfa": ((8, 64),),
     "kda.g": ((8, 64),),
     "kda.core_o": ((8, 64),),
+    "mla.chain": ((1, 64),),
+    "mla.attn_o": ((1, 16),),
 }
-_FAMILIES = frozenset(("kda",))
+_FAMILIES = frozenset(("kda", "mla"))
 
 _windows: Dict[str, Tuple[Tuple[int, int], ...]] = {}
 _owned: frozenset = frozenset()
@@ -37,7 +43,7 @@ def install(config) -> None:
     _windows, _owned = {}, frozenset()
     if config is None:
         return
-    known = set(KDA_EDGES)
+    known = set(KDA_EDGES) | {MLA_CHAIN, MLA_ATTN_O}
     names = DEFAULT_EDGES if config.edges is None else config.edges
     unknown = sorted(set(names) - known)
     if unknown:
@@ -49,9 +55,10 @@ def install(config) -> None:
     )
     _owned = _FAMILIES
 
-    from . import edges
+    from . import edges, mla_chain
 
     edges.configure_window(span(KDA_EDGES))
+    mla_chain.configure_window(span((MLA_CHAIN,)))
 
 
 def owns(family: str) -> bool:
@@ -71,8 +78,12 @@ def on(edge: str, rows: int) -> bool:
 
 
 def slot_allowed(slot: str, rows: int) -> bool:
-    """Whether the recipe lets the kda edge holding ``slot`` run at ``rows``."""
+    """Whether the recipe lets the kda / mla edge holding ``slot`` run at ``rows``."""
     family = slot.partition(".")[0]
     if family == "kda" and slot in KDA_EDGES and owns("kda"):
         return on(slot, rows)
+    if family == "mla" and owns("mla"):
+        if slot == MLA_ATTN_O and MLA_ATTN_O in _windows:
+            return on(MLA_CHAIN, rows) and on(MLA_ATTN_O, rows)
+        return on(MLA_CHAIN, rows)
     return True

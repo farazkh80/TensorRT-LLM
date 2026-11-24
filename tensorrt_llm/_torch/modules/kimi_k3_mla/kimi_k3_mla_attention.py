@@ -23,6 +23,8 @@ from ...attention.backends.interface import PositionalEmbeddingParams, RopeParam
 from ...attention.mla import MLA, k3_cute_mla_enabled
 from ...model_config import ModelConfig
 from ...utils import AuxStreamType
+from ..kimi_k3_fgs import edges as k3_fgs_edges
+from ..kimi_k3_fgs import mla_chain as k3_mla_chain
 from ..linear import Linear, TensorParallelMode
 
 
@@ -241,6 +243,20 @@ class KimiK3MLAAttention(MLA):
             module = getattr(self, name, None)
             if isinstance(module, Linear):
                 module._k3_cute_gemm = True
+        # mla.gated: the output gate writes into a slot of this edge, read only by o_proj.
+        if self.use_output_gate:
+            k3_fgs_edges.declare("mla.gated", self.o_proj.in_features, self.layer_idx)
+            if self.fuse_qkv_a_proj:
+                k3_mla_chain.declare(
+                    self.layer_idx,
+                    hidden_size,
+                    q_lora_rank,
+                    kv_lora_rank,
+                    qk_rope_head_dim,
+                    self.num_heads_tp,
+                    qk_nope_head_dim,
+                    v_head_dim,
+                )
 
     def _apply_output_gate(
         self,
@@ -259,6 +275,21 @@ class KimiK3MLAAttention(MLA):
                 )
 
                 if supported(attn_output, gate):
+                    rows = attn_output.shape[0]
+                    if k3_fgs_edges.producer_early(rows):
+                        lease = k3_fgs_edges.acquire(
+                            "mla.gated", rows, window=k3_fgs_edges.lamport_window()
+                        )
+                        # In the chain modes the producer build's early trigger only pays with the edge's slot;
+                        # without it o_proj starts early and finishes later.
+                        if lease is not None or not k3_fgs_edges.chain():
+                            # The producer build stores into a separate buffer, never in place.
+                            out = (
+                                torch.empty_like(attn_output)
+                                if lease is None
+                                else lease.tensor.view(attn_output.shape)
+                            )
+                            return mla_output_gate(attn_output, gate, out=out, fgs_producer=True)
                     return mla_output_gate(attn_output, gate)
             return attn_output * gate.sigmoid()
         return attn_output
