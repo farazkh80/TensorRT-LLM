@@ -12,6 +12,7 @@ from enum import IntEnum
 from typing import Literal, Optional
 
 import torch
+import yaml
 
 import tensorrt_llm._torch.model_config
 import tensorrt_llm._torch.pyexecutor.config_utils
@@ -50,9 +51,25 @@ from tensorrt_llm._torch.pyexecutor.model_loader import (
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.utils import get_model_extra_attrs, model_extra_attrs
 from tensorrt_llm._utils import local_mpi_size, mpi_rank, mpi_world_size, torch_dtype_to_binding
-from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, KvCacheConfig, MoeConfig, TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import (
+    DecodingBaseConfig,
+    FineGrainedSyncConfig,
+    KvCacheConfig,
+    MoeConfig,
+    TorchLlmArgs,
+)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+
+
+def _fine_grained_sync_args() -> dict:
+    """``fine_grained_sync_config`` from the ``--config`` style YAML named by ``LWB_FGS_CONFIG``, if set."""
+    path = os.environ.get("LWB_FGS_CONFIG")
+    if not path:
+        return {}
+    with open(path) as f:
+        config = yaml.safe_load(f)["fine_grained_sync_config"]
+    return {"fine_grained_sync_config": FineGrainedSyncConfig(**config)}
 
 
 class BalanceMethod(IntEnum):
@@ -474,6 +491,7 @@ class Runner:
             # `model_config.spec_config`; this keeps `llm_args` consistent with it.
             **({"speculative_config": spec_config} if spec_config is not None else {}),
             **{} if use_cuda_graph else {"cuda_graph_config": None},
+            **_fine_grained_sync_args(),
             moe_config=MoeConfig(
                 backend=moe_backend,
                 max_num_tokens=moe_max_num_tokens,
@@ -543,6 +561,8 @@ class Runner:
             # valid rows, and no `position_ids` -- MLA derives RoPE positions from
             # `attn_metadata`. `create_run_pack` passes the bank through the
             # `residual` slot and seeds the count for a mid-model slice.
+            from tensorrt_llm._torch.modules.kimi_k3_fgs import edges as k3_fgs_edges
+
             block_residual = residual
             # A decoder that folds each layer's closing residual add into the next layer
             # returns the add's operand instead; finish the last one here.
@@ -552,21 +572,22 @@ class Runner:
                 False,
             )
             residual_addend = None
-            for layer_idx in layer_indices:
-                layer = model.model.layers[layer_idx]
-                if fold:
-                    hidden_states, num_snapshots, residual_addend = layer(
-                        hidden_states,
-                        block_residual,
-                        num_snapshots,
-                        attn_metadata,
-                        residual_addend=residual_addend,
-                        defer_residual_add=True,
-                    )
-                else:
-                    hidden_states, num_snapshots = layer(
-                        hidden_states, block_residual, num_snapshots, attn_metadata
-                    )
+            with k3_fgs_edges.model_scope(layer_indices, rows=hidden_states.shape[0]):
+                for layer_idx in layer_indices:
+                    layer = model.model.layers[layer_idx]
+                    if fold:
+                        hidden_states, num_snapshots, residual_addend = layer(
+                            hidden_states,
+                            block_residual,
+                            num_snapshots,
+                            attn_metadata,
+                            residual_addend=residual_addend,
+                            defer_residual_add=True,
+                        )
+                    else:
+                        hidden_states, num_snapshots = layer(
+                            hidden_states, block_residual, num_snapshots, attn_metadata
+                        )
             if residual_addend is not None:
                 hidden_states = hidden_states + residual_addend
             return hidden_states, block_residual

@@ -60,6 +60,7 @@ from tensorrt_llm.quantization.utils.fp4_utils import (
 if TYPE_CHECKING:
     from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
     from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
+                                              FineGrainedSyncConfig,
                                               KvCacheCompressionConfig,
                                               LoraConfig, SparseAttentionConfig,
                                               SpeculativeConfig)
@@ -299,6 +300,8 @@ class ModelConfig(Generic[TConfig]):
     moe_disable_finalize_fusion: bool = False
     # If true, use low precision combine in MoE operations (only for NVFP4 quantization)
     use_low_precision_moe_combine: bool = False
+    # Per-batch-size fine-grained-sync edge recipe; None keeps the model's defaults.
+    fine_grained_sync_config: Optional["FineGrainedSyncConfig"] = None
 
     # NVFP4 GEMM backend configuration - list of backends to consider for auto-selection
     nvfp4_gemm_allowed_backends: List[str] = field(

@@ -123,8 +123,10 @@ from ..distributed.symm_mem_allgather import SymmetricMemoryAllGather
 from ..model_config import ModelConfig
 from ..modules.gated_mlp import GatedMLP
 from ..modules.kimi_k3_attn_res.attn_res_mix_cute import attn_res_mix as _cute_attn_res_mix
+from ..modules.kimi_k3_fgs import edges as k3_fgs_edges
 from ..modules.kimi_k3_fgs import moe_chain as k3_moe_chain
 from ..modules.kimi_k3_fgs import moe_streams as k3_moe_streams
+from ..modules.kimi_k3_fgs import recipe as k3_fgs_recipe
 from ..modules.kimi_kda import KimiKDALinearAttention
 from ..modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
 from ..modules.linear import (
@@ -2544,6 +2546,8 @@ class KimiLinearModel(DecoderModel):
         }
 
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size, dtype=dtype)
+        # Layers declare their fine-grained-sync edges at construction.
+        k3_fgs_recipe.install(model_config.fine_grained_sync_config)
         self.layers = nn.ModuleList(
             [
                 KimiLinearDecoderLayer(model_config, cfg, layer_idx, self.aux_stream_dict)
@@ -2628,51 +2632,52 @@ class KimiLinearModel(DecoderModel):
             if spec_metadata is not None
             else None
         )
-        for i, layer in enumerate(self.layers):
-            # DFlash/DSpark hidden-state capture. The drafter is distilled on
-            # the aggregated stream value -- the pre-norm softmax mixture its
-            # next consumer sees -- not on the raw prefix sum a layer returns,
-            # which is SGLang's fallback for models without the
-            # attention-residual scheme. Capturing the prefix sum costs 4.5pt
-            # of draft acceptance on K3 + RadixArk DSpark (AR 66.9% -> 71.4%).
-            # The tap fires inside layer i+1, which computes that tensor
-            # anyway; see its forward docstring. Ground truth: SGLang
-            # kimi_k3.py:2697 _dspark_capture_stream, attn_residual.py:313
-            # aggregate_stream_torch.
-            capture = None
-            if (
-                spec_metadata is not None
-                and i > 0
-                and (capture_set is None or self.layers[i - 1].layer_idx in capture_set)
-            ):
-                capture = (spec_metadata, self.layers[i - 1].layer_idx)
-            if i == self.helix_a2a_first_layer:
-                if residual_addend is not None:
-                    hidden_states = hidden_states + residual_addend
-                    residual_addend = None
-                # Rows are rank-replicated up to here: keep this rank's chunk.
-                hidden_states = self.helix_a2a.scatter_rows(hidden_states, num_tokens)
-                block_residual = self.helix_a2a.scatter_rows(block_residual, num_tokens)
-            if _CUTE_NORM_FOLD_ENABLED:
-                hidden_states, num_snapshots, residual_addend = layer(
-                    hidden_states,
-                    block_residual,
-                    num_snapshots,
-                    attn_metadata,
-                    capture=capture,
-                    helix_a2a=self.helix_a2a,
-                    residual_addend=residual_addend,
-                    defer_residual_add=True,
-                )
-            else:
-                hidden_states, num_snapshots = layer(
-                    hidden_states,
-                    block_residual,
-                    num_snapshots,
-                    attn_metadata,
-                    capture=capture,
-                    helix_a2a=self.helix_a2a,
-                )
+        with k3_fgs_edges.model_scope(rows=hidden_states.shape[0]):
+            for i, layer in enumerate(self.layers):
+                # DFlash/DSpark hidden-state capture. The drafter is distilled on
+                # the aggregated stream value -- the pre-norm softmax mixture its
+                # next consumer sees -- not on the raw prefix sum a layer returns,
+                # which is SGLang's fallback for models without the
+                # attention-residual scheme. Capturing the prefix sum costs 4.5pt
+                # of draft acceptance on K3 + RadixArk DSpark (AR 66.9% -> 71.4%).
+                # The tap fires inside layer i+1, which computes that tensor
+                # anyway; see its forward docstring. Ground truth: SGLang
+                # kimi_k3.py:2697 _dspark_capture_stream, attn_residual.py:313
+                # aggregate_stream_torch.
+                capture = None
+                if (
+                    spec_metadata is not None
+                    and i > 0
+                    and (capture_set is None or self.layers[i - 1].layer_idx in capture_set)
+                ):
+                    capture = (spec_metadata, self.layers[i - 1].layer_idx)
+                if i == self.helix_a2a_first_layer:
+                    if residual_addend is not None:
+                        hidden_states = hidden_states + residual_addend
+                        residual_addend = None
+                    # Rows are rank-replicated up to here: keep this rank's chunk.
+                    hidden_states = self.helix_a2a.scatter_rows(hidden_states, num_tokens)
+                    block_residual = self.helix_a2a.scatter_rows(block_residual, num_tokens)
+                if _CUTE_NORM_FOLD_ENABLED:
+                    hidden_states, num_snapshots, residual_addend = layer(
+                        hidden_states,
+                        block_residual,
+                        num_snapshots,
+                        attn_metadata,
+                        capture=capture,
+                        helix_a2a=self.helix_a2a,
+                        residual_addend=residual_addend,
+                        defer_residual_add=True,
+                    )
+                else:
+                    hidden_states, num_snapshots = layer(
+                        hidden_states,
+                        block_residual,
+                        num_snapshots,
+                        attn_metadata,
+                        capture=capture,
+                        helix_a2a=self.helix_a2a,
+                    )
         if residual_addend is not None and spec_metadata is not None:
             hidden_states = hidden_states + residual_addend
             residual_addend = None

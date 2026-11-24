@@ -1987,6 +1987,52 @@ class MoeConfig(StrictBaseModel):
     )
 
 
+class FineGrainedSyncConfig(StrictBaseModel):
+    """Fine-grained-sync (FGS) recipe: which producer -> consumer edges run per decode batch size.
+
+    An FGS edge lets a consumer kernel start before its producer completes and wait on the producer's data instead
+    (sentinel-armed slots or counters). Each CUDA graph is captured at one batch size, so a graph runs the edges whose
+    windows hold its batch size. Used by Kimi K3 on SM107; the model rejects edge names it does not have.
+    """
+    edges: Optional[Dict[str, List[Tuple[PositiveInt, PositiveInt]]]] = Field(
+        default=None,
+        description=
+        "Edge name (for example 'kda.x_norm', 'mla.chain', 'moe.recv_norm') -> inclusive [low, high] windows of "
+        "decode rows per rank where the edge runs. An edge that is not listed is off. None keeps the model's "
+        "default windows; an empty map runs no edge, which is FGS off on the same kernels."
+    )
+
+    @field_validator("edges")
+    @classmethod
+    def validate_windows(
+        cls, edges: Optional[Dict[str, List[Tuple[int, int]]]]
+    ) -> Optional[Dict[str, List[Tuple[int, int]]]]:
+        if edges is None:
+            return edges
+        for name, windows in edges.items():
+            if not windows:
+                raise ValueError(
+                    f"edge {name!r} has no window; leave it out to turn it off")
+            spans = sorted(windows)
+            for low, high in spans:
+                if low > high:
+                    raise ValueError(
+                        f"edge {name!r}: window [{low}, {high}] is empty")
+            for (prev_low, prev_high), (low, high) in zip(spans, spans[1:]):
+                if low <= prev_high:
+                    raise ValueError(
+                        f"edge {name!r}: windows [{prev_low}, {prev_high}] and [{low}, {high}] overlap"
+                    )
+        return edges
+
+    def windows(self, edge: str) -> Tuple[Tuple[int, int], ...]:
+        """The sorted row windows of ``edge`` (empty when it is off at every batch size)."""
+        return tuple(sorted((self.edges or {}).get(edge, ())))
+
+    def edge_on(self, edge: str, rows: int) -> bool:
+        return any(low <= rows <= high for low, high in self.windows(edge))
+
+
 Nvfp4Backend = Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin']
 
 # `TOKENIZER_ALIASES` (alias -> full "module.ClassName" import path) lives in
@@ -6626,6 +6672,12 @@ class TorchLlmArgs(BaseLlmArgs):
                                   description="MoE config.",
                                   status="beta")
 
+    fine_grained_sync_config: Optional[FineGrainedSyncConfig] = Field(
+        default=None,
+        description=
+        "Fine-grained-sync edge recipe per decode batch size. None keeps the model's defaults.",
+        status="prototype")
+
     nvfp4_gemm_config: Nvfp4GemmConfig = Field(
         default_factory=Nvfp4GemmConfig,
         description="NVFP4 GEMM backend config.",
@@ -8176,6 +8228,7 @@ def update_llm_args_with_extra_dict(
         "decoding_config": DecodingConfig,
         "lora_config": LoraConfig,
         "moe_config": MoeConfig,
+        "fine_grained_sync_config": FineGrainedSyncConfig,
         "nvfp4_gemm_config": Nvfp4GemmConfig,
         "attention_dp_config": AttentionDpConfig,
         "reorder_policy_config": ReorderRequestPolicyConfig,

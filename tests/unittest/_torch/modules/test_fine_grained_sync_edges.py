@@ -1,0 +1,576 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""GPU tests of the fine-grained-sync edge workspaces (sentinel slots, resets, graphs).
+
+Runs under pytest, or standalone with a PASS/FAIL summary:
+``FGS_OVL_DIR=<dir with fine_grained_sync.py> python3 test_fine_grained_sync_edges.py``
+loads the module from that directory instead of the installed package.
+"""
+
+import importlib
+import os
+import sys
+import traceback
+import types
+
+import torch
+
+try:
+    import pytest
+except ImportError:
+    pytest = None
+
+# About 50 ms on a ~2 GHz SM clock; long enough that an unordered reset always wins the race.
+SLOW_CYCLES = 100_000_000
+_fgs = None
+
+
+def fgs():
+    global _fgs
+    if _fgs is None:
+        ovl = os.environ.get("FGS_OVL_DIR")
+        if ovl:
+            package = types.ModuleType("fgs_ovl")
+            package.__path__ = [ovl]
+            sys.modules["fgs_ovl"] = package
+            _fgs = importlib.import_module("fgs_ovl.fine_grained_sync")
+        else:
+            _fgs = importlib.import_module("tensorrt_llm._torch.modules.fine_grained_sync")
+    return _fgs
+
+
+# Fill kernel per backend name: the AUTO backend runs the CuTe fill from this many bytes up.
+_CUTE_MIN_BYTES = {"auto": 4 << 20, "fill": 1 << 62, "cute": 0}
+
+
+def _backends():
+    return list(_CUTE_MIN_BYTES)
+
+
+def _parametrize(name, values):
+    if pytest is None:
+        return lambda fn: fn
+    return pytest.mark.parametrize(name, values)
+
+
+if pytest is not None:
+    pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+
+
+def _lane(dtype):
+    if dtype == torch.float8_e4m3fn:
+        return torch.uint8, 0x80
+    if dtype == torch.uint8:
+        return torch.uint8, 0xFF
+    return (
+        (torch.int16, -0x8000)
+        if dtype in (torch.bfloat16, torch.float16)
+        else (torch.int32, -(2**31))
+    )
+
+
+def non_sentinel(t: torch.Tensor) -> torch.Tensor:
+    lane, value = _lane(t.dtype)
+    return (t.reshape(-1).view(lane) != value).sum()
+
+
+def count_non_sentinel(t: torch.Tensor) -> int:
+    return int(non_sentinel(t).item())
+
+
+def junk_(t: torch.Tensor) -> torch.Tensor:
+    lane, _ = _lane(t.dtype)
+    t.view(lane).fill_(0x34 if lane == torch.uint8 else 0x1234)
+    return t
+
+
+def _edges(backend, **kwargs):
+    return fgs().EdgeWorkspaces(cute_min_bytes=_CUTE_MIN_BYTES[backend], **kwargs)
+
+
+def test_cute_fill_standalone():
+    fill = importlib.import_module(fgs().__name__.rsplit(".", 1)[0] + ".fine_grained_sync_fill")
+    word = -0x7FFF8000
+    guard = 4096
+    for vecs in (1, 3, 1024, 1025, 4096 * 4 + 7, (1 << 20) + 5):
+        for ctas in (1, 4, 212):
+            buf = torch.full((2 * guard + vecs * 8 + 8,), 0x1234, dtype=torch.int16, device="cuda")
+            target = buf[guard : guard + vecs * 8].view(torch.bfloat16)
+            fill.sentinel_fill_(target, word, max_ctas=ctas)
+            torch.cuda.synchronize()
+            assert count_non_sentinel(target) == 0, (vecs, ctas)
+            assert bool((buf[:guard] == 0x1234).all()) and bool(
+                (buf[guard + vecs * 8 :] == 0x1234).all()
+            ), (
+                "fill wrote outside its tensor",
+                vecs,
+                ctas,
+            )
+    odd = torch.full((15,), 0x1234, dtype=torch.int16, device="cuda").view(torch.bfloat16)
+    fill.sentinel_fill_(odd, word)
+    assert count_non_sentinel(odd) == 0, "byte tail"
+
+
+SHAPES = [
+    ((16, 224), torch.bfloat16),
+    ((16, 49152), torch.bfloat16),
+    ((16, 96, 128), torch.float16),
+    ((7, 9), torch.bfloat16),
+    ((7, 9), torch.float32),
+    ((512, 4096), torch.bfloat16),
+]
+
+
+@_parametrize("backend", _backends())
+def test_preinit_bitexact(backend):
+    edges = _edges(backend)
+    for index, (shape, dtype) in enumerate(SHAPES):
+        edges.workspace(f"e{index}", shape, dtype)
+    torch.cuda.synchronize()
+    for index, _ in enumerate(SHAPES):
+        for slot in edges[f"e{index}"].slots:
+            assert count_non_sentinel(slot) == 0, (backend, SHAPES[index])
+            junk_(slot)
+    edges.preinitialize()
+    torch.cuda.synchronize()
+    for index, _ in enumerate(SHAPES):
+        for slot in edges[f"e{index}"].slots:
+            assert count_non_sentinel(slot) == 0, (backend, SHAPES[index], "after junk")
+
+
+@_parametrize("backend", _backends())
+def test_reset_bitexact_and_row_bound(backend):
+    edges = _edges(backend)
+    ws = edges.workspace("rows", (64, 7168), torch.bfloat16)
+    odd = edges.workspace("odd", (7, 9), torch.bfloat16)
+    f32 = edges.workspace("f32", (40, 12), torch.float32)
+    for slot in range(2):
+        junk_(ws.slots[slot][16:])
+    with edges.scope():
+        for _ in range(2):
+            lease = edges.acquire("rows", rows=16)
+            assert lease.tensor.shape == (16, 7168)
+            lease.tensor.normal_()
+            edges.release(lease)
+        for name in ("odd", "f32"):
+            for _ in range(2):
+                lease = edges.acquire(name)
+                lease.tensor.normal_()
+                edges.release(lease)
+    torch.cuda.synchronize()
+    for slot in range(2):
+        assert count_non_sentinel(ws.slots[slot][:16]) == 0, backend
+        assert count_non_sentinel(ws.slots[slot][16:]) == 48 * 7168, "reset wrote past its rows"
+        assert count_non_sentinel(odd.slots[slot]) == 0, backend
+        assert count_non_sentinel(f32.slots[slot]) == 0, backend
+
+
+def _slow_reader_run(backend, reader_joined):
+    edges = _edges(backend)
+    n = 4 << 20
+    edges.workspace("e", (n,), torch.bfloat16, slots=1)
+    src = torch.randn(n, device="cuda", dtype=torch.bfloat16)
+    src.view(torch.int16)[src.view(torch.int16) == -0x8000] = 0
+    out = torch.empty_like(src)
+    reader = torch.cuda.Stream()
+    main = torch.cuda.current_stream()
+    with edges.scope():
+        lease = edges.acquire("e")
+        lease.tensor.copy_(src)
+        reader.wait_stream(main)
+        with torch.cuda.stream(reader):
+            torch.cuda._sleep(SLOW_CYCLES)
+            out.copy_(lease.tensor)
+        edges.release(lease, streams=[reader] if reader_joined else None)
+    torch.cuda.synchronize()
+    clobbered = count_non_sentinel(src) - count_non_sentinel(out)
+    return clobbered, torch.equal(out.view(torch.int16), src.view(torch.int16)), edges
+
+
+@_parametrize("backend", ["fill", "cute"])
+def test_release_waits_for_slow_reader(backend):
+    clobbered, intact, edges = _slow_reader_run(backend, True)
+    assert intact and clobbered == 0, "reset clobbered a slot its last reader was still reading"
+    assert count_non_sentinel(edges["e"].storage) == 0
+    # Control: releasing on the producer's stream only must visibly clobber the reader.
+    clobbered, intact, _ = _slow_reader_run(backend, False)
+    assert not intact and clobbered > 0, "control did not clobber; the test cannot detect a race"
+
+
+def test_fan_out_readers():
+    edges = _edges("fill")
+    n = 1 << 20
+    edges.workspace("e", (n,), torch.bfloat16)
+    src = torch.ones(n, device="cuda", dtype=torch.bfloat16)
+    outs = [torch.empty_like(src) for _ in range(2)]
+    readers = [torch.cuda.Stream() for _ in range(2)]
+    main = torch.cuda.current_stream()
+    with edges.scope():
+        lease = edges.acquire("e", readers=2)
+        lease.tensor.copy_(src)
+        for index, (stream, out) in enumerate(zip(readers, outs)):
+            stream.wait_stream(main)
+            with torch.cuda.stream(stream):
+                torch.cuda._sleep(SLOW_CYCLES * (2 - index))
+                out.copy_(lease.tensor)
+        edges.release(lease, streams=[readers[1]])
+        assert not lease.released
+        edges.release(lease, streams=[readers[0]])
+        assert lease.released
+    torch.cuda.synchronize()
+    for out in outs:
+        assert torch.equal(out, src)
+
+
+def _layered_forward(edges, x_in, out, violations, side, layers=5, slow=True):
+    main = torch.cuda.current_stream()
+    with edges.scope():
+        cur, prev = x_in, None
+        for layer in range(layers):
+            la = edges.acquire("a")
+            violations += non_sentinel(la.tensor)
+            torch.add(cur, float(layer + 1), out=la.tensor)
+            if prev is not None:
+                edges.release(prev)
+            lb = edges.acquire("b")
+            violations += non_sentinel(lb.tensor)
+            side.wait_stream(main)
+            with torch.cuda.stream(side):
+                if slow:
+                    torch.cuda._sleep(SLOW_CYCLES // 50)
+                torch.mul(la.tensor, 0.5, out=lb.tensor)
+            edges.release(la, streams=[side])
+            main.wait_stream(side)
+            cur, prev = lb.tensor, lb
+        out.copy_(cur)
+        edges.release(prev)
+
+
+def _layered_reference(x, layers=5):
+    for layer in range(layers):
+        x = torch.mul(torch.add(x, float(layer + 1)), 0.5)
+    return x
+
+
+@_parametrize("backend", _backends())
+def test_graph_capture_and_replays(backend):
+    edges = _edges(backend)
+    edges.workspace("a", (16, 4096), torch.bfloat16, slots=5)
+    edges.workspace("b", (16, 4096), torch.bfloat16, slots=5)
+    x_in = torch.randn(16, 4096, device="cuda", dtype=torch.bfloat16)
+    out = torch.empty_like(x_in)
+    violations = torch.zeros((), dtype=torch.int64, device="cuda")
+    side = torch.cuda.Stream()
+
+    for _ in range(2):
+        _layered_forward(edges, x_in, out, violations, side)
+    torch.cuda.synchronize()
+    assert torch.equal(out, _layered_reference(x_in)), "eager forward mismatch"
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _layered_forward(edges, x_in, out, violations, side)
+    torch.cuda.synchronize()
+    violations.zero_()
+
+    for _ in range(3):
+        x_in.copy_(torch.randn_like(x_in))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, _layered_reference(x_in)), "replay mismatch"
+        for name in ("a", "b"):
+            assert count_non_sentinel(edges[name].storage) == 0, "replay ended with an unarmed slot"
+
+    inputs = [torch.randn_like(x_in) for _ in range(10)]
+    results = []
+    for x in inputs:
+        x_in.copy_(x)
+        graph.replay()
+        results.append(out.clone())
+    torch.cuda.synchronize()
+    for x, result in zip(inputs, results):
+        assert torch.equal(result, _layered_reference(x)), "back-to-back replay mismatch"
+    assert int(violations.item()) == 0, "a producer saw an unarmed slot during replay"
+
+
+@_parametrize("backend", _backends())
+def test_step_batched_reset(backend):
+    edges = _edges(backend)
+    a = edges.workspace("a", (64, 12288), torch.bfloat16, slots=12)
+    b = edges.workspace("b", (64, 3072), torch.bfloat16, slots=12)
+    flushes = edges.flushes
+    with edges.scope():
+        leases = []
+        for layer in range(12):
+            for name in ("a", "b"):
+                lease = edges.acquire(name, rows=16)
+                lease.tensor.normal_()
+                edges.release(lease)
+                leases.append(lease)
+            if layer == 0:
+                torch.cuda.synchronize()
+                assert count_non_sentinel(leases[0].tensor) > 0, "step policy reset a slot early"
+                assert edges.flushes == flushes
+        assert edges.flushes == flushes + 1, "no flush once every slot was dirty"
+        for ws in (a, b):
+            starts = [lease.tensor.data_ptr() for lease in leases if lease.workspace is ws]
+            step = 16 * ws.shape[1] * 2
+            assert starts == [starts[0] + i * step for i in range(12)], "slots are not packed"
+    assert edges.flushes == flushes + 1, "scope exit flushed again"
+    torch.cuda.synchronize()
+    for ws in (a, b):
+        assert count_non_sentinel(ws.storage) == 0, backend
+
+
+def test_step_reuse_rules():
+    edges = _edges("fill")
+    edges.workspace("a", (16, 1024), torch.bfloat16, slots=2)
+    edges.workspace("b", (16, 1024), torch.bfloat16, slots=2)
+    violations = torch.zeros((), dtype=torch.int64, device="cuda")
+    with edges.scope():
+        # A held slot of b keeps the step from being complete, so nothing flushes on its own.
+        lease_b = edges.acquire("b")
+        for _ in range(2):
+            lease = edges.acquire("a")
+            lease.tensor.fill_(1.0)
+            edges.release(lease)
+        assert edges.flushes == 0
+        try:
+            edges.acquire("a")
+            raise AssertionError("a dirty slot was reused before a flush")
+        except RuntimeError:
+            pass
+        edges.flush()
+        lease = edges.acquire("a")
+        assert (lease.slot, lease.gen) == (0, 2)
+        violations += non_sentinel(lease.tensor)
+        edges.release(lease)
+        edges.release(lease_b)
+    torch.cuda.synchronize()
+    assert int(violations.item()) == 0, "a flushed slot was handed out before its reset"
+    with edges.scope():
+        lease = edges.acquire("a", rows=8)
+        try:
+            edges.acquire("a", rows=16)
+            raise AssertionError("two row counts in one scope were accepted for packed slots")
+        except ValueError:
+            pass
+        edges.release(lease)
+    with edges.scope():
+        edges.release(edges.acquire("a", rows=16))
+    torch.cuda.synchronize()
+    for name in ("a", "b"):
+        assert count_non_sentinel(edges[name].storage) == 0
+
+
+BYTE_SHAPES = [((40, 3072), torch.float8_e4m3fn), ((40, 96), torch.uint8), ((7, 9), torch.uint8)]
+
+
+@_parametrize("backend", _backends())
+def test_byte_sentinels(backend):
+    edges = _edges(backend)
+    for index, (shape, dtype) in enumerate(BYTE_SHAPES):
+        edges.workspace(f"b{index}", shape, dtype)
+    torch.cuda.synchronize()
+    for index, _ in enumerate(BYTE_SHAPES):
+        for slot in edges[f"b{index}"].slots:
+            assert count_non_sentinel(slot) == 0, (backend, BYTE_SHAPES[index])
+    with edges.scope():
+        for index, _ in enumerate(BYTE_SHAPES):
+            for _ in range(2):
+                lease = edges.acquire(f"b{index}")
+                junk_(lease.tensor)
+                edges.release(lease)
+    torch.cuda.synchronize()
+    for index, _ in enumerate(BYTE_SHAPES):
+        assert count_non_sentinel(edges[f"b{index}"].storage) == 0, (backend, BYTE_SHAPES[index])
+
+
+def test_bounded_reset():
+    edges = _edges("auto")
+    slots = 3
+    act = edges.workspace("act", (64, 3072), torch.float8_e4m3fn, slots=slots, bounded=True)
+    sf = edges.workspace("sf", (64, 96), torch.uint8, slots=slots, bounds_from="act")
+    assert sf.bounds is act.bounds
+    used = [5, 17, 40][:slots]
+    leases = []
+    with edges.scope():
+        for rows_used in used:
+            a, s = edges.acquire("act", rows=48), edges.acquire("sf", rows=48)
+            assert a.slot == s.slot and a.bound.data_ptr() == s.bound.data_ptr()
+            junk_(a.tensor)
+            junk_(s.tensor)
+            a.bound.fill_(rows_used)
+            edges.release(a)
+            edges.release(s)
+            leases.append((a, s))
+    torch.cuda.synchronize()
+    for (a, s), rows_used in zip(leases, used):
+        for t in (a.tensor, s.tensor):
+            assert count_non_sentinel(t[:rows_used]) == 0, rows_used
+            assert count_non_sentinel(t[rows_used:]) == (48 - rows_used) * t.shape[1], (
+                "the reset went past the bound",
+                rows_used,
+            )
+    assert any(row.get("bounded") for row in edges.ledger())
+
+
+def test_bounded_fill_standalone():
+    fill = importlib.import_module(fgs().__name__.rsplit(".", 1)[0] + ".fine_grained_sync_fill")
+    row_bytes, rows, slot_rows = 96, 8, 10
+    region = torch.full((3 * slot_rows * row_bytes,), 0x34, dtype=torch.uint8, device="cuda")
+    bounds = torch.tensor([0, 3, 99], dtype=torch.int32, device="cuda")
+    for ctas in (1, 7, 512):
+        region.fill_(0x34)
+        fill.sentinel_fill_bounded_(
+            region, bounds, slot_rows * row_bytes, rows * row_bytes, row_bytes, -0x7F7F7F80, ctas
+        )
+        torch.cuda.synchronize()
+        view = region.view(3, slot_rows, row_bytes)
+        for slot, filled in enumerate((0, 3, rows)):
+            assert bool((view[slot, :filled] == 0x80).all()), (ctas, slot)
+            assert bool((view[slot, filled:] == 0x34).all()), ("filled past the bound", ctas, slot)
+
+
+def test_spans_fill_standalone():
+    fill = importlib.import_module(fgs().__name__.rsplit(".", 1)[0] + ".fine_grained_sync_fill")
+    guard = 4096
+    sizes = [1, 1025, 4096 * 4 + 7, 3, (1 << 18) + 5, 64]
+    for ctas in (1, 4, 1 << 30):
+        bufs, spans = [], []
+        for index, vecs in enumerate(sizes):
+            dtype, lane = (
+                (torch.float32, torch.int32) if index % 2 else (torch.bfloat16, torch.int16)
+            )
+            per_vec = 16 // torch.empty((), dtype=lane).element_size()
+            buf = torch.full((2 * guard + vecs * per_vec,), 0x1234, dtype=lane, device="cuda")
+            target = buf[guard : guard + vecs * per_vec].view(dtype)
+            word = -0x80000000 if dtype == torch.float32 else -0x7FFF8000
+            bufs.append((buf, vecs * per_vec))
+            spans.append((target, word))
+        fill.sentinel_fill_spans_(spans, max_ctas=ctas)
+        torch.cuda.synchronize()
+        for (buf, length), (target, _) in zip(bufs, spans):
+            assert count_non_sentinel(target) == 0, ctas
+            assert bool((buf[:guard] == 0x1234).all()) and bool(
+                (buf[guard + length :] == 0x1234).all()
+            ), "spans fill wrote outside its tensors"
+
+
+def test_fill_pieces():
+    fill = importlib.import_module(fgs().__name__.rsplit(".", 1)[0] + ".fine_grained_sync_fill")
+    piece = fill._MAX_FILL_BYTES // 16
+    for num_vecs in (0, 1, piece - 1, piece, piece + 1, 3 * piece + 5):
+        pieces = fill._vector_pieces(num_vecs)
+        assert sum(n for _, n in pieces) == num_vecs, num_vecs
+        assert all(0 < n <= piece for _, n in pieces), num_vecs
+        assert [first for first, _ in pieces] == list(range(0, num_vecs, piece)), num_vecs
+
+
+def test_fill_split_into_pieces():
+    """Fills above one piece (shrunk to 4 KiB) go out piece by piece, plain and as spans."""
+    fill = importlib.import_module(fgs().__name__.rsplit(".", 1)[0] + ".fine_grained_sync_fill")
+    saved = fill._MAX_FILL_BYTES
+    fill._MAX_FILL_BYTES = 4096
+    try:
+        guard = 4096
+        vecs = 3 * 256 + 7
+        buf = torch.full((2 * guard + vecs * 8 + 3,), 0x1234, dtype=torch.int16, device="cuda")
+        target = buf[guard : guard + vecs * 8 + 3].view(torch.bfloat16)
+        fill.sentinel_fill_(target, -0x7FFF8000, max_ctas=4)
+        spans_buf = torch.full((2 * guard + vecs * 4,), 0x1234, dtype=torch.int32, device="cuda")
+        span = spans_buf[guard : guard + vecs * 4].view(torch.float32)
+        fill.sentinel_fill_spans_([(span, -0x80000000)], max_ctas=4)
+        torch.cuda.synchronize()
+        assert count_non_sentinel(target) == 0 and count_non_sentinel(span) == 0
+        for whole, end in ((buf, guard + vecs * 8 + 3), (spans_buf, guard + vecs * 4)):
+            assert bool((whole[:guard] == 0x1234).all()) and bool((whole[end:] == 0x1234).all())
+    finally:
+        fill._MAX_FILL_BYTES = saved
+
+
+def test_memory_ledger():
+    edges = _edges("auto")
+    specs = {
+        "mla.dec.fused_q": ((16, 96, 576), torch.bfloat16),
+        "kda.dec.qkvg": ((16, 49152), torch.bfloat16),
+        "kda.dec.core_o": ((16, 96, 128), torch.bfloat16),
+        "mla.dec.gated": ((16, 12288), torch.bfloat16),
+        "mla.dec.partial": ((16, 512), torch.float32),
+    }
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    for name, (shape, dtype) in specs.items():
+        edges.workspace(name, shape, dtype)
+    torch.cuda.synchronize()
+    delta = torch.cuda.memory_allocated() - before
+
+    def rounded(nbytes):
+        return -(-nbytes // 512) * 512
+
+    expected = 0
+    for shape, dtype in specs.values():
+        nbytes = torch.Size(shape).numel() * torch.empty((), dtype=dtype).element_size()
+        expected += 2 * rounded(nbytes)
+    assert delta == expected, (delta, expected)
+    rows = {row["name"]: row for row in edges.ledger()}
+    assert rows["kda.dec.qkvg"]["bytes_per_slot"] == 16 * 49152 * 2
+    assert rows["kda.dec.qkvg"]["bytes"] == 2 * 16 * 49152 * 2
+    print("    ledger:")
+    for row in rows.values():
+        print(f"      {row['name']:<18} {row.get('slots', '-')!s:>5} {int(row['bytes']):>10} B")
+
+
+TESTS = [
+    ("cute_fill_standalone", test_cute_fill_standalone, ()),
+    *[(f"preinit_bitexact[{b}]", test_preinit_bitexact, (b,)) for b in _backends()],
+    *[
+        (f"reset_bitexact_row_bound[{b}]", test_reset_bitexact_and_row_bound, (b,))
+        for b in _backends()
+    ],
+    *[
+        (f"release_waits_slow_reader[{b}]", test_release_waits_for_slow_reader, (b,))
+        for b in ("fill", "cute")
+    ],
+    ("fan_out_readers", test_fan_out_readers, ()),
+    *[(f"graph_capture_replays[{b}]", test_graph_capture_and_replays, (b,)) for b in _backends()],
+    ("spans_fill_standalone", test_spans_fill_standalone, ()),
+    ("fill_pieces", test_fill_pieces, ()),
+    ("fill_split_into_pieces", test_fill_split_into_pieces, ()),
+    *[(f"step_batched_reset[{b}]", test_step_batched_reset, (b,)) for b in _backends()],
+    ("step_reuse_rules", test_step_reuse_rules, ()),
+    *[(f"byte_sentinels[{b}]", test_byte_sentinels, (b,)) for b in _backends()],
+    ("bounded_reset", test_bounded_reset, ()),
+    ("bounded_fill_standalone", test_bounded_fill_standalone, ()),
+    ("memory_ledger", test_memory_ledger, ()),
+]
+
+
+def main():
+    only = sys.argv[1:]
+    print(f"torch {torch.__version__}, {torch.cuda.get_device_name()}, module {fgs().__file__}")
+    results = []
+    for name, fn, args in TESTS:
+        if only and not any(key in name for key in only):
+            continue
+        try:
+            fn(*args)
+            results.append((name, "PASS", ""))
+        except Exception as error:  # noqa: BLE001 - report every failure and keep going
+            results.append((name, "FAIL", f"{type(error).__name__}: {error}"))
+            traceback.print_exc()
+        torch.cuda.synchronize()
+        print(f"{results[-1][1]}  {name}  {results[-1][2]}", flush=True)
+    failed = [r for r in results if r[1] == "FAIL"]
+    print(f"\nSUMMARY: {len(results) - len(failed)}/{len(results)} PASS")
+    for name, _, why in failed:
+        print(f"  FAIL {name}: {why}")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    if "FGS_OVL_DIR" not in os.environ:
+        local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ovl")
+        if os.path.isdir(local):
+            os.environ["FGS_OVL_DIR"] = local
+    sys.exit(main())
