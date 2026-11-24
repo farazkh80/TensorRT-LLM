@@ -20,7 +20,7 @@ from ....mapping import Mapping
 from ....quantization import QuantAlgo
 from ...attention.backends import TrtllmAttention
 from ...attention.backends.interface import PositionalEmbeddingParams, RopeParams
-from ...attention.mla import MLA
+from ...attention.mla import MLA, k3_cute_mla_enabled
 from ...model_config import ModelConfig
 from ...utils import AuxStreamType
 from ..linear import Linear, TensorParallelMode
@@ -72,9 +72,11 @@ def _write_identity_rope_values(cos_sin: torch.Tensor) -> None:
     with torch.no_grad():
         flat[0::2] = 1.0
         flat[1::2] = 0.0
-    # Ensure the identity write reaches CUDA memory before any kernel
-    # launched from a different stream can read the table.
-    if cos_sin.is_cuda:
+    # Outside capture, make the write visible to kernels on other streams.
+    # Under capture (a resize inside a captured forward) the readers are the
+    # rope kernels later on the capturing stream, which stream order covers;
+    # a device synchronize there would invalidate the capture.
+    if cos_sin.is_cuda and not torch.cuda.is_current_stream_capturing():
         torch.cuda.synchronize(cos_sin.device)
 
 
@@ -229,6 +231,16 @@ class KimiK3MLAAttention(MLA):
         _install_identity_rope_table(self.mqa)
         self.rotary_emb = None
         self.apply_rotary_emb = False
+        # The identity table makes every MLA rope a copy, so the CuTe latent append may replace the rope kernel.
+        self._k3_cute_latent_append = True
+        # Lets cute_dsl_mla_context serve this layer's context phase.
+        self.mha._k3_cute_ctx = True
+        # MLA's BMMs run through kimi_k3_cute_gemm.
+        self._k3_cute_gemm_bmm = True
+        for name in ("kv_a_proj_with_mqa", "q_a_proj", "q_b_proj", "o_proj", "g_proj"):
+            module = getattr(self, name, None)
+            if isinstance(module, Linear):
+                module._k3_cute_gemm = True
 
     def _apply_output_gate(
         self,
@@ -239,5 +251,14 @@ class KimiK3MLAAttention(MLA):
         # sharding, so the multiply composes with the helix-CP output
         # projection.
         if self.use_output_gate:
-            return attn_output * self.g_proj(hidden_states).sigmoid()
+            gate = self.g_proj(hidden_states)
+            if k3_cute_mla_enabled("gate"):
+                from ...attention.kernels.rubin.kimi_k3_mla.mla_output_gate import (
+                    mla_output_gate,
+                    supported,
+                )
+
+                if supported(attn_output, gate):
+                    return mla_output_gate(attn_output, gate)
+            return attn_output * gate.sigmoid()
         return attn_output

@@ -37,6 +37,9 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
     load_pretrained_config,
     unwrap_kimi_text_config,
 )
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import (
+    resolve_mamba_metadata_cls,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MixedMambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.model_loader import (
     ModelLoader,
@@ -249,6 +252,11 @@ def make_balanced_routing_method(
     def balanced_routing_method(router_logits, input_ids=None):
         token_selected_experts, token_final_scales = apply_method_orig(router_logits, input_ids)
         assert moe_module._routing_results_replaced_at in [None, "make_balanced_routing_method"]
+        # Kimi K3 fused router with LWB_K3_FUSED_BALANCED=1: it already wrote this pattern into its
+        # own buffers (the early dispatch send holds them), so keep them.
+        if getattr(getattr(moe_module, "_k3_moe_layer", None), "balanced_ids", False):
+            moe_module._routing_results_replaced_at = "make_balanced_routing_method"
+            return token_selected_experts, token_final_scales
         if balance_method == BalanceMethod.Balanced:
             token_selected_experts = get_balanced_selection(
                 token_selected_experts.shape[0],
@@ -290,6 +298,39 @@ def make_balanced_routing_method(
         return token_selected_experts, token_final_scales
 
     return balanced_routing_method
+
+
+_K3_TABLE_SELECTION = {
+    BalanceMethod.ImbalancedRanks: get_all_to_one_selection,
+    BalanceMethod.ImbalancedExperts: get_balanced_rank_imbalanced_expert_selection,
+}
+
+
+def make_k3_routing_table(moe_module, balance_method, balance_ratio, dp_size, dp_rank, ep_size):
+    """``(num_tokens, device) -> int32 [num_tokens, top_k]``: the ids the stock path would substitute.
+
+    The Kimi K3 fused router stores them (``_k3_routing_table``). The selection functions are cached,
+    so the table of a token count keeps its address across the eager warm-up and the CUDA graph
+    capture.
+    """
+    select = _K3_TABLE_SELECTION[balance_method]
+    top_k = moe_module.routing_method.top_k
+    num_experts = moe_module.num_experts
+
+    def table(num_tokens, device):
+        return select(
+            num_tokens,
+            top_k,
+            num_experts,
+            balance_ratio,
+            torch.int32,
+            device,
+            dp_size,
+            dp_rank,
+            ep_size,
+        )
+
+    return table
 
 
 @functools.cache
@@ -503,11 +544,31 @@ class Runner:
             # `attn_metadata`. `create_run_pack` passes the bank through the
             # `residual` slot and seeds the count for a mid-model slice.
             block_residual = residual
+            # A decoder that folds each layer's closing residual add into the next layer
+            # returns the add's operand instead; finish the last one here.
+            fold = getattr(
+                inspect.getmodule(model.model.layers[layer_indices[0]]),
+                "_CUTE_NORM_FOLD_ENABLED",
+                False,
+            )
+            residual_addend = None
             for layer_idx in layer_indices:
                 layer = model.model.layers[layer_idx]
-                hidden_states, num_snapshots = layer(
-                    hidden_states, block_residual, num_snapshots, attn_metadata
-                )
+                if fold:
+                    hidden_states, num_snapshots, residual_addend = layer(
+                        hidden_states,
+                        block_residual,
+                        num_snapshots,
+                        attn_metadata,
+                        residual_addend=residual_addend,
+                        defer_residual_add=True,
+                    )
+                else:
+                    hidden_states, num_snapshots = layer(
+                        hidden_states, block_residual, num_snapshots, attn_metadata
+                    )
+            if residual_addend is not None:
+                hidden_states = hidden_states + residual_addend
             return hidden_states, block_residual
 
         # Layers carrying a snapshot stack take `block_residual` where the generic
@@ -521,6 +582,13 @@ class Runner:
         self.model_config = model.model_config
         self.model = model
         self.layer_indices = layer_indices
+        # Attention-core projections only, never MoE: routed through the CuTe GEMM dispatch (the MLA
+        # module tags the decode ones itself).
+        from tensorrt_llm._torch.modules.linear import Linear as _TrtllmLinear
+
+        for name, module in model.named_modules():
+            if ".self_attn." in f".{name}." and isinstance(module, _TrtllmLinear):
+                module._k3_cute_gemm = True
 
     @staticmethod
     @contextlib.contextmanager
@@ -568,19 +636,31 @@ class Runner:
             # (2) MoE: If EP, reduce the number of experts; If TP, reduce head size.
             def load_pretrained_config(*args, **kwargs):
                 pretrained_config = load_pretrained_config_orig(*args, **kwargs)
+                # Multimodal checkpoints (e.g. Kimi K3) keep the decoder fields in text_config.
+                config = getattr(pretrained_config, "text_config", None) or pretrained_config
                 if not mapping.enable_attention_dp:
-                    if hasattr(pretrained_config, "index_n_heads"):
+                    if hasattr(config, "index_n_heads"):
                         raise NotImplementedError("Not support Indexer TP for weak scaling")
-                    pretrained_config.num_attention_heads = (
-                        pretrained_config.num_attention_heads // scaled_from * mapping.tp_size
+                    config.num_attention_heads = (
+                        config.num_attention_heads // scaled_from * mapping.tp_size
                     )
-                    pretrained_config.num_key_value_heads = (
-                        pretrained_config.num_key_value_heads // scaled_from * mapping.tp_size
+                    config.num_key_value_heads = (
+                        config.num_key_value_heads // scaled_from * mapping.tp_size
                     )
+                    linear_attn_config = getattr(config, "linear_attn_config", None)
+                    if linear_attn_config is not None:
+                        linear_attn_config["num_heads"] = (
+                            linear_attn_config["num_heads"] // scaled_from * mapping.tp_size
+                        )
                 if mapping.moe_ep_size != mapping.tp_size:
                     raise NotImplementedError("Not support MoE TP for weak scaling")
-                pretrained_config.n_routed_experts = (
-                    pretrained_config.n_routed_experts // scaled_from * mapping.moe_ep_size
+                experts_attr = (
+                    "n_routed_experts" if hasattr(config, "n_routed_experts") else "num_experts"
+                )
+                setattr(
+                    config,
+                    experts_attr,
+                    getattr(config, experts_attr) // scaled_from * mapping.moe_ep_size,
                 )
                 return pretrained_config
 
@@ -718,6 +798,9 @@ class Runner:
                 max_draft_len=seq_len_q - 1,
                 max_total_draft_tokens=seq_len_q - 1,
             )
+        # As the executor does: without the model's recurrent-state metadata, Kimi K3 prefill reads
+        # cu_seqlens back to the host and cannot be graph-captured.
+        attn_metadata.mamba_metadata_cls = resolve_mamba_metadata_cls(self.model)
         attn_metadata.prepare()
         hidden_size = pretrained_config.hidden_size
         position_ids = torch.tensor(
@@ -849,10 +932,29 @@ class Runner:
                 # Latent-MoE layout (Kimi K3): the routed experts sit behind the
                 # block, and layers below `first_k_dense_replace` are dense.
                 moe_modules.append(block_sparse_moe.routed_experts)
+            elif not hasattr(getattr(layer, "mlp", None), "experts"):
+                pass
             else:
                 moe_modules.append(layer.mlp.experts)
 
+        fused_k3 = (
+            os.environ.get("LWB_K3_FUSED_BALANCED") == "1"
+            and os.environ.get("TRTLLM_LAYERWISE_BENCHMARK_BALANCED_IMPL", "DEFAULT") != "RANDOM"
+        )
+        fused_balanced = fused_k3 and balance_method == BalanceMethod.Balanced
+        fused_table = fused_k3 and balance_method in _K3_TABLE_SELECTION
         for moe_module in moe_modules:
+            if fused_balanced:
+                moe_module._k3_balanced_routing = (dp_rank, self.model_config.mapping.moe_ep_size)
+            if fused_table:
+                moe_module._k3_routing_table = make_k3_routing_table(
+                    moe_module,
+                    balance_method,
+                    balance_ratio,
+                    self.model_config.mapping.dp_size,
+                    dp_rank,
+                    self.model_config.mapping.moe_ep_size,
+                )
             # Replace `routing_method.apply` for normal cases
             apply_method_orig = moe_module.routing_method.apply
             moe_module.routing_method.apply = make_balanced_routing_method(
@@ -883,6 +985,12 @@ class Runner:
             else:
                 run_moe_orig = None
 
+            # A fused route+quant result bypasses `routing_method.apply`; force
+            # the separated path so the replaced routing is what gets dispatched.
+            backend = getattr(moe_module, "backend", None)
+            if backend is not None and hasattr(backend, "try_fused_route_quant"):
+                backend.try_fused_route_quant = lambda *args, **kwargs: None
+
             # Replace `forward_impl` to ensure that routing results are replaced
             forward_impl_orig = moe_module.forward_impl
             moe_module.forward_impl = make_forward_impl_check(moe_module, forward_impl_orig)
@@ -898,6 +1006,9 @@ class Runner:
                 if isinstance(moe_module, TRTLLMGenFusedMoE):
                     moe_module.run_moe = run_moe_orig
                 moe_module.forward_impl = forward_impl_orig
+                for attr in ("_k3_balanced_routing", "_k3_routing_table"):
+                    if hasattr(moe_module, attr):
+                        delattr(moe_module, attr)
 
     @staticmethod
     def create_kv_cache_manager(
@@ -914,9 +1025,12 @@ class Runner:
         spec_config: Optional[DecodingBaseConfig] = None,
         vision_config: Optional[str] = None,
         use_kv_cache_manager_v2: bool | Literal["auto"] = "auto",
+        scaled_from: Optional[int] = None,
     ) -> KVCacheManager:
         # Please refer to `tensorrt_llm/_torch/pyexecutor/py_executor_creator.py` for `tokens_per_block`
-        with Runner.vision_config_ctx(vision_config):
+        # Scaled head counts size per-rank recurrent state (e.g. Kimi K3 KDA), so the
+        # cache must see the same scaled config as the model.
+        with Runner.vision_config_ctx(vision_config), Runner.scaled_from_ctx(scaled_from, mapping):
             model_config = ModelConfig.from_pretrained(pretrained_model_name_or_path)
         validate_and_set_kv_cache_quant(model_config, kv_cache_dtype)
         validate_and_set_mamba_ssm_cache_dtype(model_config, mamba_ssm_cache_dtype)

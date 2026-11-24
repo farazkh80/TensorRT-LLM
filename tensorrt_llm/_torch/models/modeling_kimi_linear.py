@@ -122,6 +122,9 @@ from ..distributed import (
 from ..distributed.symm_mem_allgather import SymmetricMemoryAllGather
 from ..model_config import ModelConfig
 from ..modules.gated_mlp import GatedMLP
+from ..modules.kimi_k3_attn_res.attn_res_mix_cute import attn_res_mix as _cute_attn_res_mix
+from ..modules.kimi_k3_fgs import moe_chain as k3_moe_chain
+from ..modules.kimi_k3_fgs import moe_streams as k3_moe_streams
 from ..modules.kimi_kda import KimiKDALinearAttention
 from ..modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
 from ..modules.linear import (
@@ -445,6 +448,20 @@ def _read_fused_attn_res_max_tokens() -> int:
 _ATTN_RES_TOPOLOGY = _read_attn_res_topology()
 _FUSED_ATTN_RES_MAX_TOKENS = _read_fused_attn_res_max_tokens()
 
+_CUTE_NORM_ENABLED = True
+"""Every attention-residual mix (and the residual add / RMSNorm fused with it) whose shape the CuTe DSL
+``attn_res_mix`` kernel takes runs there instead of the C++ ``attn_res_*`` ops, ATen add and FlashInfer RMSNorm.
+Each site keeps the output rounding of the stock path it replaces: KimiK3RMSNorm double rounding where the stock
+C++ fused kernel would run, FlashInfer single rounding elsewhere. A module flag so tests can run the stock path.
+"""
+
+_CUTE_NORM_FOLD_ENABLED = True
+"""Each layer's closing ``prefix + MoE output`` add folds into the next layer's attention-residual kernel, which also
+writes a snapshot layer's prefix straight into the bank. The MoE output is untouched and the fused add is the same
+bf16 rounding of the fp32 sum, so results match the unfolded CuTe path bitwise. Layers that cannot fold (DSpark
+capture, no snapshot yet) add first, as stock does.
+"""
+
 
 def _persistent_attn_res_applicable(M: int, H: int, N: int) -> bool:
     """Shape gate for the persistent kernel: H == 7168 and 2 <= N <= 9.
@@ -470,6 +487,72 @@ def _use_persistent_attn_res(M: int, H: int, N: int) -> bool:
     if _ATTN_RES_TOPOLOGY == "persistent":
         return True
     return _ATTN_RES_TOPOLOGY == "split" and M > _FUSED_ATTN_RES_MAX_TOKENS
+
+
+def _cute_attn_res_applicable(
+    prefix_sum: torch.Tensor, block_residual: torch.Tensor, addend: Optional[torch.Tensor] = None
+) -> bool:
+    if prefix_sum.dim() != 2 or not prefix_sum.is_cuda:
+        return False
+    M, H = prefix_sum.shape
+    tensors = (
+        (prefix_sum, block_residual) if addend is None else (prefix_sum, block_residual, addend)
+    )
+    return (
+        M >= 1
+        and H == 7168
+        and 1 <= block_residual.shape[0] <= 11
+        and tuple(block_residual.shape[1:]) == (M, H)
+        and (addend is None or addend.shape == prefix_sum.shape)
+        and all(t.dtype is torch.bfloat16 and t.is_contiguous() for t in tensors)
+    )
+
+
+def _cute_norm_mode(M: int, H: int, N: int) -> str:
+    """Rounding of the stock path at this shape: C++ fused kernels (double) or FlashInfer RMSNorm (single)."""
+    stock_fuses = _FUSED_ATTN_RES_ENABLED and (
+        _use_persistent_attn_res(M, H, N) or (M <= _FUSED_ATTN_RES_MAX_TOKENS and N <= 12)
+    )
+    return "kimi" if stock_fuses else "flashinfer"
+
+
+def _cute_attn_res(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    proj: nn.Linear,
+    norm: KimiK3RMSNorm,
+    output_norm: Optional[nn.Module] = None,
+    addend: Optional[torch.Tensor] = None,
+    updated: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+):
+    M, H = prefix_sum.shape
+    N = int(block_residual.shape[0]) + 1
+    kwargs = {}
+    if output_norm is not None:
+        kwargs = dict(
+            out_norm_weight=output_norm.weight.to(torch.bfloat16).contiguous(),
+            out_norm_eps=_rms_norm_eps(output_norm),
+            norm_mode=_cute_norm_mode(M, H, N),
+        )
+    _note_attn_res_fusion(
+        f"cute{'+add' if addend is not None else ''}{'+norm' if output_norm is not None else ''}",
+        True,
+        M,
+        H,
+        N,
+    )
+    return _cute_attn_res_mix(
+        prefix_sum,
+        block_residual,
+        proj.weight.reshape(-1).to(torch.bfloat16).contiguous(),
+        norm.weight.to(torch.bfloat16).contiguous(),
+        float(norm.eps),
+        addend=addend,
+        updated=updated,
+        out=out,
+        **kwargs,
+    )
 
 
 def _apply_attn_res_fused(
@@ -673,6 +756,8 @@ def _apply_attn_res(
     contract dispatch directly to the in-tree ``trtllm::attn_res_fwd`` op.
     Only the fallback boundary restores the HF ``[M, K, H]`` layout.
     """
+    if _CUTE_NORM_ENABLED and _cute_attn_res_applicable(prefix_sum, block_residual):
+        return _cute_attn_res(prefix_sum, block_residual, proj, norm)
     if _FUSED_ATTN_RES_ENABLED:
         fused = _apply_attn_res_fused(prefix_sum, block_residual, proj, norm)
         if fused is not None:
@@ -697,6 +782,8 @@ def _apply_attn_res_and_rmsnorm(
     output_norm: nn.Module,
 ) -> torch.Tensor:
     """Apply attention-residual selection and the next RMSNorm."""
+    if _CUTE_NORM_ENABLED and _cute_attn_res_applicable(prefix_sum, block_residual):
+        return _cute_attn_res(prefix_sum, block_residual, proj, norm, output_norm)
     if _FUSED_ATTN_RES_ENABLED:
         fused = _apply_attn_res_rmsnorm_fused(prefix_sum, block_residual, proj, norm, output_norm)
         if fused is not None:
@@ -713,6 +800,8 @@ def _apply_attn_res_add_and_rmsnorm(
     output_norm: nn.Module,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Add an attention output to the running residual, then select and norm."""
+    if _CUTE_NORM_ENABLED and _cute_attn_res_applicable(prefix_sum, block_residual, addend):
+        return _cute_attn_res(prefix_sum, block_residual, proj, norm, output_norm, addend)
     if _FUSED_ATTN_RES_ENABLED:
         fused = _apply_attn_res_add_rmsnorm_fused(
             prefix_sum, addend, block_residual, proj, norm, output_norm
@@ -1397,6 +1486,7 @@ class KimiK3MoERuntime(nn.Module):
         self.experts_per_rank = len(local_expert_ids)
         self.expert_lo = local_expert_ids[0]
         self.expert_hi = self.expert_lo + self.experts_per_rank
+        k3_moe_chain.install(self.routed_experts)
 
         shared_intermediate = cfg.moe_intermediate_size * cfg.num_shared_experts
         attention_dp = model_config.mapping.enable_attention_dp
@@ -1745,8 +1835,14 @@ class KimiK3MoERuntime(nn.Module):
         """``hidden_states``: ``[num_tokens, hidden_size]`` bf16."""
         identity = hidden_states
         projected_input = None
+        k3_tail = k3_moe_chain.tail_enabled() and not self._reduce_routed_output
         early_routed_in = None
-        if self._can_fuse_router_down(hidden_states):
+        k3_entry = k3_moe_chain.entry(self, hidden_states, all_rank_num_tokens)
+        rows = hidden_states.shape[0]
+        fuse_router_down = self._can_fuse_router_down(hidden_states)
+        if k3_entry is not None:
+            projected_input, router_logits = k3_entry
+        elif fuse_router_down:
             router_logits, projected_input = torch.ops.trtllm.dsv3_router_latent_gemm_op(
                 hidden_states, self.gate.weight, self.routed_expert_down_proj.weight
             )
@@ -1808,18 +1904,53 @@ class KimiK3MoERuntime(nn.Module):
             if self._reduce_routed_output:
                 return y
             # Communication-backed paths return a complete routed result.
+            if k3_tail:
+                return y
             y = self.routed_expert_norm(y)
             return self._routed_projection(y, self.routed_expert_up_proj)
 
-        def _shared_output():
-            shared_out = self.shared_experts(
-                identity,
-                final_all_reduce_params=(
-                    AllReduceParams(enable_allreduce=False)
-                    if self._defer_shared_allreduce
-                    else None
-                ),
+        # The shared expert starts when the routed path launches its dispatch.
+        comm = getattr(self.routed_experts, "comm", None)
+        gate = comm is not None and do_multi_stream()
+        if gate:
+            if not hasattr(self, "_shared_gate_event"):
+                self._shared_gate_event = torch.cuda.Event()
+            # Per instance: the CuTe all-to-all installs its dispatch on the instance, which a class patch misses.
+            if not getattr(comm, "_k3_gate_patched", False):
+                orig_dispatch = comm.dispatch
+
+                def gated_dispatch(*a, _comm=comm, _orig=orig_dispatch, **k):
+                    ev = getattr(_comm, "_k3_gate", None)
+                    if ev is not None:
+                        ev.record()
+                    return _orig(*a, **k)
+
+                comm.dispatch = gated_dispatch
+                comm._k3_gate_patched = True
+            comm._k3_gate = self._shared_gate_event
+            if not hasattr(self, "_k3_shared_down_event"):
+                self._k3_shared_down_event = torch.cuda.Event()
+            k3_moe_streams.arm_shared_down(
+                comm,
+                self.shared_experts.down_proj,
+                self._k3_shared_down_event,
+                rows,
+                "combine_start",
             )
+
+        def _shared_output():
+            if gate:
+                self._shared_gate_event.wait()
+            shared_out = k3_moe_chain.run_shared(self, identity)
+            if shared_out is None:
+                shared_out = self.shared_experts(
+                    identity,
+                    final_all_reduce_params=(
+                        AllReduceParams(enable_allreduce=False)
+                        if self._defer_shared_allreduce
+                        else None
+                    ),
+                )
             if overlap_shared_allreduce:
                 # Wait for all routed chunks, but overlap the norm/up tail.
                 self.moe_routed_event.wait()
@@ -1858,6 +1989,10 @@ class KimiK3MoERuntime(nn.Module):
                 ),
             )
             routed_out = self._routed_projection(routed_latent, self.routed_expert_up_proj)
+        if k3_tail:
+            return k3_moe_chain.run_tail(
+                routed_out, self.routed_expert_norm, self.routed_expert_up_proj, shared_out
+            )
         return routed_out + shared_out
 
 
@@ -2227,12 +2362,19 @@ class KimiLinearDecoderLayer(nn.Module):
         attn_metadata: AttentionMetadata,
         capture: Optional[Tuple[Any, int]] = None,
         helix_a2a: Optional[KimiK3HelixA2A] = None,
-    ) -> Tuple[torch.Tensor, int]:
+        residual_addend: Optional[torch.Tensor] = None,
+        defer_residual_add: bool = False,
+    ) -> Tuple:
         """Port of HF ``KimiDecoderLayer._forward_attn_residual`` (per token).
 
         ``block_residual`` is a preallocated snapshot bank in kernel-native
         ``[K_max, M, H]`` layout. Returns the running prefix sum and the
         number of valid bank rows.
+
+        ``residual_addend`` is the previous layer's deferred MoE output: the
+        incoming prefix sum is ``hidden_states + residual_addend``. With
+        ``defer_residual_add`` this layer returns ``(prefix_sum, num_snapshots,
+        moe_output)`` and leaves the closing add to the next consumer.
 
         ``capture`` is ``(spec_metadata, layer_id)`` and taps the DSpark aux
         stream for the layer BEFORE this one: the aggregated stream for layer j
@@ -2254,6 +2396,18 @@ class KimiLinearDecoderLayer(nn.Module):
         def _full_rows(t: torch.Tensor) -> torch.Tensor:
             return t if sliced is None else sliced.all_gather(t, num_tokens)
 
+        fold_in = (
+            _CUTE_NORM_ENABLED
+            and residual_addend is not None
+            and sliced is None
+            and capture is None
+            and num_snapshots > 0
+            and _cute_attn_res_applicable(
+                hidden_states, block_residual[:num_snapshots], residual_addend
+            )
+        )
+        if residual_addend is not None and not fold_in:
+            hidden_states = hidden_states + residual_addend
         prefix_sum = hidden_states
         valid_block_residual = block_residual[:num_snapshots]
 
@@ -2274,6 +2428,21 @@ class KimiLinearDecoderLayer(nn.Module):
             tapped = hidden_states if _AUX_ATTN_RES_STREAM_ENABLED else prefix_sum
             capture[0].maybe_capture_hidden_states(capture[1], _full_rows(tapped), None)
             hidden_states = self.input_layernorm(hidden_states)
+        elif fold_in:
+            snapshot_slot = (
+                block_residual[num_snapshots]
+                if self.layer_idx % self.attn_res_block_size == 0
+                else None
+            )
+            prefix_sum, hidden_states = _cute_attn_res(
+                prefix_sum,
+                valid_block_residual,
+                self.self_attention_res_proj,
+                self.self_attention_res_norm,
+                self.input_layernorm,
+                addend=residual_addend,
+                updated=snapshot_slot,
+            )
         elif num_snapshots > 0:
             hidden_states = _apply_attn_res_and_rmsnorm(
                 prefix_sum,
@@ -2286,7 +2455,8 @@ class KimiLinearDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
 
         if self.layer_idx % self.attn_res_block_size == 0:
-            block_residual[num_snapshots].copy_(prefix_sum)
+            if not fold_in:
+                block_residual[num_snapshots].copy_(prefix_sum)
             num_snapshots += 1
             valid_block_residual = block_residual[:num_snapshots]
             prefix_sum = None
@@ -2329,6 +2499,9 @@ class KimiLinearDecoderLayer(nn.Module):
         else:
             hidden_states = self.mlp(hidden_states)
 
+        # prefix_sum is the attention output on snapshot layers.
+        if defer_residual_add:
+            return prefix_sum, num_snapshots, hidden_states
         prefix_sum = prefix_sum + hidden_states
         return prefix_sum, num_snapshots
 
@@ -2449,6 +2622,7 @@ class KimiLinearModel(DecoderModel):
             hidden_states.shape[1],
         )
         num_snapshots = 0
+        residual_addend = None
         capture_set = (
             getattr(spec_metadata, "_capture_layer_set", None)
             if spec_metadata is not None
@@ -2473,17 +2647,35 @@ class KimiLinearModel(DecoderModel):
             ):
                 capture = (spec_metadata, self.layers[i - 1].layer_idx)
             if i == self.helix_a2a_first_layer:
+                if residual_addend is not None:
+                    hidden_states = hidden_states + residual_addend
+                    residual_addend = None
                 # Rows are rank-replicated up to here: keep this rank's chunk.
                 hidden_states = self.helix_a2a.scatter_rows(hidden_states, num_tokens)
                 block_residual = self.helix_a2a.scatter_rows(block_residual, num_tokens)
-            hidden_states, num_snapshots = layer(
-                hidden_states,
-                block_residual,
-                num_snapshots,
-                attn_metadata,
-                capture=capture,
-                helix_a2a=self.helix_a2a,
-            )
+            if _CUTE_NORM_FOLD_ENABLED:
+                hidden_states, num_snapshots, residual_addend = layer(
+                    hidden_states,
+                    block_residual,
+                    num_snapshots,
+                    attn_metadata,
+                    capture=capture,
+                    helix_a2a=self.helix_a2a,
+                    residual_addend=residual_addend,
+                    defer_residual_add=True,
+                )
+            else:
+                hidden_states, num_snapshots = layer(
+                    hidden_states,
+                    block_residual,
+                    num_snapshots,
+                    attn_metadata,
+                    capture=capture,
+                    helix_a2a=self.helix_a2a,
+                )
+        if residual_addend is not None and spec_metadata is not None:
+            hidden_states = hidden_states + residual_addend
+            residual_addend = None
         sliced = self.helix_a2a is not None
 
         # The last layer has no successor, so this one recompute is
@@ -2508,13 +2700,23 @@ class KimiLinearModel(DecoderModel):
                     tail = self.helix_a2a.all_gather(tail, num_tokens)
                 spec_metadata.maybe_capture_hidden_states(last.layer_idx, tail, None)
 
-        hidden_states = _apply_attn_res_and_rmsnorm(
-            hidden_states,
-            block_residual[:num_snapshots],
-            self.output_attn_res_proj,
-            self.output_attn_res_norm,
-            self.norm,
-        )
+        if residual_addend is not None:
+            hidden_states = _apply_attn_res_add_and_rmsnorm(
+                hidden_states,
+                residual_addend,
+                block_residual[:num_snapshots],
+                self.output_attn_res_proj,
+                self.output_attn_res_norm,
+                self.norm,
+            )[1]
+        else:
+            hidden_states = _apply_attn_res_and_rmsnorm(
+                hidden_states,
+                block_residual[:num_snapshots],
+                self.output_attn_res_proj,
+                self.output_attn_res_norm,
+                self.norm,
+            )
         if sliced:
             hidden_states = self.helix_a2a.all_gather(hidden_states, num_tokens)
         return hidden_states

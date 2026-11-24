@@ -1,0 +1,668 @@
+diff --git a/fmha.py b/fmha.py
+index 5c2866ad1647d3daf34f49a9c8f38c0825e083b4..68e56f165cce464ba4d994ee1dea1fa3add270fb 100644
+--- a/fmha.py
++++ b/fmha.py
+@@ -48,6 +48,14 @@ from cutlass.cutlass_dsl import BaseDSL
+ 
+ from .helpers import fmha_helpers as fmha_utils
+ 
++try:
++    from ..mla_fgs import bf16x2_pzo, trap
++except ImportError:
++    from mla_fgs import bf16x2_pzo, trap
++
++# fgs_stats slots: re-issued loads, CTAs that re-issued, of which Q loads, of which K loads.
++FGS_STATS_LEN = 4
++
+ """
+ A fused multi-head attention (FMHA) example for the NVIDIA Blackwell SM100 architecture using CUTE DSL
+ 
+@@ -118,6 +126,10 @@ class BlackwellFusedMultiHeadAttentionForward:
+         enable_ex2_emulation: bool,
+         enable_skip_correction: bool,
+         use_tma_store: bool = True,
++        tuning: Optional[dict] = None,
++        fgs_consumer: bool = False,
++        fgs_producer: bool = False,
++        fgs_retry_limit: int = 0,
+     ):
+         """Initializes the configuration for a Blackwell Fused Multi-Head Attention (FMHA) kernel.
+ 
+@@ -192,6 +204,21 @@ class BlackwellFusedMultiHeadAttentionForward:
+         self.enable_skip_correction = enable_skip_correction
+         self.enable_ex2_emulation = enable_ex2_emulation
+         self.use_tma_store = use_tma_store
++        # Overrides of _setup_attributes / register-split attributes (kv_stage, enable_sequence_barrier,
++        # enable_correction_double_buffer, num_regs_*), "lpt" (longest causal q tiles first; snaked over CTAs when
++        # persistent) and "persistent" (read by the caller, which passes it as is_persistent).
++        self.tuning = dict(tuning or {})
++        # Fine-grained sync (Lamport) roles, see fgs_retry. fgs_consumer: no griddepcontrol.wait; Q/K/V loads use
++        # TMA report_valid against the bf16 -0.0 sentinel and the empty warp re-issues invalid stages.
++        # fgs_producer: launch_dependents at entry, O converted with cvt.rn.pzo (no -0.0; st.global epilogue).
++        # fgs_retry_limit (diagnostic): trap after that many re-issues or empty sweeps in one CTA.
++        if fgs_producer and use_tma_store:
++            raise ValueError("fgs_producer needs the st.global epilogue (use_tma_store=False)")
++        if fgs_retry_limit and not fgs_consumer:
++            raise ValueError("fgs_retry_limit applies only to fgs_consumer")
++        self.fgs_consumer = fgs_consumer
++        self.fgs_producer = fgs_producer
++        self.fgs_retry_limit = fgs_retry_limit
+ 
+         self.softmax0_warp_ids = (0, 1, 2, 3)
+         self.softmax1_warp_ids = (4, 5, 6, 7)
+@@ -347,6 +374,10 @@ class BlackwellFusedMultiHeadAttentionForward:
+         self.enable_sequence_barrier = False
+         # Optional double buffering for correction rescale.
+         self.enable_correction_double_buffer = False
++        for name, value in self.tuning.items():
++            if name not in ("lpt", "persistent"):
++                assert hasattr(self, name), f"unknown FMHA tuning attribute {name}"
++                setattr(self, name, value)
+ 
+     @cute.jit
+     def __call__(
+@@ -370,6 +401,7 @@ class BlackwellFusedMultiHeadAttentionForward:
+         total_softmax_count: Optional[cute.Tensor],
+         stream: cuda.CUstream,
+         use_pdl: bool,
++        fgs_stats: Optional[cute.Tensor] = None,
+     ):
+         """Execute the Fused Multi-Head Attention operation on the provided tensors.
+ 
+@@ -486,6 +518,7 @@ class BlackwellFusedMultiHeadAttentionForward:
+             cute.shape((s_q_max, d, ((h_r, h_k), b))),
+             self.cta_tiler,
+             self.is_persistent,
++            lpt=self.tuning.get("lpt", False),
+         )
+         self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
+         self.k_major_mode = utils.LayoutEnum.from_tensor(k).mma_major_mode()
+@@ -625,6 +658,9 @@ class BlackwellFusedMultiHeadAttentionForward:
+         self.tma_copy_k_bytes = k_copy_size
+         self.tma_copy_v_bytes = v_copy_size
+ 
++        # sO only backs the TMA-store epilogue; the st.global epilogue leaves it unused.
++        sO_cosize = cute.cosize(o_smem_layout_staged) if self.use_tma_store else 64
++
+         @cute.struct
+         class SharedStorage:
+             # Pipeline barriers
+@@ -644,7 +680,7 @@ class BlackwellFusedMultiHeadAttentionForward:
+             tmem_holding_buf: Int32
+             # Smem tensors
+             sO: cute.struct.Align[
+-                cute.struct.MemRange[self.o_dtype, cute.cosize(o_smem_layout_staged)],
++                cute.struct.MemRange[self.o_dtype, sO_cosize],
+                 self.buffer_align_bytes,
+             ]
+             sQ: cute.struct.Align[
+@@ -692,6 +728,7 @@ class BlackwellFusedMultiHeadAttentionForward:
+             skip_softmax_count,
+             total_softmax_count,
+             self.tile_sched_params,
++            fgs_stats,
+         ).launch(
+             grid=grid,
+             block=[self.threads_per_cta, 1, 1],
+@@ -734,6 +771,7 @@ class BlackwellFusedMultiHeadAttentionForward:
+         skip_softmax_count: Optional[cute.Tensor],
+         total_softmax_count: Optional[cute.Tensor],
+         tile_sched_params: fmha_utils.FmhaStaticTileSchedulerParams,
++        fgs_stats: Optional[cute.Tensor] = None,
+     ):
+         """The device kernel implementation of the Fused Multi-Head Attention.
+ 
+@@ -791,6 +829,8 @@ class BlackwellFusedMultiHeadAttentionForward:
+         :param tile_sched_params: Scheduling parameters for work distribution
+         :type tile_sched_params: fmha_utils.FmhaStaticTileSchedulerParams
+         """
++        if cutlass.const_expr(self.fgs_producer):
++            cute.arch.griddepcontrol_launch_dependents()
+         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+         # coord inside cta
+         tidx, _, _ = cute.arch.thread_idx()
+@@ -809,22 +849,44 @@ class BlackwellFusedMultiHeadAttentionForward:
+         smem = utils.SmemAllocator()
+         storage = smem.allocate(self.shared_storage)
+ 
+-        load_q_producer, load_q_consumer = pipeline.PipelineTmaUmma.create(
+-            num_stages=self.q_stage,
+-            producer_group=make_thread_cooperative_group(len([self.load_warp_id])),
+-            consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
+-            tx_count=self.tma_copy_q_bytes,
+-            barrier_storage=storage.load_q_mbar_ptr.data_ptr(),
+-            defer_sync=True,
+-        ).make_participants()
+-        load_kv_producer, load_kv_consumer = pipeline.PipelineTmaUmma.create(
+-            num_stages=self.kv_stage,
+-            producer_group=make_thread_cooperative_group(len([self.load_warp_id])),
+-            consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
+-            tx_count=self.tma_copy_k_bytes,
+-            barrier_storage=storage.load_kv_mbar_ptr.data_ptr(),
+-            defer_sync=True,
+-        ).make_participants()
++        if cutlass.const_expr(self.fgs_consumer):
++            # v1 full barriers: the MMA warp waits on the conditional phase, which completes only with valid data;
++            # the empty barriers count the MMA commit and the retry warp's release.
++            load_q_producer, load_q_consumer, _ = pipeline.PipelineTmaUmmaRetry.create(
++                num_stages=self.q_stage,
++                producer_group=make_thread_cooperative_group(len([self.load_warp_id])),
++                consumer_group_umma=make_thread_cooperative_group(len([self.mma_warp_id])),
++                consumer_group_retry=make_thread_cooperative_group(len([self.empty_warp_id])),
++                tx_count=self.tma_copy_q_bytes,
++                barrier_storage=storage.load_q_mbar_ptr.data_ptr(),
++                defer_sync=True,
++            ).make_participants()
++            load_kv_producer, load_kv_consumer, _ = pipeline.PipelineTmaUmmaRetry.create(
++                num_stages=self.kv_stage,
++                producer_group=make_thread_cooperative_group(len([self.load_warp_id])),
++                consumer_group_umma=make_thread_cooperative_group(len([self.mma_warp_id])),
++                consumer_group_retry=make_thread_cooperative_group(len([self.empty_warp_id])),
++                tx_count=self.tma_copy_k_bytes,
++                barrier_storage=storage.load_kv_mbar_ptr.data_ptr(),
++                defer_sync=True,
++            ).make_participants()
++        else:
++            load_q_producer, load_q_consumer = pipeline.PipelineTmaUmma.create(
++                num_stages=self.q_stage,
++                producer_group=make_thread_cooperative_group(len([self.load_warp_id])),
++                consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
++                tx_count=self.tma_copy_q_bytes,
++                barrier_storage=storage.load_q_mbar_ptr.data_ptr(),
++                defer_sync=True,
++            ).make_participants()
++            load_kv_producer, load_kv_consumer = pipeline.PipelineTmaUmma.create(
++                num_stages=self.kv_stage,
++                producer_group=make_thread_cooperative_group(len([self.load_warp_id])),
++                consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
++                tx_count=self.tma_copy_k_bytes,
++                barrier_storage=storage.load_kv_mbar_ptr.data_ptr(),
++                defer_sync=True,
++            ).make_participants()
+         load_kv_full_mbar_ptr = storage.load_kv_mbar_ptr.data_ptr()
+         load_kv_empty_mbar_ptr = load_kv_full_mbar_ptr + self.kv_stage
+         mma_s0_producer, mma_s0_consumer = pipeline.PipelineUmmaAsync.create(
+@@ -948,7 +1010,11 @@ class BlackwellFusedMultiHeadAttentionForward:
+             v_smem_layout_staged.inner,
+         )
+         sV = cute.make_tensor(sV_ptr, v_smem_layout_staged.outer)
+-        sO = storage.sO.get_tensor(o_smem_layout_staged.outer, swizzle=o_smem_layout_staged.inner)
++        sO = None
++        if cutlass.const_expr(self.use_tma_store):
++            sO = storage.sO.get_tensor(
++                o_smem_layout_staged.outer, swizzle=o_smem_layout_staged.inner
++            )
+         s0_warp_wants_skip_softmax_exchange = (
+             storage.s0_warp_wants_skip_softmax_exchange.get_tensor(cute.make_layout((4,)))
+         )
+@@ -1022,13 +1088,33 @@ class BlackwellFusedMultiHeadAttentionForward:
+         # ///////////////////////////////////////////////////////////////////////////////
+         if warp_idx == self.empty_warp_id:
+             cute.arch.setmaxregister_decrease(self.num_regs_other)
++            if cutlass.const_expr(self.fgs_consumer):
++                self.fgs_retry(
++                    tile_sched,
++                    work_tile,
++                    qk_thr_mma,
++                    pv_thr_mma,
++                    (tma_atom_q, mQ_qdl, sQ),
++                    (tma_atom_k, mK_kdl, sK),
++                    (tma_atom_v, mV_dkl, sV),
++                    cum_seqlen_q,
++                    cum_seqlen_k,
++                    window_size_left,
++                    window_size_right,
++                    storage.load_q_mbar_ptr.data_ptr(),
++                    load_kv_full_mbar_ptr,
++                    fgs_stats,
++                )
+ 
+         # ///////////////////////////////////////////////////////////////////////////////
+         #  LOAD
+         # ///////////////////////////////////////////////////////////////////////////////
+         if warp_idx == self.load_warp_id:
+             cute.arch.setmaxregister_decrease(self.num_regs_other)
+-            cute.arch.griddepcontrol_wait()
++            if cutlass.const_expr(not self.fgs_consumer):
++                cute.arch.griddepcontrol_wait()
++            # report_valid only in the fgs_consumer build (the kwarg does not exist before CuTe DSL 4.9).
++            rv = {"report_valid": True} if self.fgs_consumer else {}
+             while work_tile.is_valid_tile:
+                 curr_block_coord = work_tile.tile_idx
+                 batch_coord = curr_block_coord[2][1]
+@@ -1112,6 +1198,7 @@ class BlackwellFusedMultiHeadAttentionForward:
+                         tQgQ[None, q0_coord],
+                         tQsQ[None, q0_handle.index],
+                         tma_bar_ptr=q0_handle.barrier,
++                        **rv,
+                     )
+                     seqlen_kv_loop_steps = fmha_utils.FusedMask.get_trip_count(
+                         self.mask_type,
+@@ -1130,6 +1217,7 @@ class BlackwellFusedMultiHeadAttentionForward:
+                         tKgK[None, kv_coord],
+                         tKsK[None, k_handle.index],
+                         tma_bar_ptr=k_handle.barrier,
++                        **rv,
+                     )
+                     # Q1
+                     q1_coord = q0_coord + 1
+@@ -1139,6 +1227,7 @@ class BlackwellFusedMultiHeadAttentionForward:
+                         tQgQ[None, q1_coord],
+                         tQsQ[None, q1_handle.index],
+                         tma_bar_ptr=q1_handle.barrier,
++                        **rv,
+                     )
+                     kv_coord += 1
+ 
+@@ -1150,6 +1239,7 @@ class BlackwellFusedMultiHeadAttentionForward:
+                             tKgK[None, kv_coord],
+                             tKsK[None, k_handle.index],
+                             tma_bar_ptr=k_handle.barrier,
++                            **rv,
+                         )
+                         # Vi-1
+                         v_handle, load_kv_producer = self.kv_producer_update_tx_acquire_and_advance(
+@@ -1163,6 +1253,7 @@ class BlackwellFusedMultiHeadAttentionForward:
+                             tVgV[None, kv_coord - 1],
+                             tVsV[None, v_handle.index],
+                             tma_bar_ptr=load_kv_full_mbar_ptr + v_handle.index,
++                            **rv,
+                         )
+                         kv_coord += 1
+                     # End of seqlen_kv loop
+@@ -1178,6 +1269,7 @@ class BlackwellFusedMultiHeadAttentionForward:
+                         tVgV[None, kv_coord - 1],
+                         tVsV[None, v_handle.index],
+                         tma_bar_ptr=load_kv_full_mbar_ptr + v_handle.index,
++                        **rv,
+                     )
+                 # End of if not continue_cond
+                 tile_sched.advance_to_next_work()
+@@ -1707,7 +1799,7 @@ class BlackwellFusedMultiHeadAttentionForward:
+                 # Advance to next tile
+                 tile_sched.advance_to_next_work()
+                 work_tile = tile_sched.get_current_work()
+-            if cutlass.const_expr(not self.use_tma_store):
++            if cutlass.const_expr(not self.use_tma_store and not self.fgs_producer):
+                 cute.arch.griddepcontrol_launch_dependents()
+             # End of persistent scheduler loop
+             tmem.relinquish_alloc_permit()
+@@ -1734,6 +1826,249 @@ class BlackwellFusedMultiHeadAttentionForward:
+         return state, tma_producer
+ 
+     @cute.jit
++    def fgs_retry(
++        self,
++        tile_sched,
++        work_tile,
++        qk_thr_mma: cute.ThrMma,
++        pv_thr_mma: cute.ThrMma,
++        q_args: Tuple,
++        k_args: Tuple,
++        v_args: Tuple,
++        cum_seqlen_q: Optional[cute.Tensor],
++        cum_seqlen_k: Optional[cute.Tensor],
++        window_size_left: Optional[Int32],
++        window_size_right: Optional[Int32],
++        q_full_mbar_ptr: cute.Pointer,
++        kv_full_mbar_ptr: cute.Pointer,
++        fgs_stats: Optional[cute.Tensor],
++    ):
++        """Retry warp of the fgs_consumer build (the otherwise idle empty warp; the load warp cannot retry because
++        its refills block on empty barriers that need this warp's release).
++
++        Releases each Q / K / V stage once its load completed with valid data. Per work tile the load warp issues
++        Q0, Q1 into Q stages 0, 1 and K0, K1, V0, K2, V1, ..., V(n-1) into the K/V ring, so K/V load j of a tile is
++        K0 (j = 0), V(n-1) (j = 2n-1), K((j+1)/2) (odd j) or V(j/2-1) (even j). A stage is refilled only after the
++        MMA and this warp both released it, so the loads in flight lie in [base, base + kv_stage). Bit s of
++        ``kv_done`` marks stage s's load in that window as released; bit s of ``kv_parity`` / ``q_parity`` is the
++        parity of the primary phase stage s completes next. Every completion flips the primary phase, valid or not,
++        while the conditional phase the MMA waits on completes only with valid data. An invalid stage is re-armed
++        and re-loaded with report_valid into the same stage and revisited on the next sweep, so several stages can
++        retry at once.
++        """
++        tma_atom_q, mQ_qdl, sQ = q_args
++        tma_atom_k, mK_kdl, sK = k_args
++        tma_atom_v, mV_dkl, sV = v_args
++        q_empty_mbar_ptr = q_full_mbar_ptr + self.q_stage
++        kv_empty_mbar_ptr = kv_full_mbar_ptr + self.kv_stage
++        q_parity = Int32(0)
++        kv_parity = Int32(0)
++        kv_stage_base = Int32(0)
++        retries = Int32(0)
++        q_retries = Int32(0)
++        k_retries = Int32(0)
++        stalls = Int32(0)
++        while work_tile.is_valid_tile:
++            curr_block_coord = work_tile.tile_idx
++            batch_coord = curr_block_coord[2][1]
++            continue_cond = False
++            seqlen_q = mQ_qdl.shape[0]
++            seqlen_k = mK_kdl.shape[0]
++            if cutlass.const_expr(cum_seqlen_q is not None):
++                seqlen_q = cum_seqlen_q[batch_coord + 1] - cum_seqlen_q[batch_coord]
++                continue_cond = (
++                    not fmha_utils.FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
++                        self.cta_tiler[0],
++                        curr_block_coord[0],
++                        seqlen_q,
++                    )
++                )
++            if not continue_cond:
++                if cutlass.const_expr(cum_seqlen_k is not None):
++                    seqlen_k = cum_seqlen_k[batch_coord + 1] - cum_seqlen_k[batch_coord]
++                continue_cond = seqlen_k <= 0
++            if not continue_cond:
++                mQ_qdl_ = mQ_qdl
++                mK_kdl_ = mK_kdl
++                mV_dkl_ = mV_dkl
++                if cutlass.const_expr(cum_seqlen_q is not None):
++                    mQ_qdl_ = cute.domain_offset(
++                        (cum_seqlen_q[batch_coord], 0, ((0, 0), 0)), mQ_qdl
++                    )
++                if cutlass.const_expr(cum_seqlen_k is not None):
++                    mK_kdl_ = cute.domain_offset(
++                        (cum_seqlen_k[batch_coord], 0, ((0, 0), 0)), mK_kdl
++                    )
++                    mV_dkl_ = cute.domain_offset(
++                        (0, cum_seqlen_k[batch_coord], ((0, 0), 0)), mV_dkl
++                    )
++                gQ_qdl = cute.flat_divide(mQ_qdl_, cute.select(self.qk_mma_tiler, mode=[0, 2]))
++                tQsQ, tQgQ_qdl = cute.nvgpu.cpasync.tma_partition(
++                    tma_atom_q,
++                    0,
++                    cute.make_layout(1),
++                    cute.group_modes(sQ, 0, 3),
++                    cute.group_modes(qk_thr_mma.partition_A(gQ_qdl), 0, 3),
++                )
++                tQgQ = tQgQ_qdl[None, None, 0, curr_block_coord[2]]
++                gK_kdl = cute.flat_divide(mK_kdl_, cute.select(self.qk_mma_tiler, mode=[1, 2]))
++                tKsK, tKgK_kdl = cute.nvgpu.cpasync.tma_partition(
++                    tma_atom_k,
++                    0,
++                    cute.make_layout(1),
++                    cute.group_modes(sK, 0, 3),
++                    cute.group_modes(qk_thr_mma.partition_B(gK_kdl), 0, 3),
++                )
++                tKgK = tKgK_kdl[None, None, 0, curr_block_coord[2]]
++                gV_dkl = cute.flat_divide(mV_dkl_, cute.select(self.pv_mma_tiler, mode=[1, 2]))
++                tVsV, tVgV_dkl = cute.nvgpu.cpasync.tma_partition(
++                    tma_atom_v,
++                    0,
++                    cute.make_layout(1),
++                    cute.group_modes(sV, 0, 3),
++                    cute.group_modes(pv_thr_mma.partition_B(gV_dkl), 0, 3),
++                )
++                tVgV = tVgV_dkl[None, 0, None, curr_block_coord[2]]
++                kv_start = fmha_utils.FusedMask.get_trip_start(
++                    self.mask_type,
++                    curr_block_coord,
++                    self.cta_tiler,
++                    seqlen_q,
++                    seqlen_k,
++                    window_size_left,
++                )
++                # The load warp issues K0 and V(n-1) even for an empty trip.
++                kv_loads = 2 * cutlass.max(
++                    fmha_utils.FusedMask.get_trip_count(
++                        self.mask_type,
++                        curr_block_coord,
++                        self.cta_tiler,
++                        seqlen_q,
++                        seqlen_k,
++                        window_size_left,
++                        window_size_right,
++                    ),
++                    Int32(1),
++                )
++                # Q: q_stage loads, stage s holds q tile q_stage * blk + s.
++                q_done = Int32(0)
++                while q_done != (1 << self.q_stage) - 1:
++                    progress = cutlass.Boolean(False)
++                    for s in cutlass.range_constexpr(self.q_stage):
++                        if (q_done >> s) & 1 == 0:
++                            complete, invalid = cute.arch.mbarrier_try_wait_primary(
++                                q_full_mbar_ptr + s, (q_parity >> s) & 1
++                            )
++                            if complete:
++                                progress = True
++                                q_parity = q_parity ^ (1 << s)
++                                if invalid:
++                                    retries += 1
++                                    q_retries += 1
++                                    with cute.arch.elect_one():
++                                        cute.arch.mbarrier_arrive_and_expect_tx(
++                                            q_full_mbar_ptr + s, self.tma_copy_q_bytes
++                                        )
++                                    cute.copy(
++                                        tma_atom_q,
++                                        tQgQ[None, self.q_stage * curr_block_coord[0] + s],
++                                        tQsQ[None, s],
++                                        tma_bar_ptr=q_full_mbar_ptr + s,
++                                        report_valid=True,
++                                    )
++                                else:
++                                    q_done = q_done | (1 << s)
++                                    with cute.arch.elect_one():
++                                        cute.arch.mbarrier_arrive(q_empty_mbar_ptr + s)
++                    stalls = self.fgs_check_limit(progress, stalls, retries)
++                base = Int32(0)
++                kv_done = Int32(0)
++                while base < kv_loads:
++                    progress = cutlass.Boolean(False)
++                    stage = kv_stage_base
++                    for i in cutlass.range(self.kv_stage, unroll=1):
++                        bit = Int32(1) << stage
++                        j = base + i
++                        if j < kv_loads and (kv_done & bit) == 0:
++                            complete, invalid = cute.arch.mbarrier_try_wait_primary(
++                                kv_full_mbar_ptr + stage, (kv_parity >> stage) & 1
++                            )
++                            if complete:
++                                progress = True
++                                kv_parity = kv_parity ^ bit
++                                if invalid:
++                                    retries += 1
++                                    is_k = cutlass.Boolean(True)
++                                    tile = (j + 1) >> 1
++                                    if j == kv_loads - 1:
++                                        is_k = cutlass.Boolean(False)
++                                        tile = (kv_loads >> 1) - 1
++                                    else:
++                                        if j > 0 and j & 1 == 0:
++                                            is_k = cutlass.Boolean(False)
++                                            tile = (j >> 1) - 1
++                                    if is_k:
++                                        k_retries += 1
++                                        with cute.arch.elect_one():
++                                            cute.arch.mbarrier_arrive_and_expect_tx(
++                                                kv_full_mbar_ptr + stage, self.tma_copy_k_bytes
++                                            )
++                                        cute.copy(
++                                            tma_atom_k,
++                                            tKgK[None, kv_start + tile],
++                                            tKsK[None, stage],
++                                            tma_bar_ptr=kv_full_mbar_ptr + stage,
++                                            report_valid=True,
++                                        )
++                                    else:
++                                        with cute.arch.elect_one():
++                                            cute.arch.mbarrier_arrive_and_expect_tx(
++                                                kv_full_mbar_ptr + stage, self.tma_copy_v_bytes
++                                            )
++                                        cute.copy(
++                                            tma_atom_v,
++                                            tVgV[None, kv_start + tile],
++                                            tVsV[None, stage],
++                                            tma_bar_ptr=kv_full_mbar_ptr + stage,
++                                            report_valid=True,
++                                        )
++                                else:
++                                    kv_done = kv_done | bit
++                                    with cute.arch.elect_one():
++                                        cute.arch.mbarrier_arrive(kv_empty_mbar_ptr + stage)
++                        stage = stage + 1
++                        if stage == self.kv_stage:
++                            stage = Int32(0)
++                    while (kv_done >> kv_stage_base) & 1 == 1:
++                        kv_done = kv_done ^ (Int32(1) << kv_stage_base)
++                        base = base + 1
++                        kv_stage_base = kv_stage_base + 1
++                        if kv_stage_base == self.kv_stage:
++                            kv_stage_base = Int32(0)
++                    stalls = self.fgs_check_limit(progress, stalls, retries)
++            tile_sched.advance_to_next_work()
++            work_tile = tile_sched.get_current_work()
++        if cutlass.const_expr(fgs_stats is not None):
++            with cute.arch.elect_one():
++                if retries > 0:
++                    cute.arch.atomic_add(fgs_stats.iterator, retries)
++                    cute.arch.atomic_add(fgs_stats.iterator + 1, Int32(1))
++                    cute.arch.atomic_add(fgs_stats.iterator + 2, q_retries)
++                    cute.arch.atomic_add(fgs_stats.iterator + 3, k_retries)
++
++    @cute.jit
++    def fgs_check_limit(self, progress, stalls, retries):
++        """Diagnostic fgs_retry_limit: trap once a CTA re-issued, or swept without progress, that many times."""
++        if cutlass.const_expr(self.fgs_retry_limit > 0):
++            if progress:
++                stalls = Int32(0)
++            else:
++                stalls = stalls + 1
++            if stalls > self.fgs_retry_limit or retries > self.fgs_retry_limit:
++                trap()
++        return stalls
++
++    @cute.jit
+     def get_skip_softmax_flag(self, tiled_tmem_load_v, tTMEM_LOADtS_v, tTMEM_LOADrS_v):
+         cute.copy(tiled_tmem_load_v, tTMEM_LOADtS_v, tTMEM_LOADrS_v)
+         tTMEM_LOADrS_v_i32 = cute.recast_tensor(tTMEM_LOADrS_v, dtype=cutlass.Int32)
+@@ -3082,8 +3417,16 @@ class BlackwellFusedMultiHeadAttentionForward:
+                     (scale, scale),
+                 )
+             tDMrO = cute.make_rmem_tensor(tTMrO.shape, self.o_dtype)
+-            o_vec = tTMrO.load()
+-            tDMrO.store(o_vec.to(self.o_dtype))
++            if cutlass.const_expr(self.fgs_producer):
++                # cvt.rn.pzo: same rounding as the default convert except that -0.0 (the sentinel) becomes +0.0.
++                # The store stays the default one: the consumer (output gate) checks every element of a chunk.
++                assert cutlass.const_expr(self.o_dtype == cutlass.BFloat16)
++                o_words = cute.recast_tensor(tDMrO, Int32)
++                for e in cutlass.range_constexpr(cute.size(tTMrO) // 2):
++                    o_words[e] = bf16x2_pzo(tTMrO[2 * e], tTMrO[2 * e + 1], True)
++            else:
++                o_vec = tTMrO.load()
++                tDMrO.store(o_vec.to(self.o_dtype))
+             if cutlass.const_expr(self.use_tma_store):
+                 # TMA store path: write to shared memory
+                 cute.copy(tiled_smem_store, tDMrO, tTMEM_LOADdO_i)
+diff --git a/helpers/fmha_helpers.py b/helpers/fmha_helpers.py
+index f2034556e1d8040e440252bc3088bfb96e6d3f72..f4afa90d274d487a7eb8e39b37a28639475f1f33 100644
+--- a/helpers/fmha_helpers.py
++++ b/helpers/fmha_helpers.py
+@@ -70,6 +70,7 @@ class FmhaStaticTileSchedulerParams:
+         is_persistent: bool,
+         problem_shape_mhb: cute.Shape,
+         *,
++        lpt: bool = False,
+         loc=None,
+         ip=None,
+     ):
+@@ -83,6 +84,7 @@ class FmhaStaticTileSchedulerParams:
+         """
+         self.is_persistent = is_persistent
+         self.problem_shape_mhb = problem_shape_mhb
++        self.lpt = lpt
+         self._loc = loc
+         self._ip = ip
+ 
+@@ -99,7 +101,9 @@ class FmhaStaticTileSchedulerParams:
+         for obj, n_items in zip([self.problem_shape_mhb], self._values_pos):
+             obj_list.append(new_from_mlir_values(obj, values[:n_items]))
+             values = values[n_items:]
+-        return FmhaStaticTileSchedulerParams(self.is_persistent, *(tuple(obj_list)), loc=self._loc)
++        return FmhaStaticTileSchedulerParams(
++            self.is_persistent, *(tuple(obj_list)), lpt=self.lpt, loc=self._loc
++        )
+ 
+ 
+ class FmhaStaticTileScheduler:
+@@ -229,19 +233,36 @@ class FmhaStaticTileScheduler:
+         :return: WorkTileInfo containing tile coordinates and validity flag.
+         :rtype: WorkTileInfo
+         """
+-        is_valid = (
+-            self._current_work_linear_idx < self._num_blocks
+-            if self._is_persistent
+-            else self._is_first_block
+-        )
++        work_idx = self._current_work_linear_idx
++        if self._is_persistent and self._params.lpt:
++            # Snake the CTAs over rounds of the longest-first order below, so every CTA's tiles sum to about the
++            # same causal work. Each round is a full permutation of its slots, so the tiles stay covered once.
++            n_cta = self.num_persistent_sm
++            rnd = work_idx // n_cta
++            slot = work_idx - rnd * n_cta
++            work_idx = rnd * n_cta + slot + (rnd & 1) * (n_cta - 1 - 2 * slot)
++        is_valid = work_idx < self._num_blocks if self._is_persistent else self._is_first_block
+ 
+         blk_coord = (0, 0, 0)
+-        if self._is_persistent:
+-            blk_coord = self._problem_shape_mhb.get_hier_coord(
+-                self._current_work_linear_idx, loc=loc, ip=ip
+-            )
++        if self._is_persistent and self._params.lpt:
++            m_cnt, h_cnt, b_cnt = self._params.problem_shape_mhb
++            hb_cnt = h_cnt * b_cnt
++            m_rank = work_idx // hb_cnt
++            rest = work_idx - m_rank * hb_cnt
++            blk_coord = (m_cnt - 1 - m_rank, rest % h_cnt, rest // h_cnt)
++        elif self._is_persistent:
++            blk_coord = self._problem_shape_mhb.get_hier_coord(work_idx, loc=loc, ip=ip)
+         else:
+             blk_coord = self._blk_coord
++            if self._params.lpt:
++                # Launch order is block-linear with m fastest; walk q tiles from the last (the longest causal
++                # rows) to the first across all heads and batches so the light tiles fill the tail wave.
++                m_cnt, h_cnt, b_cnt = self._grid_shape
++                hb_cnt = h_cnt * b_cnt
++                lin = blk_coord[0] + m_cnt * (blk_coord[1] + h_cnt * blk_coord[2])
++                m_rank = lin // hb_cnt
++                rest = lin - m_rank * hb_cnt
++                blk_coord = (m_cnt - 1 - m_rank, rest % h_cnt, rest // h_cnt)
+ 
+         # cur_tile_coord is (mid, 0, (bid, hid))
+         cur_tile_coord = (
+@@ -318,6 +339,7 @@ def create_fmha_static_tile_scheduler(
+ def create_fmha_static_tile_scheduler_params(
+     is_persistent: bool,
+     problem_shape_mhb: cute.Shape,
++    lpt: bool = False,
+ ) -> FmhaStaticTileSchedulerParams:
+     """
+     Create FMHA static tile scheduler parameters.
+@@ -330,7 +352,7 @@ def create_fmha_static_tile_scheduler_params(
+     :return: New FmhaStaticTileSchedulerParams instance.
+     :rtype: FmhaStaticTileSchedulerParams
+     """
+-    return FmhaStaticTileSchedulerParams(is_persistent, problem_shape_mhb)
++    return FmhaStaticTileSchedulerParams(is_persistent, problem_shape_mhb, lpt=lpt)
+ 
+ 
+ def compute_grid(
+@@ -338,6 +360,7 @@ def compute_grid(
+     cta_tiler: Tuple[int, int, int],
+     is_persistent: bool,
+     is_2cta: bool = False,
++    lpt: bool = False,
+ ) -> Tuple[FmhaStaticTileSchedulerParams, Tuple[int, int, int]]:
+     """
+     Compute grid parameters for FMHA operation.
+@@ -372,6 +395,7 @@ def compute_grid(
+             cute.size(o_shape[2][0]),
+             cute.size(o_shape[2][1]),
+         ),
++        lpt=lpt,
+     )
+     grid = FmhaStaticTileScheduler.get_grid_shape(tile_sched_params)
+ 
