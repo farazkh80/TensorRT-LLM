@@ -124,6 +124,7 @@ from ..model_config import ModelConfig
 from ..modules.gated_mlp import GatedMLP
 from ..modules.kimi_k3_attn_res.attn_res_mix_cute import attn_res_mix as _cute_attn_res_mix
 from ..modules.kimi_k3_fgs import edges as k3_fgs_edges
+from ..modules.kimi_k3_fgs import kda_chain as k3_kda_chain
 from ..modules.kimi_k3_fgs import moe_chain as k3_moe_chain
 from ..modules.kimi_k3_fgs import moe_streams as k3_moe_streams
 from ..modules.kimi_k3_fgs import recipe as k3_fgs_recipe
@@ -527,6 +528,7 @@ def _cute_attn_res(
     addend: Optional[torch.Tensor] = None,
     updated: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    **fgs_kwargs,
 ):
     M, H = prefix_sum.shape
     N = int(block_residual.shape[0]) + 1
@@ -553,6 +555,7 @@ def _cute_attn_res(
         addend=addend,
         updated=updated,
         out=out,
+        **fgs_kwargs,
         **kwargs,
     )
 
@@ -2412,6 +2415,27 @@ class KimiLinearDecoderLayer(nn.Module):
             hidden_states = hidden_states + residual_addend
         prefix_sum = hidden_states
         valid_block_residual = block_residual[:num_snapshots]
+        # The pre-attention mix publishes x_norm into a slot the attention chain consumes (both KDA GEMMs).
+        x_norm_lease = None
+        if (
+            sliced is None
+            and capture is None
+            and attn_metadata.num_contexts == 0
+            and num_snapshots > 0
+            and _CUTE_NORM_ENABLED
+            and k3_fgs_edges.chain()
+            and (not self.is_kda or self.linear_attn.k3_chain_ready())
+            and _cute_attn_res_applicable(
+                prefix_sum, valid_block_residual, residual_addend if fold_in else None
+            )
+        ):
+            if self.is_kda:
+                x_norm_lease = k3_kda_chain.acquire(
+                    k3_kda_chain.X_NORM, prefix_sum.shape[0], readers=2
+                )
+        x_norm_fgs = (
+            {} if x_norm_lease is None else dict(out=x_norm_lease.tensor, fgs_producer=True)
+        )
 
         if capture is not None:
             # The mixture tap needs the PRE-norm value, which the fused
@@ -2444,6 +2468,16 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.input_layernorm,
                 addend=residual_addend,
                 updated=snapshot_slot,
+                **x_norm_fgs,
+            )
+        elif x_norm_lease is not None:
+            hidden_states = _cute_attn_res(
+                prefix_sum,
+                valid_block_residual,
+                self.self_attention_res_proj,
+                self.self_attention_res_norm,
+                self.input_layernorm,
+                **x_norm_fgs,
             )
         elif num_snapshots > 0:
             hidden_states = _apply_attn_res_and_rmsnorm(
@@ -2473,8 +2507,60 @@ class KimiLinearDecoderLayer(nn.Module):
         else:
             hidden_states = self.self_attn(hidden_states, attn_metadata)
 
-        if prefix_sum is None:
-            prefix_sum = hidden_states
+        # The attention output is an o_proj slot; this mix consumes it and releases it.
+        attn_o_lease = (
+            k3_fgs_edges.lease_containing(hidden_states) if k3_fgs_edges.chain() else None
+        )
+        chain_mix = (
+            attn_o_lease is not None
+            and _CUTE_NORM_ENABLED
+            and _cute_attn_res_applicable(
+                hidden_states if prefix_sum is None else prefix_sum,
+                valid_block_residual,
+                None if prefix_sum is None else hidden_states,
+            )
+        )
+        if chain_mix:
+            mix_fgs = dict(
+                fgs_consumer=True,
+                fgs_counters=k3_kda_chain.mix_counters(self, hidden_states.device),
+            )
+            owner = k3_kda_chain.mix_owner(self, self.layer_idx, hidden_states.shape[0])
+            if prefix_sum is None:
+                attn_out = hidden_states
+                hidden_states = _cute_attn_res(
+                    attn_out,
+                    valid_block_residual,
+                    self.mlp_res_proj,
+                    self.mlp_res_norm,
+                    self.post_attention_layernorm,
+                    out=k3_kda_chain.buffer(owner, "mix_out", attn_out),
+                    **mix_fgs,
+                )
+                # The residual add reads the attention output after the slot is re-armed.
+                prefix_sum = k3_kda_chain.buffer(owner, "attn_out", attn_out).copy_(attn_out)
+            else:
+                prefix_sum, hidden_states = _cute_attn_res(
+                    prefix_sum,
+                    valid_block_residual,
+                    self.mlp_res_proj,
+                    self.mlp_res_norm,
+                    self.post_attention_layernorm,
+                    addend=hidden_states,
+                    updated=k3_kda_chain.buffer(owner, "mix_updated", prefix_sum),
+                    out=k3_kda_chain.buffer(owner, "mix_out", prefix_sum),
+                    **mix_fgs,
+                )
+        elif prefix_sum is None:
+            prefix_sum = (
+                hidden_states
+                if attn_o_lease is None
+                else k3_kda_chain.buffer(
+                    k3_kda_chain.mix_owner(self, self.layer_idx, hidden_states.shape[0]),
+                    "attn_out",
+                    hidden_states,
+                ).copy_(hidden_states)
+            )
             hidden_states = _apply_attn_res_and_rmsnorm(
                 prefix_sum,
                 valid_block_residual,
@@ -2491,6 +2577,8 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.mlp_res_norm,
                 self.post_attention_layernorm,
             )
+        if attn_o_lease is not None:
+            k3_fgs_edges.consumed(attn_o_lease)
         if self.is_moe:
             hidden_states = self.block_sparse_moe(
                 hidden_states,

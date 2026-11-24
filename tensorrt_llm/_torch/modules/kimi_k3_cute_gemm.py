@@ -22,6 +22,9 @@ else FlashInfer's default split-K tactic; a strided input at split-K rows runs t
 ``_FGS_SMALL_TACTIC``. The direct consumer checks element 0 of each 16 B chunk in software (the TMA report_valid
 rule, sound because every producer of a direct GEMM's input slot stores whole chunks); a direct producer stores whole
 16 B chunks (``_DIRECT_AUTO_STORE``).
+The ``rubin`` producer build of the KDA qkvg projection computes the q / k / v tiles of heads 0 .. h1 - 1 first
+(``dense_gemm_fgs`` ``n_order``; same tiles, bit-exact): h1 = 70 at 9..16 rows (the rows the KDA core's late-gate,
+head-major producer order runs at).
 
 A shape without an entry runs the ``rubin`` backend under the TRT-LLM autotuner. Non-BF16 operands keep the
 cuBLAS matmul; empty problems launch nothing.
@@ -177,6 +180,20 @@ class _Roles(NamedTuple):
 
 def _roles(consume: bool, produce: bool) -> _Roles:
     return _Roles(check=consume, wait=not consume, arm=produce, early=produce)
+
+
+# KDA qkvg projection (N, K) and its heads (q | k | v | gate sections of one-tile heads).
+_QKVG = (49152, 7168)
+_QKVG_HEADS = 96
+
+
+# Head-ordered qkvg tiles: (min rows, max rows, h1).
+_QKVG_ORDER = (9, 16, 70)
+
+
+def _qkvg_order(m: int) -> int:
+    low, high, h1 = _QKVG_ORDER
+    return h1 if low <= m <= high else 0
 
 
 # Preferred smem carveout (percent) of the vendored split-K launches.
@@ -342,12 +359,18 @@ def _fgs_linear(x, weight, out, consume: bool, produce: bool) -> None:
     if backend == "rubin" or not dense:
         if backend != "rubin":
             tactic = _FGS_SMALL_TACTIC
+        n_order = None
+        if roles.arm and backend == "rubin" and (n, k) == _QKVG:
+            h1 = _qkvg_order(m)
+            if h1 > 0:
+                n_order = (_QKVG_HEADS, h1)
         _fgs_rubin(
             x.unsqueeze(0),
             weight.unsqueeze(0),
             out.unsqueeze(0),
             tactic,
             roles,
+            n_order=n_order,
         )
         return
     exact = backend == "vsplitk"

@@ -5,13 +5,22 @@
 :func:`install` runs once, before the model declares its edges. An edge runs only at the rows of its windows, and an
 edge the recipe does not list is off; a config without ``edges`` runs ``DEFAULT_EDGES``, an empty map none (FGS off on
 the same kernels).
+
+Edge names: the KDA chain edges (``KDA_EDGES``).
 """
 
 from typing import Dict, Optional, Tuple
 
+KDA_EDGES = ("kda.x_norm", "kda.qkvg", "kda.bfa", "kda.g", "kda.core_o", "kda.attn_o")
 # Edge windows of the decode recipe, run when the config lists no edges.
-DEFAULT_EDGES: Dict[str, Tuple[Tuple[int, int], ...]] = {}
-_FAMILIES = frozenset()
+DEFAULT_EDGES: Dict[str, Tuple[Tuple[int, int], ...]] = {
+    "kda.x_norm": ((8, 64),),
+    "kda.qkvg": ((8, 64),),
+    "kda.bfa": ((8, 64),),
+    "kda.g": ((8, 64),),
+    "kda.core_o": ((8, 64),),
+}
+_FAMILIES = frozenset(("kda",))
 
 _windows: Dict[str, Tuple[Tuple[int, int], ...]] = {}
 _owned: frozenset = frozenset()
@@ -28,7 +37,7 @@ def install(config) -> None:
     _windows, _owned = {}, frozenset()
     if config is None:
         return
-    known = set()
+    known = set(KDA_EDGES)
     names = DEFAULT_EDGES if config.edges is None else config.edges
     unknown = sorted(set(names) - known)
     if unknown:
@@ -39,6 +48,10 @@ def install(config) -> None:
         dict(DEFAULT_EDGES) if config.edges is None else {n: config.windows(n) for n in names}
     )
     _owned = _FAMILIES
+
+    from . import edges
+
+    edges.configure_window(span(KDA_EDGES))
 
 
 def owns(family: str) -> bool:
@@ -58,5 +71,8 @@ def on(edge: str, rows: int) -> bool:
 
 
 def slot_allowed(slot: str, rows: int) -> bool:
-    """Whether the recipe lets the edge holding ``slot`` run at ``rows``."""
+    """Whether the recipe lets the kda edge holding ``slot`` run at ``rows``."""
+    family = slot.partition(".")[0]
+    if family == "kda" and slot in KDA_EDGES and owns("kda"):
+        return on(slot, rows)
     return True
