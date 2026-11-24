@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Kimi K3 decode MoE expert path in CuTe DSL: routing -> FC1 -> FC2 -> finalize, the CuTe
-all-to-all and the post-combine latent tail.
+all-to-all, the post-combine latent tail and the fine-grained-sync edges between them (the recipe's ``moe.*``
+edges).
 
 It replaces only the TRTLLM-Gen runner call inside the routed experts' ``run_moe``; quantize, dispatch and combine
 stay stock. Per call, on one rank, with R = ep_size * max_tokens_per_rank received rows:
@@ -16,30 +17,70 @@ stay stock. Per call, on one rank, with R = ep_size * max_tokens_per_rank receiv
                            for every r < R (zero when no k is local), written into the combine payload buffer
 
 Weights are the backend's TRTLLM-Gen W4A8_MXFP4_MXFP8 buffers, read in place. Every buffer is allocated once per
-device for the largest R seen outside graph capture, so CUDA-graph replays see fixed addresses.
+device for the largest R seen outside graph capture, so CUDA-graph replays and FGS sentinels see fixed addresses.
 """
 
 import importlib
 import os
 import threading
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Mapping, Optional, Tuple
 
 import torch
 
 from ..multi_stream_utils import do_multi_stream
+from . import edges as k3_edges
 from . import moe_streams
+from . import recipe as k3_recipe
 
 HIDDEN = 3584
 INTER = 3072
 TOP_K = 16
 NUM_EXPERTS = 896
 SF_VEC = 32
+# The MoE edges a recipe can list (``recipe.py`` validates ``moe.<edge>`` names against EDGES + V2_EDGES).
+EDGES = ("fc1_fc2",)
+_COMM_EDGES = frozenset(("recv_norm",))
+# FC1 -> FC2 (Lamport): FC1 writes act / act_sf into the FC1_ACT / FC1_SF slots (armed 0x80 / 0xFF) by TMA store,
+# FC2 checks each act chunk with a TMA report_valid load, and the edge workspaces' reset stream re-arms the rows FC2
+# reports.
+FC1_ACT = "moe.fc1_act"
+FC1_SF = "moe.fc1_sf"
+# Rows per rank the expert-path edges serve (the fc1_fc2 / recv_norm windows end at 128); the tail edges stop where
+# the split-K up-projection consumer does.
+FGS_MAX_ROWS = 128
 TAIL_FGS_MAX_ROWS = 32
 # Forwards with more tokens on the fullest rank, such as context steps, keep the stock kernels.
 MAX_TOKENS_PER_RANK = 128
 # The fused router serves up to this many tokens per rank; the stock gate GEMM runs above.
 ROUTER_MAX_ROWS = 64
+
+
+V2_EDGES = ("mix_latent", "recv_norm")
+# Edges whose producer is the pre-MoE mix: it writes the MoE input into a -0-armed slot (``mix_out``).
+_MIX_EDGES = frozenset(("mix_latent",))
+MIX_X = "moe.x"
+MODEL_HIDDEN = 7168
+MIX_MAX_ROWS = 64
+
+
+@dataclass(frozen=True)
+class EdgeSync:
+    """One edge's sync object as a fused kernel sees it: ``kind`` ``slot`` (the -0-armed mix slot the consumer reads)
+    or ``lamport`` (the FC1 -> FC2 slots; ``tensor`` is the int32 [1] word FC2 stores its padded rows into)."""
+
+    edge: str
+    kind: str
+    tensor: Optional[torch.Tensor]
+
+
+@dataclass(frozen=True)
+class StageSync:
+    """The edges one call of a fused kernel consumes (``waits``) and produces (``publishes``); empty maps or no
+    ``StageSync`` at all is the FUSED-OFF build."""
+
+    waits: Mapping[str, EdgeSync]
+    publishes: Mapping[str, EdgeSync]
 
 
 def _resolve(entry: str):
@@ -54,6 +95,16 @@ def _resolve(entry: str):
         if obj is None:
             return None
     return obj
+
+
+@dataclass
+class Fc1Slots:
+    """The Lamport FC1 -> FC2 slot pair of one MoE forward: ``act`` / ``act_sf`` (rows past the workspace's are never
+    touched) and the int32 [1] word FC2 stores its padded rows into."""
+
+    act: torch.Tensor
+    act_sf: torch.Tensor
+    rows_used: torch.Tensor
 
 
 def _max_tokens_per_rank() -> int:
@@ -260,6 +311,7 @@ def run_expert_path(
     ws: Optional[Workspace] = None,
     stage_kwargs: Optional[Dict[str, dict]] = None,
     tokens_per_rank: Optional[int] = None,
+    act_bufs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Workspace:
     """Run routing -> FC1 -> FC2 + finalize on the current stream; writes ``out`` [R, 3584] bf16.
 
@@ -268,7 +320,8 @@ def run_expert_path(
       routing(topk_ids, local_expert_offset, num_local, plan)
       fc1(x, x_sf, weights, plan, act, act_sf)
       fc2_v2(act, act_sf, weights, plan, topk_w, out)            FC2 with the finalize fused
-    ``stage_kwargs`` adds keyword arguments per stage.
+    ``stage_kwargs`` adds keyword arguments per stage (the FGS edge builds). ``act_bufs`` replaces the workspace's
+    ``act`` / ``act_sf`` (the Lamport FC1 -> FC2 slots).
     """
     rows = x.shape[0]
     assert x.shape == (rows, HIDDEN) and x.dtype == torch.float8_e4m3fn, (x.shape, x.dtype)
@@ -283,7 +336,7 @@ def run_expert_path(
     if ws is None:
         ws = workspace(x.device, rows, weights.num_local, tile_n_for(rows))
     plan = ws.plan
-    act, act_sf = ws.act, ws.act_sf
+    act, act_sf = act_bufs if act_bufs is not None else (ws.act, ws.act_sf)
     run["routing"](
         topk_ids, weights.local_expert_offset, weights.num_local, plan, **kw.get("routing", {})
     )
@@ -296,19 +349,77 @@ def _pdl() -> bool:
     return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
 
+def fgs_edges() -> frozenset:
+    """The MoE FGS edges the recipe lists (``recipe.moe_edge_names``); none without one."""
+    return k3_recipe.moe_edge_names() or frozenset()
+
+
+def configure_windows(windows: Mapping[str, Tuple[int, int]]) -> None:
+    """Size the mix slot for the recipe's MoE edge spans (``recipe.install``)."""
+    global MIX_MAX_ROWS
+    for edge, (_, high) in windows.items():
+        if edge in _MIX_EDGES:
+            MIX_MAX_ROWS = max(MIX_MAX_ROWS, high)
+
+
+def _edge_rows(edge: str) -> tuple:
+    return k3_recipe.span((f"moe.{edge}",)) or (1, 0)
+
+
 class _Call:
-    """One forward of one MoE layer."""
+    """One forward of one MoE layer: the edges it runs and their leases (``edges.acquire*``)."""
 
     def __init__(self, layer: "_Layer", rows: int):
         self.rows = rows
+        self.leases: Dict[str, object] = {}
+        self.fc1: Optional[Fc1Slots] = None
+        if layer.fc1_fc2_lamport and 1 <= rows <= FGS_MAX_ROWS:
+            self._acquire_fc1_slots(layer, rows)
+
+    def _acquire_fc1_slots(self, layer: "_Layer", rows: int) -> None:
+        low, high = _edge_rows("fc1_fc2")
+        if not (low <= rows <= high and k3_recipe.moe_on("fc1_fc2", rows)):
+            return
+        p = layer.workspace(layer.ep * rows).act.shape[0]
+        act = k3_edges.acquire_bytes(FC1_ACT, rows, p, window=(1, FGS_MAX_ROWS))
+        sf = (
+            None
+            if act is None
+            else k3_edges.acquire_bytes(FC1_SF, rows, p, window=(1, FGS_MAX_ROWS))
+        )
+        if sf is None:
+            if act is not None:
+                k3_edges.consumed(act)
+            return
+        if act.slot != sf.slot:
+            raise RuntimeError(f"{FC1_ACT} slot {act.slot} and {FC1_SF} slot {sf.slot} must pair")
+        self.leases["fc1_fc2"] = act
+        self.leases["fc1_sf"] = sf
+        self.fc1 = Fc1Slots(act.tensor.view(torch.float8_e4m3fn), sf.tensor, act.bound)
+
+    def fc1_slots(self, rows: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The Lamport FC1 -> FC2 slots as the workspace's ``rows``-row ``act`` / ``act_sf``."""
+        act, sf = self.fc1.act, self.fc1.act_sf
+        if act.shape[0] < rows:
+            raise RuntimeError(f"{FC1_ACT}: a {act.shape[0]}-row slot for a {rows}-row workspace")
+        return act[:rows], sf[:rows]
+
+    def on(self, edge: str) -> bool:
+        return edge in self.leases
+
+    def consumed(self, edge: str) -> None:
+        lease = self.leases.get(edge)
+        if lease is not None:
+            k3_edges.consumed(lease)
 
 
 class _Layer:
-    """The expert-path state of one MoE layer: its backend, its CuteA2A and the
+    """The expert-path state of one MoE layer: its backend, its CuteA2A, its FGS edges and the
     forward in flight between dispatch, run_moe and combine."""
 
-    def __init__(self, routed_experts, a2a):
+    def __init__(self, routed_experts, edges: frozenset, a2a):
         self.backend = routed_experts.backend
+        self.edges = edges
         self.a2a = a2a
         self.num_local = int(self.backend.expert_size_per_partition)
         self.num_experts = int(self.backend.num_slots)
@@ -326,7 +437,38 @@ class _Layer:
         # keeps.
         self.balanced_ids = False
         self.entry_kernels: Tuple[str, ...] = ()
+        layer_idx = getattr(routed_experts, "layer_idx", None)
+        if edges & _MIX_EDGES:
+            k3_edges.declare(MIX_X, MODEL_HIDDEN, layer_idx, max_rows=MIX_MAX_ROWS, min_rows=1)
+        self.fc1_fc2_lamport = "fc1_fc2" in edges
+        if self.fc1_fc2_lamport:
+            # The workspace's act rows for any R the edge serves (the tile_n bucket's largest R).
+            slot_rows = max(
+                max_permuted(
+                    _bucket_rows(self.ep * rows, self.num_experts, self.max_rows),
+                    self.num_local,
+                    tile_n_for(self.ep * rows, self.num_experts),
+                )
+                for rows in range(1, FGS_MAX_ROWS + 1)
+            )
+            # The framework arms a 1-byte edge by dtype: the E4M3 act slots with -0, the uint8 scale slots with 0xFF.
+            for name, width, dtype, shared in (
+                (FC1_ACT, INTER, torch.float8_e4m3fn, None),
+                (FC1_SF, INTER // SF_VEC, torch.uint8, FC1_ACT),
+            ):
+                k3_edges.declare_bytes(
+                    name,
+                    width,
+                    dtype,
+                    slot_rows,
+                    layer_idx,
+                    max_rows=FGS_MAX_ROWS,
+                    policy=None,
+                    bounded=shared is None,
+                    bounds_from=shared,
+                )
         self.tail_fused = a2a is not None
+        self.inbox = "recv_norm" in edges and self.tail_fused
         self.entry_events = None
         # The routed-expert latent RMSNorm, for the fused combine; set by ``entry`` at every MoE forward.
         self.tail_norm = None
@@ -344,14 +486,23 @@ class _Layer:
             _bucket_rows(rows, self.num_experts, self.max_rows),
         )
 
-    def stage_kwargs(self) -> Dict[str, dict]:
-        """Keyword arguments of the expert-path stages."""
+    def stage_kwargs(self, call: Optional[_Call]) -> Dict[str, dict]:
+        """Keyword arguments of the expert-path stages: FC2 (finalize fused) takes ``fgs=StageSync`` and
+        ``enable_pdl``; with ``fc1_fc2`` FC1 runs its Lamport build and FC2 waits on the slots."""
         kw = {"routing": {"enable_pdl": _pdl()}, "fc1": {}, "fc2": {"enable_pdl": _pdl()}}
+        sync = StageSync({}, {})
+        if call is not None and call.on("fc1_fc2") and self.fc1_fc2_lamport:
+            kw["fc1"]["lamport"] = True
+            sync.waits["fc1_fc2"] = EdgeSync("fc1_fc2", "lamport", call.fc1.rows_used)
+        if sync.waits or sync.publishes:
+            kw["fc2"]["fgs"] = sync
         return kw
 
     def run_moe(self, ctx, out: torch.Tensor) -> None:
         call, self.call = self.call, None
         rows = max(ctx.all_rank_num_tokens) if ctx.all_rank_num_tokens else ctx.x.shape[0]
+        if call is None and self.a2a is None and self.edges:
+            call = _Call(self, rows)
         topk_w = ctx.token_final_scales
         if topk_w.dtype != torch.bfloat16:
             topk_w = topk_w.to(torch.bfloat16)
@@ -364,10 +515,17 @@ class _Layer:
             ExpertWeights.from_backend(self.backend),
             out,
             ws=ws,
-            stage_kwargs=self.stage_kwargs(),
+            stage_kwargs=self.stage_kwargs(call),
             tokens_per_rank=rows,
+            act_bufs=(
+                call.fc1_slots(ws.act.shape[0])
+                if call is not None and call.fc1 is not None
+                else None
+            ),
         )
         if call is not None:
+            for edge in ("fc1_fc2", "fc1_sf"):
+                call.consumed(edge)
             if self.tail_fused:
                 self.call = call
 
@@ -377,22 +535,33 @@ class _Layer:
         from .moe import tail
 
         norm = self.tail_norm
+        inbox_kw = {}
+        # The inbox changes what peers push, so every rank decides it on the rank-consistent row count; the
+        # recv_norm edge only decides how the reduce waits for it.
+        inbox = self.inbox and call.rows <= self.a2a.lamport_rows
+        if inbox:
+            inbox_kw = {"inbox": "lamport"}
         out = tail.combine_norm(
             self.a2a,
             final_hidden_states,
             norm.weight,
             float(norm.variance_epsilon),
+            **inbox_kw,
         )
         _pending_tail.fused = out.data_ptr()
         return out
 
     def abandon(self) -> None:
-        """The stock runner takes this forward."""
-        self.call = None
+        """The stock runner takes this forward: its producers never run, so its edges stay off (released
+        unwritten; the step reset re-arms them)."""
+        call, self.call = self.call, None
+        if call is not None:
+            for edge in call.leases:
+                call.consumed(edge)
 
     def install_comm(self, comm) -> None:
         """Wrap the CuteA2A dispatch / combine that ``moe.comm.install`` put on ``comm`` so a forward on the CuTe
-        path ends in the fused combine + norm; anything else goes to those wrappers unchanged."""
+        path carries this layer's edge arguments; anything else goes to those wrappers unchanged."""
         m1_dispatch, m1_combine = comm.dispatch, comm.combine
         a2a = self.a2a
 
@@ -471,10 +640,21 @@ def _check_weights(backend) -> None:
 def install(routed_experts) -> bool:
     """Install the CuTe expert path on one MoE layer: the routed experts' TRTLLM-Gen W4A8 MXFP4 x MXFP8 ``run_moe``
     runs :func:`run_expert_path` (calls the path cannot take keep the stock runner: no combine payload buffer,
-    unfinalized output, internal routing) and dispatch / combine go through ``moe.comm.CuteA2A``.
+    unfinalized output, internal routing), dispatch / combine go through ``moe.comm.CuteA2A``, and the recipe's MoE
+    edges (``fgs_edges``) run.
 
     Forwards with more than ``MAX_TOKENS_PER_RANK`` tokens on the fullest rank keep the stock path.
     """
+    edges = fgs_edges()
+    unknown = edges - set(EDGES) - set(V2_EDGES)
+    if unknown:
+        raise ValueError(
+            f"MoE FGS edges: unknown {sorted(unknown)}; edges are {', '.join(EDGES + V2_EDGES)}"
+        )
+    if edges and not k3_edges.slots():
+        raise ValueError(
+            f"MoE FGS edges need edge slots ({k3_edges.ENV}=chain|chain_after|lamport)"
+        )
     from .moe import comm as k3_comm
 
     backend = routed_experts.backend
@@ -482,10 +662,14 @@ def install(routed_experts) -> bool:
         raise ValueError(f"CuTe MoE path needs the SiTU experts, got {type(backend).__name__}")
     comm = getattr(routed_experts, "comm", None)
     # Only an NVLinkOneSided strategy with counted writes has the CFT workspace CuteA2A runs on; other strategies
-    # (e.g. the allgather / reduce-scatter of a prefill model) keep their stock comm.
+    # (e.g. the allgather / reduce-scatter of a prefill model) keep their stock comm and the layer drops its comm edges.
     cft = comm is not None and getattr(comm, "can_use_cft_counted_writes", False)
-    a2a = k3_comm.install(comm) if cft else None
-    layer = _Layer(routed_experts, a2a)
+    lamport_rows = _max_tokens_per_rank() if "recv_norm" in edges else 0
+    a2a = k3_comm.install(comm, lamport_rows=lamport_rows) if cft else None
+    if a2a is None and edges & _COMM_EDGES:
+        edges = edges - _COMM_EDGES
+    layer = _Layer(routed_experts, edges, a2a)
+    # The forward's edge leases are taken at the CuTe dispatch, so it is wrapped for any edge, not only the comm ones.
     if a2a is not None:
         layer.install_comm(comm)
     _install_entry(routed_experts, layer)
@@ -651,6 +835,7 @@ def entry(runtime, hidden_states: torch.Tensor, all_rank_num_tokens) -> Optional
     fused_router = not stock_why
     bufs = _entry_bufs(hidden_states.device, layer.entry_kernels)
     ids = weights = None
+    latent_sync = _mix_sync(layer, "mix_latent", hidden_states)
     balanced = hot_ids = None
     if fused_router:
         ids, weights = bufs.ids[:m], bufs.weights[:m]
@@ -683,6 +868,7 @@ def entry(runtime, hidden_states: torch.Tensor, all_rank_num_tokens) -> Optional
             runtime.routed_expert_down_proj.weight,
             xq,
             x_sf,
+            fgs=latent_sync,
             enable_pdl=_pdl(),
             workspace=bufs.scratch["latent_down"] or None,
         )
@@ -705,6 +891,36 @@ def entry(runtime, hidden_states: torch.Tensor, all_rank_num_tokens) -> Optional
 
 def _router_max_rows() -> int:
     return ROUTER_MAX_ROWS
+
+
+def _mix_sync(layer: _Layer, edge: str, hidden_states: torch.Tensor) -> Optional[StageSync]:
+    """The ``mix_latent`` consumer side: the MoE input itself, when it lives in the ``mix_out`` slot and the edge is
+    on."""
+    if (
+        edge not in layer.edges
+        or not k3_recipe.moe_on(edge, hidden_states.shape[0])
+        or k3_edges.lease_containing(hidden_states) is None
+    ):
+        return None
+    return StageSync({edge: EdgeSync(edge, "slot", hidden_states)}, {})
+
+
+def mix_out(runtime, rows: int):
+    """The slot the pre-MoE mix writes the MoE input into when ``mix_latent`` is on, or None for its plain buffer.
+    The mix stores it as an FGS producer (no -0, dependents launched at entry); the slot is released once the MoE
+    block has joined its streams (``mix_done``), which re-arms it on the reset stream."""
+    layer = getattr(getattr(runtime, "routed_experts", None), "_k3_moe_layer", None)
+    if layer is None or not any(k3_recipe.moe_on(e, rows) for e in layer.edges & _MIX_EDGES):
+        return None
+    lease = k3_edges.acquire(MIX_X, rows, window=(1, MIX_MAX_ROWS))
+    return lease
+
+
+def mix_done(hidden_states: torch.Tensor) -> None:
+    """Release the ``mix_out`` slot ``hidden_states`` lives in, after the last of its readers was launched."""
+    lease = k3_edges.lease_containing(hidden_states)
+    if lease is not None:
+        k3_edges.consumed(lease)
 
 
 def run_tail(y: torch.Tensor, norm, up_proj, shared: torch.Tensor) -> torch.Tensor:

@@ -1,0 +1,38 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Kimi K3 on Rubin, DEP16 decode with fine-grained sync (FGS) edges chosen per decode batch (rows per rank).
+# Needs TRTLLM_ENABLE_PDL=1, CUDA_MODULE_LOADING=EAGER (a lazy module load while a consumer spins can hang) and CuTe
+# DSL >= 4.9.
+tensor_parallel_size: 16
+moe_expert_parallel_size: 16
+enable_attention_dp: true
+enable_chunked_prefill: true
+trust_remote_code: true
+stream_interval: 10
+cuda_graph_config:
+  max_batch_size: 64
+  enable_padding: true
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.6
+moe_config:
+  use_low_precision_moe_combine: true
+fine_grained_sync_config:
+  edges:
+    # KDA decode chain from 8 rows: below 8 its direct-GEMM builds cost more than the chain saves. Above 64 rows the
+    # bfa projection runs a 2-CTA A-multicast tile, which has no FGS consumer build.
+    kda.x_norm: [[8, 64]]
+    kda.qkvg: [[8, 64]]
+    kda.bfa: [[8, 64]]
+    kda.g: [[8, 64]]
+    kda.core_o: [[8, 64]]
+    # No kda.attn_o: o_proj is a single wave, so the early-launched mix beside it only stretches it.
+    # MLA chain up to 64 rows. Its o_proj -> pre-MoE mix edge stops at 16 rows: above that the polling mix stays
+    # resident beside a multi-wave o_proj and stretches it.
+    mla.chain: [[1, 64]]
+    mla.attn_o: [[1, 16]]
+    moe.recv_norm: [[1, 128]]
+    moe.fc1_fc2: [[1, 128]]
+    # Pre-MoE mix -> latent down up to 64 rows: above that the mix runs a kernel without an FGS producer build.
+    moe.mix_latent: [[1, 64]]

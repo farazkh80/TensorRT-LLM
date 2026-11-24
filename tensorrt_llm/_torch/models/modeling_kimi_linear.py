@@ -1980,6 +1980,8 @@ class KimiK3MoERuntime(nn.Module):
             self.shared_expert_stream,
             disable_on_compile=True,
         )
+        # Every reader of a mix_out slot (router, latent down, shared expert) is launched and joined here.
+        k3_moe_chain.mix_done(identity)
         if self._defer_shared_allreduce and not overlap_shared_allreduce:
             shared_out = self.shared_experts.down_proj.all_reduce(shared_out)
         if self._reduce_routed_output:
@@ -2556,12 +2558,28 @@ class KimiLinearDecoderLayer(nn.Module):
                 None if prefix_sum is None else hidden_states,
             )
         )
+        # moe.mix_latent: the mix writes the MoE input into a -0-armed slot as an FGS producer.
+        mix_lease = (
+            k3_moe_chain.mix_out(self.block_sparse_moe, hidden_states.shape[0])
+            if self.is_moe
+            and _CUTE_NORM_ENABLED
+            and (attn_o_lease is None or chain_mix)
+            and _cute_attn_res_applicable(
+                hidden_states if prefix_sum is None else prefix_sum,
+                valid_block_residual,
+                None if prefix_sum is None else hidden_states,
+            )
+            else None
+        )
+        mix_out_kw = {} if mix_lease is None else dict(out=mix_lease.tensor, fgs_producer=True)
         if chain_mix:
             mix_fgs = dict(
                 fgs_consumer=True,
                 fgs_counters=k3_kda_chain.mix_counters(self, hidden_states.device),
             )
             owner = k3_kda_chain.mix_owner(self, self.layer_idx, hidden_states.shape[0])
+            if mix_lease is not None:
+                mix_fgs["fgs_producer"] = True
             if prefix_sum is None:
                 attn_out = hidden_states
                 hidden_states = _cute_attn_res(
@@ -2570,7 +2588,9 @@ class KimiLinearDecoderLayer(nn.Module):
                     self.mlp_res_proj,
                     self.mlp_res_norm,
                     self.post_attention_layernorm,
-                    out=k3_kda_chain.buffer(owner, "mix_out", attn_out),
+                    out=k3_kda_chain.buffer(owner, "mix_out", attn_out)
+                    if mix_lease is None
+                    else mix_lease.tensor,
                     **mix_fgs,
                 )
                 # The residual add reads the attention output after the slot is re-armed.
@@ -2584,8 +2604,31 @@ class KimiLinearDecoderLayer(nn.Module):
                     self.post_attention_layernorm,
                     addend=hidden_states,
                     updated=k3_kda_chain.buffer(owner, "mix_updated", prefix_sum),
-                    out=k3_kda_chain.buffer(owner, "mix_out", prefix_sum),
+                    out=k3_kda_chain.buffer(owner, "mix_out", prefix_sum)
+                    if mix_lease is None
+                    else mix_lease.tensor,
                     **mix_fgs,
+                )
+        elif mix_lease is not None:
+            if prefix_sum is None:
+                prefix_sum = hidden_states
+                hidden_states = _cute_attn_res(
+                    prefix_sum,
+                    valid_block_residual,
+                    self.mlp_res_proj,
+                    self.mlp_res_norm,
+                    self.post_attention_layernorm,
+                    **mix_out_kw,
+                )
+            else:
+                prefix_sum, hidden_states = _cute_attn_res(
+                    prefix_sum,
+                    valid_block_residual,
+                    self.mlp_res_proj,
+                    self.mlp_res_norm,
+                    self.post_attention_layernorm,
+                    addend=hidden_states,
+                    **mix_out_kw,
                 )
         elif prefix_sum is None:
             prefix_sum = (

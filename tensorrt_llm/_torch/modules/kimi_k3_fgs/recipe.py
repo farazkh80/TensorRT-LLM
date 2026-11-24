@@ -8,7 +8,8 @@ the same kernels).
 
 Edge names: the KDA chain edges (``KDA_EDGES``); ``mla.chain``, every mla.* slot (the decode MLA layer runs as a
 chain only with all of them) except ``mla.attn_o``, the chain's o_proj -> pre-MoE mix edge, which when listed runs only
-at its own rows (unlisted: wherever the chain runs).
+at its own rows (unlisted: wherever the chain runs); ``moe.<edge>`` for the MoE edges of ``moe_chain``, where
+``moe.recv_norm`` also selects the Lamport combine inbox at its rows.
 """
 
 from typing import Dict, Optional, Tuple
@@ -25,11 +26,20 @@ DEFAULT_EDGES: Dict[str, Tuple[Tuple[int, int], ...]] = {
     "kda.core_o": ((8, 64),),
     "mla.chain": ((1, 64),),
     "mla.attn_o": ((1, 16),),
+    "moe.recv_norm": ((1, 128),),
+    "moe.fc1_fc2": ((1, 128),),
+    "moe.mix_latent": ((1, 64),),
 }
-_FAMILIES = frozenset(("kda", "mla"))
+_FAMILIES = frozenset(("kda", "mla", "moe"))
 
 _windows: Dict[str, Tuple[Tuple[int, int], ...]] = {}
 _owned: frozenset = frozenset()
+
+
+def moe_edges() -> Tuple[str, ...]:
+    from . import moe_chain
+
+    return tuple(f"moe.{e}" for e in moe_chain.EDGES + tuple(moe_chain.V2_EDGES))
 
 
 def mode() -> str:
@@ -43,7 +53,7 @@ def install(config) -> None:
     _windows, _owned = {}, frozenset()
     if config is None:
         return
-    known = set(KDA_EDGES) | {MLA_CHAIN, MLA_ATTN_O}
+    known = set(KDA_EDGES) | {MLA_CHAIN, MLA_ATTN_O} | set(moe_edges())
     names = DEFAULT_EDGES if config.edges is None else config.edges
     unknown = sorted(set(names) - known)
     if unknown:
@@ -55,10 +65,13 @@ def install(config) -> None:
     )
     _owned = _FAMILIES
 
-    from . import edges, mla_chain
+    from . import edges, mla_chain, moe_chain
 
     edges.configure_window(span(KDA_EDGES))
     mla_chain.configure_window(span((MLA_CHAIN,)))
+    moe_chain.configure_windows(
+        {n[len("moe.") :]: span((n,)) for n in _windows if n.startswith("moe.")}
+    )
 
 
 def owns(family: str) -> bool:
@@ -78,7 +91,8 @@ def on(edge: str, rows: int) -> bool:
 
 
 def slot_allowed(slot: str, rows: int) -> bool:
-    """Whether the recipe lets the kda / mla edge holding ``slot`` run at ``rows``."""
+    """Whether the recipe lets the kda / mla edge holding ``slot`` run at ``rows`` (MoE slots are gated by edge name
+    in ``moe_chain``)."""
     family = slot.partition(".")[0]
     if family == "kda" and slot in KDA_EDGES and owns("kda"):
         return on(slot, rows)
@@ -87,3 +101,15 @@ def slot_allowed(slot: str, rows: int) -> bool:
             return on(MLA_CHAIN, rows) and on(MLA_ATTN_O, rows)
         return on(MLA_CHAIN, rows)
     return True
+
+
+def moe_on(edge: str, rows: int) -> bool:
+    """Whether the recipe runs MoE edge ``edge`` at ``rows``."""
+    return not owns("moe") or on(f"moe.{edge}", rows)
+
+
+def moe_edge_names() -> Optional[frozenset]:
+    """The MoE edges the recipe lists (without the ``moe.`` prefix), or None when no recipe is installed."""
+    if not owns("moe"):
+        return None
+    return frozenset(n[len("moe.") :] for n in _windows if n.startswith("moe."))
